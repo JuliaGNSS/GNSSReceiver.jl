@@ -1,8 +1,10 @@
 # GNSSReceiver (WIP)
 
+![Exemplary output](media/output.png)
+
 Currently, this includes the Manifest.toml because this implementation depends on pending pull requests.
 
-# Installation
+## Installation
 
 Git clone GNSSReceiver.jl
 
@@ -14,7 +16,7 @@ pkg> activate .
 (GNSSReceiver) pkg> instantiate
 ```
 
-![Exemplary output](media/output.png)
+## Usage
 
 ```julia
 using GNSSSignals, Tracking, GNSSReceiver, Unitful
