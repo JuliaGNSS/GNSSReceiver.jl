@@ -1,4 +1,5 @@
-function read_files(files, sampling_freq, measurement = get_default_measurement(files, sampling_freq))
+function read_files(files, num_samples; type = Complex{Int16})
+    measurement = get_measurement(files, num_samples, type)
     streams = open.(files)
     measurement_channel = Channel{typeof(measurement)}()
     Base.errormonitor(Threads.@spawn begin
@@ -20,9 +21,8 @@ function read_files(files, sampling_freq, measurement = get_default_measurement(
     return measurement_channel
 end
 
-function get_default_measurement(files, sampling_freq)
-    num_samples = Int(upreferred(sampling_freq * 4ms))
-    files isa AbstractVector ? Matrix{Complex{Int16}}(undef, num_samples, length(files)) : Vector{Complex{Int16}}(undef, num_samples)
+function get_measurement(files, num_samples, type)
+    files isa AbstractVector ? Matrix{type}(undef, num_samples, length(files)) : Vector{type}(undef, num_samples)
 end
 
 function read_measurement!(streams::AbstractVector, measurements)
