@@ -18,10 +18,22 @@ UnicodePlots = "b8865327-cd53-5732-bb35-84acbb429228"
 Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
 
 [compat]
+Acquisition = "0.0.4"
+GNSSDecoder = "0.0.1"
+UnicodePlots = "3.0.4"
+StaticArrays = "1"
+Term = "1"
+JLD2 = "0.4"
+GNSSSignals = "0.16"
+Unitful = "1"
+Tracking = "0.14"
+PositionVelocityTime = "0.0.1"
 julia = "1.6"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+Geodesy = "0ef565a4-170c-5f04-8de2-149903a85f3d"
+AstroTime = "c61b5328-d09d-5e37-a9a8-0eb41c39009c"
 
 [targets]
-test = ["Test"]
+test = ["Test", "Geodesy", "AstroTime"]

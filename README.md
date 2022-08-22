@@ -32,11 +32,16 @@ sampling_freq = 5e6Hz
 num_samples = Int(upreferred(sampling_freq * 4ms))
 measurement_channel = read_files(files, num_samples, type = Complex{Int16})
 # Let's receive GPS L1 signals
-data_channel, gui_channel = receive(measurement_channel, gpsl1, sampling_freq, num_ants = NumAnts(4))
+data_channel = receive(measurement_channel, gpsl1, sampling_freq, num_ants = NumAnts(4))
+# Get gui channel from data channel
+gui_channel = get_gui_data_channel(data_channel)
 # Hook up GUI
 GNSSReceiver.gui(gui_channel)
-# Save interesting data
-save_data(data_channel, filename = "data.jld2")
+# If you'd like to save the data as well, you will have to split the data channel:
+# data_channel1, data_channel2 = tee(data_channel)
+# save_data(data_channel1, filename = "data.jld2")
+# gui_channel = get_gui_data_channel(data_channel)
+# GNSSReceiver.gui(gui_channel)
 ```
 
 That's it. You can watch the GUI being updated in real time.
