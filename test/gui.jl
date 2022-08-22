@@ -76,6 +76,6 @@ end
     @test occursin("42.2", out)
     @test occursin("43.2", out)
     @test occursin("46.3", out)
-    @test occursin("Latitude: 50.830894797269906", out)
-    @test occursin("Longitude: 5.568737077976637", out)
+    @test occursin("50.830894797269906", out)
+    @test occursin("5.568737077976637", out)
 end
