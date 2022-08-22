@@ -42,7 +42,7 @@ function process(
         )
         for (prn, state) in filter(((prn, state),) -> is_in_lock(state), sat_channel_states)
     )
-    sat_channel_states = Dict(
+    sat_channel_states = Dict{Int, SatelliteChannelState}(
         prn => is_in_lock(state) ? SatelliteChannelState(
             get_state(track_results[prn][end]),
             foldl(track_results[prn], init = sat_channel_states[prn].decoder) do prev_decoder, track_res

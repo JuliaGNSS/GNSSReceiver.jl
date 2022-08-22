@@ -3,7 +3,12 @@ module GNSSReceiver
     using StaticArrays, GNSSDecoder, Tracking, PositionVelocityTime, GNSSSignals, Acquisition, Unitful, LinearAlgebra, JLD2
     using Unitful:dBHz, ms, Hz
 
-    export receive, reset_but_keep_decoders_and_pvt, read_files, save_data
+    export 
+        receive,
+        reset_but_keep_decoders_and_pvt,
+        read_files,
+        save_data,
+        get_gui_data_channel
 
     include("lock_detector.jl")
     include("beamformer.jl")
@@ -58,9 +63,9 @@ module GNSSReceiver
 
     include("channel.jl")
     include("process.jl")
-    include("gui.jl")
     include("read_file.jl")
     include("receive.jl")
+    include("gui.jl")
     include("save_data.jl")
 
 end

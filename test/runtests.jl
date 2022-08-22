@@ -1,6 +1,10 @@
-using GNSSReceiver
-using Test
+using Test, GNSSReceiver, GNSSSignals, Tracking, Unitful, Geodesy, AstroTime, PositionVelocityTime, JLD2
 
-@testset "GNSSReceiver.jl" begin
-    # Write your tests here.
-end
+using Unitful: Hz, dBHz, ms
+
+include("beamformer.jl")
+include("receive.jl")
+include("process.jl")
+include("gui.jl")
+include("save_data.jl")
+
