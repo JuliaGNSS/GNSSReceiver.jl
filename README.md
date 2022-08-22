@@ -40,7 +40,7 @@ GNSSReceiver.gui(gui_channel)
 # If you'd like to save the data as well, you will have to split the data channel:
 # data_channel1, data_channel2 = tee(data_channel)
 # save_data(data_channel1, filename = "data.jld2")
-# gui_channel = get_gui_data_channel(data_channel)
+# gui_channel = get_gui_data_channel(data_channel2)
 # GNSSReceiver.gui(gui_channel)
 ```
 
