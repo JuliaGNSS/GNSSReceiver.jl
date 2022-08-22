@@ -1,6 +1,16 @@
 module GNSSReceiver
 
-    using StaticArrays, GNSSDecoder, Tracking, PositionVelocityTime, GNSSSignals, Acquisition, Unitful, LinearAlgebra, JLD2
+    using StaticArrays,
+        GNSSDecoder,
+        Tracking,
+        PositionVelocityTime,
+        GNSSSignals,
+        Acquisition,
+        Unitful,
+        LinearAlgebra,
+        JLD2,
+        SoapySDR
+
     using Unitful:dBHz, ms, Hz
 
     export 
@@ -9,7 +19,10 @@ module GNSSReceiver
         read_files,
         save_data,
         get_gui_data_channel,
-        tee
+        tee,
+        rechunk,
+        stream_data
+
 
     include("lock_detector.jl")
     include("beamformer.jl")
@@ -68,5 +81,6 @@ module GNSSReceiver
     include("receive.jl")
     include("gui.jl")
     include("save_data.jl")
+    include("soapy_sdr_helper.jl")
 
 end

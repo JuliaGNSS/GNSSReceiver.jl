@@ -11,9 +11,10 @@
     end
 
     @sync begin
-        save_data(data_channel, filename = "./data.jld2")
+        save_data(data_channel, filename = "/tmp/data.jld2")
     end
-    data_over_time = load("./data.jld2", "data_over_time")
+    sleep(1.0)
+    data_over_time = load("/tmp/data.jld2", "data_over_time")
 
     @test length(data_over_time) == 20
     @test length(last(data_over_time).sat_data) == 0
