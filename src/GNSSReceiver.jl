@@ -8,7 +8,8 @@ module GNSSReceiver
         reset_but_keep_decoders_and_pvt,
         read_files,
         save_data,
-        get_gui_data_channel
+        get_gui_data_channel,
+        tee
 
     include("lock_detector.jl")
     include("beamformer.jl")

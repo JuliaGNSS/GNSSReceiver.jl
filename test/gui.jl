@@ -1,8 +1,13 @@
 @testset "Get GUI data from data channel" begin
-    data_channel = Channel{GNSSReceiver.ReceiverDataOfInterest{4}}() do ch
+    data_channel = Channel{GNSSReceiver.ReceiverDataOfInterest{2}}() do ch
         foreach(1:200) do i
-            data = GNSSReceiver.ReceiverDataOfInterest{4}(
-                Dict{Int, Vector{GNSSReceiver.SatelliteDataOfInterest{4}}}(),
+            data = GNSSReceiver.ReceiverDataOfInterest{2}(
+                Dict{Int, Vector{GNSSReceiver.SatelliteDataOfInterest{2}}}(
+                    1 => [GNSSReceiver.SatelliteDataOfInterest{2}(
+                        45.0dBHz,
+                        SVector(complex(1.0,2.0),complex(2.0,3.0))
+                    )]
+                ),
                 GNSSReceiver.PVTSolution(),
                 (i - 1) * 1ms
             )
@@ -14,8 +19,10 @@
 
     gui_datas = collect(gui_data_channel)
     @test length(gui_datas) == 2
-    @test length(gui_datas[1].cn0s) == 0
-    @test length(gui_datas[2].cn0s) == 0
+    @test length(gui_datas[1].cn0s) == 1
+    @test first(gui_datas[1].cn0s) == (1 => 45dBHz)
+    @test length(gui_datas[2].cn0s) == 1
+    @test first(gui_datas[2].cn0s) == (1 => 45dBHz)
     @test isnothing(gui_datas[1].pvt.time)
 end
 

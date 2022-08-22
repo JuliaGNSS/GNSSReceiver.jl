@@ -17,3 +17,21 @@ function consume_channel(f::Function, c::Channel, args...)
         f(data, args...)
     end
 end
+
+"""
+    tee(in::Channel)
+Returns two channels that synchronously output what comes in from `in`.
+"""
+function tee(in::Channel{T}) where {T}
+    out1 = Channel{T}()
+    out2 = Channel{T}()
+    Base.errormonitor(Threads.@spawn begin
+        consume_channel(in) do data
+            put!(out1, data)
+            put!(out2, data)
+        end
+        close(out1)
+        close(out2)
+    end)
+    return (out1, out2)
+end

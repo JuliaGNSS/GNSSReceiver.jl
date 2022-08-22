@@ -1,4 +1,4 @@
-using Test, GNSSReceiver, GNSSSignals, Tracking, Unitful, Geodesy, AstroTime, PositionVelocityTime, JLD2
+using Test, GNSSReceiver, GNSSSignals, Tracking, Unitful, Geodesy, AstroTime, PositionVelocityTime, JLD2, StaticArrays
 
 using Unitful: Hz, dBHz, ms
 

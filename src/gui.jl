@@ -52,7 +52,7 @@ function get_gui_data_channel(data_channel::Channel{<:ReceiverDataOfInterest}, p
         consume_channel(data_channel) do data
             if (data.runtime - last_gui_output) > push_gui_data_roughly_every || first
                 cn0s = Dict(
-                    prn => last(sat_data.cn0)
+                    prn => last(sat_data).cn0
                     for (prn, sat_data) in data.sat_data
                 )
                 push!(gui_data_channel, GUIData(cn0s, data.pvt))
