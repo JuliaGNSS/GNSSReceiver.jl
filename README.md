@@ -83,5 +83,8 @@ Device(first(Devices())) do dev
 
     # Display the GUI and block
     GNSSReceiver.gui(gui_channel)
+
+    # Keep this so we don't segfault right now
+    sleep(1)
 end
 ```
