@@ -74,12 +74,7 @@ Device(first(Devices())) do dev
     c = stream_data(stream, num_samples)
     # Resizing the chunks to 4ms in length
     reshunked_c = rechunk(c, four_ms_samples)
-    # Inserts diagnostics
-
-    vec_c = Channel{Vector{ComplexF32}}()
-    @async GNSSReceiver.consume_channel(reshunked_c) do buff
-        put!(vec_c, vec(buff))
-    end
+    vec_c = vectorize_data(reshunked_c)
 
     # Performing GNSS acquisition and tracking
     data_channel = receive(vec_c, gpsl1, sampling_freq)

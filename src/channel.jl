@@ -97,3 +97,18 @@ function rechunk(in::Channel{Matrix{T}}, chunk_size::Integer) where {T}
 
     return out
 end
+
+"""
+    vectorize_data(in::Channel)
+Returns channels with vectorized data.
+"""
+function vectorize_data(in::Channel{<:AbstractMatrix{T}}) where {T}
+    vec_c = Channel{Vector{T}}()
+    Base.errormonitor(Threads.@spawn begin
+        consume_channel(in) do buff
+            put!(vec_c, vec(buff))
+        end
+        close(vec_c)
+    end)
+    return vec_c
+end

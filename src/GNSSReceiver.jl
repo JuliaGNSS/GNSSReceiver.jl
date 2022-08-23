@@ -21,7 +21,8 @@ module GNSSReceiver
         get_gui_data_channel,
         tee,
         rechunk,
-        stream_data
+        stream_data,
+        vectorize_data
 
 
     include("lock_detector.jl")
