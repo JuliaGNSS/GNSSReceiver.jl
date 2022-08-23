@@ -57,7 +57,7 @@ using SoapySDR, SoapyLMS7_jll
 using SoapySDR: dB
 gpsl1 = GPSL1()
 
-sampling_freq = 5.0u"MHz"
+sampling_freq = 5e6u"Hz"
 four_ms_samples = Int(upreferred(sampling_freq * 4u"ms"))
 num_samples = Int(upreferred(sampling_freq * 10u"s"))
 
@@ -77,7 +77,7 @@ Device(first(Devices())) do dev
     # Inserts diagnostics
 
     vec_c = Channel{Vector{ComplexF32}}()
-    @async consume_channel(reshunked_c) do buff
+    @async GNSSReceiver.consume_channel(reshunked_c) do buff
         put!(vec_c, vec(buff))
     end
 
@@ -88,8 +88,5 @@ Device(first(Devices())) do dev
 
     # Display the GUI and block
     GNSSReceiver.gui(gui_channel)
-
-    # Keep this so we don't segfault right now
-    sleep(1)
 end
 ```

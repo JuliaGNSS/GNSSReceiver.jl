@@ -40,7 +40,7 @@ end
     buf = IOBuffer()
     GNSSReceiver.gui(gui_data_channel, buf)
     out = String(take!(buf))
-    @test occursin("No satellites acquired.", out)
+    @test occursin("Searching for satellites", out)
     @test occursin("Not enough satellites to calculate position.", out)
 end
 

@@ -24,18 +24,19 @@ GNSSDecoder = "0.0.1"
 GNSSSignals = "0.16"
 JLD2 = "0.4"
 PositionVelocityTime = "0.0.1"
+SoapySDR = "0.3.3"
 StaticArrays = "1"
 Term = "1"
 Tracking = "0.14"
 UnicodePlots = "3.0.4"
 Unitful = "1"
-SoapySDR = "0.3.3"
 julia = "1.6"
 
 [extras]
 AstroTime = "c61b5328-d09d-5e37-a9a8-0eb41c39009c"
 Geodesy = "0ef565a4-170c-5f04-8de2-149903a85f3d"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 
 [targets]
-test = ["Test", "Geodesy", "AstroTime"]
+test = ["Test", "Geodesy", "AstroTime", "Random"]
