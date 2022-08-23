@@ -84,7 +84,7 @@ function gui(gui_data_channel, io::IO = stdout)
         cn0_panel_title = "Carrier-to-Noise-Density-Ratio (CN0)"
         panels = !isempty(rounded_cn0s) ?
             panel(barplot(rounded_cn0s, ylabel = "Satellites", xlabel = "Carrier-to-Noise-Density-Ratio (CN0) [dBHz]"), fit = true, title = cn0_panel_title) :
-            Panel("No satellites acquired.", title = cn0_panel_title)
+            Panel("Searching for satellites$(repeat(".", dots_counter))", title = cn0_panel_title, width = length(cn0_panel_title) + 5)
         if !isnothing(pvt.time)
             sat_enus = map(sat_pos -> get_sat_enu(pvt.position, sat_pos), pvt.sat_positions)
             azs = map(x -> x.θ, sat_enus)
@@ -97,11 +97,11 @@ function gui(gui_data_channel, io::IO = stdout)
             panels *= Panel(not_enought_sats_text, title = sat_doa_panel_title)
             panels *= Panel(not_enought_sats_text, title = position_panel_title)
         else
-            dots_counter = mod(dots_counter + 1, 4)
             decoding_text = "Decoding satellites$(repeat(".", dots_counter))"
             panels *= Panel(decoding_text, title = sat_doa_panel_title, width = length(not_enought_sats_text) + 5)
             panels *= Panel(decoding_text, title = position_panel_title, width = length(not_enought_sats_text) + 5)
         end
+        dots_counter = mod(dots_counter + 1, 4)
         out = string(panels)
         REPL.Terminals.clear(terminal)
         _cursor_hide(io)

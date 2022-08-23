@@ -35,3 +35,80 @@ function tee(in::Channel{T}) where {T}
     end)
     return (out1, out2)
 end
+
+"""
+    rechunk(in::Channel, chunk_size::Int)
+Converts a stream of chunks with size A to a stream of chunks with size B.
+"""
+function rechunk(in::Channel{Matrix{T}}, chunk_size::Integer) where {T}
+    out = Channel{Matrix{T}}()
+
+    Base.errormonitor(Threads.@spawn begin
+        chunk_filled = 0
+        chunk_idx = 1
+        # We'll alternate between filling up these three chunks, then sending
+        # them down the channel.  We have three so that we can have:
+        # - One that we're modifying,
+        # - One that was sent out to a downstream,
+        # - One that is being held by an intermediary
+        chunks = [
+            Matrix{T}(undef, 0, 0),
+            Matrix{T}(undef, 0, 0),
+            Matrix{T}(undef, 0, 0),
+        ]
+        function make_chunks!(num_channels)
+            if size(chunks[1], 2) != num_channels
+                for idx in eachindex(chunks)
+                    chunks[idx] = Matrix{T}(undef, chunk_size, num_channels)
+                end
+                global chunk_filled = 0
+                global chunk_idx = 1
+            end
+        end
+        consume_channel(in) do data
+            # Make the loop type-stable
+            data = view(data, 1:size(data, 1), :)
+
+            # Generate chunks until this data is done
+            while !isempty(data)
+                make_chunks!(size(data, 2))
+
+                # How many samples are we going to consume from this buffer?
+                samples_wanted = (chunk_size - chunk_filled)
+                samples_taken = min(size(data, 1), samples_wanted)
+
+                # Copy as much of `data` as we can into `chunks`
+                chunks[chunk_idx][chunk_filled+1:chunk_filled + samples_taken, :] = data[1:samples_taken, :]
+                chunk_filled += samples_taken
+
+                # Move our view of `data` forward:
+                data = view(data, samples_taken+1:size(data, 1), :)
+
+                # If we filled the chunk completely, then send it off and flip `chunk_idx`:
+                if chunk_filled >= chunk_size
+                    put!(out, chunks[chunk_idx])
+                    chunk_idx = mod1(chunk_idx + 1, length(chunks))
+                    chunk_filled = 0
+                end
+            end
+        end
+        close(out)
+    end)
+
+    return out
+end
+
+"""
+    vectorize_data(in::Channel)
+Returns channels with vectorized data.
+"""
+function vectorize_data(in::Channel{<:AbstractMatrix{T}}) where {T}
+    vec_c = Channel{Vector{T}}()
+    Base.errormonitor(Threads.@spawn begin
+        consume_channel(in) do buff
+            put!(vec_c, vec(buff))
+        end
+        close(vec_c)
+    end)
+    return vec_c
+end

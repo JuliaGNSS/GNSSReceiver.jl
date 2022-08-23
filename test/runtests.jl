@@ -1,6 +1,19 @@
-using Test, GNSSReceiver, GNSSSignals, Tracking, Unitful, Geodesy, AstroTime, PositionVelocityTime, JLD2, StaticArrays
+using Test,
+    GNSSReceiver,
+    GNSSSignals,
+    GNSSDecoder,
+    Tracking,
+    Unitful,
+    Geodesy,
+    AstroTime,
+    PositionVelocityTime,
+    JLD2,
+    StaticArrays,
+    Random
 
 using Unitful: Hz, dBHz, ms
+
+Random.seed!(2345)
 
 include("beamformer.jl")
 include("receive.jl")

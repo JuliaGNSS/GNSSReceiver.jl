@@ -1,10 +1,10 @@
-struct SatelliteDataOfInterest{N}
+struct SatelliteDataOfInterest{P <: Union{<:Complex, <:AbstractVector{<:Complex}}}
     cn0::typeof(1.0dBHz)
-    prompts::SVector{N,ComplexF64}
+    prompt::P
 end
 
-struct ReceiverDataOfInterest{N}
-    sat_data::Dict{Int, Vector{SatelliteDataOfInterest{N}}}
+struct ReceiverDataOfInterest{S <: SatelliteDataOfInterest}
+    sat_data::Dict{Int, Vector{S}}
     pvt::PVTSolution
     runtime::typeof(1ms)
 end
@@ -22,7 +22,8 @@ function receive(
     T <: AbstractMatrix && N == 1 && throw(ArgumentError("Measurement channel contains a matrix. Please specify num_ants to the number of used antennas with num_ants = NumAnts(N)"))
     T <: AbstractVector && N > 1 && throw(ArgumentError("Measurement channel contains a vector. In this case number of antennas should be one: num_ants = NumAnts(1) (default)"))
     
-    data_channel = Channel{ReceiverDataOfInterest{N}}()
+    sat_data_type = N == 1 ? SatelliteDataOfInterest{ComplexF64} : SatelliteDataOfInterest{SVector{N, ComplexF64}}
+    data_channel = Channel{ReceiverDataOfInterest{sat_data_type}}()
 
     Base.errormonitor(Threads.@spawn begin
         consume_channel(measurement_channel) do measurement
@@ -39,7 +40,7 @@ function receive(
                 acq_threshold,
                 time_in_lock_before_pvt
             )
-            sat_data = Dict{Int, Vector{SatelliteDataOfInterest{N}}}(
+            sat_data = Dict{Int, Vector{sat_data_type}}(
                 prn => map(x -> SatelliteDataOfInterest(get_cn0(x), get_prompt(x)), res)
                 for (prn, res) in track_results
             )
