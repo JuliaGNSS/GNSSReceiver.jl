@@ -908,6 +908,12 @@ git-tree-sha1 = "3841791b9d1a4d5a4394d7eb4c43f42303a20e0c"
 uuid = "66db9d55-30c0-4569-8b51-7e840670fc0c"
 version = "1.0.0"
 
+[[SoapyLMS7_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg", "libusb_jll", "soapysdr_jll"]
+git-tree-sha1 = "5d9d88fafa5729d17dac079b7204bf23327eeb7a"
+uuid = "e7ed14a0-13eb-5dc7-93e2-6133b2eb8bed"
+version = "20.10.0+1"
+
 [[SoapySDR]]
 deps = ["CEnum", "Intervals", "Unitful", "soapysdr_jll"]
 git-tree-sha1 = "22ddf1d022bfc8583c2a5380862d71839f33fb67"
@@ -1116,6 +1122,12 @@ version = "1.2.12+3"
 deps = ["Artifacts", "Libdl", "OpenBLAS_jll"]
 uuid = "8e850b90-86db-534c-a0d3-1478176c7d93"
 version = "5.1.1+0"
+
+[[libusb_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg"]
+git-tree-sha1 = "6cd61968d9ec00371b4d1f68a446de2f53de0aa8"
+uuid = "a877fdc9-fe69-5ed6-b93d-11ecd0dc2d49"
+version = "1.0.24+0"
 
 [[nghttp2_jll]]
 deps = ["Artifacts", "Libdl"]

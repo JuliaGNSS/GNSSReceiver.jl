@@ -1,9 +1,10 @@
 @testset "Get GUI data from data channel" begin
-    data_channel = Channel{GNSSReceiver.ReceiverDataOfInterest{2}}() do ch
+    sat_data_type = GNSSReceiver.SatelliteDataOfInterest{SVector{2, ComplexF64}}
+    data_channel = Channel{GNSSReceiver.ReceiverDataOfInterest{sat_data_type}}() do ch
         foreach(1:200) do i
-            data = GNSSReceiver.ReceiverDataOfInterest{2}(
-                Dict{Int, Vector{GNSSReceiver.SatelliteDataOfInterest{2}}}(
-                    1 => [GNSSReceiver.SatelliteDataOfInterest{2}(
+            data = GNSSReceiver.ReceiverDataOfInterest{sat_data_type}(
+                Dict{Int, Vector{sat_data_type}}(
+                    1 => [sat_data_type(
                         45.0dBHz,
                         SVector(complex(1.0,2.0),complex(2.0,3.0))
                     )]
