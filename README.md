@@ -41,9 +41,10 @@ gui_channel = get_gui_data_channel(data_channel)
 GNSSReceiver.gui(gui_channel)
 # If you'd like to save the data as well, you will have to split the data channel:
 # data_channel1, data_channel2 = tee(data_channel)
-# save_data(data_channel1, filename = "data.jld2")
+# data_task = @async save_data(data_channel1)
 # gui_channel = get_gui_data_channel(data_channel2)
 # GNSSReceiver.gui(gui_channel)
+# data = fetch(data_task)
 ```
 
 That's it. You can watch the GUI being updated in real time.

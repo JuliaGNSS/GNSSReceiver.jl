@@ -8,7 +8,6 @@ module GNSSReceiver
         Acquisition,
         Unitful,
         LinearAlgebra,
-        JLD2,
         SoapySDR
 
     using Unitful:dBHz, ms, Hz
