@@ -60,7 +60,7 @@ gpsl1 = GPSL1()
 
 sampling_freq = 5e6u"Hz"
 four_ms_samples = Int(upreferred(sampling_freq * 4u"ms"))
-num_samples = Int(upreferred(sampling_freq * 10u"s"))
+num_samples = Int(upreferred(sampling_freq * 40u"s"))
 
 Device(first(Devices())) do dev
     chan = dev.rx[1]
@@ -68,17 +68,23 @@ Device(first(Devices())) do dev
     chan.frequency = 1575.42u"MHz"
     chan.sample_rate = sampling_freq
     chan.bandwidth = sampling_freq
-    chan.gain = 61dB
+    chan.gain_mode = true
 
-    stream = SoapySDR.Stream(ComplexF32, chan)
+    stream = SoapySDR.Stream(ComplexF32, dev.rx)
     # Getting samples in chunks of `mtu`
-    c = stream_data(stream, num_samples)
+    data_stream = stream_data(stream, num_samples)
+
+    # Satellite acquisition takes about 1s to process on a recent laptop
+    # Let's take a buffer length of 5s to be on the save side
+    buffer_length = 5u"s"
+    buffered_stream = membuffer(data_stream, ceil(Int, buffer_length * sampling_freq / stream.mtu))
+
     # Resizing the chunks to 4ms in length
-    reshunked_c = rechunk(c, four_ms_samples)
-    vec_c = vectorize_data(reshunked_c)
+    reshunked_stream = rechunk(buffered_stream, four_ms_samples)
+    vectorized_stream = vectorize_data(reshunked_stream)
 
     # Performing GNSS acquisition and tracking
-    data_channel = receive(vec_c, gpsl1, sampling_freq)
+    data_channel = receive(vectorized_stream, gpsl1, sampling_freq)
 
     gui_channel = get_gui_data_channel(data_channel)
 
