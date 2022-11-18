@@ -38,12 +38,11 @@ end
 
 """
     rechunk(in::Channel, chunk_size::Int)
+
 Converts a stream of chunks with size A to a stream of chunks with size B.
 """
-function rechunk(in::Channel{Matrix{T}}, chunk_size::Integer) where {T}
-    out = Channel{Matrix{T}}()
-
-    Base.errormonitor(Threads.@spawn begin
+function rechunk(in::Channel{Matrix{T}}, chunk_size::Integer) where {T <: Number}
+    return spawn_channel_thread(;T) do out
         chunk_filled = 0
         chunk_idx = 1
         # We'll alternate between filling up these three chunks, then sending
@@ -92,10 +91,7 @@ function rechunk(in::Channel{Matrix{T}}, chunk_size::Integer) where {T}
                 end
             end
         end
-        close(out)
-    end)
-
-    return out
+    end
 end
 
 """
@@ -111,4 +107,29 @@ function vectorize_data(in::Channel{<:AbstractMatrix{T}}) where {T}
         close(vec_c)
     end)
     return vec_c
+end
+
+"""
+    write_to_file(in::Channel, file_path)
+
+Consume a channel and write to file(s). Multiple channels will
+be written to different files. The channel number is appended
+to the filename.
+"""
+function write_to_file(in::Channel{Matrix{T}}, file_path::String) where {T <: Number}
+    streams = IOStream[]
+    try
+        consume_channel(in) do buffs
+            if length(streams) != size(buffs, 2)
+                type_string = string(T)
+                streams = [open("$file_path$type_string$i.dat", "w") for i in 1:size(buffs, 2)]
+            end
+
+            foreach(eachcol(buffs), streams) do buff, stream
+                write(stream, buff)
+            end
+        end
+    finally
+        close.(streams)
+    end
 end

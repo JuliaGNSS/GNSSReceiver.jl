@@ -7,8 +7,8 @@ module GNSSReceiver
         GNSSSignals,
         Acquisition,
         Unitful,
-        LinearAlgebra,
         JLD2,
+        LinearAlgebra,
         SoapySDR
 
     using Unitful:dBHz, ms, Hz
@@ -22,7 +22,9 @@ module GNSSReceiver
         tee,
         rechunk,
         stream_data,
-        vectorize_data
+        vectorize_data,
+        membuffer,
+        write_to_file
 
 
     include("lock_detector.jl")
