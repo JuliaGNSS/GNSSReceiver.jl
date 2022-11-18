@@ -521,6 +521,12 @@ git-tree-sha1 = "a3f24677c21f5bbe9d2a714f95dcd58337fb2856"
 uuid = "82899510-4779-5014-852e-03e436cf321d"
 version = "1.0.0"
 
+[[JLD2]]
+deps = ["FileIO", "MacroTools", "Mmap", "OrderedCollections", "Pkg", "Printf", "Reexport", "TranscodingStreams", "UUIDs"]
+git-tree-sha1 = "18dd357553912b6adc23b5f721e4be19930140c6"
+uuid = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+version = "0.4.28"
+
 [[JLLWrappers]]
 deps = ["Preferences"]
 git-tree-sha1 = "abc9885a7ca2052a736a600f7fa66209f96506e1"
@@ -1058,6 +1064,12 @@ deps = ["DocStringExtensions", "LinearAlgebra", "Test", "Unitful"]
 git-tree-sha1 = "d19cbeb5c6363149dee98090451a58aef1fa1b9c"
 uuid = "0814aff9-93cb-554c-9fff-9bf1cfdb5efa"
 version = "0.1.1"
+
+[[TranscodingStreams]]
+deps = ["Random", "Test"]
+git-tree-sha1 = "8a75929dcd3c38611db2f8d08546decb514fcadf"
+uuid = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
+version = "0.9.9"
 
 [[URIs]]
 git-tree-sha1 = "e59ecc5a41b000fa94423a578d29290c7266fc10"
