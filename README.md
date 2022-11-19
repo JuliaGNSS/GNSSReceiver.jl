@@ -51,45 +51,49 @@ That's it. You can watch the GUI being updated in real time.
 
 ### Example to read from SDR
 
-
 ```julia
-using GNSSSignals, Tracking, GNSSReceiver, Unitful
-using SoapySDR, SoapyLMS7_jll
+using GNSSSignals, Tracking, GNSSReceiver, Unitful, SoapySDR, SoapyLMS7_jll
 using SoapySDR: dB
-gpsl1 = GPSL1()
 
-sampling_freq = 5e6u"Hz"
-four_ms_samples = Int(upreferred(sampling_freq * 4u"ms"))
-num_samples = Int(upreferred(sampling_freq * 40u"s"))
 
-Device(first(Devices())) do dev
-    chan = dev.rx[1]
+function gnss_receiver_gui(;
+    system = GPSL1(),
+    sampling_freq = 2e6u"Hz",
+    acquisition_time = 4u"ms", # A longer time increases the SNR for satellite acquisition, but also increases the computational load. Must be longer than 1ms
+    run_time = 40u"s",
+    num_ants = NumAnts(2)
+)
+    num_samples_acquisition = Int(upreferred(sampling_freq * acquisition_time))
+    eval_num_samples = Int(upreferred(sampling_freq * run_time))
+    Device(first(Devices())) do dev
 
-    chan.frequency = 1575.42u"MHz"
-    chan.sample_rate = sampling_freq
-    chan.bandwidth = sampling_freq
-    chan.gain_mode = true
+        for crx in dev.rx
+            crx.frequency = get_center_frequency(system)
+            crx.sample_rate = sampling_freq
+            crx.bandwidth = sampling_freq
+            crx.gain_mode = true
+        end
 
-    stream = SoapySDR.Stream(ComplexF32, dev.rx)
-    # Getting samples in chunks of `mtu`
-    data_stream = stream_data(stream, num_samples)
+        stream = SoapySDR.Stream(ComplexF32, dev.rx)
+        # Getting samples in chunks of `mtu`
+        data_stream = stream_data(stream, eval_num_samples)
 
-    # Satellite acquisition takes about 1s to process on a recent laptop
-    # Let's take a buffer length of 5s to be on the save side
-    buffer_length = 5u"s"
-    buffered_stream = membuffer(data_stream, ceil(Int, buffer_length * sampling_freq / stream.mtu))
+        # Satellite acquisition takes about 1s to process on a recent laptop
+        # Let's take a buffer length of 5s to be on the save side
+        buffer_length = 5u"s"
+        buffered_stream = membuffer(data_stream, ceil(Int, buffer_length * sampling_freq / stream.mtu))
 
-    # Resizing the chunks to 4ms in length
-    reshunked_stream = rechunk(buffered_stream, four_ms_samples)
-    vectorized_stream = vectorize_data(reshunked_stream)
+        # Resizing the chunks to 4ms in length
+        reshunked_stream = rechunk(buffered_stream, num_samples_acquisition)
 
-    # Performing GNSS acquisition and tracking
-    data_channel = receive(vectorized_stream, gpsl1, sampling_freq)
+        # Performing GNSS acquisition and tracking
+        data_channel = receive(reshunked_stream, system, sampling_freq; num_ants)
 
-    gui_channel = get_gui_data_channel(data_channel)
+        gui_channel = get_gui_data_channel(data_channel)
 
-    # Display the GUI and block
-    GNSSReceiver.gui(gui_channel)
+        # Display the GUI and block
+        GNSSReceiver.gui(gui_channel)
+    end
 end
 ```
 
