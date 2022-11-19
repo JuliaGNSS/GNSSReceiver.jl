@@ -27,12 +27,13 @@ function receive(
 
     Base.errormonitor(Threads.@spawn begin
         consume_channel(measurement_channel) do measurement
-            size(measurement, 2) == N || throw(ArgumentError("The number of antenna channels must match num_ants"))
+            num_channels = size(measurement, 2)
+            num_channels == N || throw(ArgumentError("The number of antenna channels must match num_ants"))
             signal_duration = convert(typeof(1ms), size(measurement, 1) / sampling_freq)
             signal_duration % 1ms == 0ms || throw(ArgumentError("Signal length must be multiples of 1ms"))
             receiver_state, track_results = process(
                 receiver_state,
-                measurement,
+                num_channels == N == 1 ? vec(measurement) : measurement,
                 system,
                 sampling_freq;
                 num_ants,
