@@ -52,7 +52,9 @@ That's it. You can watch the GUI being updated in real time.
 ### Example to read from SDR
 
 ```julia
-using GNSSSignals, Tracking, GNSSReceiver, Unitful, SoapySDR, SoapyLMS7_jll
+using GNSSSignals, Tracking, GNSSReceiver, Unitful, SoapySDR
+# Replace SoapyLMS7_jll with whatever SoapySDR driver that you need
+using SoapyLMS7_jll
 using SoapySDR: dB
 
 
@@ -79,11 +81,11 @@ function gnss_receiver_gui(;
         data_stream = stream_data(stream, eval_num_samples)
 
         # Satellite acquisition takes about 1s to process on a recent laptop
-        # Let's take a buffer length of 5s to be on the save side
+        # Let's take a buffer length of 5s to be on the safe side
         buffer_length = 5u"s"
         buffered_stream = membuffer(data_stream, ceil(Int, buffer_length * sampling_freq / stream.mtu))
 
-        # Resizing the chunks to 4ms in length
+        # Resizing the chunks to acquisition length
         reshunked_stream = rechunk(buffered_stream, num_samples_acquisition)
 
         # Performing GNSS acquisition and tracking
@@ -95,5 +97,7 @@ function gnss_receiver_gui(;
         GNSSReceiver.gui(gui_channel)
     end
 end
+
+gnss_receiver_gui() # You'll might want to run it twice for optimal performance.
 ```
 
