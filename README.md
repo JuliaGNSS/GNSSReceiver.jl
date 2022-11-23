@@ -2,18 +2,11 @@
 
 ![Exemplary output](media/output.png)
 
-Currently, this includes the Manifest.toml because this implementation depends on pending pull requests.
-
 ## Installation
 
-Git clone GNSSReceiver.jl
-
 ```julia
-julia> ;
-shell> cd folder/GNSSReceiver.jl
 julia> ]
-pkg> activate .
-(GNSSReceiver) pkg> instantiate
+pkg> add GNSSReceiver
 ```
 
 ## Usage

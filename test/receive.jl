@@ -4,7 +4,11 @@
     gpsl1 = GPSL1()
     
     measurement_channel = Channel{Matrix{type}}() do ch
-        foreach(i -> put!(ch, rand(type, 20000, 4)), 1:20)
+        if type <: Complex{Int16}
+            foreach(i -> put!(ch, type.(round.(randn(ComplexF32, 20000, 4) * 512))), 1:20)
+        else
+            foreach(i -> put!(ch, randn(type, 20000, 4) * 512), 1:20)
+        end
     end
 
     data_channel = receive(measurement_channel, gpsl1, sampling_freq, num_ants = NumAnts(4)) 
@@ -29,7 +33,11 @@
     )
 
     measurement_channel = Channel{Matrix{type}}() do ch
-        foreach(i -> put!(ch, rand(type, 20000, 4)), 1:20)
+        if type <: Complex{Int16}
+            foreach(i -> put!(ch, type.(round.(randn(ComplexF32, 20000, 4) * 512))), 1:20)
+        else
+            foreach(i -> put!(ch, randn(type, 20000, 4) * 512), 1:20)
+        end
     end
 
     data_channel = receive(measurement_channel, gpsl1, sampling_freq, num_ants = NumAnts(4), receiver_state = rec_state) 
@@ -47,7 +55,11 @@ end
     gpsl1 = GPSL1()
     
     measurement_channel = Channel{Vector{type}}() do ch
-        foreach(i -> put!(ch, rand(type, 20000)), 1:20)
+        if type <: Complex{Int16}
+            foreach(i -> put!(ch, type.(round.(randn(ComplexF32, 20000) * 512))), 1:20)
+        else
+            foreach(i -> put!(ch, randn(type, 20000) * 512), 1:20)
+        end
     end
 
     data_channel = receive(measurement_channel, gpsl1, sampling_freq, num_ants = NumAnts(1)) 
@@ -72,7 +84,11 @@ end
     )
 
     measurement_channel = Channel{Vector{type}}() do ch
-        foreach(i -> put!(ch, rand(type, 20000)), 1:20)
+        if type <: Complex{Int16}
+            foreach(i -> put!(ch, type.(round.(randn(ComplexF32, 20000) * 512))), 1:20)
+        else
+            foreach(i -> put!(ch, randn(type, 20000) * 512), 1:20)
+        end
     end
 
     data_channel = receive(measurement_channel, gpsl1, sampling_freq, num_ants = NumAnts(1), receiver_state = rec_state) 
