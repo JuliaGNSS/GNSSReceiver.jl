@@ -22,11 +22,16 @@ function read_files(files, num_samples; type = Complex{Int16})
 end
 
 function get_measurement(files, num_samples, type)
-    files isa AbstractVector ? Matrix{type}(undef, num_samples, length(files)) : Vector{type}(undef, num_samples)
+    files isa AbstractVector ? Matrix{type}(undef, num_samples, length(files)) :
+    Vector{type}(undef, num_samples)
 end
 
 function read_measurement!(streams::AbstractVector, measurements)
-    foreach((stream, measurement) -> read!(stream, measurement), streams, eachcol(measurements))
+    foreach(
+        (stream, measurement) -> read!(stream, measurement),
+        streams,
+        eachcol(measurements),
+    )
 end
 
 function read_measurement!(stream, measurement)

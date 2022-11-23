@@ -8,7 +8,8 @@ using Test,
     AstroTime,
     PositionVelocityTime,
     StaticArrays,
-    Random
+    Random,
+    Acquisition
 
 using Unitful: Hz, dBHz, ms
 
@@ -19,4 +20,3 @@ include("receive.jl")
 include("process.jl")
 include("gui.jl")
 include("save_data.jl")
-

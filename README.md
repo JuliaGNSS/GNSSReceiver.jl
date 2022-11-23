@@ -27,7 +27,7 @@ sampling_freq = 5e6Hz
 num_samples = Int(upreferred(sampling_freq * 4ms))
 measurement_channel = read_files(files, num_samples, type = Complex{Int16})
 # Let's receive GPS L1 signals
-data_channel = receive(measurement_channel, gpsl1, sampling_freq, num_ants = NumAnts(4))
+data_channel = receive(measurement_channel, gpsl1, sampling_freq; num_ants = NumAnts(4), num_samples)
 # Get gui channel from data channel
 gui_channel = get_gui_data_channel(data_channel)
 # Hook up GUI
@@ -82,7 +82,7 @@ function gnss_receiver_gui(;
         reshunked_stream = rechunk(buffered_stream, num_samples_acquisition)
 
         # Performing GNSS acquisition and tracking
-        data_channel = receive(reshunked_stream, system, sampling_freq; num_ants)
+        data_channel = receive(reshunked_stream, system, sampling_freq; num_ants, num_samples = num_samples_acquisition)
 
         gui_channel = get_gui_data_channel(data_channel)
 

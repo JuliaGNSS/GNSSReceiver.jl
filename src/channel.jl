@@ -1,5 +1,6 @@
 """
     consume_channel(f::Function, c::Channel, args...)
+
 Consumes the given channel, calling `f(data, args...)` where `data` is what is
 taken from the given channel.  Returns when the channel closes.
 """
@@ -20,6 +21,7 @@ end
 
 """
     tee(in::Channel)
+
 Returns two channels that synchronously output what comes in from `in`.
 """
 function tee(in::Channel{T}) where {T}
@@ -41,8 +43,8 @@ end
 
 Converts a stream of chunks with size A to a stream of chunks with size B.
 """
-function rechunk(in::Channel{Matrix{T}}, chunk_size::Integer) where {T <: Number}
-    return spawn_channel_thread(;T) do out
+function rechunk(in::Channel{Matrix{T}}, chunk_size::Integer) where {T<:Number}
+    return spawn_channel_thread(; T) do out
         chunk_filled = 0
         chunk_idx = 1
         # We'll alternate between filling up these three chunks, then sending
@@ -50,11 +52,7 @@ function rechunk(in::Channel{Matrix{T}}, chunk_size::Integer) where {T <: Number
         # - One that we're modifying,
         # - One that was sent out to a downstream,
         # - One that is being held by an intermediary
-        chunks = [
-            Matrix{T}(undef, 0, 0),
-            Matrix{T}(undef, 0, 0),
-            Matrix{T}(undef, 0, 0),
-        ]
+        chunks = [Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0)]
         function make_chunks!(num_channels)
             if size(chunks[1], 2) != num_channels
                 for idx in eachindex(chunks)
@@ -77,7 +75,8 @@ function rechunk(in::Channel{Matrix{T}}, chunk_size::Integer) where {T <: Number
                 samples_taken = min(size(data, 1), samples_wanted)
 
                 # Copy as much of `data` as we can into `chunks`
-                chunks[chunk_idx][chunk_filled+1:chunk_filled + samples_taken, :] = data[1:samples_taken, :]
+                chunks[chunk_idx][chunk_filled+1:chunk_filled+samples_taken, :] =
+                    data[1:samples_taken, :]
                 chunk_filled += samples_taken
 
                 # Move our view of `data` forward:
@@ -96,6 +95,7 @@ end
 
 """
     vectorize_data(in::Channel)
+
 Returns channels with vectorized data.
 """
 function vectorize_data(in::Channel{<:AbstractMatrix{T}}) where {T}
@@ -116,13 +116,14 @@ Consume a channel and write to file(s). Multiple channels will
 be written to different files. The channel number is appended
 to the filename.
 """
-function write_to_file(in::Channel{Matrix{T}}, file_path::String) where {T <: Number}
+function write_to_file(in::Channel{Matrix{T}}, file_path::String) where {T<:Number}
     streams = IOStream[]
     try
         consume_channel(in) do buffs
             if length(streams) != size(buffs, 2)
                 type_string = string(T)
-                streams = [open("$file_path$type_string$i.dat", "w") for i in 1:size(buffs, 2)]
+                streams =
+                    [open("$file_path$type_string$i.dat", "w") for i = 1:size(buffs, 2)]
             end
 
             foreach(eachcol(buffs), streams) do buff, stream
