@@ -8,7 +8,8 @@ using Test,
     AstroTime,
     PositionVelocityTime,
     StaticArrays,
-    Random
+    Random,
+    Acquisition
 
 using Unitful: Hz, dBHz, ms
 

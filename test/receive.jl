@@ -11,7 +11,7 @@
         end
     end
 
-    data_channel = receive(measurement_channel, gpsl1, sampling_freq, num_ants = NumAnts(4)) 
+    data_channel = receive(measurement_channel, gpsl1, sampling_freq, num_ants = NumAnts(4), num_samples = 20000) 
 
     GNSSReceiver.consume_channel(data_channel) do data
         @test length(data.sat_data) == 0
@@ -40,7 +40,7 @@
         end
     end
 
-    data_channel = receive(measurement_channel, gpsl1, sampling_freq, num_ants = NumAnts(4), receiver_state = rec_state) 
+    data_channel = receive(measurement_channel, gpsl1, sampling_freq, num_ants = NumAnts(4), receiver_state = rec_state, num_samples = 20000) 
 
     GNSSReceiver.consume_channel(data_channel) do data
         @test length(data.sat_data) == 1
@@ -62,7 +62,7 @@ end
         end
     end
 
-    data_channel = receive(measurement_channel, gpsl1, sampling_freq, num_ants = NumAnts(1)) 
+    data_channel = receive(measurement_channel, gpsl1, sampling_freq, num_ants = NumAnts(1), num_samples = 20000) 
 
     GNSSReceiver.consume_channel(data_channel) do data
         @test length(data.sat_data) == 0
@@ -91,7 +91,7 @@ end
         end
     end
 
-    data_channel = receive(measurement_channel, gpsl1, sampling_freq, num_ants = NumAnts(1), receiver_state = rec_state) 
+    data_channel = receive(measurement_channel, gpsl1, sampling_freq, num_ants = NumAnts(1), receiver_state = rec_state, num_samples = 20000) 
 
     GNSSReceiver.consume_channel(data_channel) do data
         @test length(data.sat_data) == 1

@@ -3,6 +3,7 @@ get_default_acq_threshold(system::GalileoE1B) = 37
 
 function process(
     receiver_state::ReceiverState,
+    acq_plan,
     measurement,
     system::AbstractGNSS,
     sampling_freq;
@@ -19,7 +20,7 @@ function process(
             filter(prn -> !(prn in keys(sat_channel_states)), 1:32),
             collect(keys(filter(((prn, state),) -> !is_in_lock(state), sat_channel_states)))
         )
-        acq_res = coarse_fine_acquire(system, view(measurement, :, 1), sampling_freq, missing_satellites)
+        acq_res = acquire!(acq_plan, view(measurement, :, 1), missing_satellites)
         acq_res_valid = filter(res -> res.CN0 > acq_threshold, acq_res)
         new_sat_channel_states = Dict(
             res.prn => SatelliteChannelState(

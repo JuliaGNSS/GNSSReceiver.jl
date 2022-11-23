@@ -5,8 +5,11 @@
     system = GPSL1()
     sampling_freq = 5e6Hz
 
+    acq_plan = CoarseFineAcquisitionPlan(system, size(measurement, 1), sampling_freq)
+
     next_receiver_state, track_results = GNSSReceiver.process(
         receiver_state,
+        acq_plan,
         measurement,
         system,
         sampling_freq
@@ -31,6 +34,7 @@
 
     next_receiver_state, track_results = GNSSReceiver.process(
         receiver_state,
+        acq_plan,
         measurement,
         system,
         sampling_freq
