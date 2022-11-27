@@ -20,21 +20,6 @@ function receive(
     acq_threshold = get_default_acq_threshold(system),
     time_in_lock_before_pvt = 2000ms,
 ) where {N,T<:AbstractArray}
-    T <: AbstractMatrix &&
-        N == 1 &&
-        throw(
-            ArgumentError(
-                "Measurement channel contains a matrix. Please specify num_ants to the number of used antennas with num_ants = NumAnts(N)",
-            ),
-        )
-    T <: AbstractVector &&
-        N > 1 &&
-        throw(
-            ArgumentError(
-                "Measurement channel contains a vector. In this case number of antennas should be one: num_ants = NumAnts(1) (default)",
-            ),
-        )
-
     acq_plan = CoarseFineAcquisitionPlan(system, num_samples, sampling_freq)
 
     sat_data_type =
