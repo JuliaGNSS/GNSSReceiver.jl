@@ -45,9 +45,10 @@ That's it. You can watch the GUI being updated in real time.
 ### Example to read from SDR
 
 ```julia
-# Replace SoapyLMS7_jll with whatever SoapySDR driver that you need
+# Replace SoapyLMS7_jll with whatever SoapySDR driver that you need, e.g. SoapyRTLSDR_jll
 using SoapyLMS7_jll
 using GNSSReceiver, GNSSSignals, Unitful
+using Tracking
 
 # You'll might want to run it twice for optimal performance.
 gnss_receiver_gui(;
@@ -55,7 +56,7 @@ gnss_receiver_gui(;
     sampling_freq = 2e6u"Hz",
     acquisition_time = 4u"ms", # A longer time increases the SNR for satellite acquisition, but also increases the computational load. Must be longer than 1ms
     run_time = 40u"s",
-    num_ants = NumAnts(2) # Number of antenna channels
+    num_ants = Tracking.NumAnts(2) # Number of antenna channels
 )
 ```
 
