@@ -83,11 +83,12 @@ function gnss_receiver_gui(;
     sampling_freq = 2e6u"Hz",
     acquisition_time = 4u"ms", # A longer time increases the SNR for satellite acquisition, but also increases the computational load. Must be longer than 1ms
     run_time = 40u"s",
-    num_ants = NumAnts(2)
+    num_ants = NumAnts(2),
+    dev_args = first(Devices()),
 )
     num_samples_acquisition = Int(upreferred(sampling_freq * acquisition_time))
     eval_num_samples = Int(upreferred(sampling_freq * run_time))
-    Device(first(Devices())) do dev
+    Device(dev_args) do dev
 
         for crx in dev.rx
             crx.frequency = get_center_frequency(system)
@@ -122,11 +123,13 @@ function gnss_write_to_file(;
     system = GPSL1(),
     sampling_freq = 2e6u"Hz",
     acquisition_time = 4u"ms", # A longer time increases the SNR for satellite acquisition, but also increases the computational load. Must be longer than 1ms
-    run_time = 4u"s"
+    run_time = 4u"s",
+    dev_args = first(Devices()),
+    output_file = "gnss_test_data.dat"
 )
     num_samples_acquisition = Int(upreferred(sampling_freq * acquisition_time))
     eval_num_samples = Int(upreferred(sampling_freq * run_time))
-    Device(first(Devices())) do dev
+    Device(dev_args) do dev
 
         for crx in dev.rx
             crx.frequency = get_center_frequency(system)
@@ -147,7 +150,7 @@ function gnss_write_to_file(;
         # Resizing the chunks to acquisition length
         reshunked_stream = rechunk(buffered_stream, num_samples_acquisition)
 
-        write_to_file(reshunked_stream, "/home/schoenbrod/Messungen/testdata")
+        write_to_file(reshunked_stream, output_file)
     end
 end
 
