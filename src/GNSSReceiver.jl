@@ -97,7 +97,8 @@ function gnss_receiver_gui(;
             crx.gain_mode = true
         end
 
-        stream = SoapySDR.Stream(ComplexF32, dev.rx)
+        stream = SoapySDR.Stream(first(dev.rx).native_stream_format, dev.rx)
+
         # Getting samples in chunks of `mtu`
         data_stream = stream_data(stream, eval_num_samples)
 
@@ -122,12 +123,10 @@ end
 function gnss_write_to_file(;
     system = GPSL1(),
     sampling_freq = 2e6u"Hz",
-    acquisition_time = 4u"ms", # A longer time increases the SNR for satellite acquisition, but also increases the computational load. Must be longer than 1ms
     run_time = 4u"s",
     dev_args = first(Devices()),
-    output_file = "gnss_test_data.dat"
+    output_file = "gnss_test_data"
 )
-    num_samples_acquisition = Int(upreferred(sampling_freq * acquisition_time))
     eval_num_samples = Int(upreferred(sampling_freq * run_time))
     Device(dev_args) do dev
 
@@ -138,19 +137,12 @@ function gnss_write_to_file(;
             crx.gain_mode = true
         end
 
-        stream = SoapySDR.Stream(ComplexF32, dev.rx)
+        stream = SoapySDR.Stream(first(dev.rx).native_stream_format, dev.rx)
+        
         # Getting samples in chunks of `mtu`
         data_stream = stream_data(stream, eval_num_samples)
 
-        # Satellite acquisition takes about 1s to process on a recent laptop
-        # Let's take a buffer length of 5s to be on the safe side
-        buffer_length = 5u"s"
-        buffered_stream = membuffer(data_stream, ceil(Int, buffer_length * sampling_freq / stream.mtu))
-
-        # Resizing the chunks to acquisition length
-        reshunked_stream = rechunk(buffered_stream, num_samples_acquisition)
-
-        write_to_file(reshunked_stream, output_file)
+        write_to_file(data_stream, output_file)
     end
 end
 
