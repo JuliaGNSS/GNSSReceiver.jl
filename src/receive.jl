@@ -19,6 +19,7 @@ function receive(
     acquire_every = 10000ms,
     acq_threshold = get_default_acq_threshold(system),
     time_in_lock_before_pvt = 2000ms,
+    interm_freq = 0.0u"Hz"
 ) where {N,T<:AbstractArray}
     acq_plan = CoarseFineAcquisitionPlan(system, num_samples, sampling_freq)
 
@@ -48,6 +49,7 @@ function receive(
                     acquire_every,
                     acq_threshold,
                     time_in_lock_before_pvt,
+                    interm_freq
                 )
                 sat_data = Dict{Int,Vector{sat_data_type}}(
                     prn => map(

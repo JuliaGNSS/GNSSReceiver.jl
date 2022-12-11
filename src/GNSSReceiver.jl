@@ -85,6 +85,7 @@ function gnss_receiver_gui(;
     run_time = 40u"s",
     num_ants = NumAnts(2),
     dev_args = first(Devices()),
+    interm_freq = 0.0u"Hz"
 )
     num_samples_acquisition = Int(upreferred(sampling_freq * acquisition_time))
     eval_num_samples = Int(upreferred(sampling_freq * run_time))
@@ -111,7 +112,14 @@ function gnss_receiver_gui(;
         reshunked_stream = rechunk(buffered_stream, num_samples_acquisition)
 
         # Performing GNSS acquisition and tracking
-        data_channel = receive(reshunked_stream, system, sampling_freq; num_ants, num_samples = num_samples_acquisition)
+        data_channel = receive(
+            reshunked_stream,
+            system,
+            sampling_freq;
+            num_ants,
+            num_samples = num_samples_acquisition,
+            interm_freq
+        )
 
         gui_channel = get_gui_data_channel(data_channel)
 
