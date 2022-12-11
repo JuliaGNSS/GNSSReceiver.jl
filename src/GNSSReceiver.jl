@@ -85,7 +85,8 @@ function gnss_receiver_gui(;
     run_time = 40u"s",
     num_ants = NumAnts(2),
     dev_args = first(Devices()),
-    interm_freq = 0.0u"Hz"
+    interm_freq = 0.0u"Hz",
+    gain::Union{Nothing, <:Unitful.Gain} = nothing
 )
     num_samples_acquisition = Int(upreferred(sampling_freq * acquisition_time))
     eval_num_samples = Int(upreferred(sampling_freq * run_time))
@@ -95,7 +96,11 @@ function gnss_receiver_gui(;
             crx.frequency = get_center_frequency(system)
             crx.sample_rate = sampling_freq
             crx.bandwidth = sampling_freq
-            crx.gain_mode = true
+            if isnothing(crx.gain_mode)
+                crx.gain_mode = false
+            else
+                crx.gain = gain
+            end
         end
 
         stream = SoapySDR.Stream(first(dev.rx).native_stream_format, dev.rx)
