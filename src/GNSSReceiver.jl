@@ -18,11 +18,6 @@ export receive,
     read_files,
     save_data,
     get_gui_data_channel,
-    tee,
-    rechunk,
-    stream_data,
-    vectorize_data,
-    membuffer,
     write_to_file,
     gnss_receiver_gui,
     gnss_write_to_file
@@ -85,16 +80,26 @@ function gnss_receiver_gui(;
     run_time = 40u"s",
     num_ants = NumAnts(2),
     dev_args = first(Devices()),
+    interm_freq = 0.0u"Hz",
+    gain::Union{Nothing, <:Unitful.Gain} = nothing,
+    antenna = nothing
 )
     num_samples_acquisition = Int(upreferred(sampling_freq * acquisition_time))
     eval_num_samples = Int(upreferred(sampling_freq * run_time))
     Device(dev_args) do dev
 
         for crx in dev.rx
-            crx.frequency = get_center_frequency(system)
+            if !isnothting(antenna)
+                crx.antenna = antenna
+            end
             crx.sample_rate = sampling_freq
             crx.bandwidth = sampling_freq
-            crx.gain_mode = true
+            if isnothing(gain)
+                crx.gain_mode = true
+            else
+                crx.gain = gain
+            end
+            crx.frequency = get_center_frequency(system)
         end
 
         stream = SoapySDR.Stream(first(dev.rx).native_stream_format, dev.rx)
@@ -111,7 +116,14 @@ function gnss_receiver_gui(;
         reshunked_stream = rechunk(buffered_stream, num_samples_acquisition)
 
         # Performing GNSS acquisition and tracking
-        data_channel = receive(reshunked_stream, system, sampling_freq; num_ants, num_samples = num_samples_acquisition)
+        data_channel = receive(
+            reshunked_stream,
+            system,
+            sampling_freq;
+            num_ants,
+            num_samples = num_samples_acquisition,
+            interm_freq
+        )
 
         gui_channel = get_gui_data_channel(data_channel)
 

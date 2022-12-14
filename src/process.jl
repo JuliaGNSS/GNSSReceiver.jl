@@ -11,6 +11,7 @@ function process(
     acquire_every = 10000ms,
     acq_threshold = get_default_acq_threshold(system),
     time_in_lock_before_pvt = 2000ms,
+    interm_freq = 0.0u"Hz",
 ) where {N}
     signal_duration = convert(typeof(1ms), size(measurement, 1) / sampling_freq)
     signal_duration % 1ms == 0ms ||
@@ -23,7 +24,7 @@ function process(
                 keys(filter(((prn, state),) -> !is_in_lock(state), sat_channel_states)),
             ),
         )
-        acq_res = acquire!(acq_plan, view(measurement, :, 1), missing_satellites)
+        acq_res = acquire!(acq_plan, view(measurement, :, 1), missing_satellites; interm_freq)
         acq_res_valid = filter(res -> res.CN0 > acq_threshold, acq_res)
         new_sat_channel_states = Dict(
             res.prn => SatelliteChannelState(
@@ -49,6 +50,7 @@ function process(
             measurement,
             sampling_freq,
             signal_duration,
+            interm_freq,
         ) for
         (prn, state) in filter(((prn, state),) -> is_in_lock(state), sat_channel_states)
     )
@@ -102,11 +104,11 @@ function view_part(measurement::AbstractVector, sample_range)
     view(measurement, sample_range)
 end
 
-function track_measurement_parts(track_state, measurement, sampling_freq, signal_duration)
+function track_measurement_parts(track_state, measurement, sampling_freq, signal_duration, intermediate_frequency)
     samples = Int(upreferred(1ms * sampling_freq))
     num_parts = Int(upreferred(signal_duration / 1ms))
     first_track_result =
-        track(view_part(measurement, 1:samples), track_state, sampling_freq)
+        track(view_part(measurement, 1:samples), track_state, sampling_freq; intermediate_frequency)
     track_results = Vector{typeof(first_track_result)}(undef, num_parts)
     track_results[1] = first_track_result
     track_state = get_state(first_track_result)
@@ -114,7 +116,8 @@ function track_measurement_parts(track_state, measurement, sampling_freq, signal
         track_results[i] = track(
             view_part(measurement, (i-1)*samples+1:i*samples),
             track_state,
-            sampling_freq,
+            sampling_freq;
+            intermediate_frequency
         )
         track_state = get_state(track_results[i])
     end

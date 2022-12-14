@@ -4,7 +4,7 @@
 Consumes the given channel, calling `f(data, args...)` where `data` is what is
 taken from the given channel.  Returns when the channel closes.
 """
-function consume_channel(f::Function, c::Channel, args...)
+function consume_channel(f::Function, c::AbstractChannel, args...)
     while !isempty(c) || isopen(c)
         local data
         try

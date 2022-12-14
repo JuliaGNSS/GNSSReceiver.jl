@@ -125,8 +125,8 @@ function gui(gui_data_channel, io::IO = stdout)
                 title = position_panel_title,
             )
         elseif length(rounded_cn0s) < 4
-            panels *= Panel(not_enought_sats_text; title = sat_doa_panel_title)
-            panels *= Panel(not_enought_sats_text; title = position_panel_title)
+            panels *= Panel(not_enought_sats_text; title = sat_doa_panel_title, fit = true)
+            panels *= Panel(not_enought_sats_text; title = position_panel_title, fit = true)
         else
             decoding_text = "Decoding satellites$(repeat(".", dots_counter))"
             panels *= Panel(
