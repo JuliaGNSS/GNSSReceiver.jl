@@ -10,7 +10,7 @@ struct ReceiverDataOfInterest{S<:SatelliteDataOfInterest}
 end
 
 function receive(
-    measurement_channel::Channel{T},
+    measurement_channel::AbstractChannel,
     system,
     sampling_freq;
     num_samples,
@@ -20,7 +20,7 @@ function receive(
     acq_threshold = get_default_acq_threshold(system),
     time_in_lock_before_pvt = 2000ms,
     interm_freq = 0.0u"Hz"
-) where {N,T<:AbstractArray}
+) where {N}
     acq_plan = CoarseFineAcquisitionPlan(system, num_samples, sampling_freq)
 
     sat_data_type =

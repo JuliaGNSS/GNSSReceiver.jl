@@ -108,7 +108,7 @@ function track_measurement_parts(track_state, measurement, sampling_freq, signal
     samples = Int(upreferred(1ms * sampling_freq))
     num_parts = Int(upreferred(signal_duration / 1ms))
     first_track_result =
-        track(view_part(measurement, 1:samples), track_state, sampling_freq)
+        track(view_part(measurement, 1:samples), track_state, sampling_freq; intermediate_frequency)
     track_results = Vector{typeof(first_track_result)}(undef, num_parts)
     track_results[1] = first_track_result
     track_state = get_state(first_track_result)
