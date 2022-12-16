@@ -73,78 +73,83 @@ _cursor_hide(io::IO) = print(io, "\x1b[?25l")
 _cursor_show(io::IO) = print(io, "\x1b[?25h")
 panel(plot; kw...) = Panel(string(plot; color = true); fit = true, kw...)
 
-function gui(gui_data_channel, io::IO = stdout)
+function gui(gui_data_channel, io::IO = stdout; construct_gui_panels = construct_gui_panels)
     terminal = REPL.Terminals.TTYTerminal("", stdin, io, stderr)
-    dots_counter = 0
+    num_dots = 0
     consume_channel(gui_data_channel) do gui_data
-        rounded_cn0s = Dict(
-            prn => round(10 * log10(linear(cn0) / Hz); digits = 1) for
-            (prn, cn0) in gui_data.cn0s
-        )
-        pvt = gui_data.pvt
-        sat_doa_panel_title = "Satellite Direction-of-Arrival (DOA)"
-        position_panel_title = "User position"
-        not_enought_sats_text = "Not enough satellites to calculate position."
-        cn0_panel_title = "Carrier-to-Noise-Density-Ratio (CN0)"
-        panels =
-            !isempty(rounded_cn0s) ?
-            panel(
-                barplot(
-                    rounded_cn0s;
-                    ylabel = "Satellites",
-                    xlabel = "Carrier-to-Noise-Density-Ratio (CN0) [dBHz]",
-                );
-                fit = true,
-                title = cn0_panel_title,
-            ) :
-            Panel(
-                "Searching for satellites$(repeat(".", dots_counter))";
-                title = cn0_panel_title,
-                width = length(cn0_panel_title) + 5,
-            )
-        if !isnothing(pvt.time)
-            sat_enus = map(sat_pos -> get_sat_enu(pvt.position, sat_pos), pvt.sat_positions)
-            azs = map(x -> x.θ, sat_enus)
-            els = map(x -> x.ϕ, sat_enus)
-            prn_markers = map(prn -> PRNMARKERS[prn], pvt.used_sats)
-            panels *= panel(
-                polarplot(
-                    azs,
-                    els * 180 / π;
-                    rlim = (0, 90),
-                    scatter = true,
-                    marker = prn_markers,
-                );
-                fit = true,
-                title = sat_doa_panel_title,
-            )
-            lla = get_LLA(pvt)
-            panels *= Panel(
-                "Latitude: $(lla.lat)\nLongitude: $(lla.lon)\nAltitude: $(lla.alt)\nCompact:$(lla.lat),$(lla.lon)\nGoogle: https://www.google.com/maps/search/$(lla.lat),$(lla.lon)";
-                fit = true,
-                title = position_panel_title,
-            )
-        elseif length(rounded_cn0s) < 4
-            panels *= Panel(not_enought_sats_text; title = sat_doa_panel_title, fit = true)
-            panels *= Panel(not_enought_sats_text; title = position_panel_title, fit = true)
-        else
-            decoding_text = "Decoding satellites$(repeat(".", dots_counter))"
-            panels *= Panel(
-                decoding_text;
-                title = sat_doa_panel_title,
-                width = length(not_enought_sats_text) + 5,
-            )
-            panels *= Panel(
-                decoding_text;
-                title = position_panel_title,
-                width = length(not_enought_sats_text) + 5,
-            )
-        end
-        dots_counter = mod(dots_counter + 1, 4)
+        panels = construct_gui_panels(gui_data, num_dots)
+        num_dots = mod(num_dots + 1, 4)
         out = string(panels)
         REPL.Terminals.clear(terminal)
         _cursor_hide(io)
         println(io, out)
         _cursor_show(io)
     end
+end
+
+function construct_gui_panels(gui_data, num_dots)
+    rounded_cn0s = Dict(
+        prn => round(10 * log10(linear(cn0) / Hz); digits = 1) for
+        (prn, cn0) in gui_data.cn0s
+    )
+    pvt = gui_data.pvt
+    sat_doa_panel_title = "Satellite Direction-of-Arrival (DOA)"
+    position_panel_title = "User position"
+    not_enough_sats_text = "Not enough satellites to calculate position."
+    cn0_panel_title = "Carrier-to-Noise-Density-Ratio (CN0)"
+    panels =
+        !isempty(rounded_cn0s) ?
+        panel(
+            barplot(
+                rounded_cn0s;
+                ylabel = "Satellites",
+                xlabel = "Carrier-to-Noise-Density-Ratio (CN0) [dBHz]",
+            );
+            fit = true,
+            title = cn0_panel_title,
+        ) :
+        Panel(
+            "Searching for satellites$(repeat(".", num_dots))";
+            title = cn0_panel_title,
+            width = length(cn0_panel_title) + 5,
+        )
+    if !isnothing(pvt.time)
+        sat_enus = map(sat_pos -> get_sat_enu(pvt.position, sat_pos), pvt.sat_positions)
+        azs = map(x -> x.θ, sat_enus)
+        els = map(x -> x.ϕ, sat_enus)
+        prn_markers = map(prn -> PRNMARKERS[prn], pvt.used_sats)
+        panels *= panel(
+            polarplot(
+                azs,
+                els * 180 / π;
+                rlim = (0, 90),
+                scatter = true,
+                marker = prn_markers,
+            );
+            fit = true,
+            title = sat_doa_panel_title,
+        )
+        lla = get_LLA(pvt)
+        panels *= Panel(
+            "Latitude: $(lla.lat)\nLongitude: $(lla.lon)\nAltitude: $(lla.alt)\nCompact:$(lla.lat),$(lla.lon)\nGoogle: https://www.google.com/maps/search/$(lla.lat),$(lla.lon)";
+            fit = true,
+            title = position_panel_title,
+        )
+    elseif length(rounded_cn0s) < 4
+        panels *= Panel(not_enough_sats_text; title = sat_doa_panel_title)
+        panels *= Panel(not_enough_sats_text; title = position_panel_title)
+    else
+        decoding_text = "Decoding satellites$(repeat(".", num_dots))"
+        panels *= Panel(
+            decoding_text;
+            title = sat_doa_panel_title,
+            width = length(not_enough_sats_text) + 5,
+        )
+        panels *= Panel(
+            decoding_text;
+            title = position_panel_title,
+            width = length(not_enough_sats_text) + 5,
+        )
+    end
+    panels
 end
