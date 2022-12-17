@@ -1,0 +1,10 @@
+[deps]
+GNSSReceiver = "c84cffac-6943-4fe6-9449-f6d23817af8b"
+GNSSSignals = "52c80523-2a4e-5c38-8979-05588f836870"
+SoapyBladeRF_jll = "80aee790-0d4a-5951-bcd6-30e0bbfe317a"
+SoapyLMS7_jll = "e7ed14a0-13eb-5dc7-93e2-6133b2eb8bed"
+SoapyRTLSDR_jll = "7bed6c1d-f2db-586c-9908-488058499e34"
+SoapySDR = "4fa426e6-03fd-45b2-b2dd-25f726820c03"
+SoapyUHD_jll = "5710b6fb-c5a3-5f8f-93a5-d73c28ee0e84"
+Tracking = "10b2438b-ffd4-5096-aa58-44041d5c8f3b"
+Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
