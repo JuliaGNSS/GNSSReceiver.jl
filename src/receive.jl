@@ -15,7 +15,7 @@ function receive(
     sampling_freq;
     num_samples,
     num_ants::NumAnts{N} = NumAnts(1),
-    receiver_state = ReceiverState(),
+    receiver_state = ReceiverState(system, num_ants),
     acquire_every = 10000ms,
     acq_threshold = get_default_acq_threshold(system),
     time_in_lock_before_pvt = 2000ms,

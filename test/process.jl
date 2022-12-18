@@ -1,7 +1,7 @@
 @testset "Process measurement" begin
-    receiver_state = GNSSReceiver.ReceiverState()
     measurement = randn(ComplexF64, 20000, 4)
     system = GPSL1()
+    receiver_state = GNSSReceiver.ReceiverState(system)
     sampling_freq = 5e6Hz
 
     acq_plan = CoarseFineAcquisitionPlan(system, size(measurement, 1), sampling_freq)
