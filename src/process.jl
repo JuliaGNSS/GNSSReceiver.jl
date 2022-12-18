@@ -150,8 +150,8 @@ function try_to_reacquire_lost_satellites(
             state.num_unsuccessful_reacquisition^2 * 100ms >= state.time_out_of_lock
     end
     acq_res = Dict(
-        acquire!(
-            acq_plan,
+        prn => acquire!(
+            fast_re_acq_plan,
             view(measurement, :, 1),
             prn;
             interm_freq,
@@ -167,7 +167,7 @@ function try_to_reacquire_lost_satellites(
                 post_corr_filter = 
                     sat_channel_states[prn].track_state.post_corr_filter,
             ),
-            sat_channel_states[prn].decoder :
+            sat_channel_states[prn].decoder,
             CodeLockDetector(),
             CarrierLockDetector(),
             0ms,

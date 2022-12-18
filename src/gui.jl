@@ -136,8 +136,8 @@ function construct_gui_panels(gui_data, num_dots)
             title = position_panel_title,
         )
     elseif length(rounded_cn0s) < 4
-        panels *= Panel(not_enough_sats_text; title = sat_doa_panel_title)
-        panels *= Panel(not_enough_sats_text; title = position_panel_title)
+        panels *= Panel(not_enough_sats_text; title = sat_doa_panel_title, fit = true)
+        panels *= Panel(not_enough_sats_text; title = position_panel_title, fit = true)
     else
         decoding_text = "Decoding satellites$(repeat(".", num_dots))"
         panels *= Panel(

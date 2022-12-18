@@ -22,7 +22,7 @@ function receive(
     interm_freq = 0.0u"Hz"
 ) where {N}
     acq_plan = CoarseFineAcquisitionPlan(system, num_samples, sampling_freq)
-    coarse_step = 1 / 3 / (num_samples / sampling_freq)
+    coarse_step = 1 / (num_samples / sampling_freq)
     fine_step = 1 / 12 / (num_samples / sampling_freq)
     fine_doppler_range = -2*coarse_step:fine_step:2*coarse_step
     fast_re_acq_plan = AcquisitionPlan(
