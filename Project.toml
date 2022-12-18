@@ -1,7 +1,7 @@
 name = "GNSSReceiver"
 uuid = "c84cffac-6943-4fe6-9449-f6d23817af8b"
 authors = ["Soeren Schoenbrod <soeren.schoenbrod@outlook.de> and contributors"]
-version = "0.1.4"
+version = "0.1.5"
 
 [deps]
 Acquisition = "d4bbf60b-102b-5ffb-8f97-a7ea5817e69f"
@@ -19,7 +19,7 @@ UnicodePlots = "b8865327-cd53-5732-bb35-84acbb429228"
 Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
 
 [compat]
-Acquisition = "0.0.5"
+Acquisition = "0.1.0"
 GNSSDecoder = "0.1.0"
 GNSSSignals = "0.16"
 JLD2 = "0.4"

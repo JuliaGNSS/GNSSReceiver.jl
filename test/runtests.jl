@@ -16,7 +16,7 @@ using Unitful: Hz, dBHz, ms
 Random.seed!(2345)
 
 include("beamformer.jl")
-include("receive.jl")
 include("process.jl")
 include("gui.jl")
 include("save_data.jl")
+include("receive.jl")

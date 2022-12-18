@@ -36,6 +36,8 @@ struct SatelliteChannelState{
     code_lock_detector::COLD
     carrier_lock_detector::CALD
     time_in_lock::typeof(1ms)
+    time_out_of_lock::typeof(1ms)
+    num_unsuccessful_reacquisition::Int
 end
 
 function is_in_lock(state::SatelliteChannelState)
@@ -49,6 +51,20 @@ function mark_out_of_lock(state::SatelliteChannelState)
         mark_out_of_lock(state.code_lock_detector),
         mark_out_of_lock(state.carrier_lock_detector),
         0ms,
+        0ms,
+        0
+    )
+end
+
+function increase_time_out_of_lock(state::SatelliteChannelState, time::typeof(1ms))
+    SatelliteChannelState(
+        state.track_state,
+        state.decoder,
+        state.code_lock_detector,
+        state.carrier_lock_detector,
+        0ms,
+        state.time_out_of_lock + time,
+        0,
     )
 end
 

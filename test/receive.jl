@@ -33,6 +33,8 @@
         GNSSReceiver.CodeLockDetector(),
         GNSSReceiver.CarrierLockDetector(),
         0ms,
+        0ms,
+        0,
     )
 
     rec_state = GNSSReceiver.ReceiverState(
@@ -99,6 +101,8 @@ end
         GNSSReceiver.CodeLockDetector(),
         GNSSReceiver.CarrierLockDetector(),
         0ms,
+        0ms,
+        0,
     )
 
     rec_state = GNSSReceiver.ReceiverState(

@@ -5,9 +5,18 @@
     sampling_freq = 5e6Hz
 
     acq_plan = CoarseFineAcquisitionPlan(system, size(measurement, 1), sampling_freq)
+    coarse_step = 1 / 3 / (size(measurement, 1) / sampling_freq)
+    fine_step = 1 / 12 / (size(measurement, 1) / sampling_freq)
+    fine_doppler_range = -2*coarse_step:fine_step:2*coarse_step
+    fast_re_acq_plan = AcquisitionPlan(
+        system,
+        size(measurement, 1),
+        sampling_freq,
+        dopplers = fine_doppler_range
+    )
 
     next_receiver_state, track_results =
-        GNSSReceiver.process(receiver_state, acq_plan, measurement, system, sampling_freq)
+        GNSSReceiver.process(receiver_state, acq_plan, fast_re_acq_plan, measurement, system, sampling_freq)
 
     @test length(track_results) == 0
 
@@ -17,13 +26,15 @@
         GNSSReceiver.CodeLockDetector(),
         GNSSReceiver.CarrierLockDetector(),
         0ms,
+        0ms,
+        0,
     )
 
     receiver_state =
         GNSSReceiver.ReceiverState(Dict(1 => sat_state), GNSSReceiver.PVTSolution(), 0ms)
 
     next_receiver_state, track_results =
-        GNSSReceiver.process(receiver_state, acq_plan, measurement, system, sampling_freq)
+        GNSSReceiver.process(receiver_state, acq_plan, fast_re_acq_plan, measurement, system, sampling_freq)
 
     @test length(track_results) == 1
 end
