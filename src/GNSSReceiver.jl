@@ -89,7 +89,7 @@ function gnss_receiver_gui(;
     Device(dev_args) do dev
 
         for crx in dev.rx
-            if !isnothting(antenna)
+            if !isnothing(antenna)
                 crx.antenna = antenna
             end
             crx.sample_rate = sampling_freq
