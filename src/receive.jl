@@ -48,7 +48,7 @@ function receive(
                     convert(typeof(1ms), size(measurement, 1) / sampling_freq)
                 signal_duration % 1ms == 0ms ||
                     throw(ArgumentError("Signal length must be multiples of 1ms"))
-                receiver_state, track_results = process(
+                track_results = process!(
                     receiver_state,
                     acq_plan,
                     fast_re_acq_plan,

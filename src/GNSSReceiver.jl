@@ -66,7 +66,7 @@ function increase_time_out_of_lock(state::SatelliteChannelState, time::typeof(1m
     )
 end
 
-struct ReceiverState{DS<:SatelliteChannelState,P<:PVTSolution}
+mutable struct ReceiverState{DS<:SatelliteChannelState,P<:PVTSolution}
     sat_channel_states::Dict{Int,DS}
     pvt::P
     runtime::typeof(1ms)

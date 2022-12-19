@@ -1,7 +1,7 @@
 get_default_acq_threshold(system::GPSL1) = 43
 get_default_acq_threshold(system::GalileoE1B) = 37
 
-function process(
+function process!(
     receiver_state::ReceiverState{DS},
     acq_plan,
     fast_re_acq_plan,
@@ -105,7 +105,9 @@ function process(
     if length(sat_states) >= 4
         pvt = calc_pvt(sat_states, pvt)
     end
-    ReceiverState{DS, typeof(pvt)}(sat_channel_states, pvt, receiver_state.runtime + signal_duration),
+    receiver_state.sat_channel_states = sat_channel_states
+    receiver_state.pvt = pvt
+    receiver_state.runtime += signal_duration
     track_results
 end
 
