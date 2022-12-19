@@ -19,7 +19,7 @@ UnicodePlots = "b8865327-cd53-5732-bb35-84acbb429228"
 Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
 
 [compat]
-Acquisition = "0.0.5"
+Acquisition = "0.0.5, 0.1"
 GNSSDecoder = "0.1.0"
 GNSSSignals = "0.16"
 JLD2 = "0.4"
