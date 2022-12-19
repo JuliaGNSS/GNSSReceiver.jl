@@ -53,7 +53,7 @@ function process(
                 0,
             ) for res in acq_res_valid
         )
-        sat_channel_states = merge(sat_channel_states, new_sat_channel_states)::Dict{Int,DS}
+        merge!(sat_channel_states, new_sat_channel_states)::Dict{Int,DS}
     end
     sat_channel_states_in_lock = filter(((prn, state),) -> is_in_lock(state), sat_channel_states)::Dict{Int,DS}
     track_results = Dict{Int,Vector{Tracking.TrackingResults}}(
@@ -175,5 +175,5 @@ function try_to_reacquire_lost_satellites(
             0,
         ) for (prn, res) in acq_res_valid
     )
-    merge(sat_channel_states, new_sat_channel_states)
+    merge!(sat_channel_states, new_sat_channel_states)
 end
