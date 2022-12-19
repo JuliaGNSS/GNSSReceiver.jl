@@ -15,13 +15,22 @@ function receive(
     sampling_freq;
     num_samples,
     num_ants::NumAnts{N} = NumAnts(1),
-    receiver_state = ReceiverState(),
+    receiver_state = ReceiverState(system, num_ants),
     acquire_every = 10000ms,
     acq_threshold = get_default_acq_threshold(system),
     time_in_lock_before_pvt = 2000ms,
     interm_freq = 0.0u"Hz"
 ) where {N}
     acq_plan = CoarseFineAcquisitionPlan(system, num_samples, sampling_freq)
+    coarse_step = 1 / (num_samples / sampling_freq)
+    fine_step = 1 / 12 / (num_samples / sampling_freq)
+    fine_doppler_range = -2*coarse_step:fine_step:2*coarse_step
+    fast_re_acq_plan = AcquisitionPlan(
+        system,
+        num_samples,
+        sampling_freq,
+        dopplers = fine_doppler_range
+    )
 
     sat_data_type =
         N == 1 ? SatelliteDataOfInterest{ComplexF64} :
@@ -42,6 +51,7 @@ function receive(
                 receiver_state, track_results = process(
                     receiver_state,
                     acq_plan,
+                    fast_re_acq_plan,
                     num_channels == N == 1 ? vec(measurement) : measurement,
                     system,
                     sampling_freq;

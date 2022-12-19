@@ -28,14 +28,14 @@ include("beamformer.jl")
 struct SatelliteChannelState{
     DS<:GNSSDecoderState,
     TS<:TrackingState,
-    COLD<:CodeLockDetector,
-    CALD<:CarrierLockDetector,
 }
     track_state::TS
     decoder::DS
-    code_lock_detector::COLD
-    carrier_lock_detector::CALD
+    code_lock_detector::CodeLockDetector
+    carrier_lock_detector::CarrierLockDetector
     time_in_lock::typeof(1ms)
+    time_out_of_lock::typeof(1ms)
+    num_unsuccessful_reacquisition::Int
 end
 
 function is_in_lock(state::SatelliteChannelState)
@@ -49,13 +49,41 @@ function mark_out_of_lock(state::SatelliteChannelState)
         mark_out_of_lock(state.code_lock_detector),
         mark_out_of_lock(state.carrier_lock_detector),
         0ms,
+        0ms,
+        0
     )
 end
 
-Base.@kwdef struct ReceiverState{DS<:SatelliteChannelState,P<:PVTSolution}
-    sat_channel_states::Dict{Int,DS} = Dict{Int,SatelliteChannelState}()
-    pvt::P = PVTSolution()
-    runtime::typeof(1ms) = 0ms
+function increase_time_out_of_lock(state::SatelliteChannelState, time::typeof(1ms))
+    SatelliteChannelState(
+        state.track_state,
+        state.decoder,
+        state.code_lock_detector,
+        state.carrier_lock_detector,
+        0ms,
+        state.time_out_of_lock + time,
+        0,
+    )
+end
+
+struct ReceiverState{DS<:SatelliteChannelState,P<:PVTSolution}
+    sat_channel_states::Dict{Int,DS}
+    pvt::P
+    runtime::typeof(1ms)
+end
+
+function ReceiverState(system, num_ants::NumAnts{N}) where N
+    track_state = TrackingState(1, system, 1.0Hz, 1.0; num_ants,
+    post_corr_filter = N == 1 ? Tracking.DefaultPostCorrFilter() :
+                       EigenBeamformer(N))
+    decoder = GNSSDecoderState(system, 1)
+    pvt = PositionVelocityTime.PVTSolution()
+    sat_channel_type = SatelliteChannelState{typeof(decoder), typeof(track_state)}
+    ReceiverState{sat_channel_type, typeof(pvt)}(
+        Dict{Int, sat_channel_type}(),
+        pvt,
+        0ms
+    )
 end
 
 function reset_but_keep_decoders_and_pvt(rec_state::ReceiverState)
