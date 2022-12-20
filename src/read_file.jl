@@ -1,12 +1,12 @@
 function read_files(files, num_samples; type = Complex{Int16})
     measurement = get_measurement(files, num_samples, type)
-    is_compressed = all(f -> endswith(f, ".gz"), files)
+    is_compressed = typeof(files) <: AbstractVector ? all(f -> endswith(f, ".gz"), files) : endswith(files, ".gz")
     streams_gz = if is_compressed
         GZip.open(files)
     else
         GZipStream[]
     end
-    streams = if !iscompressed
+    streams = if !is_compressed
         open.(files)
     else
         IOStream[]

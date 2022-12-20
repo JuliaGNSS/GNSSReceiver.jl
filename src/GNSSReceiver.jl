@@ -9,7 +9,8 @@ using StaticArrays,
     Unitful,
     JLD2,
     LinearAlgebra,
-    SoapySDR
+    SoapySDR,
+    GZip
 
 using Unitful: dBHz, ms, Hz
 
