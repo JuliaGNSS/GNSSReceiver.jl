@@ -54,7 +54,7 @@ function process(
                 0,
             ) for res in acq_res_valid
         )
-        sat_channel_states = merge(sat_channel_states, new_sat_channel_states)::Dict{Int,DS}
+        sat_channel_states = merge!(sat_channel_states, new_sat_channel_states)::Dict{Int,DS}
         acq_counter += 1
     end
     sat_channel_states_in_lock =
@@ -154,7 +154,7 @@ function try_to_reacquire_lost_satellites(
                 ) : increment_num_unsuccessful_reacquisition(sat_state) for
             (prn, sat_state) in out_of_lock_sat_states
         )
-        merge(sat_channel_states, new_sat_channel_states)
+        merge!(sat_channel_states, new_sat_channel_states)
     else
         sat_channel_states
     end

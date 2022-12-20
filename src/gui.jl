@@ -4,6 +4,7 @@ import REPL
 struct GUIData
     cn0s::Dict{Int,typeof(1.0u"Hz")}
     pvt::PVTSolution
+    runtime::typeof(1.0u"s")
 end
 
 const PRNMARKERS = (
@@ -58,7 +59,7 @@ function get_gui_data_channel(
                     cn0s = Dict(
                         prn => sat_data.cn0 for (prn, sat_data) in data.sat_data
                     )
-                    push!(gui_data_channel, GUIData(cn0s, data.pvt))
+                    push!(gui_data_channel, GUIData(cn0s, data.pvt, data.runtime))
                     last_gui_output = data.runtime
                     first = false
                 end
@@ -89,7 +90,7 @@ end
 
 function construct_gui_panels(gui_data, num_dots)
     rounded_cn0s = Dict(
-        prn => (println(cn0); round(10 * log10(linear(cn0 == (Inf)u"Hz" ? 1u"Hz" : cn0) / u"Hz"); digits = 1)) for
+        prn => round(10 * log10(linear(cn0 == (Inf)u"Hz" ? 1u"Hz" : cn0) / u"Hz"); digits = 1) for
         (prn, cn0) in gui_data.cn0s
     )
     pvt = gui_data.pvt

@@ -1,7 +1,7 @@
 function read_files(files, num_samples, end_condition::Union{Nothing,Integer,Base.Event} = nothing; type = Complex{Int16})
-    measurement = get_measurement(files, num_samples, type)
-    measurement_channel = MatrixSizedChannel{type}(num_samples, size(measurement, 2))
+    measurement_channel = MatrixSizedChannel{type}(num_samples, length(files))
     Base.errormonitor(Threads.@spawn begin
+        measurement = get_measurement(files, num_samples, type)
         streams = open.(files)
         num_read_samples = 0
         try
@@ -12,7 +12,7 @@ function read_files(files, num_samples, end_condition::Union{Nothing,Integer,Bas
                 end
                 read_measurement!(streams, measurement)
                 num_read_samples += num_samples
-                push!(measurement_channel, measurement)
+                push!(measurement_channel, copy(measurement))
             end
         catch e
             if e isa EOFError
