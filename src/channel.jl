@@ -116,18 +116,30 @@ Consume a channel and write to file(s). Multiple channels will
 be written to different files. The channel number is appended
 to the filename.
 """
-function write_to_file(in::Channel{Matrix{T}}, file_path::String) where {T<:Number}
-    streams = IOStream[]
+function write_to_file(in::Channel{Matrix{T}}, file_path::String; compress=false, compression_rati) where {T<:Number}
+    type_string = string(T)
     try
         consume_channel(in) do buffs
-            if length(streams) != size(buffs, 2)
-                type_string = string(T)
-                streams =
-                    [open("$file_path$type_string$i.dat", "w") for i = 1:size(buffs, 2)]
-            end
+            if compress
+                streams = if length(streams) != size(buffs, 2)
+                    [GZip.open("$file_path$type_string$i.dat", "w") for i = 1:size(buffs, 2)]
+                else
+                    GZipStream[]
+                end
 
-            foreach(eachcol(buffs), streams) do buff, stream
-                write(stream, buff)
+                foreach(eachcol(buffs), streams) do buff, stream
+                    write(stream, buff)
+                end
+            else
+                streams = if length(streams) != size(buffs, 2)
+                    [open("$file_path$type_string$i.dat", "w") for i = 1:size(buffs, 2)]
+                else
+                    IOStream[]
+                end
+
+                foreach(eachcol(buffs), streams) do buff, stream
+                    write(stream, buff)
+                end
             end
         end
     finally
