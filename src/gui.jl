@@ -89,7 +89,7 @@ end
 
 function construct_gui_panels(gui_data, num_dots)
     rounded_cn0s = Dict(
-        prn => round(10 * log10(linear(cn0) / u"Hz"); digits = 1) for
+        prn => (println(cn0); round(10 * log10(linear(cn0 == (Inf)u"Hz" ? 1u"Hz" : cn0) / u"Hz"); digits = 1)) for
         (prn, cn0) in gui_data.cn0s
     )
     pvt = gui_data.pvt

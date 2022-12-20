@@ -53,7 +53,7 @@ function mark_out_of_lock(state::SatelliteChannelState)
     )
 end
 
-function increase_time_out_of_lock(state::SatelliteChannelState, time::typeof(1.0u"s"))
+function increase_time_out_of_lock(state::SatelliteChannelState, time::Unitful.Time)
     SatelliteChannelState(
         state.track_state,
         state.decoder,

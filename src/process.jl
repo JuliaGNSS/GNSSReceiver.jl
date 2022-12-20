@@ -26,7 +26,7 @@ function process(
         acq_threshold,
         num_ants,
     )
-    if acq_counter * acquire_every >= receiver_state.runtime && isfull(acq_buffer)
+    if receiver_state.runtime >= acq_counter * acquire_every && isfull(acq_buffer)
         missing_satellites = vcat(
             filter(prn -> !(prn in keys(sat_channel_states)), 1:32),
             collect(
@@ -87,7 +87,7 @@ function process(
         sat_channel_states,
     )::Dict{Int,DS}
     sat_states = SatelliteState[
-        SatelliteState(sat_channel_states[prn].decoder, track_results[prn][end]) for
+        SatelliteState(sat_channel_states[prn].decoder, track_results[prn]) for
         prn in keys(sat_channel_states_for_pvt)
     ]
     pvt = receiver_state.pvt
@@ -124,7 +124,7 @@ function try_to_reacquire_lost_satellites(
         out_of_lock_sat_states = filter(sat_channel_states) do (prn, state)
             !is_in_lock(state) &&
                 state.num_unsuccessful_reacquisition <= 10 &&
-                state.num_unsuccessful_reacquisition^2 * 100ms >= state.time_out_of_lock
+                state.num_unsuccessful_reacquisition^2 * 100u"ms" >= state.time_out_of_lock
         end
         acq_res = Dict(
             prn => acquire!(
@@ -141,15 +141,15 @@ function try_to_reacquire_lost_satellites(
                 prn in keys(acq_res_valid) ?
                 SatelliteChannelState(
                     TrackingState(
-                        res;
+                        acq_res_valid[prn];
                         num_ants,
                         post_corr_filter = sat_state.track_state.post_corr_filter,
                     ),
                     sat_state.decoder,
                     CodeLockDetector(),
                     CarrierLockDetector(),
-                    0ms,
-                    0ms,
+                    0.0u"s",
+                    0.0u"s",
                     0,
                 ) : increment_num_unsuccessful_reacquisition(sat_state) for
             (prn, sat_state) in out_of_lock_sat_states
