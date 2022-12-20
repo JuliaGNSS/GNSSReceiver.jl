@@ -11,8 +11,6 @@ using StaticArrays,
     LinearAlgebra,
     SoapySDR
 
-using Unitful: dBHz, ms, Hz
-
 export receive,
     reset_but_keep_decoders_and_pvt,
     read_files,
@@ -24,6 +22,7 @@ export receive,
 
 include("lock_detector.jl")
 include("beamformer.jl")
+include("acquisition_buffer.jl")
 
 struct SatelliteChannelState{
     DS<:GNSSDecoderState,
@@ -33,8 +32,8 @@ struct SatelliteChannelState{
     decoder::DS
     code_lock_detector::CodeLockDetector
     carrier_lock_detector::CarrierLockDetector
-    time_in_lock::typeof(1ms)
-    time_out_of_lock::typeof(1ms)
+    time_in_lock::typeof(1.0u"s")
+    time_out_of_lock::typeof(1.0u"s")
     num_unsuccessful_reacquisition::Int
 end
 
@@ -48,41 +47,58 @@ function mark_out_of_lock(state::SatelliteChannelState)
         state.decoder,
         mark_out_of_lock(state.code_lock_detector),
         mark_out_of_lock(state.carrier_lock_detector),
-        0ms,
-        0ms,
+        0.0u"s",
+        0.0u"s",
         0
     )
 end
 
-function increase_time_out_of_lock(state::SatelliteChannelState, time::typeof(1ms))
+function increase_time_out_of_lock(state::SatelliteChannelState, time::typeof(1.0u"s"))
     SatelliteChannelState(
         state.track_state,
         state.decoder,
         state.code_lock_detector,
         state.carrier_lock_detector,
-        0ms,
+        0.0u"s",
         state.time_out_of_lock + time,
         0,
     )
 end
 
-struct ReceiverState{DS<:SatelliteChannelState,P<:PVTSolution}
-    sat_channel_states::Dict{Int,DS}
-    pvt::P
-    runtime::typeof(1ms)
+function increment_num_unsuccessful_reacquisition(state::SatelliteChannelState)
+    SatelliteChannelState(
+        state.track_state,
+        state.decoder,
+        state.code_lock_detector,
+        state.carrier_lock_detector,
+        state.time_in_lock,
+        state.time_out_of_lock,
+        state.num_unsuccessful_reacquisition + 1,
+    )
 end
 
-function ReceiverState(system, num_ants::NumAnts{N}) where N
-    track_state = TrackingState(1, system, 1.0Hz, 1.0; num_ants,
+struct ReceiverState{T, DS<:SatelliteChannelState,P<:PVTSolution}
+    sat_channel_states::Dict{Int,DS}
+    pvt::P
+    runtime::typeof(1.0u"s")
+    acq_counter::Int
+    acq_buffer::AcquisitionBuffer{T}
+end
+
+function ReceiverState(T::Type, num_samples, acq_time::typeof(1u"ms"), system, num_ants::NumAnts{N}) where N
+    track_state = TrackingState(1, system, 1.0u"Hz", 1.0; num_ants,
     post_corr_filter = N == 1 ? Tracking.DefaultPostCorrFilter() :
                        EigenBeamformer(N))
     decoder = GNSSDecoderState(system, 1)
     pvt = PositionVelocityTime.PVTSolution()
     sat_channel_type = SatelliteChannelState{typeof(decoder), typeof(track_state)}
-    ReceiverState{sat_channel_type, typeof(pvt)}(
+    acq_buffer = AcquisitionBuffer(T, num_samples, acq_time.val)
+    ReceiverState{T, sat_channel_type, typeof(pvt)}(
         Dict{Int, sat_channel_type}(),
         pvt,
-        0ms
+        0.0u"s",
+        0,
+        acq_buffer
     )
 end
 
@@ -90,7 +106,8 @@ function reset_but_keep_decoders_and_pvt(rec_state::ReceiverState)
     sat_channel_states = Dict(
         prn => mark_out_of_lock(state) for (prn, state) in rec_state.sat_channel_states
     )
-    ReceiverState(sat_channel_states, rec_state.pvt, 0ms)
+    acq_buffer = AcquisitionBuffer(rec_state.acq_buffer.buffer, rec_state.acq_buffer.size, 0)
+    ReceiverState(sat_channel_states, rec_state.pvt, 0.0ms, 0, acq_buffer)
 end
 
 include("channel.jl")
@@ -149,7 +166,6 @@ function gnss_receiver_gui(;
             system,
             sampling_freq;
             num_ants,
-            num_samples = num_samples_acquisition,
             interm_freq
         )
 

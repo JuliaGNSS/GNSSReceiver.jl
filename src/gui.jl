@@ -2,7 +2,7 @@ using UnicodePlots, Term
 import REPL
 
 struct GUIData
-    cn0s::Dict{Int,typeof(1.0Hz)}
+    cn0s::Dict{Int,typeof(1.0u"Hz")}
     pvt::PVTSolution
 end
 
@@ -46,17 +46,17 @@ const PRNMARKERS = (
 
 function get_gui_data_channel(
     data_channel::Channel{<:ReceiverDataOfInterest},
-    push_gui_data_roughly_every = 500ms,
+    push_gui_data_roughly_every = 500u"ms",
 )
     gui_data_channel = Channel{GUIData}()
-    last_gui_output = 0.0ms
+    last_gui_output = 0.0u"ms"
     first = true
     Base.errormonitor(
         Threads.@spawn begin
             consume_channel(data_channel) do data
                 if (data.runtime - last_gui_output) > push_gui_data_roughly_every || first
                     cn0s = Dict(
-                        prn => last(sat_data).cn0 for (prn, sat_data) in data.sat_data
+                        prn => sat_data.cn0 for (prn, sat_data) in data.sat_data
                     )
                     push!(gui_data_channel, GUIData(cn0s, data.pvt))
                     last_gui_output = data.runtime
@@ -89,7 +89,7 @@ end
 
 function construct_gui_panels(gui_data, num_dots)
     rounded_cn0s = Dict(
-        prn => round(10 * log10(linear(cn0) / Hz); digits = 1) for
+        prn => round(10 * log10(linear(cn0) / u"Hz"); digits = 1) for
         (prn, cn0) in gui_data.cn0s
     )
     pvt = gui_data.pvt

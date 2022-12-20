@@ -3,13 +3,11 @@
     data_channel = Channel{GNSSReceiver.ReceiverDataOfInterest{sat_data_type}}() do ch
         foreach(1:200) do i
             data = GNSSReceiver.ReceiverDataOfInterest{sat_data_type}(
-                Dict{Int,Vector{sat_data_type}}(
-                    1 => [
-                        sat_data_type(
-                            45.0dBHz,
-                            SVector(complex(1.0, 2.0), complex(2.0, 3.0)),
-                        ),
-                    ],
+                Dict{Int,sat_data_type}(
+                    1 => sat_data_type(
+                        45.0dBHz,
+                        SVector(complex(1.0, 2.0), complex(2.0, 3.0)),
+                    ),
                 ),
                 GNSSReceiver.PVTSolution(),
                 (i - 1) * 1ms,
