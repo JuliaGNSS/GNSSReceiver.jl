@@ -1,11 +1,25 @@
 function read_files(files, num_samples; type = Complex{Int16})
     measurement = get_measurement(files, num_samples, type)
-    streams = open.(files)
+    is_compressed = all(f -> endswith(f, ".gz"), files)
+    streams_gz = if is_compressed
+        GZip.open(files)
+    else
+        GZipStream[]
+    end
+    streams = if !iscompressed
+        open.(files)
+    else
+        IOStream[]
+    end
     measurement_channel = Channel{typeof(measurement)}()
     Base.errormonitor(Threads.@spawn begin
         try
             while true
-                read_measurement!(streams, measurement)
+                if is_compressed
+                    read_measurement!(streams_gz, measurement)
+                else
+                    read_measurement!(streams, measurement)
+                end
                 push!(measurement_channel, measurement)
             end
         catch e
