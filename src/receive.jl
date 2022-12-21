@@ -31,9 +31,9 @@ function receive(
     num_channels == N ||
         throw(ArgumentError("The number of antenna channels must match num_ants"))
     signal_duration = measurement_channel.num_samples / sampling_freq
-    isapprox(signal_duration, 1u"ms"; atol = 2u"μs") && signal_duration >= 1u"ms" || throw(
+    isapprox(signal_duration, 4u"ms"; atol = 1u"μs") && signal_duration >= 4u"ms" || throw(
         ArgumentError(
-            "Signal length must be close to 1ms and above 1ms. Use $(ceil(1u"ms" * sampling_freq)) samples instead.",
+            "Signal length must be close to 1ms and above 4ms. Use $(ceil(4u"ms" * sampling_freq)) samples instead.",
         ),
     )
 

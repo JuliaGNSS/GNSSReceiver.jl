@@ -9,7 +9,8 @@ using StaticArrays,
     Unitful,
     JLD2,
     LinearAlgebra,
-    SoapySDR
+    SoapySDR,
+    AstroTime
 
 export receive,
     reset_but_keep_decoders_and_pvt,
@@ -86,13 +87,14 @@ struct ReceiverState{T, DS<:SatelliteChannelState,P<:PVTSolution}
 end
 
 function ReceiverState(T::Type, num_samples, acq_time::typeof(1u"ms"), system, num_ants::NumAnts{N}) where N
+    acq_time.val >= 4 || throw(ArgumentError("Acquisition time must be at least 4ms"))
     track_state = TrackingState(1, system, 1.0u"Hz", 1.0; num_ants,
     post_corr_filter = N == 1 ? Tracking.DefaultPostCorrFilter() :
                        EigenBeamformer(N))
     decoder = GNSSDecoderState(system, 1)
     pvt = PositionVelocityTime.PVTSolution()
     sat_channel_type = SatelliteChannelState{typeof(decoder), typeof(track_state)}
-    acq_buffer = AcquisitionBuffer(T, num_samples, acq_time.val)
+    acq_buffer = AcquisitionBuffer(T, num_samples, acq_time.val >> 2)
     ReceiverState{T, sat_channel_type, typeof(pvt)}(
         Dict{Int, sat_channel_type}(),
         pvt,
@@ -199,6 +201,38 @@ function gnss_write_to_file(;
         data_stream = stream_data(stream, eval_num_samples)
 
         write_to_file(data_stream, output_file)
+    end
+end
+
+function receive_and_gui(files;clock_drift = 0.0, system = GPSL1(), sampling_freq = 5e6u"Hz", type = Complex{Int16}, num_ants = NumAnts(4))
+    #    files = map(i -> "/mnt/data_disk/measurementComplex{Int16}$i.dat", 1:2)
+    close_stream_event = Base.Event()
+    adjusted_sample_freq = sampling_freq * (1 - clock_drift)
+    
+    num_samples_to_receive = Int(upreferred(sampling_freq * 4u"ms"))
+    measurement_channel = read_files(files, num_samples_to_receive, close_stream_event; type)
+
+    # Let's receive GPS L1 signals
+    data_channel = receive(measurement_channel, system, adjusted_sample_freq; num_ants, interm_freq = clock_drift * get_center_frequency(system))
+    # Get gui channel from data channel
+    gui_channel = get_gui_data_channel(data_channel)
+    # Hook up GUI
+    Base.errormonitor(@async GNSSReceiver.gui(gui_channel; construct_gui_panels = make_construct_gui_panels()))
+    
+        # Read any input to close
+    t = REPL.TerminalMenus.terminal
+    REPL.Terminals.raw!(t, true)
+    char = read(stdin, Char) 
+    REPL.Terminals.raw!(t, false)
+    notify(close_stream_event)
+end
+function make_construct_gui_panels()
+    function construct_gui_panels(gui_data, num_dots)
+        panels = GNSSReceiver.construct_gui_panels(gui_data, num_dots)
+        nanoseconds = isnothing(gui_data.pvt.time) ? nothing : nanosecond(gui_data.pvt.time)
+        microseconds = isnothing(gui_data.pvt.time) ? nothing : microsecond(gui_data.pvt.time)
+        milliseconds = isnothing(gui_data.pvt.time) ? nothing : millisecond(gui_data.pvt.time)
+        panels / Panel("Runtime: $(gui_data.runtime)\nTime: $(gui_data.pvt.time)\nMilliseconds: $milliseconds\nMicroseconds: $microseconds\nNanoseconds: $nanoseconds", fit = true)
     end
 end
 
