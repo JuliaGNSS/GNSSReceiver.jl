@@ -1,6 +1,7 @@
 struct SatelliteDataOfInterest{P<:Union{<:Complex,<:AbstractVector{<:Complex}}}
     cn0::typeof(1.0u"dBHz")
     prompt::P
+    is_healthy::Bool
 end
 
 struct ReceiverDataOfInterest{S<:SatelliteDataOfInterest}
@@ -71,7 +72,7 @@ function receive(
                     interm_freq,
                 )
                 sat_data = Dict{Int,sat_data_type}(
-                    prn => SatelliteDataOfInterest(get_cn0(res), get_prompt(res)) for
+                    prn => SatelliteDataOfInterest(get_cn0(res), get_prompt(res), is_sat_healthy(receiver_state.sat_channel_states[prn].decoder)) for
                     (prn, res) in track_results
                 )
                 push!(
