@@ -1,7 +1,7 @@
 abstract type AbstractLockDetector end
 
 struct CodeLockDetector <: AbstractLockDetector
-    cn0_threshold::typeof(1.0dBHz)
+    cn0_threshold::typeof(1.0u"dBHz")
     num_out_of_lock::Int
     num_out_of_lock_threshold::Int
     wait_counter_threshold::Int
@@ -9,7 +9,7 @@ struct CodeLockDetector <: AbstractLockDetector
 end
 
 function CodeLockDetector(;
-    cn0_threshold = 30dBHz,
+    cn0_threshold = 30u"dBHz",
     num_out_of_lock_threshold = 50,
     wait_counter_threshold = 20,
 )

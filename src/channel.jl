@@ -1,3 +1,70 @@
+import Base.close, Base.put!, Base.close, Base.isempty
+
+struct MatrixSizedChannel{T} <: AbstractChannel{T}
+    num_samples::Int
+    num_antenna_channels::Int
+    channel::Channel{Matrix{T}}
+    function MatrixSizedChannel{T}(
+        num_samples::Integer,
+        num_antenna_channels::Integer,
+        sz::Integer = 0,
+    ) where {T}
+        return new(num_samples, num_antenna_channels, Channel{Matrix{T}}(sz))
+    end
+end
+
+function MatrixSizedChannel{T}(
+    func::Function,
+    num_samples::Integer,
+    num_antenna_channels::Integer,
+    size = 0;
+    taskref = nothing,
+    spawn = false,
+) where {T}
+    chnl = MatrixSizedChannel{T}(num_samples, num_antenna_channels, size)
+    task = Task(() -> func(chnl))
+    task.sticky = !spawn
+    bind(chnl, task)
+    if spawn
+        schedule(task) # start it on (potentially) another thread
+    else
+        yield(task) # immediately start it, yielding the current thread
+    end
+    isa(taskref, Ref{Task}) && (taskref[] = task)
+    return chnl
+end
+
+function Base.put!(c::MatrixSizedChannel, v::AbstractMatrix)
+    if size(v, 1) != c.num_samples || size(v, 2) != c.num_antenna_channels
+        throw(
+            ArgumentError(
+                "First dimension must be the number of samples and second dimension number of channels",
+            ),
+        )
+    end
+    Base.put!(c.channel, v)
+end
+
+Base.bind(c::MatrixSizedChannel, task::Task) = Base.bind(c.channel, task)
+Base.take!(c::MatrixSizedChannel) = Base.take!(c.channel)
+Base.close(c::MatrixSizedChannel, excp::Exception = Base.closed_exception()) =
+    Base.close(c.channel, excp)
+Base.isopen(c::MatrixSizedChannel) = Base.isopen(c.channel)
+Base.close_chnl_on_taskdone(t::Task, c::MatrixSizedChannel) =
+    Base.close_chnl_on_taskdone(t, c.channel)
+Base.isready(c::MatrixSizedChannel) = Base.isready(c.channel)
+Base.isempty(c::MatrixSizedChannel) = Base.isempty(c.channel)
+Base.n_avail(c::MatrixSizedChannel) = Base.n_avail(c.channel)
+
+Base.lock(c::MatrixSizedChannel) = Base.lock(c.channel)
+Base.lock(f, c::MatrixSizedChannel) = Base.lock(f, c.channel)
+Base.unlock(c::MatrixSizedChannel) = Base.unlock(c.channel)
+Base.trylock(c::MatrixSizedChannel) = Base.trylock(c.channel)
+Base.wait(c::MatrixSizedChannel) = Base.wait(c.channel)
+Base.eltype(c::MatrixSizedChannel) = Base.eltype(c.channel)
+Base.show(io::IO, c::MatrixSizedChannel) = Base.show(io, c.channel)
+Base.iterate(c::MatrixSizedChannel, state = nothing) = Base.iterate(c.channel, state)
+
 """
     consume_channel(f::Function, c::Channel, args...)
 
@@ -24,9 +91,9 @@ end
 
 Returns two channels that synchronously output what comes in from `in`.
 """
-function tee(in::Channel{T}) where {T}
-    out1 = Channel{T}()
-    out2 = Channel{T}()
+function tee(in::MatrixSizedChannel{T}) where {T<:Number}
+    out1 = MatrixSizedChannel{T}(in.num_samples, in.num_antenna_channels)
+    out2 = MatrixSizedChannel{T}(in.num_samples, in.num_antenna_channels)
     Base.errormonitor(Threads.@spawn begin
         consume_channel(in) do data
             put!(out1, data)
@@ -43,8 +110,12 @@ end
 
 Converts a stream of chunks with size A to a stream of chunks with size B.
 """
-function rechunk(in::Channel{Matrix{T}}, chunk_size::Integer) where {T<:Number}
-    return spawn_channel_thread(; T) do out
+function rechunk(in::MatrixSizedChannel{T}, chunk_size::Integer) where {T<:Number}
+    return spawn_channel_thread(;
+        T,
+        num_samples = chunk_size,
+        in.num_antenna_channels,
+    ) do out
         chunk_filled = 0
         chunk_idx = 1
         # We'll alternate between filling up these three chunks, then sending
@@ -52,23 +123,17 @@ function rechunk(in::Channel{Matrix{T}}, chunk_size::Integer) where {T<:Number}
         # - One that we're modifying,
         # - One that was sent out to a downstream,
         # - One that is being held by an intermediary
-        chunks = [Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0)]
-        function make_chunks!(num_channels)
-            if size(chunks[1], 2) != num_channels
-                for idx in eachindex(chunks)
-                    chunks[idx] = Matrix{T}(undef, chunk_size, num_channels)
-                end
-                global chunk_filled = 0
-                global chunk_idx = 1
-            end
-        end
+        chunks = [
+            Matrix{T}(undef, chunk_size, in.num_antenna_channels),
+            Matrix{T}(undef, chunk_size, in.num_antenna_channels),
+            Matrix{T}(undef, chunk_size, in.num_antenna_channels),
+        ]
         consume_channel(in) do data
             # Make the loop type-stable
             data = view(data, 1:size(data, 1), :)
 
             # Generate chunks until this data is done
             while !isempty(data)
-                make_chunks!(size(data, 2))
 
                 # How many samples are we going to consume from this buffer?
                 samples_wanted = (chunk_size - chunk_filled)
@@ -94,43 +159,28 @@ function rechunk(in::Channel{Matrix{T}}, chunk_size::Integer) where {T<:Number}
 end
 
 """
-    vectorize_data(in::Channel)
-
-Returns channels with vectorized data.
-"""
-function vectorize_data(in::Channel{<:AbstractMatrix{T}}) where {T}
-    vec_c = Channel{Vector{T}}()
-    Base.errormonitor(Threads.@spawn begin
-        consume_channel(in) do buff
-            put!(vec_c, vec(buff))
-        end
-        close(vec_c)
-    end)
-    return vec_c
-end
-
-"""
     write_to_file(in::Channel, file_path)
 
 Consume a channel and write to file(s). Multiple channels will
 be written to different files. The channel number is appended
 to the filename.
 """
-function write_to_file(in::Channel{Matrix{T}}, file_path::String) where {T<:Number}
-    streams = IOStream[]
-    try
-        consume_channel(in) do buffs
-            if length(streams) != size(buffs, 2)
-                type_string = string(T)
-                streams =
-                    [open("$file_path$type_string$i.dat", "w") for i = 1:size(buffs, 2)]
-            end
-
-            foreach(eachcol(buffs), streams) do buff, stream
-                write(stream, buff)
+function write_to_file(in::MatrixSizedChannel{T}, file_path::String) where {T<:Number}
+    Base.errormonitor(
+        Threads.@spawn begin
+            type_string = string(T)
+            streams = [
+                open("$file_path$type_string$i.dat", "w") for i = 1:in.num_antenna_channels
+            ]
+            try
+                consume_channel(in) do buffs
+                    foreach(eachcol(buffs), streams) do buff, stream
+                        write(stream, buff)
+                    end
+                end
+            finally
+                close.(streams)
             end
         end
-    finally
-        close.(streams)
-    end
+    )
 end

@@ -1,9 +1,10 @@
 using UnicodePlots, Term
 import REPL
 
-struct GUIData
-    cn0s::Dict{Int,typeof(1.0Hz)}
+struct GUIData{S<:SatelliteDataOfInterest}
+    sat_data::Dict{Int,S}
     pvt::PVTSolution
+    runtime::typeof(1.0u"s")
 end
 
 const PRNMARKERS = (
@@ -46,19 +47,16 @@ const PRNMARKERS = (
 
 function get_gui_data_channel(
     data_channel::Channel{<:ReceiverDataOfInterest},
-    push_gui_data_roughly_every = 500ms,
+    push_gui_data_roughly_every = 500u"ms",
 )
     gui_data_channel = Channel{GUIData}()
-    last_gui_output = 0.0ms
+    last_gui_output = 0.0u"ms"
     first = true
     Base.errormonitor(
         Threads.@spawn begin
             consume_channel(data_channel) do data
                 if (data.runtime - last_gui_output) > push_gui_data_roughly_every || first
-                    cn0s = Dict(
-                        prn => last(sat_data).cn0 for (prn, sat_data) in data.sat_data
-                    )
-                    push!(gui_data_channel, GUIData(cn0s, data.pvt))
+                    push!(gui_data_channel, GUIData(data.sat_data, data.pvt, data.runtime))
                     last_gui_output = data.runtime
                     first = false
                 end
@@ -88,20 +86,20 @@ function gui(gui_data_channel, io::IO = stdout; construct_gui_panels = construct
 end
 
 function construct_gui_panels(gui_data, num_dots)
-    rounded_cn0s = Dict(
-        prn => round(10 * log10(linear(cn0) / Hz); digits = 1) for
-        (prn, cn0) in gui_data.cn0s
-    )
+    prn_strings = string.(keys(gui_data.sat_data))
+    cn0s = map(x -> round(10 * log10(linear(x.cn0 == (Inf)u"Hz" ? 1u"Hz" : x.cn0) / u"Hz"); digits = 1), values(gui_data.sat_data))
+    colors = map(x -> x.is_healthy ? :green : :red, values(gui_data.sat_data))
     pvt = gui_data.pvt
     sat_doa_panel_title = "Satellite Direction-of-Arrival (DOA)"
     position_panel_title = "User position"
     not_enough_sats_text = "Not enough satellites to calculate position."
     cn0_panel_title = "Carrier-to-Noise-Density-Ratio (CN0)"
     panels =
-        !isempty(rounded_cn0s) ?
+        !isempty(prn_strings) ?
         panel(
             barplot(
-                rounded_cn0s;
+                prn_strings, cn0s;
+                color = colors,
                 ylabel = "Satellites",
                 xlabel = "Carrier-to-Noise-Density-Ratio (CN0) [dBHz]",
             );
@@ -114,10 +112,10 @@ function construct_gui_panels(gui_data, num_dots)
             width = length(cn0_panel_title) + 5,
         )
     if !isnothing(pvt.time)
-        sat_enus = map(sat_pos -> get_sat_enu(pvt.position, sat_pos), pvt.sat_positions)
+        sat_enus = map(sat -> get_sat_enu(pvt.position, sat.position), values(pvt.sats))
         azs = map(x -> x.θ, sat_enus)
         els = map(x -> x.ϕ, sat_enus)
-        prn_markers = map(prn -> PRNMARKERS[prn], pvt.used_sats)
+        prn_markers = map(prn -> PRNMARKERS[prn], collect(keys(pvt.sats)))
         panels *= panel(
             polarplot(
                 azs,
@@ -135,7 +133,7 @@ function construct_gui_panels(gui_data, num_dots)
             fit = true,
             title = position_panel_title,
         )
-    elseif length(rounded_cn0s) < 4
+    elseif length(prn_strings) < 4
         panels *= Panel(not_enough_sats_text; title = sat_doa_panel_title, fit = true)
         panels *= Panel(not_enough_sats_text; title = position_panel_title, fit = true)
     else

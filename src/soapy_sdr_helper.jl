@@ -9,12 +9,10 @@ end
 Use this convenience wrapper to invoke `f(out_channel)` on a separate thread, closing
 `out_channel` when `f()` finishes.
 """
-function spawn_channel_thread(
-    f::Function;
-    T::DataType = ComplexF32,
-    buffers_in_flight::Int = 0,
-)
-    out = Channel{Matrix{T}}(buffers_in_flight)
+function spawn_channel_thread(f::Function; T::DataType = ComplexF32,
+                              num_samples = nothing, num_antenna_channels = nothing,
+                              buffers_in_flight::Int = 0)
+    out = select_appropriate_channel(num_samples, num_antenna_channels, T, buffers_in_flight)
     Base.errormonitor(Threads.@spawn begin
         try
             f(out)
@@ -25,13 +23,20 @@ function spawn_channel_thread(
     return out
 end
 
+function select_appropriate_channel(num_samples::Nothing, num_antenna_channels::Nothing, T::DataType, sz)
+    Channel{Matrix{T}}(sz)
+end
+function select_appropriate_channel(num_samples, num_antenna_channels, T::DataType, sz)
+    MatrixSizedChannel{T}(num_samples, num_antenna_channels, sz)
+end
+
 """
     membuffer(in, max_size = 16)
 
 Provide some buffering for realtime applications.
 """
-function membuffer(in::Channel{Matrix{T}}, max_size::Int = 16) where {T<:Number}
-    spawn_channel_thread(; T, buffers_in_flight = max_size) do out
+function membuffer(in::MatrixSizedChannel{T}, max_size::Int = 16) where {T <: Number}
+    spawn_channel_thread(;T, in.num_samples, in.num_antenna_channels, buffers_in_flight=max_size) do out
         consume_channel(in) do buff
             put!(out, buff)
         end
@@ -41,19 +46,15 @@ end
 """
     generate_stream(gen_buff!::Function, buff_size, num_channels)
 
-Returns a `Channel` that allows multiple buffers to be
+Returns a `Channel` that allows multiple buffers to be 
 """
-function generate_stream(
-    gen_buff!::Function,
-    buff_size::Integer,
-    num_channels::Integer;
-    wrapper::Function = (f) -> f(),
-    buffers_in_flight::Integer = 1,
-    T = ComplexF32,
-)
-    return spawn_channel_thread(; T, buffers_in_flight) do c
+function generate_stream(gen_buff!::Function, num_samples::Integer, num_antenna_channels::Integer;
+                         wrapper::Function = (f) -> f(),
+                         buffers_in_flight::Integer = 1,
+                         T = ComplexF32)
+    return spawn_channel_thread(;T, num_samples, num_antenna_channels, buffers_in_flight) do c
         wrapper() do
-            buff = Matrix{T}(undef, buff_size, num_channels)
+            buff = Matrix{T}(undef, num_samples, num_antenna_channels)
 
             # Keep on generating buffers until `gen_buff!()` returns `false`.
             while gen_buff!(buff)
@@ -62,7 +63,7 @@ function generate_stream(
         end
     end
 end
-function generate_stream(f::Function, s::SoapySDR.Stream{T}; kwargs...) where {T<:Number}
+function generate_stream(f::Function, s::SoapySDR.Stream{T}; kwargs...) where {T <: Number}
     return generate_stream(f, s.mtu, s.nchannels; T, kwargs...)
 end
 
@@ -73,12 +74,9 @@ Returns a `Channel` which will yield buffers of data to be processed of size `s_
 Starts an asynchronous task that does the reading from the stream, until the requested
 number of samples are read, or the given `Event` is notified.
 """
-function stream_data(
-    s_rx::SoapySDR.Stream{T},
-    end_condition::Union{Integer,Base.Event};
-    leadin_buffers::Integer = 16,
-    kwargs...,
-) where {T<:Number}
+function stream_data(s_rx::SoapySDR.Stream{T}, end_condition::Union{Integer,Base.Event};
+                     leadin_buffers::Integer = 16,
+                     kwargs...) where {T <: Number}
     # Wrapper to activate/deactivate `s_rx`
     wrapper = (f) -> begin
         buff = Matrix{T}(undef, s_rx.mtu, s_rx.nchannels)
@@ -100,7 +98,7 @@ function stream_data(
     buff_idx = 0
     return generate_stream(s_rx.mtu, s_rx.nchannels; wrapper, T, kwargs...) do buff
         if isa(end_condition, Integer)
-            if buff_idx * s_rx.mtu >= end_condition
+            if buff_idx*s_rx.mtu >= end_condition
                 return false
             end
         else
@@ -111,15 +109,16 @@ function stream_data(
 
         flags = Ref{Int}(0)
         try
-            read!(s_rx, split_matrix(buff); flags, throw_error = true)
+            read!(s_rx, split_matrix(buff); flags, timeout=0.9u"s", throw_error = true)
         catch e
             if e isa SoapySDR.SoapySDRDeviceError
                 if e.status == SoapySDR.SOAPY_SDR_OVERFLOW
-                    @warn("RX buffer overflowed.")
+                    _num_overflows[] += 1
+                    print("O")
                 elseif e.status == SoapySDR.SOAPY_SDR_TIMEOUT
-                    println("Tᵣ")
+                    print("Tᵣ")
                 else
-                    println("Eᵣ")
+                    print("Eᵣ")
                 end
             else
                 rethrow(e)
