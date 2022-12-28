@@ -27,6 +27,7 @@ function receive(
     acq_threshold = get_default_acq_threshold(system),
     time_in_lock_before_pvt = 2u"s",
     interm_freq = 0.0u"Hz",
+    max_prn = 31,
 ) where {N,T}
     num_channels = measurement_channel.num_antenna_channels
     num_channels == N ||
@@ -70,6 +71,7 @@ function receive(
                     acq_threshold,
                     time_in_lock_before_pvt,
                     interm_freq,
+                    max_prn,
                 )
                 sat_data = Dict{Int,sat_data_type}(
                     prn => SatelliteDataOfInterest(get_cn0(res), get_prompt(res), is_sat_healthy(receiver_state.sat_channel_states[prn].decoder)) for

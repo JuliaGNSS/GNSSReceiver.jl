@@ -112,10 +112,10 @@ function construct_gui_panels(gui_data, num_dots)
             width = length(cn0_panel_title) + 5,
         )
     if !isnothing(pvt.time)
-        sat_enus = map(sat_pos -> get_sat_enu(pvt.position, sat_pos), pvt.sat_positions)
+        sat_enus = map(sat -> get_sat_enu(pvt.position, sat.position), values(pvt.sats))
         azs = map(x -> x.θ, sat_enus)
         els = map(x -> x.ϕ, sat_enus)
-        prn_markers = map(prn -> PRNMARKERS[prn], pvt.used_sats)
+        prn_markers = map(prn -> PRNMARKERS[prn], collect(keys(pvt.sats)))
         panels *= panel(
             polarplot(
                 azs,

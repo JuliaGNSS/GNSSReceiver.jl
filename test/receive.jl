@@ -5,7 +5,7 @@
 ]
     sampling_freq = 5e6Hz
     gpsl1 = GPSL1()
-    num_samples = 5000
+    num_samples = 20000
     num_ants = 4
 
     measurement_channel = GNSSReceiver.MatrixSizedChannel{type}(num_samples, num_ants) do ch

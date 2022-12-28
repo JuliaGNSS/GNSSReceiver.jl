@@ -13,6 +13,7 @@ function process(
     acq_threshold = get_default_acq_threshold(system),
     time_in_lock_before_pvt = 2u"s",
     interm_freq = 0.0u"Hz",
+    max_prn = 31
 ) where {N, T <: Complex, DS<:SatelliteChannelState}
     signal_duration = size(measurement, 1) / sampling_freq
     sat_channel_states = receiver_state.sat_channel_states
@@ -28,7 +29,7 @@ function process(
     )
     if receiver_state.runtime >= acq_counter * acquire_every && isfull(acq_buffer)
         missing_satellites = vcat(
-            filter(prn -> !(prn in keys(sat_channel_states)), 1:32),
+            filter(prn -> !(prn in keys(sat_channel_states)), 1:max_prn),
             collect(
                 keys(filter(((prn, state),) -> !is_in_lock(state), sat_channel_states)),
             ),
@@ -92,7 +93,7 @@ function process(
     ]
     pvt = receiver_state.pvt
     if length(sat_states) >= 4
-        pvt = calc_pvt(sat_states, pvt)
+        pvt = calc_pvt(sat_states)
     end
     ReceiverState{T, DS, typeof(pvt)}(
         sat_channel_states,
