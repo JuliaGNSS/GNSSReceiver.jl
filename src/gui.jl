@@ -87,7 +87,13 @@ end
 
 function construct_gui_panels(gui_data, num_dots)
     prn_strings = string.(keys(gui_data.sat_data))
-    cn0s = map(x -> round(10 * log10(linear(x.cn0 == (Inf)u"Hz" ? 1u"Hz" : x.cn0) / u"Hz"); digits = 1), values(gui_data.sat_data))
+    cn0s = map(
+        x -> round(
+            10 * log10(linear(x.cn0 == (Inf)u"Hz" ? 1u"Hz" : x.cn0) / u"Hz");
+            digits = 1,
+        ),
+        values(gui_data.sat_data),
+    )
     colors = map(x -> x.is_healthy ? :green : :red, values(gui_data.sat_data))
     pvt = gui_data.pvt
     sat_doa_panel_title = "Satellite Direction-of-Arrival (DOA)"
@@ -98,7 +104,8 @@ function construct_gui_panels(gui_data, num_dots)
         !isempty(prn_strings) ?
         panel(
             barplot(
-                prn_strings, cn0s;
+                prn_strings,
+                cn0s;
                 color = colors,
                 ylabel = "Satellites",
                 xlabel = "Carrier-to-Noise-Density-Ratio (CN0) [dBHz]",

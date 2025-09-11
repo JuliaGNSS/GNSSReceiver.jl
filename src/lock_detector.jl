@@ -38,16 +38,6 @@ function is_in_lock(lock_detector::AbstractLockDetector)
     lock_detector.num_out_of_lock < lock_detector.num_out_of_lock_threshold
 end
 
-function mark_out_of_lock(lock_detector::CodeLockDetector)
-    CodeLockDetector(
-        lock_detector.cn0_threshold,
-        lock_detector.num_out_of_lock_threshold + 1,
-        lock_detector.num_out_of_lock_threshold,
-        lock_detector.wait_counter_threshold,
-        lock_detector.wait_counter,
-    )
-end
-
 struct CarrierLockDetector <: AbstractLockDetector
     prev_filtered_inphase::Float64
     prev_filtered_quadrature::Float64
@@ -56,18 +46,6 @@ struct CarrierLockDetector <: AbstractLockDetector
     num_out_of_lock_threshold::Int
     wait_counter_threshold::Int
     wait_counter::Int
-end
-
-function mark_out_of_lock(lock_detector::CarrierLockDetector)
-    CarrierLockDetector(
-        lock_detector.prev_filtered_inphase,
-        lock_detector.prev_filtered_quadrature,
-        lock_detector.integration_counter,
-        lock_detector.num_out_of_lock_threshold + 1,
-        lock_detector.num_out_of_lock_threshold,
-        lock_detector.wait_counter_threshold,
-        lock_detector.wait_counter,
-    )
 end
 
 function CarrierLockDetector(num_out_of_lock_threshold = 50, wait_counter_threshold = 20)
