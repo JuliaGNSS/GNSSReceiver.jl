@@ -115,6 +115,7 @@ struct ReceiverState{
     pvt::P
     runtime::typeof(1.0u"s")
     last_time_acquisition_ran::typeof(1.0u"s")
+    num_samples_processed::Int
 end
 
 get_num_ants(num_ants::NumAnts{N}) where {N} = N
@@ -147,6 +148,7 @@ function ReceiverState(
         pvt,
         0.0u"s",
         -Inf * 1.0u"s",
+        0,
     )
 end
 
