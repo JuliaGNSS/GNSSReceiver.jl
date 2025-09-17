@@ -1,7 +1,12 @@
 @testset "Process measurement" begin
     measurement = randn(ComplexF64, 20000, 4)
     system = GPSL1()
-    receiver_state = GNSSReceiver.ReceiverState(ComplexF64, size(measurement, 1), 4ms, system, NumAnts(4))
+    receiver_state = GNSSReceiver.ReceiverState(
+        ComplexF64,
+        system;
+        num_samples_for_acquisition = 20000,
+        num_ants = NumAnts(4),
+    )
     sampling_freq = 5e6Hz
 
     acq_plan = CoarseFineAcquisitionPlan(system, size(measurement, 1), sampling_freq)
@@ -11,31 +16,49 @@
     fast_re_acq_plan = AcquisitionPlan(
         system,
         size(measurement, 1),
-        sampling_freq,
-        dopplers = fine_doppler_range
+        sampling_freq;
+        dopplers = fine_doppler_range,
     )
 
-    next_receiver_state, track_results =
-        GNSSReceiver.process(receiver_state, acq_plan, fast_re_acq_plan, measurement, system, sampling_freq)
-
-    @test length(track_results) == 0
-
-    sat_state = GNSSReceiver.SatelliteChannelState(
-        TrackingState(1, system, 1202.0Hz, 123.2; num_ants = NumAnts(4)),
-        GNSSReceiver.GNSSDecoderState(system, 1),
-        GNSSReceiver.CodeLockDetector(),
-        GNSSReceiver.CarrierLockDetector(),
-        0.0u"s",
-        0.0u"s",
-        0,
+    next_receiver_state = GNSSReceiver.process(
+        receiver_state,
+        acq_plan,
+        fast_re_acq_plan,
+        measurement,
+        system,
+        sampling_freq;
+        num_ants = NumAnts(4),
     )
 
-    acq_buffer = GNSSReceiver.AcquisitionBuffer(ComplexF64, size(measurement, 1), 4)
-    receiver_state =
-        GNSSReceiver.ReceiverState(Dict(1 => sat_state), GNSSReceiver.PVTSolution(), 0.0u"s", 0, acq_buffer)
+    @test length(get_sat_states(next_receiver_state.track_state)) == 0
 
-    next_receiver_state, track_results =
-        GNSSReceiver.process(receiver_state, acq_plan, fast_re_acq_plan, measurement, system, sampling_freq)
+    receiver_sat_states = (Dictionary([1], [GNSSReceiver.ReceiverSatState(system, 1)]),)
 
-    @test length(track_results) == 1
+    track_state =
+        TrackState(system, [SatState(system, 1, 0.0, 20u"Hz"; num_ants = NumAnts(4))])
+
+    acquisition_buffer = GNSSReceiver.SampleBuffer(ComplexF64, 20000)
+
+    pvt = PositionVelocityTime.PVTSolution()
+
+    receiver_state = ReceiverState(
+        track_state,
+        receiver_sat_states,
+        acquisition_buffer,
+        pvt,
+        0.0u"s",
+        -Inf * 1.0u"s",
+    )
+
+    next_receiver_state = GNSSReceiver.process(
+        receiver_state,
+        acq_plan,
+        fast_re_acq_plan,
+        measurement,
+        system,
+        sampling_freq;
+        num_ants = NumAnts(4),
+    )
+
+    @test length(get_sat_states(next_receiver_state.track_state)) == 1
 end

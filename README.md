@@ -27,7 +27,7 @@ sampling_freq = 5e6Hz
 num_samples = Int(upreferred(sampling_freq * 4ms))
 measurement_channel = read_files(files, num_samples, type = Complex{Int16})
 # Let's receive GPS L1 signals
-data_channel = receive(measurement_channel, gpsl1, sampling_freq; num_ants = NumAnts(4), num_samples)
+data_channel = receive(measurement_channel, gpsl1, sampling_freq; num_ants = NumAnts(4))
 # Get gui channel from data channel
 gui_channel = get_gui_data_channel(data_channel)
 # Hook up GUI

@@ -7,7 +7,7 @@
                     1 => sat_data_type(
                         45.0dBHz,
                         SVector(complex(1.0, 2.0), complex(2.0, 3.0)),
-                        true
+                        true,
                     ),
                 ),
                 GNSSReceiver.PVTSolution(),
@@ -31,7 +31,11 @@ end
 @testset "GUI with no data" begin
     gui_data_channel = Channel{GNSSReceiver.GUIData}() do ch
         sat_data_type = GNSSReceiver.SatelliteDataOfInterest{SVector{2,ComplexF64}}
-        gui_data = GNSSReceiver.GUIData(Dict{Int,sat_data_type}(), GNSSReceiver.PVTSolution(), 0.0u"s")
+        gui_data = GNSSReceiver.GUIData(
+            Dict{Int,sat_data_type}(),
+            GNSSReceiver.PVTSolution(),
+            0.0u"s",
+        )
 
         foreach(i -> put!(ch, gui_data), 1:20)
     end
@@ -48,10 +52,26 @@ end
     gui_data_channel = Channel{GNSSReceiver.GUIData}() do ch
         gui_data = GNSSReceiver.GUIData(
             Dict{Int,sat_data_type}(
-                3 => GNSSReceiver.SatelliteDataOfInterest(46.3453dBHz, zeros(SVector{2,ComplexF64}), true),
-                12 => GNSSReceiver.SatelliteDataOfInterest(42.233dBHz, zeros(SVector{2,ComplexF64}), true),
-                23 => GNSSReceiver.SatelliteDataOfInterest(43.23123dBHz, zeros(SVector{2,ComplexF64}), true),
-                10 => GNSSReceiver.SatelliteDataOfInterest(45.123467dBHz, zeros(SVector{2,ComplexF64}), true),
+                3 => GNSSReceiver.SatelliteDataOfInterest(
+                    46.3453dBHz,
+                    zeros(SVector{2,ComplexF64}),
+                    true,
+                ),
+                12 => GNSSReceiver.SatelliteDataOfInterest(
+                    42.233dBHz,
+                    zeros(SVector{2,ComplexF64}),
+                    true,
+                ),
+                23 => GNSSReceiver.SatelliteDataOfInterest(
+                    43.23123dBHz,
+                    zeros(SVector{2,ComplexF64}),
+                    true,
+                ),
+                10 => GNSSReceiver.SatelliteDataOfInterest(
+                    45.123467dBHz,
+                    zeros(SVector{2,ComplexF64}),
+                    true,
+                ),
             ),
             PositionVelocityTime.PVTSolution(
                 ECEF(4.0e6, 3.9e5, 4.9e6),
@@ -67,7 +87,7 @@ end
                     10 => PositionVelocityTime.SatInfo(ECEF(3e6, 1e6, 1e6), 0.0),
                 ),
             ),
-            10.0u"s"
+            10.0u"s",
         )
 
         foreach(i -> put!(ch, gui_data), 1:20)
