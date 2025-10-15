@@ -1,7 +1,7 @@
 name = "GNSSReceiver"
 uuid = "c84cffac-6943-4fe6-9449-f6d23817af8b"
 authors = ["Soeren Schoenbrod <soeren.schoenbrod@outlook.de> and contributors"]
-version = "0.1.5"
+version = "0.1.6"
 
 [deps]
 Accessors = "7d9f7c33-5ae7-4f3b-8dc6-eff91059b697"
