@@ -166,21 +166,22 @@ be written to different files. The channel number is appended
 to the filename.
 """
 function write_to_file(in::MatrixSizedChannel{T}, file_path::String) where {T<:Number}
-    Base.errormonitor(
-        Threads.@spawn begin
-            type_string = string(T)
-            streams = [
-                open("$file_path$type_string$i.dat", "w") for i = 1:in.num_antenna_channels
-            ]
-            try
-                consume_channel(in) do buffs
-                    foreach(eachcol(buffs), streams) do buff, stream
-                        write(stream, buff)
-                    end
+    task = Threads.@spawn begin
+        type_string = string(T)
+        streams = [
+            open("$file_path$type_string$i.dat", "w") for i = 1:in.num_antenna_channels
+        ]
+        try
+            consume_channel(in) do buffs
+                foreach(eachcol(buffs), streams) do buff, stream
+                    write(stream, buff)
                 end
-            finally
-                close.(streams)
             end
+        finally
+            close.(streams)
         end
-    )
+    end
+    Base.errormonitor(task)
+    # Wait for the task to complete before returning
+    wait(task)
 end

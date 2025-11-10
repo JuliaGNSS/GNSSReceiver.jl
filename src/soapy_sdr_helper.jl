@@ -113,7 +113,6 @@ function stream_data(s_rx::SoapySDR.Stream{T}, end_condition::Union{Integer,Base
         catch e
             if e isa SoapySDR.SoapySDRDeviceError
                 if e.status == SoapySDR.SOAPY_SDR_OVERFLOW
-                    _num_overflows[] += 1
                     print("O")
                 elseif e.status == SoapySDR.SOAPY_SDR_TIMEOUT
                     print("Tᵣ")
