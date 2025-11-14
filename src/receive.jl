@@ -25,13 +25,14 @@ function receive(
     acq_threshold = get_default_acq_threshold(system),
     time_in_lock_before_calculating_pvt = 2u"s",
     interm_freq = 0.0u"Hz",
+    prns = 1:32,
 ) where {N,T}
     num_channels = measurement_channel.num_antenna_channels
     num_channels == N ||
         throw(ArgumentError("The number of antenna channels must match num_ants"))
 
     acq_num_samples = receiver_state.acquisition_buffer.max_length
-    acq_plan = CoarseFineAcquisitionPlan(system, acq_num_samples, sampling_freq)
+    acq_plan = CoarseFineAcquisitionPlan(system, acq_num_samples, sampling_freq; prns)
     coarse_step = 1 / (acq_num_samples / sampling_freq)
     fine_step = 1 / 12 / (acq_num_samples / sampling_freq)
     fine_doppler_range = -2*coarse_step:fine_step:2*coarse_step
@@ -40,6 +41,7 @@ function receive(
         acq_num_samples,
         sampling_freq;
         dopplers = fine_doppler_range,
+        prns,
     )
 
     sat_data_type =

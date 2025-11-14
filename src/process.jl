@@ -218,7 +218,7 @@ function acquire_satellites(
     if SampleBuffers.isfull(acquisition_buffer) &&
        runtime - last_time_acquisition_ran >= acquire_every
         missing_satellites = vcat(
-            filter(prn -> !(prn in keys(receiver_sat_states)), 1:32),
+            filter(prn -> !(prn in keys(receiver_sat_states)), acq_plan.coarse_plan.avail_prn_channels),
             collect(keys(filter(state -> !is_in_lock(state), receiver_sat_states))),
         )
         acq_res = acquire!(
