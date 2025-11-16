@@ -303,6 +303,13 @@ function try_to_reacquire_lost_satellites(
             )
         end
 
+        invalid_acq_res_prns = get_prns(filter(res -> res.CN0 <= acq_threshold, acq_res))
+        receiver_sat_states = map(receiver_sat_states) do state
+            state.prn in invalid_acq_res_prns ?
+                increment_num_unsuccessful_reacquisition(state) :
+                state
+        end
+
         return update_states_from_acquisition_results(
             corrected_acq_res,
             acq_threshold,
