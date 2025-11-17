@@ -173,7 +173,7 @@ function update_states_from_acquisition_results(
         ReceiverSatState(
             res,
             res.prn in keys(receiver_sat_states) ?
-            receiver_sat_states[res.prn].decoder : nothing,
+                reset_decoder_state(receiver_sat_states[res.prn].decoder) : nothing,
         )
     end
 
