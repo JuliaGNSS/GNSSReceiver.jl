@@ -24,6 +24,7 @@ function receive(
     ),
     acq_threshold = get_default_acq_threshold(system),
     time_in_lock_before_calculating_pvt = 2u"s",
+    pvt_update_interval = 100u"ms",
     interm_freq = 0.0u"Hz",
     prns = 1:32,
 ) where {N,T}
@@ -63,6 +64,7 @@ function receive(
                     acquire_every,
                     acq_threshold,
                     time_in_lock_before_calculating_pvt,
+                    pvt_update_interval,
                     interm_freq,
                 )
                 sat_data = Dict{Int,sat_data_type}(
