@@ -115,6 +115,7 @@ struct ReceiverState{
     pvt::P
     runtime::typeof(1.0u"s")
     last_time_acquisition_ran::typeof(1.0u"s")
+    last_time_pvt_ran::typeof(1.0u"s")
     num_samples_processed::Int
 end
 
@@ -147,6 +148,7 @@ function ReceiverState(
         acquisition_buffer,
         pvt,
         0.0u"s",
+        -Inf * 1.0u"s",
         -Inf * 1.0u"s",
         0,
     )

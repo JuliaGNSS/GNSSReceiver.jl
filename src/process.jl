@@ -12,6 +12,7 @@ function process(
     acquire_every = 10u"s",
     acq_threshold = get_default_acq_threshold(system),
     time_in_lock_before_calculating_pvt = 2u"s",
+    pvt_update_interval = 100u"ms",
     interm_freq = 0.0u"Hz",
 ) where {N,RS,TS,AB,P}
     num_samples = size(measurement, 1)
@@ -22,6 +23,7 @@ function process(
     acquisition_buffer = buffer(receiver_state.acquisition_buffer, @view(measurement[:, 1]))
     runtime = receiver_state.runtime
     last_time_acquisition_ran = receiver_state.last_time_acquisition_ran
+    last_time_pvt_ran = receiver_state.last_time_pvt_ran
 
     track_state, receiver_sat_states, last_time_acquisition_ran = acquire_satellites(
         acq_plan,
@@ -44,12 +46,15 @@ function process(
     receiver_sat_states =
         update_receiver_sat_states(receiver_sat_states, track_state, signal_duration)
 
-    pvt = update_pvt(
+    pvt, last_time_pvt_ran = update_pvt(
         system,
         receiver_state.pvt,
         receiver_sat_states,
         track_state,
+        runtime,
         time_in_lock_before_calculating_pvt,
+        last_time_pvt_ran,
+        pvt_update_interval,
     )
 
     track_state = filter_in_lock_sats(receiver_sat_states, track_state)
@@ -61,6 +66,7 @@ function process(
         pvt,
         receiver_state.runtime + signal_duration,
         last_time_acquisition_ran,
+        last_time_pvt_ran,
         receiver_state.num_samples_processed + num_samples,
     )
 end
@@ -80,26 +86,34 @@ function update_pvt(
     pvt,
     receiver_sat_states,
     track_state,
+    runtime,
     time_in_lock_before_calculating_pvt,
+    last_time_pvt_ran,
+    pvt_update_interval,
 )
-    receiver_sat_states_ready_for_pvt = filter(receiver_sat_states) do receiver_sat_state
-        is_in_lock(receiver_sat_state) &&
-            receiver_sat_state.time_in_lock > time_in_lock_before_calculating_pvt
-    end
-
-    pvt_satellite_states =
-        map(receiver_sat_states_ready_for_pvt.values) do receiver_sat_state
-            SatelliteState(
-                receiver_sat_state.decoder,
-                system,
-                get_sat_state(track_state, receiver_sat_state.prn),
-            )
+    if runtime - last_time_pvt_ran >= pvt_update_interval
+        receiver_sat_states_ready_for_pvt = filter(receiver_sat_states) do receiver_sat_state
+            is_in_lock(receiver_sat_state) &&
+                receiver_sat_state.time_in_lock > time_in_lock_before_calculating_pvt
         end
 
-    if length(pvt_satellite_states) >= 4
-        pvt = calc_pvt(pvt_satellite_states, pvt)
+        pvt_satellite_states =
+            map(receiver_sat_states_ready_for_pvt.values) do receiver_sat_state
+                SatelliteState(
+                    receiver_sat_state.decoder,
+                    system,
+                    get_sat_state(track_state, receiver_sat_state.prn),
+                )
+            end
+
+        if length(pvt_satellite_states) >= 4
+            pvt = calc_pvt(pvt_satellite_states, pvt)
+        end
+
+        last_time_pvt_ran = runtime
     end
-    return pvt
+
+    return pvt, last_time_pvt_ran
 end
 
 function update_receiver_sat_states(receiver_sat_states, track_state, signal_duration)
