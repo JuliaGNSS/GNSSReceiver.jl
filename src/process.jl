@@ -1,8 +1,8 @@
 get_default_acq_threshold(system::GPSL1) = 43
 get_default_acq_threshold(system::GalileoE1B) = 37
 
-get_default_trk_threshold(system::GPSL1) = 30.0u"dBHz"
-get_default_trk_threshold(system::GalileoE1B) = 30.0u"dBHz"
+get_default_code_lock_tracking_threshold(system::GPSL1) = 30.0u"dBHz"
+get_default_code_lock_tracking_threshold(system::GalileoE1B) = 30.0u"dBHz"
 
 function process(
     receiver_state::ReceiverState{RS,TS,AB,P},
@@ -14,7 +14,7 @@ function process(
     num_ants::NumAnts{N} = NumAnts(1),
     acquire_every = 10u"s",
     acq_threshold = get_default_acq_threshold(system),
-    trk_threshold = get_default_trk_threshold(system),
+    code_lock_tracking_threshold = get_default_code_lock_tracking_threshold(system),
     time_in_lock_before_calculating_pvt = 2u"s",
     pvt_update_interval = 100u"ms",
     interm_freq = 0.0u"Hz",
@@ -37,7 +37,7 @@ function process(
         receiver_sat_states,
         interm_freq,
         acq_threshold,
-        trk_threshold,
+        code_lock_tracking_threshold,
         runtime,
         num_ants,
         last_time_acquisition_ran,
@@ -182,7 +182,7 @@ end
 function update_states_from_acquisition_results(
     acquisition_results,
     acq_threshold,
-    trk_threshold,
+    code_lock_tracking_threshold,
     track_state,
     receiver_sat_states,
     num_ants,
@@ -194,7 +194,7 @@ function update_states_from_acquisition_results(
             res,
             res.prn in keys(receiver_sat_states) ?
                 reset_decoder_state(receiver_sat_states[res.prn].decoder) : nothing,
-            trk_threshold,
+            code_lock_tracking_threshold,
         )
     end
 
@@ -219,7 +219,7 @@ function acquire_satellites(
     receiver_sat_states,
     interm_freq,
     acq_threshold,
-    trk_threshold,
+    code_lock_tracking_threshold,
     runtime,
     num_ants,
     last_time_acquisition_ran,
@@ -233,7 +233,7 @@ function acquire_satellites(
         acquisition_buffer,
         interm_freq,
         acq_threshold,
-        trk_threshold,
+        code_lock_tracking_threshold,
         num_ants,
         num_samples_processed,
     )
@@ -261,7 +261,7 @@ function acquire_satellites(
         track_state, receiver_sat_states = update_states_from_acquisition_results(
             corrected_acq_res,
             acq_threshold,
-            trk_threshold,
+            code_lock_tracking_threshold,
             track_state,
             receiver_sat_states,
             num_ants,
@@ -300,7 +300,7 @@ function try_to_reacquire_lost_satellites(
     acquisition_buffer,
     interm_freq,
     acq_threshold,
-    trk_threshold,
+    code_lock_tracking_threshold,
     num_ants,
     num_samples_processed,
 )
@@ -338,7 +338,7 @@ function try_to_reacquire_lost_satellites(
         return update_states_from_acquisition_results(
             corrected_acq_res,
             acq_threshold,
-            trk_threshold,
+            code_lock_tracking_threshold,
             track_state,
             receiver_sat_states,
             num_ants,

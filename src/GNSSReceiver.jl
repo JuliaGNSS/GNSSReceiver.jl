@@ -44,12 +44,12 @@ end
 function ReceiverSatState(
     acq::Acquisition.AcquisitionResults,
     decoder::Tracking.Maybe{<:GNSSDecoderState} = nothing,
-    trk_threshold::typeof(1.0u"dBHz") = get_default_trk_threshold(acq.system),
+    code_lock_tracking_threshold::typeof(1.0u"dBHz") = get_default_code_lock_tracking_threshold(acq.system),
 )
     ReceiverSatState(
         acq.prn,
         isnothing(decoder) ? GNSSDecoderState(acq.system, acq.prn) : decoder,
-        CodeLockDetector(cn0_threshold = trk_threshold),
+        CodeLockDetector(cn0_threshold = code_lock_tracking_threshold),
         CarrierLockDetector(),
         0.0u"s",
         0.0u"s",
@@ -61,12 +61,12 @@ end
 function ReceiverSatState(
     system::AbstractGNSS,
     prn::Int,
-    trk_threshold::typeof(1.0u"dBHz") = get_default_trk_threshold(system),
+    code_lock_tracking_threshold::typeof(1.0u"dBHz") = get_default_code_lock_tracking_threshold(system),
 )
     ReceiverSatState(
         prn,
         GNSSDecoderState(system, prn),
-        CodeLockDetector(cn0_threshold = trk_threshold),
+        CodeLockDetector(cn0_threshold = code_lock_tracking_threshold),
         CarrierLockDetector(),
         0.0u"s",
         0.0u"s",
