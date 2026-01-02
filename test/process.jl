@@ -48,6 +48,8 @@
         pvt,
         0.0u"s",
         -Inf * 1.0u"s",
+        -Inf * 1.0u"s",
+        0,
     )
 
     next_receiver_state = GNSSReceiver.process(

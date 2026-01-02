@@ -136,22 +136,22 @@ using GNSSReceiver.SampleBuffers
         buf = SampleBuffer(Float64, 5, Val(2))
 
         # Initially empty
-        @test !isfull(buf)
+        @test !SampleBuffers.isfull(buf)
 
         # Add some samples but not full
         chunk = [1.0 2.0; 3.0 4.0]  # 2x2
         buf = buffer(buf, chunk)
-        @test !isfull(buf)
+        @test !SampleBuffers.isfull(buf)
 
         # Fill to capacity
         chunk_full = [5.0 6.0; 7.0 8.0; 9.0 10.0]  # 3x2
         buf = buffer(buf, chunk_full)
-        @test isfull(buf)
+        @test SampleBuffers.isfull(buf)
 
         # Add more samples - should still be full (FIFO)
         chunk_more = [11.0 12.0]  # 1x2
         buf = buffer(buf, chunk_more)
-        @test isfull(buf)
+        @test SampleBuffers.isfull(buf)
     end
 
     @testset "Vector (single antenna) functionality" begin
@@ -184,7 +184,7 @@ using GNSSReceiver.SampleBuffers
         chunk3 = [6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]  # 7 more samples
         buf = buffer(buf, chunk3)
         @test buf.current_length == 10
-        @test isfull(buf)
+        @test SampleBuffers.isfull(buf)
         samples = get_samples(buf)
         @test samples == [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]  # FIFO removed first 2 samples
 
@@ -211,7 +211,7 @@ using GNSSReceiver.SampleBuffers
         chunk_overflow = [4.0, 5.0, 6.0, 7.0]  # This will cause FIFO
         buf_counter = buffer(buf_counter, chunk_overflow)
         @test buf_counter.first_sample_counter == 3  # 2 samples removed
-        @test isfull(buf_counter)
+        @test SampleBuffers.isfull(buf_counter)
     end
 
     @testset "Helper functions for first sample counter" begin

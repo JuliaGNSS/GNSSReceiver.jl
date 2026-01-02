@@ -12,21 +12,18 @@ function process(
     acquire_every = 10u"s",
     acq_threshold = get_default_acq_threshold(system),
     time_in_lock_before_calculating_pvt = 2u"s",
+    pvt_update_interval = 100u"ms",
     interm_freq = 0.0u"Hz",
 ) where {N,RS,TS,AB,P}
-    size(measurement, 1) <= receiver_state.acquisition_buffer.max_length || throw(
-        ArgumentError(
-            "The number of samples in the measurement must not exceed the capacity of the acquisition buffer. This is because the buffer will skip the first samples if they do not fit, which will not align with the start of tracking.",
-        ),
-    )
-
-    signal_duration = size(measurement, 1) / sampling_freq
+    num_samples = size(measurement, 1)
+    signal_duration = num_samples / sampling_freq
     # Currently this only supports a single system. Hence [1]
     receiver_sat_states = receiver_state.receiver_sat_states[1]
     track_state = receiver_state.track_state
     acquisition_buffer = buffer(receiver_state.acquisition_buffer, @view(measurement[:, 1]))
     runtime = receiver_state.runtime
     last_time_acquisition_ran = receiver_state.last_time_acquisition_ran
+    last_time_pvt_ran = receiver_state.last_time_pvt_ran
 
     track_state, receiver_sat_states, last_time_acquisition_ran = acquire_satellites(
         acq_plan,
@@ -40,6 +37,7 @@ function process(
         num_ants,
         last_time_acquisition_ran,
         acquire_every,
+        receiver_state.num_samples_processed,
     )
 
     track_state =
@@ -48,12 +46,15 @@ function process(
     receiver_sat_states =
         update_receiver_sat_states(receiver_sat_states, track_state, signal_duration)
 
-    pvt = update_pvt(
+    pvt, last_time_pvt_ran = update_pvt(
         system,
         receiver_state.pvt,
         receiver_sat_states,
         track_state,
+        runtime,
         time_in_lock_before_calculating_pvt,
+        last_time_pvt_ran,
+        pvt_update_interval,
     )
 
     track_state = filter_in_lock_sats(receiver_sat_states, track_state)
@@ -65,6 +66,8 @@ function process(
         pvt,
         receiver_state.runtime + signal_duration,
         last_time_acquisition_ran,
+        last_time_pvt_ran,
+        receiver_state.num_samples_processed + num_samples,
     )
 end
 
@@ -83,26 +86,34 @@ function update_pvt(
     pvt,
     receiver_sat_states,
     track_state,
+    runtime,
     time_in_lock_before_calculating_pvt,
+    last_time_pvt_ran,
+    pvt_update_interval,
 )
-    receiver_sat_states_ready_for_pvt = filter(receiver_sat_states) do receiver_sat_state
-        is_in_lock(receiver_sat_state) &&
-            receiver_sat_state.time_in_lock > time_in_lock_before_calculating_pvt
-    end
-
-    pvt_satellite_states =
-        map(receiver_sat_states_ready_for_pvt.values) do receiver_sat_state
-            SatelliteState(
-                receiver_sat_state.decoder,
-                system,
-                get_sat_state(track_state, receiver_sat_state.prn),
-            )
+    if runtime - last_time_pvt_ran >= pvt_update_interval
+        receiver_sat_states_ready_for_pvt = filter(receiver_sat_states) do receiver_sat_state
+            is_in_lock(receiver_sat_state) &&
+                receiver_sat_state.time_in_lock > time_in_lock_before_calculating_pvt
         end
 
-    if length(pvt_satellite_states) >= 4
-        pvt = calc_pvt(pvt_satellite_states, pvt)
+        pvt_satellite_states =
+            map(receiver_sat_states_ready_for_pvt.values) do receiver_sat_state
+                SatelliteState(
+                    receiver_sat_state.decoder,
+                    system,
+                    get_sat_state(track_state, receiver_sat_state.prn),
+                )
+            end
+
+        if length(pvt_satellite_states) >= 4
+            pvt = calc_pvt(pvt_satellite_states, pvt)
+        end
+
+        last_time_pvt_ran = runtime
     end
-    return pvt
+
+    return pvt, last_time_pvt_ran
 end
 
 function update_receiver_sat_states(receiver_sat_states, track_state, signal_duration)
@@ -176,7 +187,7 @@ function update_states_from_acquisition_results(
         ReceiverSatState(
             res,
             res.prn in keys(receiver_sat_states) ?
-            receiver_sat_states[res.prn].decoder : nothing,
+                reset_decoder_state(receiver_sat_states[res.prn].decoder) : nothing,
         )
     end
 
@@ -205,6 +216,7 @@ function acquire_satellites(
     num_ants,
     last_time_acquisition_ran,
     acquire_every,
+    num_samples_processed,
 )
     track_state, receiver_sat_states = try_to_reacquire_lost_satellites(
         fast_re_acq_plan,
@@ -214,24 +226,31 @@ function acquire_satellites(
         interm_freq,
         acq_threshold,
         num_ants,
+        num_samples_processed,
     )
 
-    if isfull(acquisition_buffer) && runtime - last_time_acquisition_ran >= acquire_every
+    if SampleBuffers.isfull(acquisition_buffer) &&
+       runtime - last_time_acquisition_ran >= acquire_every
         missing_satellites = vcat(
-            filter(prn -> !(prn in keys(receiver_sat_states)), 1:32),
+            filter(prn -> !(prn in keys(receiver_sat_states)), acq_plan.coarse_plan.avail_prn_channels),
             collect(keys(filter(state -> !is_in_lock(state), receiver_sat_states))),
         )
         acq_res = acquire!(
             acq_plan,
-            # TODO: If the incoming number of samples is larger than the buffer, the buffer will skip the first samples
-            # until it fits. This unaligns with tracking as it starts from beginning
             get_samples(acquisition_buffer),
             missing_satellites;
             interm_freq,
         )
 
+        corrected_acq_res = map(acq_res) do res
+            advance_code_phase(
+                res,
+                num_samples_processed - (get_first_sample_counter(acquisition_buffer) - 1),
+            )
+        end
+
         track_state, receiver_sat_states = update_states_from_acquisition_results(
-            acq_res,
+            corrected_acq_res,
             acq_threshold,
             track_state,
             receiver_sat_states,
@@ -243,6 +262,27 @@ function acquire_satellites(
     track_state, receiver_sat_states, last_time_acquisition_ran
 end
 
+function advance_code_phase(acq_res::Acquisition.AcquisitionResults, num_samples)
+    code_phase = mod(
+        (
+            get_code_frequency(acq_res.system) +
+            acq_res.carrier_doppler * get_code_center_frequency_ratio(acq_res.system)
+        ) * num_samples / acq_res.sampling_frequency + acq_res.code_phase,
+        get_code_length(acq_res.system),
+    )
+    Acquisition.AcquisitionResults(
+        acq_res.system,
+        acq_res.prn,
+        acq_res.sampling_frequency,
+        acq_res.carrier_doppler,
+        code_phase,
+        acq_res.CN0,
+        acq_res.noise_power,
+        acq_res.power_bins,
+        acq_res.dopplers,
+    )
+end
+
 function try_to_reacquire_lost_satellites(
     fast_re_acq_plan,
     track_state,
@@ -251,8 +291,9 @@ function try_to_reacquire_lost_satellites(
     interm_freq,
     acq_threshold,
     num_ants,
+    num_samples_processed,
 )
-    if isfull(acquisition_buffer)
+    if SampleBuffers.isfull(acquisition_buffer)
         out_of_lock_receiver_sat_states = filter(receiver_sat_states) do state
             !is_in_lock(state) &&
                 state.num_unsuccessful_reacquisition <= 10 &&
@@ -269,8 +310,22 @@ function try_to_reacquire_lost_satellites(
             )
         end
 
+        corrected_acq_res = map(acq_res) do res
+            advance_code_phase(
+                res,
+                num_samples_processed - (get_first_sample_counter(acquisition_buffer) - 1),
+            )
+        end
+
+        invalid_acq_res_prns = get_prns(filter(res -> res.CN0 <= acq_threshold, acq_res))
+        receiver_sat_states = map(receiver_sat_states) do state
+            state.prn in invalid_acq_res_prns ?
+                increment_num_unsuccessful_reacquisition(state) :
+                state
+        end
+
         return update_states_from_acquisition_results(
-            acq_res,
+            corrected_acq_res,
             acq_threshold,
             track_state,
             receiver_sat_states,

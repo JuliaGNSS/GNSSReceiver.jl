@@ -115,6 +115,8 @@ struct ReceiverState{
     pvt::P
     runtime::typeof(1.0u"s")
     last_time_acquisition_ran::typeof(1.0u"s")
+    last_time_pvt_ran::typeof(1.0u"s")
+    num_samples_processed::Int
 end
 
 get_num_ants(num_ants::NumAnts{N}) where {N} = N
@@ -147,6 +149,8 @@ function ReceiverState(
         pvt,
         0.0u"s",
         -Inf * 1.0u"s",
+        -Inf * 1.0u"s",
+        0,
     )
 end
 
@@ -186,7 +190,7 @@ function gnss_receiver_gui(;
             crx.frequency = get_center_frequency(system)
         end
 
-        stream = SoapySDR.Stream(first(dev.rx).native_stream_format, dev.rx)
+        stream = SoapySDR.Stream(first(dev.rx).native_stream_format, first(dev.rx))
 
         # Getting samples in chunks of `mtu`
         data_stream = stream_data(stream, eval_num_samples)
@@ -220,14 +224,13 @@ function gnss_write_to_file(;
 )
     eval_num_samples = Int(upreferred(sampling_freq * run_time))
     Device(dev_args) do dev
-        for crx in dev.rx
-            crx.frequency = get_center_frequency(system)
-            crx.sample_rate = sampling_freq
-            crx.bandwidth = sampling_freq
-            crx.gain_mode = true
-        end
+        rx = dev.rx[1]
+        rx.frequency = 2.4e9u"Hz"
+        rx.sample_rate = sampling_freq
+        rx.bandwidth = sampling_freq
+        rx.gain = 50u"dB"
 
-        stream = SoapySDR.Stream(first(dev.rx).native_stream_format, dev.rx)
+        stream = SoapySDR.Stream(Complex{Int16}, rx)
 
         # Getting samples in chunks of `mtu`
         data_stream = stream_data(stream, eval_num_samples)

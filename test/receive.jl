@@ -46,6 +46,8 @@
         pvt,
         0.0u"s",
         -Inf * 1.0u"s",
+        -Inf * 1.0u"s",
+        0,
     )
 
     measurement_channel = GNSSReceiver.MatrixSizedChannel{type}(num_samples, num_ants) do ch
