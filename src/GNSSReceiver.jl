@@ -136,9 +136,12 @@ function ReceiverState(
         num_ants,
     ),
     post_corr_filter = create_post_corr_filter(num_ants),
+    doppler_estimator::Tracking.AbstractDopplerEstimator = ConventionalPLLAndDLL((
+        SystemSatsState(system, SatState{typeof(correlator),typeof(post_corr_filter)}[]),
+    )),
 ) where {T,N}
     track_state =
-        TrackState(system, SatState{typeof(correlator),typeof(post_corr_filter)}[])
+        TrackState(system, SatState{typeof(correlator),typeof(post_corr_filter)}[]; doppler_estimator)
     decoder = GNSSDecoderState(system, 1)
     receiver_sat_states = (Dictionary{Int64,ReceiverSatState{typeof(decoder)}}(),)
     pvt = PositionVelocityTime.PVTSolution()
