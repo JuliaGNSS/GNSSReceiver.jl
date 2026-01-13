@@ -24,7 +24,7 @@ Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
 
 [compat]
 Accessors = "0.1.42"
-Acquisition = "0.1.2, 0.2"
+Acquisition = "0.1.2, 0.2, 0.3"
 AstroTime = "0.7"
 Dictionaries = "0.4.5"
 GNSSDecoder = "0.1.4"
