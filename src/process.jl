@@ -212,6 +212,14 @@ function update_states_from_acquisition_results(
     new_track_state, new_receiver_sat_states_dictionary
 end
 
+function get_available_prn_channels(acq_plan::AcquisitionPlan)
+    return acq_plan.avail_prn_channels
+end
+
+function get_available_prn_channels(acq_plan::CoarseFineAcquisitionPlan)
+    return acq_plan.coarse_plan.avail_prn_channels
+end
+
 function acquire_satellites(
     acq_plan,
     fast_re_acq_plan,
@@ -242,7 +250,10 @@ function acquire_satellites(
     if SampleBuffers.isfull(acquisition_buffer) &&
        runtime - last_time_acquisition_ran >= acquire_every
         missing_satellites = vcat(
-            filter(prn -> !(prn in keys(receiver_sat_states)), acq_plan.avail_prn_channels),
+            filter(
+                prn -> !(prn in keys(receiver_sat_states)),
+                get_available_prn_channels(acq_plan),
+            ),
             collect(keys(filter(state -> !is_in_lock(state), receiver_sat_states))),
         )
         acq_res = acquire!(
