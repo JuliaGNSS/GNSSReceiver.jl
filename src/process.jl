@@ -1,4 +1,4 @@
-get_default_acq_threshold(system::GPSL1) = 43
+get_default_acq_threshold(system::GPSL1) = 45
 get_default_acq_threshold(system::GalileoE1B) = 37
 
 get_default_code_lock_cn0_threshold(system::GPSL1) = 30.0u"dBHz"
@@ -11,6 +11,7 @@ function process(
     measurement,
     system::AbstractGNSS,
     sampling_freq;
+    downconvert_and_correlator = CPUThreadedDownconvertAndCorrelator(Val(sampling_freq)),
     num_ants::NumAnts{N} = NumAnts(1),
     acquire_every = 10u"s",
     acq_threshold = get_default_acq_threshold(system),
@@ -18,17 +19,31 @@ function process(
     time_in_lock_before_calculating_pvt = 2u"s",
     pvt_update_interval = 100u"ms",
     interm_freq = 0.0u"Hz",
+    always_buffer = false,
 ) where {N,RS,TS,AB,P}
     num_samples = size(measurement, 1)
     signal_duration = num_samples / sampling_freq
     # Currently this only supports a single system. Hence [1]
     receiver_sat_states = receiver_state.receiver_sat_states[1]
     track_state = receiver_state.track_state
-    acquisition_buffer = buffer(receiver_state.acquisition_buffer, @view(measurement[:, 1]))
     runtime = receiver_state.runtime
     last_time_acquisition_ran = receiver_state.last_time_acquisition_ran
+
+    # When always_buffer is false, only fill the acquisition buffer when
+    # acquisition could plausibly fire. This avoids ~46 μs of memcpy on
+    # every steady-state frame. When always_buffer is true, the buffer is
+    # kept up to date for fast reacquisition of lost satellites.
+    needs_buffering = always_buffer ||
+        runtime - last_time_acquisition_ran >= acquire_every ||
+        any(should_reacquire, receiver_sat_states)
+    acquisition_buffer = if needs_buffering
+        buffer(receiver_state.acquisition_buffer, @view(measurement[:, 1]))
+    else
+        receiver_state.acquisition_buffer
+    end
     last_time_pvt_ran = receiver_state.last_time_pvt_ran
 
+    prev_last_time_acquisition_ran = last_time_acquisition_ran
     track_state, receiver_sat_states, last_time_acquisition_ran = acquire_satellites(
         acq_plan,
         fast_re_acq_plan,
@@ -44,9 +59,19 @@ function process(
         acquire_every,
         receiver_state.num_samples_processed,
     )
+    # Reset buffer after periodic acquisition so stale samples aren't reused.
+    # Skip reset when always_buffer is true — the buffer stays fresh every frame.
+    if !always_buffer && last_time_acquisition_ran != prev_last_time_acquisition_ran
+        acquisition_buffer = SampleBuffers.reset(acquisition_buffer)
+    end
 
-    track_state =
-        track(measurement, track_state, sampling_freq; intermediate_frequency = interm_freq)
+    track_state = track(
+        measurement,
+        track_state,
+        sampling_freq;
+        intermediate_frequency = interm_freq,
+        downconvert_and_correlator,
+    )
 
     receiver_sat_states =
         update_receiver_sat_states(receiver_sat_states, track_state, signal_duration)
@@ -77,13 +102,16 @@ function process(
 end
 
 function filter_in_lock_sats(receiver_sat_states, track_state)
-    tracked_prns_out_of_lock =
-        filter(receiver_sat_states) do receiver_sat_state
-            !is_in_lock(receiver_sat_state) &&
-                receiver_sat_state.prn in keys(get_sat_states(track_state))
-        end |> get_prns
+    isempty(receiver_sat_states) && return track_state
 
-    filter_out_sats(track_state, tracked_prns_out_of_lock)
+    tracked_prns = keys(get_sat_states(track_state))
+    should_remove(rs) = !is_in_lock(rs) && rs.prn in tracked_prns
+
+    # Use lazy iterator - only allocates if any satellites need removal
+    out_of_lock = Iterators.filter(should_remove, receiver_sat_states)
+    prns_to_remove = Int[rs.prn for rs in out_of_lock]
+
+    isempty(prns_to_remove) ? track_state : filter_out_sats(track_state, prns_to_remove)
 end
 
 function update_pvt(
@@ -97,10 +125,11 @@ function update_pvt(
     pvt_update_interval,
 )
     if runtime - last_time_pvt_ran >= pvt_update_interval
-        receiver_sat_states_ready_for_pvt = filter(receiver_sat_states) do receiver_sat_state
-            is_in_lock(receiver_sat_state) &&
-                receiver_sat_state.time_in_lock > time_in_lock_before_calculating_pvt
-        end
+        receiver_sat_states_ready_for_pvt =
+            filter(receiver_sat_states) do receiver_sat_state
+                is_in_lock(receiver_sat_state) &&
+                    receiver_sat_state.time_in_lock > time_in_lock_before_calculating_pvt
+            end
 
         pvt_satellite_states =
             map(receiver_sat_states_ready_for_pvt.values) do receiver_sat_state
@@ -188,13 +217,17 @@ function update_states_from_acquisition_results(
     receiver_sat_states,
     num_ants,
 )
+    # Early return if no results to process
+    isempty(acquisition_results) && return track_state, receiver_sat_states
+
     acq_res_valids = filter(res -> res.CN0 > acq_threshold, acquisition_results)
+    isempty(acq_res_valids) && return track_state, receiver_sat_states
 
     new_receiver_sat_states = map(acq_res_valids) do res
         ReceiverSatState(
             res,
             res.prn in keys(receiver_sat_states) ?
-                reset_decoder_state(receiver_sat_states[res.prn].decoder) : nothing,
+            reset_decoder_state(receiver_sat_states[res.prn].decoder) : nothing,
             code_lock_cn0_threshold,
         )
     end
@@ -263,12 +296,12 @@ function acquire_satellites(
             interm_freq,
         )
 
-        corrected_acq_res = map(acq_res) do res
+        corrected_acq_res = Acquisition.AcquisitionResults[
             advance_code_phase(
                 res,
                 num_samples_processed - (get_first_sample_counter(acquisition_buffer) - 1),
-            )
-        end
+            ) for res in acq_res
+        ]
 
         track_state, receiver_sat_states = update_states_from_acquisition_results(
             corrected_acq_res,
@@ -305,6 +338,12 @@ function advance_code_phase(acq_res::Acquisition.AcquisitionResults, num_samples
     )
 end
 
+function should_reacquire(state)
+    !is_in_lock(state) &&
+    state.num_unsuccessful_reacquisition <= 10 &&
+    state.num_unsuccessful_reacquisition^2 * 100u"ms" >= state.time_out_of_lock
+end
+
 function try_to_reacquire_lost_satellites(
     fast_re_acq_plan,
     track_state,
@@ -316,46 +355,44 @@ function try_to_reacquire_lost_satellites(
     num_ants,
     num_samples_processed,
 )
-    if SampleBuffers.isfull(acquisition_buffer)
-        out_of_lock_receiver_sat_states = filter(receiver_sat_states) do state
-            !is_in_lock(state) &&
-                state.num_unsuccessful_reacquisition <= 10 &&
-                state.num_unsuccessful_reacquisition^2 * 100u"ms" >= state.time_out_of_lock
-        end
+    SampleBuffers.isfull(acquisition_buffer) || return track_state, receiver_sat_states
 
-        acq_res = map(out_of_lock_receiver_sat_states.values) do receiver_sat_state
-            acquire!(
-                fast_re_acq_plan,
-                get_samples(acquisition_buffer),
-                receiver_sat_state.prn;
-                interm_freq,
-                doppler_offset = receiver_sat_state.carrier_doppler_for_reacquisition,
-            )
-        end
+    any(should_reacquire, receiver_sat_states) || return track_state, receiver_sat_states
 
-        corrected_acq_res = map(acq_res) do res
-            advance_code_phase(
-                res,
-                num_samples_processed - (get_first_sample_counter(acquisition_buffer) - 1),
-            )
-        end
+    # Only now allocate the filtered Dictionary (preserves type stability)
+    out_of_lock_receiver_sat_states = filter(should_reacquire, receiver_sat_states)
 
-        invalid_acq_res_prns = get_prns(filter(res -> res.CN0 <= acq_threshold, acq_res))
+    acq_res = map(out_of_lock_receiver_sat_states.values) do receiver_sat_state
+        acquire!(
+            fast_re_acq_plan,
+            get_samples(acquisition_buffer),
+            receiver_sat_state.prn;
+            interm_freq,
+            doppler_offset = receiver_sat_state.carrier_doppler_for_reacquisition,
+        )
+    end
+
+    corrected_acq_res = Acquisition.AcquisitionResults[
+        advance_code_phase(
+            res,
+            num_samples_processed - (get_first_sample_counter(acquisition_buffer) - 1),
+        ) for res in acq_res
+    ]
+
+    invalid_acq_res_prns = get_prns(filter(res -> res.CN0 <= acq_threshold, acq_res))
+    if !isempty(invalid_acq_res_prns)
         receiver_sat_states = map(receiver_sat_states) do state
             state.prn in invalid_acq_res_prns ?
-                increment_num_unsuccessful_reacquisition(state) :
-                state
+            increment_num_unsuccessful_reacquisition(state) : state
         end
-
-        return update_states_from_acquisition_results(
-            corrected_acq_res,
-            acq_threshold,
-            code_lock_cn0_threshold,
-            track_state,
-            receiver_sat_states,
-            num_ants,
-        )
-    else
-        return track_state, receiver_sat_states
     end
+
+    return update_states_from_acquisition_results(
+        corrected_acq_res,
+        acq_threshold,
+        code_lock_cn0_threshold,
+        track_state,
+        receiver_sat_states,
+        num_ants,
+    )
 end
