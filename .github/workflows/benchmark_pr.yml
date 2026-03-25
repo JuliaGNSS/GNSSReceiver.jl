@@ -56,7 +56,7 @@ jobs:
             --url=${{ github.event.repository.clone_url }} \
             --bench-on=$HEAD_SHA \
             --output-dir=results/ \
-            --add=GNSSSignals,Unitful,StaticArrays,Dictionaries,GNSSDecoder,PositionVelocityTime,BenchmarkTools
+            --add=GNSSSignals,Unitful,StaticArrays,Dictionaries,GNSSDecoder,PositionVelocityTime
 
       - name: Create comment body
         env:
