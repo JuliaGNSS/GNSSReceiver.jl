@@ -46,10 +46,10 @@ jobs:
         run: |
           export PATH="$HOME/.julia/bin:$PATH"
           mkdir results
-          if [ "$BASE_REF" = "master" ]; then
-            REVS="master,$HEAD_SHA"
+          if [ "$BASE_REF" = "main" ]; then
+            REVS="main,$HEAD_SHA"
           else
-            REVS="master,$BASE_REF,$HEAD_SHA"
+            REVS="main,$BASE_REF,$HEAD_SHA"
           fi
           benchpkg GNSSReceiver \
             --rev=$REVS \
@@ -67,14 +67,14 @@ jobs:
           export PATH="$HOME/.julia/bin:$PATH"
           echo "## Benchmark Results" > body.md
           echo "" >> body.md
-          if [ "$BASE_REF" = "master" ]; then
+          if [ "$BASE_REF" = "main" ]; then
             for m in time memory; do
               {
                 echo "<details><summary>${m^} benchmarks</summary>"
                 echo ""
                 benchpkgtable GNSSReceiver \
                   --input-dir=results/ \
-                  --rev=master,$HEAD_SHA \
+                  --rev=main,$HEAD_SHA \
                   --mode=$m \
                   --ratio
                 echo ""
@@ -99,11 +99,11 @@ jobs:
             done
             for m in time memory; do
               {
-                echo "<details><summary>${m^} benchmarks (vs master)</summary>"
+                echo "<details><summary>${m^} benchmarks (vs main)</summary>"
                 echo ""
                 benchpkgtable GNSSReceiver \
                   --input-dir=results/ \
-                  --rev=master,$HEAD_SHA \
+                  --rev=main,$HEAD_SHA \
                   --mode=$m \
                   --ratio
                 echo ""
