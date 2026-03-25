@@ -9,7 +9,7 @@
     )
     sampling_freq = 5e6Hz
 
-    acq_plan = CoarseFineAcquisitionPlan(system, size(measurement, 1), sampling_freq)
+    acq_plan = AcquisitionPlan(system, size(measurement, 1), float(sampling_freq))
     coarse_step = 1 / 3 / (size(measurement, 1) / sampling_freq)
     fine_step = 1 / 12 / (size(measurement, 1) / sampling_freq)
     fine_doppler_range = -2*coarse_step:fine_step:2*coarse_step

@@ -170,6 +170,7 @@ function create_sat_state_from_acq(
         acq.carrier_doppler,
         0,
         1,
+        false,
         correlator,
         correlator,
         complex(0.0, 0.0),
@@ -241,7 +242,7 @@ function acquire_satellites(
     if SampleBuffers.isfull(acquisition_buffer) &&
        runtime - last_time_acquisition_ran >= acquire_every
         missing_satellites = vcat(
-            filter(prn -> !(prn in keys(receiver_sat_states)), acq_plan.coarse_plan.avail_prn_channels),
+            filter(prn -> !(prn in keys(receiver_sat_states)), acq_plan.avail_prn_channels),
             collect(keys(filter(state -> !is_in_lock(state), receiver_sat_states))),
         )
         acq_res = acquire!(
