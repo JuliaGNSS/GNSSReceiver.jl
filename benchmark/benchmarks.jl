@@ -82,6 +82,20 @@ function make_acq_plans(; system = GPSL1(), num_samples = 20000, sampling_freq =
     acq_plan, fast_re_acq_plan
 end
 
+# Check if process supports downconvert_and_correlator keyword
+const _process_supports_dc = any(methods(GNSSReceiver.process)) do m
+    :downconvert_and_correlator in Base.kwarg_decl(m)
+end
+
+function _process_kwargs(; num_ants, sampling_freq)
+    kwargs = Dict{Symbol,Any}(:num_ants => NumAnts(num_ants))
+    if _process_supports_dc
+        kwargs[:downconvert_and_correlator] =
+            Tracking.CPUThreadedDownconvertAndCorrelator(Val(sampling_freq))
+    end
+    return pairs(kwargs)
+end
+
 # ── Benchmark: initialization with acquisition ────────────────────────────
 
 function bench_process_with_acquisition(; num_ants = 1)
@@ -103,7 +117,7 @@ function bench_process_with_acquisition(; num_ants = 1)
     measurement =
         num_ants == 1 ? randn(ComplexF64, num_samples) :
         randn(ComplexF64, num_samples, num_ants)
-    dc = Tracking.CPUThreadedDownconvertAndCorrelator(Val(sampling_freq))
+    kwargs = _process_kwargs(; num_ants, sampling_freq)
 
     @benchmarkable GNSSReceiver.process(
         $receiver_state,
@@ -112,8 +126,7 @@ function bench_process_with_acquisition(; num_ants = 1)
         $measurement,
         $system,
         $sampling_freq;
-        downconvert_and_correlator = $dc,
-        num_ants = $(NumAnts(num_ants)),
+        $kwargs...,
     )
 end
 
@@ -140,7 +153,7 @@ function bench_process_steady_state(; num_ants = 1, num_sats = 8)
     measurement =
         num_ants == 1 ? randn(ComplexF64, num_samples) :
         randn(ComplexF64, num_samples, num_ants)
-    dc = Tracking.CPUThreadedDownconvertAndCorrelator(Val(sampling_freq))
+    kwargs = _process_kwargs(; num_ants, sampling_freq)
 
     @benchmarkable GNSSReceiver.process(
         $receiver_state,
@@ -149,8 +162,7 @@ function bench_process_steady_state(; num_ants = 1, num_sats = 8)
         $measurement,
         $system,
         $sampling_freq;
-        downconvert_and_correlator = $dc,
-        num_ants = $(NumAnts(num_ants)),
+        $kwargs...,
     )
 end
 

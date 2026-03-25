@@ -34,7 +34,7 @@ function receive(
         throw(ArgumentError("The number of antenna channels must match num_ants"))
 
     acq_num_samples = receiver_state.acquisition_buffer.max_length
-    acq_plan = CoarseFineAcquisitionPlan(system, acq_num_samples, sampling_freq; prns)
+    acq_plan = AcquisitionPlan(system, acq_num_samples, float(sampling_freq); prns)
     coarse_step = 1 / (acq_num_samples / sampling_freq)
     fine_step = 1 / 12 / (acq_num_samples / sampling_freq)
     fine_doppler_range = -2*coarse_step:fine_step:2*coarse_step
