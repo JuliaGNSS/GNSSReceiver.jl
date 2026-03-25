@@ -1,0 +1,130 @@
+name: Benchmark this PR
+on:
+  pull_request_target:
+    branches: [ '**' ]
+permissions:
+  pull-requests: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: julia-actions/setup-julia@v2
+        env:
+          GITHUB_TOKEN: ""
+        with:
+          version: '1'
+
+      - uses: julia-actions/cache@v2
+        env:
+          GITHUB_TOKEN: ""
+
+      - name: Install AirspeedVelocity
+        env:
+          GITHUB_TOKEN: ""
+        run: |
+          # Use fork with [sources] fix until upstream merges it
+          julia -e '
+            ENV["JULIA_PKG_PRECOMPILE_AUTO"]=0
+            using Pkg
+            Pkg.add(url="https://github.com/zsoerenm/AirspeedVelocity.jl", rev="ss/fix-sources-resolution")
+            Pkg.build("AirspeedVelocity")
+          '
+
+      - name: Run benchmarks
+        env:
+          GITHUB_TOKEN: ""
+          JULIA_NUM_THREADS: auto
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          export PATH="$HOME/.julia/bin:$PATH"
+          mkdir results
+          if [ "$BASE_REF" = "master" ]; then
+            REVS="master,$HEAD_SHA"
+          else
+            REVS="master,$BASE_REF,$HEAD_SHA"
+          fi
+          benchpkg GNSSReceiver \
+            --rev=$REVS \
+            --url=${{ github.event.repository.clone_url }} \
+            --bench-on=$HEAD_SHA \
+            --output-dir=results/ \
+            --add=GNSSSignals,Unitful,StaticArrays,Dictionaries,GNSSDecoder,PositionVelocityTime,BenchmarkTools
+
+      - name: Create comment body
+        env:
+          GITHUB_TOKEN: ""
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          export PATH="$HOME/.julia/bin:$PATH"
+          echo "## Benchmark Results" > body.md
+          echo "" >> body.md
+          if [ "$BASE_REF" = "master" ]; then
+            for m in time memory; do
+              {
+                echo "<details><summary>${m^} benchmarks</summary>"
+                echo ""
+                benchpkgtable GNSSReceiver \
+                  --input-dir=results/ \
+                  --rev=master,$HEAD_SHA \
+                  --mode=$m \
+                  --ratio
+                echo ""
+                echo "</details>"
+                echo ""
+              } >> body.md
+            done
+          else
+            for m in time memory; do
+              {
+                echo "<details><summary>${m^} benchmarks (vs base branch)</summary>"
+                echo ""
+                benchpkgtable GNSSReceiver \
+                  --input-dir=results/ \
+                  --rev=$BASE_REF,$HEAD_SHA \
+                  --mode=$m \
+                  --ratio
+                echo ""
+                echo "</details>"
+                echo ""
+              } >> body.md
+            done
+            for m in time memory; do
+              {
+                echo "<details><summary>${m^} benchmarks (vs master)</summary>"
+                echo ""
+                benchpkgtable GNSSReceiver \
+                  --input-dir=results/ \
+                  --rev=master,$HEAD_SHA \
+                  --mode=$m \
+                  --ratio
+                echo ""
+                echo "</details>"
+                echo ""
+              } >> body.md
+            done
+          fi
+
+      - name: Find comment
+        uses: peter-evans/find-comment@v4
+        id: find
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: "Benchmark Results"
+
+      - name: Create or update comment
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          comment-id: ${{ steps.find.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: body.md
+          edit-mode: replace
