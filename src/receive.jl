@@ -15,18 +15,26 @@ function receive(
     system,
     sampling_freq;
     num_ants::NumAnts{N} = NumAnts(1),
-    acquisition_time = 4u"ms",
+    num_code_cycles_for_acquisition = 1,
     acquire_every = 10u"s",
     receiver_state = ReceiverState(
         T,
         system;
-        num_samples_for_acquisition = floor(Int, acquisition_time * sampling_freq),
+        num_ants,
+        num_samples_for_acquisition = round(
+            Int,
+            get_code_length(system) *
+            upreferred(sampling_freq / get_code_frequency(system)) *
+            num_code_cycles_for_acquisition,
+        ),
     ),
+    downconvert_and_correlator = CPUThreadedDownconvertAndCorrelator(Val(sampling_freq)),
     acq_threshold = get_default_acq_threshold(system),
     code_lock_cn0_threshold = get_default_code_lock_cn0_threshold(system),
     time_in_lock_before_calculating_pvt = 2u"s",
     pvt_update_interval = 100u"ms",
     interm_freq = 0.0u"Hz",
+    always_buffer = false,
     prns = 1:32,
 ) where {N,T}
     num_channels = measurement_channel.num_antenna_channels
@@ -35,9 +43,9 @@ function receive(
 
     acq_num_samples = receiver_state.acquisition_buffer.max_length
     acq_plan = AcquisitionPlan(system, acq_num_samples, float(sampling_freq); prns)
-    coarse_step = 1 / (acq_num_samples / sampling_freq)
-    fine_step = 1 / 12 / (acq_num_samples / sampling_freq)
-    fine_doppler_range = -2*coarse_step:fine_step:2*coarse_step
+    coarse_step = 2 * sampling_freq / acq_num_samples
+    fine_step = 1 / 4 / (acq_num_samples / sampling_freq)
+    fine_doppler_range = -coarse_step:fine_step:coarse_step
     fast_re_acq_plan = AcquisitionPlan(
         system,
         acq_num_samples,
@@ -61,6 +69,7 @@ function receive(
                     num_channels == N == 1 ? vec(measurement) : measurement,
                     system,
                     sampling_freq;
+                    downconvert_and_correlator,
                     num_ants,
                     acquire_every,
                     acq_threshold,
@@ -68,6 +77,7 @@ function receive(
                     time_in_lock_before_calculating_pvt,
                     pvt_update_interval,
                     interm_freq,
+                    always_buffer,
                 )
                 sat_data = Dict{Int,sat_data_type}(
                     sat_state.prn => SatelliteDataOfInterest(

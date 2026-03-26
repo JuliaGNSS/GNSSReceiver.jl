@@ -1,7 +1,7 @@
 module SampleBuffers
 
 export SampleBuffer,
-    buffer, get_samples, isfull, get_first_sample_counter, reset_first_sample_counter
+    buffer, get_samples, isfull, get_first_sample_counter, reset_first_sample_counter, reset
 
 struct SampleBuffer{T,A}
     buffer::A
@@ -151,6 +151,17 @@ end
 
 function get_first_sample_counter(sample_buffer::SampleBuffer)
     sample_buffer.first_sample_counter
+end
+
+function reset(sample_buffer::SampleBuffer{T}) where {T}
+    SampleBuffer{T,typeof(sample_buffer.buffer)}(
+        sample_buffer.buffer,
+        sample_buffer.fifo_buffer,
+        sample_buffer.max_length,
+        0,
+        1,
+        sample_buffer.first_sample_counter + sample_buffer.current_length,
+    )
 end
 
 function reset_first_sample_counter(sample_buffer::SampleBuffer{T}) where {T}
