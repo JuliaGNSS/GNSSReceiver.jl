@@ -10,7 +10,8 @@ using Test,
     StaticArrays,
     Random,
     Acquisition,
-    Dictionaries
+    Dictionaries,
+    Scratch
 
 using Unitful: Hz, dBHz, ms
 
@@ -20,3 +21,4 @@ include("gui.jl")
 include("save_data.jl")
 include("receive.jl")
 include("sample_buffer.jl")
+include("gnss_sdr_integration.jl")

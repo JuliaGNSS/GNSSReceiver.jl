@@ -12,7 +12,8 @@ using StaticArrays,
     SoapySDR,
     AstroTime,
     Accessors,
-    Dictionaries
+    Dictionaries,
+    Dates
 
 export ReceiverState,
     receive,
