@@ -1,0 +1,106 @@
+name: Benchmarks
+
+# Compares the PR head against the PR's *base* branch with AirspeedVelocity's `benchpkg`,
+# but reports the **minimum** time per benchmark instead of its built-in median table.
+# The minimum is far more robust to noisy-neighbour contention on shared GitHub runners
+# (it captures the least-disturbed sample), so it doesn't manufacture phantom regressions
+# when the head build lands on a busier runner window.
+#
+# Runs on both x86 (Ubuntu) and ARM (Apple Silicon, macos-14).
+#
+# No `branches:` filter, so this runs for PRs targeting *any* base branch (e.g. stacked PRs
+# whose base is a feature branch), comparing head against that PR's own base — not always the
+# default branch. NOTE: for `pull_request_target` GitHub reads this workflow (and its `on:`
+# filters) from the PR's BASE branch, so this behaviour only applies to PRs whose base branch
+# already contains this version of the file (it must be merged to `main`, and to any feature
+# branch used as a base, to take effect there).
+#
+# Security: runs as pull_request_target so the comment-posting token has write access.
+# The repo is checked out at the *base* (trusted) ref, and benchpkg benchmarks the PR's
+# own benchmark/benchmarks.jl via --bench-on=<head sha>. GITHUB_TOKEN is blanked for
+# every step that builds/executes benchmark code; only the comment steps see the token.
+on:
+  pull_request_target:
+
+# Key the concurrency group on the PR number (not the base ref): a new push to a PR cancels
+# that PR's own in-flight run, but PRs sharing a base branch don't cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  benchmark:
+    # Run on both x86 (Ubuntu) and ARM (Apple Silicon: macos-14+ are M-series).
+    # fail-fast: false so a flake on one platform doesn't cancel the other's results.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      # Base (trusted) checkout — provides .github/scripts/min_table.jl. The PR's own
+      # code is fetched separately by benchpkg via --url, not checked out here.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: julia-actions/setup-julia@v2
+        env:
+          GITHUB_TOKEN: ""
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+        env:
+          GITHUB_TOKEN: ""
+
+      - name: Install benchpkg + JSON3
+        env:
+          GITHUB_TOKEN: ""
+        run: |
+          export JULIA_PKG_PRECOMPILE_AUTO=0
+          julia -e 'import Pkg; Pkg.add(name="AirspeedVelocity", version="0.6"); Pkg.add("JSON3")'
+          julia -e 'import Pkg; Pkg.build("AirspeedVelocity")'
+          echo "$HOME/.julia/bin" >> "$GITHUB_PATH"
+
+      - name: Run benchmarks (base vs PR head, using the PR's benchmark suite)
+        env:
+          GITHUB_TOKEN: ""
+        run: |
+          mkdir -p results
+          benchpkg GNSSReceiver \
+            --url=${{ github.event.repository.clone_url }} \
+            --rev=${{ github.event.pull_request.base.sha }},${{ github.event.pull_request.head.sha }} \
+            --bench-on=${{ github.event.pull_request.head.sha }} \
+            --add=GNSSSignals,Unitful,StaticArrays,Dictionaries,GNSSDecoder,PositionVelocityTime,Tracking,Acquisition \
+            --output-dir=results/ \
+            --tune
+
+      - name: Build minimum-time comparison table
+        env:
+          GITHUB_TOKEN: ""
+        run: |
+          julia .github/scripts/min_table.jl results GNSSReceiver \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}" \
+            "${{ matrix.runner }}" > body.md
+          cat body.md
+
+      - name: Find existing benchmark comment
+        uses: peter-evans/find-comment@v4
+        id: find
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: "Benchmark Results (minimum time) — ${{ matrix.runner }}"
+
+      - name: Create or update comment
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          comment-id: ${{ steps.find.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: body.md
+          edit-mode: replace
