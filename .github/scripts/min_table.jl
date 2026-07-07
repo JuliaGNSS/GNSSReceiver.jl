@@ -12,8 +12,13 @@ using JSON3
 input_dir, pkg, base_rev, head_rev = ARGS[1], ARGS[2], ARGS[3], ARGS[4]
 label = length(ARGS) >= 5 ? ARGS[5] : ""
 
-readrev(rev) = open(joinpath(input_dir, "results_$(pkg)@$(rev).json"), "r") do io
-    JSON3.read(io, Dict{String,Any})
+# Tolerate a missing result file: a revision that failed to benchmark (e.g. a base
+# branch that doesn't build against current deps) simply contributes no rows, rather
+# than erroring out the whole comparison.
+function readrev(rev)
+    f = joinpath(input_dir, "results_$(pkg)@$(rev).json")
+    isfile(f) || return Dict{String,Any}()
+    open(io -> JSON3.read(io, Dict{String,Any}), f)
 end
 
 # Recursively collect leaf trials (nodes carrying a "times" array) keyed by "a/b/c".

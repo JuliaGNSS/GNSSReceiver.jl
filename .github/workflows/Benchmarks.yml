@@ -69,15 +69,21 @@ jobs:
       - name: Run benchmarks (base vs PR head, using the PR's benchmark suite)
         env:
           GITHUB_TOKEN: ""
+          ADD: GNSSSignals,Unitful,StaticArrays,Dictionaries,GNSSDecoder,PositionVelocityTime,Tracking,Acquisition
+          URL: ${{ github.event.repository.clone_url }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           mkdir -p results
-          benchpkg GNSSReceiver \
-            --url=${{ github.event.repository.clone_url }} \
-            --rev=${{ github.event.pull_request.base.sha }},${{ github.event.pull_request.head.sha }} \
-            --bench-on=${{ github.event.pull_request.head.sha }} \
-            --add=GNSSSignals,Unitful,StaticArrays,Dictionaries,GNSSDecoder,PositionVelocityTime,Tracking,Acquisition \
-            --output-dir=results/ \
-            --tune
+          # Benchmark head and base independently so a broken *base* revision (e.g. a
+          # base branch that doesn't build against the current registry deps) still
+          # yields the PR's own numbers instead of aborting the whole run. The head rev
+          # must succeed (it's the PR's code); a base failure is only a warning.
+          benchpkg GNSSReceiver --url="$URL" --rev="$HEAD" --bench-on="$HEAD" \
+            --add="$ADD" --output-dir=results/ --tune
+          benchpkg GNSSReceiver --url="$URL" --rev="$BASE" --bench-on="$HEAD" \
+            --add="$ADD" --output-dir=results/ --tune \
+            || echo "::warning::base rev $BASE could not be benchmarked (does it build against current deps?)"
 
       - name: Build minimum-time comparison table
         env:
