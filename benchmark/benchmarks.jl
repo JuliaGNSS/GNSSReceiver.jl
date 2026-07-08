@@ -87,20 +87,20 @@ const CHUNKS = load_chunks(N_LOCK + N_RUN)
 run_process(rs, acq_plan, fast, chunks, acquire_every) =
     foldl((s, c) -> _process(s, acq_plan, fast, c; acquire_every), chunks; init = rs)
 
-# ── Benchmark: steady-state tracking over RUN_SECONDS (no re-acquisition) ──
+# ── Benchmark: process without acquisition over RUN_SECONDS ───────────────
 # Acquire and lock over the first LOCK_SECONDS (setup, not timed), then benchmark
-# tracking the following RUN_SECONDS with acquire_every huge — no acquisition in
+# processing the following RUN_SECONDS with acquire_every huge — no acquisition in
 # the timed run. A fix is obtained partway through, so PVT runs too.
-function bench_process_steady_state()
+function bench_process_without_acquisition()
     rs, acq_plan, fast = make_receiver_and_plans()
     locked = run_process(rs, acq_plan, fast, @view(CHUNKS[1:N_LOCK]), NEVER)
     timed_chunks = CHUNKS[N_LOCK+1:N_LOCK+N_RUN]
     @benchmarkable run_process($locked, $acq_plan, $fast, $timed_chunks, NEVER)
 end
 
-# ── Benchmark: full pipeline over RUN_SECONDS (with acquisition) ───────────
-# Process RUN_SECONDS from a fresh receiver, re-acquiring periodically (10 s) as
-# in normal operation — acquire, lock, decode, and reach a position fix.
+# ── Benchmark: process with acquisition every 10 sec over RUN_SECONDS ─────
+# Process RUN_SECONDS from a fresh receiver, re-acquiring every 10 s as in normal
+# operation — acquire, lock, decode, and reach a position fix.
 function bench_process_with_acquisition()
     rs, acq_plan, fast = make_receiver_and_plans()
     timed_chunks = CHUNKS[1:N_RUN]
@@ -108,5 +108,5 @@ function bench_process_with_acquisition()
 end
 
 # ── Register benchmarks ───────────────────────────────────────────────────
-SUITE["process steady-state ($RUN_LABEL)"]["1-ant"] = bench_process_steady_state()
-SUITE["process with acquisition ($RUN_LABEL)"]["1-ant"] = bench_process_with_acquisition()
+SUITE["process without acquisition ($RUN_LABEL)"]["1-ant"] = bench_process_without_acquisition()
+SUITE["process with acquisition every 10 sec ($RUN_LABEL)"]["1-ant"] = bench_process_with_acquisition()
