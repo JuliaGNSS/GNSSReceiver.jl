@@ -12,6 +12,12 @@ gnss_receiver_gui
 ReceiverState
 ```
 
+## Signals
+
+```@docs
+CombinedSignal
+```
+
 ## Reading and recording samples
 
 ```@docs

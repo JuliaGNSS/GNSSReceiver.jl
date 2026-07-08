@@ -41,37 +41,31 @@ sampling_freq = 2.048e6u"Hz"
 system = GPSL1CA()
 num_samples = Int(upreferred(sampling_freq * 4u"ms"))   # 4 ms chunks
 
-measurement_channel = read_uint8_iq_file(file, num_samples)
+measurement_channel =
+    read_uint8_iq_file(file, num_samples; center = 127.5, type = ComplexF32)
 
 data_channel = receive(
     measurement_channel,
     system,
     sampling_freq;
-    acquisition_num_coherent_code_periods = 10,   # 10 ms coherent integration
-    approximate_year = 2017,                       # resolves the GPS week rollover
-    max_meas = 2^7,                                # bytes recentred on 128 ⇒ |sample| ≤ 128
+    pvt_approximate_year = 2017,   # resolves the GPS week-number rollover for old data
 )
 
 results = collect_data(data_channel)
-length(results)   # number of processed chunks
+length(results)   # one snapshot per `pvt_update_interval`, plus the final state
 ```
 
-!!! note "Where `max_meas = 2^7` comes from"
+!!! note "Reading the raw offset-binary file"
     The raw file stores each I and Q value as an 8-bit **unsigned** byte (`0…255`) in
     *offset-binary* form: the zero-signal level sits at the middle of the range, `128`,
     rather than at `0`. So a byte of `128` means ≈ zero amplitude, `255` means maximum
     positive and `0` means maximum negative.
 
     [`read_uint8_iq_file`](@ref) turns that into normal signed baseband samples by
-    **recentring on 128** — subtracting `128` from every byte — which maps the range
-    `0…255` to `−128…+127`. The largest magnitude any component can then reach is `128`
-    (from byte `0` → `−128`), i.e. `|real|, |imag| ≤ 128`.
-
-    That maximum is exactly the front-end full-scale [`receive`](@ref) needs for
-    `Complex{Int16}` samples, so we pass `max_meas = 2^7 = 128`. (Subtracting the integer
-    `128` leaves a harmless ~0.5-LSB DC offset that the carrier loop removes; for exact
-    midscale recentring in floating point use `read_uint8_iq_file(...; center = 127.5,
-    type = ComplexF32)`, which uses the float backend and needs no `max_meas`.)
+    **recentring** — subtracting `center` from every byte. Reading as `ComplexF32` with
+    `center = 127.5` recentres exactly on midscale and produces float baseband samples, so
+    [`receive`](@ref)'s default `CPUThreadedDownconvertAndCorrelator()` processes them with
+    no extra configuration.
 
 `results` is a `Vector` of [`ReceiverDataOfInterest`](@ref
 GNSSReceiver.ReceiverDataOfInterest) snapshots. The last one is the final state of the
@@ -87,17 +81,24 @@ final.runtime
 The estimated CN0 of every tracked satellite — this is the same information the live GUI
 shows as a bar chart:
 
+`sat_data` is a `Dictionaries.Dictionary` keyed by `(signal_id, prn)`, so iterate it with
+`pairs`:
+
 ```@example iondata
 using UnicodePlots
 
-prns = collect(keys(final.sat_data))
-cn0s = [ustrip(sd.cn0) for sd in values(final.sat_data)]
+labels = String[]
+cn0s = Float64[]
+for ((signal_id, prn), sd) in pairs(final.sat_data)
+    push!(labels, string(signal_id, " ", prn))
+    push!(cn0s, ustrip(sd.cn0))
+end
 
 barplot(
-    string.(prns),
+    labels,
     round.(cn0s; digits = 1);
     xlabel = "CN0 [dBHz]",
-    ylabel = "PRN",
+    ylabel = "Satellite",
     title = "Carrier-to-Noise-Density Ratio",
 )
 ```
@@ -140,7 +141,9 @@ println("Velocity (ECEF):     ", round.(pvt.velocity; digits = 2), " m/s")
 println("Clock drift:         ", pvt.relative_clock_drift)
 println("GDOP / HDOP / VDOP:  ", round(pvt.dop.GDOP; digits = 2), " / ",
         round(pvt.dop.HDOP; digits = 2), " / ", round(pvt.dop.VDOP; digits = 2))
-println("Prompt (PRN 5):      ", final.sat_data[5].prompt)
+# `sat_data` is keyed by (signal_id, prn):
+some_key = first(keys(final.sat_data))
+println("Prompt ($some_key):  ", final.sat_data[some_key].prompt)
 ```
 
 If you need a quantity that the summary does **not** carry at all — the raw carrier

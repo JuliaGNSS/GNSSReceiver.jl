@@ -1,8 +1,22 @@
-# Seed a local RNG so the noise — and hence any acquisition false alarms — is
-# deterministic and this test isn't flaky. An explicit Xoshiro avoids the
-# task-local RNG nondeterminism of the producer running in a spawned task.
-function make_noise_channel(type, num_samples, num_ants)
-    GNSSReceiver.SignalChannel{type,num_ants}(num_samples) do ch
+@testset "Receive signal matrix of type $(type)" for type in [
+    ComplexF64,
+    ComplexF32,
+    Complex{Int16},
+]
+    sampling_freq = 5e6Hz
+    system = GPSL1CA()
+    key = get_signal_id(system)
+    num_samples = 20000
+    num_ants = 4
+
+    measurement_channel = GNSSReceiver.spawn_signal_channel_thread(;
+        T = type,
+        num_samples,
+        num_antenna_channels = num_ants,
+    ) do ch
+        # Seed a local RNG so the noise — and hence any acquisition false alarms — is
+        # deterministic and this test isn't flaky. An explicit Xoshiro avoids the
+        # task-local RNG nondeterminism of the producer running in a spawned task.
         rng = Random.Xoshiro(1234)
         if type <: Complex{Int16}
             foreach(
@@ -16,74 +30,59 @@ function make_noise_channel(type, num_samples, num_ants)
             foreach(i -> put!(ch, randn(rng, type, num_samples, num_ants) * 512), 1:20)
         end
     end
-end
 
-@testset "Receive signal matrix of type $(type)" for type in [
-    ComplexF64,
-    ComplexF32,
-    Complex{Int16},
-]
-    sampling_freq = 5e6Hz
-    system = GPSL1CA()
-    num_samples = 20000
-    num_ants = 4
-
-    measurement_channel = make_noise_channel(type, num_samples, num_ants)
-
-    # Samples are `randn * 512`, so |real|/|imag| stays well under 2^12; declare
-    # that as the Int16 full-scale. `max_meas` is ignored for float element types.
-    max_meas = 2^12
+    # The `Complex{Int16}` variant auto-selects Tracking's integer backend, which needs
+    # `max_meas`; the noise is `round.(randn) * 512`, so `2^12` covers its full-scale.
+    # `max_meas` is ignored for the float element types.
     data_channel = receive(
         measurement_channel,
         system,
         sampling_freq;
         num_ants = NumAnts(num_ants),
-        max_meas,
+        max_meas = 2^12,
     )
 
     GNSSReceiver.consume_channel(data_channel) do data
         @test length(data.sat_data) == 0
         @test isnothing(data.pvt.time)
     end
+end
 
-    receiver_sat_states = (Dictionary([1], [GNSSReceiver.ReceiverSatState(system, 1)]),)
-
-    track_state =
-        TrackState(system, [TrackedSat(system, 1, 0.0, 20u"Hz"; num_ants = NumAnts(4))])
-
-    acquisition_buffer = GNSSReceiver.SampleBuffer(ComplexF64, 20000)
-
-    pvt = PositionVelocityTime.PVTSolution()
-
-    decoder = GNSSDecoderState(system, 1)
-    pvt_sat_state_buffer = SatelliteState{Float64,typeof(decoder),typeof(system)}[]
-
-    receiver_state = ReceiverState(
-        track_state,
-        receiver_sat_states,
-        acquisition_buffer,
-        pvt,
-        pvt_sat_state_buffer,
-        0.0u"s",
-        -Inf * 1.0u"s",
-        -Inf * 1.0u"s",
-        0,
+@testset "Rejects a pilot-only (non-decodable) system" begin
+    # A bare pilot carries no navigation data, so it has no decoder and must be
+    # rejected up front rather than failing deep in decoder construction.
+    @test_throws ArgumentError GNSSReceiver.ReceiverState(
+        ComplexF64,
+        GPSL5Q();
+        num_samples_for_acquisition = 20000,
+        num_ants = NumAnts(1),
     )
+    # A CombinedSignal that pairs the pilot with its data component is accepted.
+    @test GNSSReceiver.ReceiverState(
+        ComplexF64,
+        GNSSReceiver.CombinedSignal(GPSL5Q(), GPSL5I());
+        num_samples_for_acquisition = 20000,
+        num_ants = NumAnts(1),
+    ) isa GNSSReceiver.ReceiverState
+    # Guard predicate directly: pilot not decodable, data / combined are.
+    @test !GNSSReceiver.is_decodable(GPSL5Q())
+    @test GNSSReceiver.is_decodable(GPSL5I())
+    @test GNSSReceiver.is_decodable(GNSSReceiver.CombinedSignal(GPSL5Q(), GPSL5I()))
+end
 
-    measurement_channel = make_noise_channel(type, num_samples, num_ants)
-
-    data_channel = receive(
-        measurement_channel,
-        system,
-        sampling_freq;
-        num_ants = NumAnts(num_ants),
-        receiver_state,
-        max_meas,
-    )
-
-    GNSSReceiver.consume_channel(data_channel) do data
-        @test length(data.sat_data) == 1
-        @test isnothing(data.pvt.time)
+# Deterministic multi-antenna noise channel for the extract-hook tests below: the
+# noise (and hence any acquisition false alarm) is reproducible, and nothing is ever
+# actually acquired, so the tests exercise the payload plumbing, not tracking.
+function make_noise_channel(type, num_samples, num_ants)
+    GNSSReceiver.spawn_signal_channel_thread(;
+        T = type,
+        num_samples,
+        num_antenna_channels = num_ants,
+    ) do ch
+        rng = Random.Xoshiro(1234)
+        foreach(1:20) do _
+            put!(ch, type.(round.(randn(rng, ComplexF32, num_samples, num_ants) * 512)))
+        end
     end
 end
 
@@ -101,17 +100,20 @@ end
     my_extract(rs) =
         (runtime = rs.runtime, num_sats = length(Tracking.get_sat_states(rs.track_state)))
 
+    # `pvt_update_interval = 4u"ms"` (one chunk) makes every chunk emit a payload, so
+    # the 80 ms noise run yields a real sequence rather than a single snapshot.
     data_channel = receive(
         measurement_channel,
         system,
         sampling_freq;
         num_ants = NumAnts(num_ants),
         max_meas,
+        pvt_update_interval = 4u"ms",
         extract = my_extract,
     )
 
-    # The channel element type is inferred from `extract`, concretely, and is no longer
-    # a ReceiverDataOfInterest.
+    # The channel element type is inferred from `extract` and is the concrete
+    # payload type `extract` returns, not `ReceiverDataOfInterest`.
     @test isconcretetype(eltype(data_channel))
     @test eltype(data_channel) <: NamedTuple
     @test !(eltype(data_channel) <: GNSSReceiver.ReceiverDataOfInterest)
@@ -137,7 +139,8 @@ end
     # inference barrier hides it as `Any`), even though every call returns an `Int`.
     # `Base.promote_op` yields a non-concrete type, so `receive` falls back to
     # calling `extract` on the initial state to learn the concrete payload type.
-    opaque_extract(rs) = Base.inferencebarrier(rs.num_samples_processed)::Any
+    opaque_extract(rs) =
+        Base.inferencebarrier(length(Tracking.get_sat_states(rs.track_state)))::Any
 
     data_channel = receive(
         measurement_channel,

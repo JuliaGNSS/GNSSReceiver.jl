@@ -1,5 +1,17 @@
+# `read_measurement!` is the per-frame parser: `read_measurement!(streams, chunk)`
+# must *completely* fill `chunk` (a `num_samples × num_ants` matrix of `type`) from
+# the open `streams`. Contract at end of data: it MUST throw `EOFError` (or otherwise
+# error) rather than fill the chunk only partially and return normally — `read_files`
+# reuses two chunk buffers, so a short frame that returned would be pushed downstream
+# still carrying stale samples from an earlier frame. A read that throws is caught
+# below and cleanly ends the stream ("Reached end of file."). The default parser is a
+# raw `read!`-per-antenna (one file per antenna column), and `read!` already throws on
+# a short read; a custom parser for a packed or otherwise-encoded format should
+# likewise build on `read!` (or throw `EOFError` itself) so the contract holds. The
+# parser owns any temporary buffers it needs.
 """
-    read_files(files, num_samples, end_condition = nothing; type = Complex{Int16})
+    read_files(files, num_samples, end_condition = nothing; type = Complex{Int16},
+               read_measurement! = read_measurement!)
 
 Return a `SignalChannel` that yields `num_samples`-long chunks read from `files`, one
 file per antenna channel (a single path is treated as one channel). Samples are read
@@ -9,14 +21,22 @@ The read runs on a spawned task that stops when `end_condition` is reached: an
 `Integer` sample count, a notified `Base.Event`, or end-of-file (`nothing` reads until
 EOF). Each chunk is a freshly allocated buffer, since the lock-free channel may still
 hold a previously enqueued chunk.
+
+A custom `read_measurement!(streams, chunk)` can be supplied to decode packed or
+otherwise-encoded sample formats; see the note above for the contract it must honour.
 """
 function read_files(
     files,
     num_samples,
     end_condition::Union{Nothing,Integer,Base.Event} = nothing;
     type = Complex{Int16},
+    read_measurement! = read_measurement!,
 )
-    num_ants = files isa AbstractVector ? length(files) : 1
+    # Normalize a single path to a one-element vector so `open.(files)` yields a
+    # vector of streams (a bare `String` broadcasts to a scalar `IOStream`, which
+    # `read_measurement!` does not accept).
+    files isa AbstractVector || (files = [files])
+    num_ants = length(files)
     return spawn_signal_channel_thread(;
         T = type,
         num_samples,

@@ -35,13 +35,26 @@ read are:
 
 | Field | What it holds | Useful accessors |
 |---|---|---|
-| `track_state` | Tracking's per-satellite loop state | `get_sat_states`, `get_carrier_doppler`, `get_code_phase`, `get_carrier_phase`, `estimate_cn0`, `get_prompt` (from [Tracking](https://github.com/JuliaGNSS/Tracking.jl)) |
-| `receiver_sat_states[1]` | Per-PRN decoder state (dictionary keyed by PRN) | `GNSSReceiver.is_sat_healthy(…​.decoder)`, plus the decoded ephemeris in `…​.decoder` (from [GNSSDecoder](https://github.com/JuliaGNSS/GNSSDecoder.jl)) |
+| `track_state` | Tracking's per-satellite loop state, grouped by signal | `get_sat_states(track_state, group_key)`, then per `sat_state`: `get_prn`, `get_carrier_doppler`, `get_code_phase`, `get_carrier_phase`, `estimate_cn0` (from [Tracking](https://github.com/JuliaGNSS/Tracking.jl)) |
+| `receiver_sat_states` | A `NamedTuple` keyed by signal id (`:GPSL1CA`, …); each value is a `Dictionaries.Dictionary{Int,ReceiverSatState}` keyed by PRN | `GNSSReceiver.is_sat_healthy(…​.decoder)`, plus the decoded ephemeris in `…​.decoder` (from [GNSSDecoder](https://github.com/JuliaGNSS/GNSSDecoder.jl)) |
 | `pvt` | Current PVT solution | fields of `PositionVelocityTime.PVTSolution` |
 | `runtime` | Elapsed signal time | — |
 
-`get_sat_states(track_state)` returns a `Dictionaries.Dictionary` keyed by PRN, so
-iterating its `keys` gives you the currently tracked satellites.
+The tracking-group keys are exactly `keys(receiver_sat_states)` — one per constellation /
+signal (e.g. `:GPSL1CA`, `:GalileoE1B`). To visit every tracked satellite, iterate the
+group keys and, for each, the `sat_state`s of that group:
+
+```julia
+for group_key in keys(receiver_state.receiver_sat_states)
+    for sat_state in get_sat_states(receiver_state.track_state, group_key)
+        prn = get_prn(sat_state)
+        # get_carrier_doppler(sat_state), get_code_phase(sat_state), …
+    end
+end
+```
+
+Key any per-satellite payload by `(group_key, prn)` — the same key `sat_data` and
+`pvt.sats` use, so a satellite lines up across constellations and bands.
 
 ## Example
 
@@ -72,13 +85,17 @@ Define an `extract` that copies the quantities of interest into a plain named tu
 ```@example custom
 function tracking_details(receiver_state)
     track_state = receiver_state.track_state
-    decoders = receiver_state.receiver_sat_states[1]
+    receiver_sat_states = receiver_state.receiver_sat_states
     sats = Dict(
-        prn => (
-            doppler = get_carrier_doppler(track_state, prn),
-            code_phase = get_code_phase(track_state, prn),
-            healthy = GNSSReceiver.is_sat_healthy(decoders[prn].decoder),
-        ) for prn in keys(get_sat_states(track_state))
+        (group_key, get_prn(sat_state)) => (
+            doppler = get_carrier_doppler(sat_state),
+            code_phase = get_code_phase(sat_state),
+            healthy = GNSSReceiver.is_sat_healthy(
+                receiver_sat_states[group_key][get_prn(sat_state)].decoder,
+            ),
+        )
+        for group_key in keys(receiver_sat_states)
+        for sat_state in get_sat_states(track_state, group_key)
     )
     return (; runtime = receiver_state.runtime, sats)
 end
@@ -89,12 +106,10 @@ our named tuple, not a `ReceiverDataOfInterest`:
 
 ```@example custom
 data_channel = receive(
-    read_uint8_iq_file(file, num_samples),
+    read_uint8_iq_file(file, num_samples; center = 127.5, type = ComplexF32),
     system,
     sampling_freq;
-    acquisition_num_coherent_code_periods = 10,
-    approximate_year = 2017,
-    max_meas = 2^7,
+    pvt_approximate_year = 2017,
     extract = tracking_details,
 )
 
@@ -105,10 +120,10 @@ eltype(data_channel)
 snapshots = collect_data(data_channel)   # a Vector of our named tuples
 final = last(snapshots)
 
-for prn in sort(collect(keys(final.sats)))
-    s = final.sats[prn]
+for (signal_id, prn) in sort(collect(keys(final.sats)))
+    s = final.sats[(signal_id, prn)]
     println(
-        "PRN ", lpad(prn, 2),
+        signal_id, " PRN ", lpad(prn, 2),
         "   carrier Doppler ", round(ustrip(u"Hz", s.doppler); digits = 1), " Hz",
         "   code phase ", round(s.code_phase; digits = 1),
         "   healthy ", s.healthy,
@@ -134,14 +149,15 @@ documents the payload and keeps the channel element type explicit:
 ```@example custom
 struct DopplerSnapshot
     runtime::typeof(1.0u"s")
-    dopplers::Dict{Int,typeof(1.0u"Hz")}
+    dopplers::Dict{Tuple{Symbol,Int},typeof(1.0u"Hz")}
 end
 
 function doppler_only(receiver_state)
     track_state = receiver_state.track_state
     dopplers = Dict(
-        prn => get_carrier_doppler(track_state, prn)
-        for prn in keys(get_sat_states(track_state))
+        (group_key, get_prn(sat_state)) => get_carrier_doppler(sat_state)
+        for group_key in keys(receiver_state.receiver_sat_states)
+        for sat_state in get_sat_states(track_state, group_key)
     )
     return DopplerSnapshot(receiver_state.runtime, dopplers)
 end

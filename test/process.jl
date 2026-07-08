@@ -1,79 +1,171 @@
-@testset "Process measurement with number of antennas $i" for i in [1, 4]
+@testset "process with number of antennas $i" for i in [1, 4]
     measurement = randn(ComplexF64, 20000, i)
     system = GPSL1CA()
+    systems = (system,)
+    key = get_signal_id(system)
+    bk = get_band_id(GNSSReceiver.system_band(system))
+    sampling_freq = 5e6Hz
+
     receiver_state = GNSSReceiver.ReceiverState(
         ComplexF64,
         system;
         num_samples_for_acquisition = 20000,
         num_ants = NumAnts(i),
     )
-    sampling_freq = 5e6Hz
 
-    acq_plan = plan_acquire(system, float(sampling_freq), collect(1:32))
+    acq_plans = (; key => plan_acquire(system, float(sampling_freq), collect(1:32)))
 
+    # A tiny false-alarm probability so pure noise never acquires.
     next_receiver_state = GNSSReceiver.process(
         receiver_state,
-        acq_plan,
-        measurement,
-        system,
-        sampling_freq;
+        acq_plans,
+        (measurement,),
+        (systems,),
+        sampling_freq,
+        (0.0u"Hz",);
         num_ants = NumAnts(i),
+        acq_pfa = 1e-12,
     )
 
     @test length(get_sat_states(next_receiver_state.track_state)) == 0
 
-    receiver_sat_states = (Dictionary([1], [GNSSReceiver.ReceiverSatState(system, 1)]),)
-
-    track_state =
-        TrackState(system, [TrackedSat(system, 1, 0.0, 20u"Hz"; num_ants = NumAnts(i))])
-
-    acquisition_buffer = GNSSReceiver.SampleBuffer(ComplexF64, 20000)
-
+    # Now seed one tracked satellite and confirm it survives a processing step.
+    # The sat must be built by `create_tracked_sat` — the receiver's canonical
+    # constructor that pinned the track state's satellite-slot type (for i > 1
+    # it injects the `EigenBeamformer` post-corr filter); a default `TrackedSat`
+    # would be rejected by `merge_sats` for its slot type.
+    track_state = merge_sats(
+        receiver_state.track_state,
+        key,
+        [GNSSReceiver.create_tracked_sat(
+            GNSSReceiver.tracking_signals(system),
+            1,
+            0.0,
+            20.0u"Hz",
+            NumAnts(i),
+            receiver_state.track_state.doppler_estimator,
+        )],
+    )
+    receiver_sat_states =
+        (; key => Dictionary([1], [GNSSReceiver.ReceiverSatState(system, 1)]))
+    acquisition_buffers = NamedTuple{(bk,)}((GNSSReceiver.SampleBuffer(ComplexF64, 20000),))
+    last_time_acquisition_ran = NamedTuple{(bk,)}((-Inf * 1.0u"s",))
     pvt = PositionVelocityTime.PVTSolution()
-
-    decoder = GNSSDecoderState(system, 1)
-    pvt_sat_state_buffer = SatelliteState{Float64,typeof(decoder),typeof(system)}[]
 
     receiver_state = ReceiverState(
         track_state,
         receiver_sat_states,
-        acquisition_buffer,
+        acquisition_buffers,
+        last_time_acquisition_ran,
         pvt,
-        pvt_sat_state_buffer,
+        PositionVelocityTime.SatelliteState[],
         0.0u"s",
         -Inf * 1.0u"s",
-        -Inf * 1.0u"s",
-        0,
     )
 
     next_receiver_state = GNSSReceiver.process(
         receiver_state,
-        acq_plan,
-        measurement,
-        system,
-        sampling_freq;
+        acq_plans,
+        (measurement,),
+        (systems,),
+        sampling_freq,
+        (0.0u"Hz",);
         num_ants = NumAnts(i),
+        acq_pfa = 1e-12,
     )
 
     @test length(get_sat_states(next_receiver_state.track_state)) == 1
 end
 
+# Exercise `update_pvt`'s timing gate with no ready satellites, so a broken
+# `pvt_update_interval` / `time_in_lock` gate can't ship untested.
+@testset "update_pvt timing gate" begin
+    system = GPSL1CA()
+    all_systems = (system,)
+    receiver_state = GNSSReceiver.ReceiverState(
+        ComplexF64,
+        system;
+        num_samples_for_acquisition = 20000,
+        num_ants = NumAnts(1),
+    )
+    runtime = 5.0u"s"
+    pvt = PositionVelocityTime.PVTSolution()
+    pvt_update_interval = 100u"ms"
+    time_in_lock_before_pvt = 2u"s"
+
+    # Gate closed: too soon since the last solve → pvt and timestamp unchanged.
+    pvt_out, last_time = GNSSReceiver.update_pvt(
+        all_systems,
+        receiver_state.receiver_sat_states,
+        receiver_state.track_state,
+        pvt,
+        receiver_state.pvt_sat_state_buffer,
+        runtime,
+        time_in_lock_before_pvt,
+        runtime,               # last_time_pvt_ran == runtime ⇒ 0 elapsed
+        pvt_update_interval,
+    )
+    @test pvt_out === pvt
+    @test last_time == runtime
+
+    # Gate open (interval elapsed) but no in-lock satellites ⇒ no fix, yet the
+    # solve timestamp still advances to the current runtime.
+    pvt_out, last_time = GNSSReceiver.update_pvt(
+        all_systems,
+        receiver_state.receiver_sat_states,
+        receiver_state.track_state,
+        pvt,
+        receiver_state.pvt_sat_state_buffer,
+        runtime,
+        time_in_lock_before_pvt,
+        -Inf * 1.0u"s",        # last_time_pvt_ran ⇒ gate open
+        pvt_update_interval,
+    )
+    @test isnothing(pvt_out.time)
+    @test last_time == runtime
+end
+
 # Helpers for the reacquisition-path tests below. A satellite is "out of lock" once
 # its code lock detector has accumulated out-of-lock time past its threshold; we build
 # that state directly instead of driving many `update` calls through `process`.
+# `time_out_of_lock` is the `ReceiverSatState`'s own out-of-lock timer, which gates
+# the reacquisition back-off (`should_reacquire`) — pass a value past the first
+# back-off step (200 ms) to make the sat eligible for reacquisition.
 out_of_lock_code_detector() =
     GNSSReceiver.CodeLockDetector(30.0u"dBHz", 250u"ms", 200u"ms", 80u"ms", 80u"ms")
 
-function out_of_lock_sat_state(system, prn)
+function out_of_lock_sat_state(system, prn; time_out_of_lock = 0.0u"s")
     GNSSReceiver.ReceiverSatState(
         prn,
         GNSSDecoderState(system, prn),
         out_of_lock_code_detector(),
         GNSSReceiver.CarrierLockDetector(),
         0.0u"s",
-        0.0u"s",
+        uconvert(u"s", float(time_out_of_lock)),
         0,
-        100.0u"Hz",
+    )
+end
+
+# A single-group track state with one satellite seeded through the receiver's
+# canonical constructor, so its slot type matches what `ReceiverState` pinned.
+function single_sat_track_state(system, prn; num_ants = NumAnts(1))
+    base = GNSSReceiver.ReceiverState(
+        ComplexF64,
+        system;
+        num_samples_for_acquisition = 20000,
+        num_ants,
+    )
+    merge_sats(
+        base.track_state,
+        get_signal_id(system),
+        [GNSSReceiver.create_tracked_sat(
+            GNSSReceiver.tracking_signals(system),
+            prn,
+            0.0,
+            20.0u"Hz",
+            num_ants,
+            base.track_state.doppler_estimator,
+        )],
     )
 end
 
@@ -88,7 +180,6 @@ end
         5.0u"s",
         0.0u"s",
         0,
-        0.0u"Hz",
     )
 
     lost = GNSSReceiver.increase_time_out_of_lock(state, 4u"ms")
@@ -106,33 +197,37 @@ end
     ).num_unsuccessful_reacquisition == 2
 end
 
-@testset "filter_in_lock_sats drops out-of-lock tracked satellites" begin
+@testset "remove_lost_satellites drops out-of-lock tracked satellites" begin
     system = GPSL1CA()
-    track_state =
-        TrackState(system, [TrackedSat(system, 5, 0.0, 20u"Hz"; num_ants = NumAnts(1))])
-    receiver_sat_states = Dictionary([5], [out_of_lock_sat_state(system, 5)])
+    key = get_signal_id(system)
+    track_state = single_sat_track_state(system, 5)
+    receiver_sat_states = (; key => Dictionary([5], [out_of_lock_sat_state(system, 5)]))
 
-    filtered = GNSSReceiver.filter_in_lock_sats(receiver_sat_states, track_state)
-    @test length(get_sat_states(filtered)) == 0
+    pruned = GNSSReceiver.remove_lost_satellites(receiver_sat_states, track_state)
+    @test length(get_sat_states(pruned)) == 0
 end
 
-@testset "update_receiver_sat_states advances out-of-lock timer" begin
+@testset "update_all_receiver_sat_states advances out-of-lock timer" begin
     system = GPSL1CA()
-    track_state =
-        TrackState(system, [TrackedSat(system, 5, 0.0, 20u"Hz"; num_ants = NumAnts(1))])
-    receiver_sat_states = Dictionary([5], [out_of_lock_sat_state(system, 5)])
+    key = get_signal_id(system)
+    track_state = single_sat_track_state(system, 5)
+    receiver_sat_states = (; key => Dictionary([5], [out_of_lock_sat_state(system, 5)]))
 
-    updated =
-        GNSSReceiver.update_receiver_sat_states(receiver_sat_states, track_state, 4u"ms")
-    @test updated[5].time_out_of_lock == 4u"ms"
-    @test !GNSSReceiver.is_in_lock(updated[5])
+    updated = GNSSReceiver.update_all_receiver_sat_states(
+        receiver_sat_states,
+        track_state,
+        (system,),
+        4u"ms",
+    )
+    @test updated[key][5].time_out_of_lock == 4u"ms"
+    @test !GNSSReceiver.is_in_lock(updated[key][5])
 end
 
-@testset "create_sat_state_from_acq builds a matching tracked-sat slot" begin
+@testset "tracked_sat_from_acq builds a matching tracked-sat slot ($i antennas)" for i in [1, 4]
     system = GPSL1CA()
-    num_ants = NumAnts(1)
+    num_ants = NumAnts(i)
     empty_track_state =
-        ReceiverState(
+        GNSSReceiver.ReceiverState(
             ComplexF64,
             system;
             num_samples_for_acquisition = 20000,
@@ -155,29 +250,46 @@ end
         5000,
         1,
     )
-    tracked_sat = GNSSReceiver.create_sat_state_from_acq(acq, empty_track_state, num_ants)
-    # Built with the same slot type the track state uses, so `merge_sats` accepts it.
+    tracked_sat = GNSSReceiver.tracked_sat_from_acq(
+        acq,
+        GNSSReceiver.tracking_signals(system),
+        num_ants,
+        empty_track_state.doppler_estimator,
+    )
+    # Built with the same slot type the track state pins (for multiple antennas that
+    # includes the `EigenBeamformer` post-corr filter), so `merge_sats` accepts it.
     @test tracked_sat isa eltype(get_sat_states(empty_track_state))
+    merged = merge_sats(empty_track_state, get_signal_id(system), [tracked_sat])
+    @test length(get_sat_states(merged)) == 1
 end
 
 @testset "update_states_from_acquisition_results is a no-op without detections" begin
     system = GPSL1CA()
     num_ants = NumAnts(1)
-    base = ReceiverState(ComplexF64, system; num_samples_for_acquisition = 20000, num_ants)
+    base = GNSSReceiver.ReceiverState(
+        ComplexF64,
+        system;
+        num_samples_for_acquisition = 20000,
+        num_ants,
+    )
     empty_track_state = base.track_state
-    empty_receiver_sat_states = base.receiver_sat_states[1]
+    empty_receiver_sat_states = base.receiver_sat_states[get_signal_id(system)]
 
     # No acquisition results leaves both the track state and the receiver-sat-state
     # dictionary untouched. (The detection-handover path is covered end-to-end by the
     # reacquisition integration test, which feeds it real acquisition results.)
-    @test GNSSReceiver.update_states_from_acquisition_results(
+    ts, rss, acquired = GNSSReceiver.update_states_from_acquisition_results(
         Acquisition.AcquisitionResults[],
         1e-4,
-        30.0u"dBHz",
+        nothing,
         empty_track_state,
         empty_receiver_sat_states,
+        system,
         num_ants,
-    ) === (empty_track_state, empty_receiver_sat_states)
+    )
+    @test ts === empty_track_state
+    @test rss === empty_receiver_sat_states
+    @test isempty(acquired)
 end
 
 @testset "try_to_reacquire_lost_satellites counts failed reacquisitions" begin
@@ -186,7 +298,7 @@ end
     sampling_freq = 5e6Hz
     acq_plan = plan_acquire(system, float(sampling_freq), collect(1:32))
 
-    # Fill the acquisition buffer with noise so `should_reacquire` fires but the
+    # Fill the acquisition buffer with noise so the reacquisition attempt runs but the
     # (deterministic) acquisition finds nothing, driving the failed-reacquisition
     # counter path.
     rng = Random.Xoshiro(1)
@@ -197,21 +309,25 @@ end
     )
     @test GNSSReceiver.SampleBuffers.isfull(acquisition_buffer)
 
-    track_state =
-        TrackState(system, [TrackedSat(system, 5, 0.0, 20u"Hz"; num_ants = NumAnts(1))])
-    receiver_sat_states = Dictionary([5], [out_of_lock_sat_state(system, 5)])
+    track_state = single_sat_track_state(system, 5)
+    receiver_sat_states = Dictionary(
+        [5],
+        [out_of_lock_sat_state(system, 5; time_out_of_lock = 0.25u"s")],
+    )
     @test GNSSReceiver.should_reacquire(receiver_sat_states[5])
 
     _, updated_receiver_sat_states = GNSSReceiver.try_to_reacquire_lost_satellites(
-        acq_plan,
         track_state,
         receiver_sat_states,
+        system,
+        acq_plan,
         acquisition_buffer,
         0.0u"Hz",
         1e-4,
-        30.0u"dBHz",
+        nothing,
         num_ants,
         20000,
+        true,
     )
     @test updated_receiver_sat_states[5].num_unsuccessful_reacquisition == 1
 end
