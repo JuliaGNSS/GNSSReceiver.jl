@@ -20,7 +20,10 @@ const SUITE = BenchmarkGroup()
 # against real time (real-time capable iff time < RUN_SECONDS).
 const SIGNAL_URL = "https://sdr.ion.org/RTL_SDR/RTLSDR_Bands-L1.uint8"
 const SAMPLING_FREQ = 2.048e6u"Hz"
-const SYSTEM = GPSL1()
+# GNSSSignals v3 renamed GPSL1 -> GPSL1CA. Feature-detect so this one script runs
+# against both the v3 head and a pre-v3 base (benchpkg --bench-on=head).
+const SYSTEM =
+    isdefined(GNSSSignals, :GPSL1CA) ? GNSSSignals.GPSL1CA() : GNSSSignals.GPSL1()
 const CHUNK = Int(upreferred(SAMPLING_FREQ * 4u"ms"))        # 8192 samples per process() call
 const ACQ_CODE_CYCLES = 10        # 10 ms coherent integration locks the full healthy set
 const RUN_SECONDS = 45            # benchmarked duration (enough to get a position fix, ~35 s)
@@ -31,7 +34,11 @@ const N_RUN = floor(Int, upreferred(SAMPLING_FREQ * (RUN_SECONDS * u"s")) / CHUN
 const N_LOCK = floor(Int, upreferred(SAMPLING_FREQ * (LOCK_SECONDS * u"s")) / CHUNK)
 const RUN_LABEL = "$(uconvert(u"s", N_RUN * CHUNK / SAMPLING_FREQ)) signal"
 
-const DC = Tracking.CPUThreadedDownconvertAndCorrelator(Val(SAMPLING_FREQ))
+# Tracking v3 dropped the `Val(sampling_freq)` constructor argument.
+const DC =
+    hasmethod(Tracking.CPUThreadedDownconvertAndCorrelator, Tuple{}) ?
+    Tracking.CPUThreadedDownconvertAndCorrelator() :
+    Tracking.CPUThreadedDownconvertAndCorrelator(Val(SAMPLING_FREQ))
 
 # Feature-detect the acquisition API so this one script runs against both the
 # Acquisition-v2 head (plan_acquire, single plan) and a pre-v2 base (AcquisitionPlan
