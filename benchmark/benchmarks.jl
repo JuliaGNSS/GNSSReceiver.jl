@@ -14,6 +14,12 @@ using StaticArrays
 
 const SUITE = BenchmarkGroup()
 
+# All `process` benchmarks handle one chunk of 20000 samples at 5 MHz. Surface that
+# chunk's real-time duration in the labels so the measured time can be compared
+# against real time: the receiver is real-time capable iff time per call < this.
+const CHUNK_DURATION = uconvert(u"ms", 20000 / 5e6u"Hz")   # 4.0 ms
+const CHUNK_LABEL = "$(CHUNK_DURATION) signal"
+
 # ── Helper: build a ReceiverState with N satellites already tracked ────────
 
 function make_receiver_state(;
@@ -168,8 +174,8 @@ end
 
 # ── Register benchmarks ──────────────────────────────────────────────────
 
-SUITE["process with acquisition"]["1-ant"] = bench_process_with_acquisition(; num_ants = 1)
-SUITE["process with acquisition"]["4-ant"] = bench_process_with_acquisition(; num_ants = 4)
+SUITE["process with acquisition ($CHUNK_LABEL)"]["1-ant"] = bench_process_with_acquisition(; num_ants = 1)
+SUITE["process with acquisition ($CHUNK_LABEL)"]["4-ant"] = bench_process_with_acquisition(; num_ants = 4)
 
-SUITE["process steady-state 8sat"]["1-ant"] = bench_process_steady_state(; num_ants = 1)
-SUITE["process steady-state 8sat"]["4-ant"] = bench_process_steady_state(; num_ants = 4)
+SUITE["process steady-state 8sat ($CHUNK_LABEL)"]["1-ant"] = bench_process_steady_state(; num_ants = 1)
+SUITE["process steady-state 8sat ($CHUNK_LABEL)"]["4-ant"] = bench_process_steady_state(; num_ants = 4)
