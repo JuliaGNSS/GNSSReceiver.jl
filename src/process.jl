@@ -61,7 +61,13 @@ function process(
         acquisition_buffer = SampleBuffers.reset(acquisition_buffer)
     end
 
-    track_state = track(
+    # Use the in-place `track!` rather than the immutable `track`: the latter
+    # detaches (copies) the satellite slot vectors and rebuilds the TrackedSat
+    # wrappers each call, which dominated per-chunk allocations. The receiver
+    # discards the previous ReceiverState every chunk and reuses one correlator
+    # (hoisted in `receive`), so mutating the track state in place is safe and
+    # is Tracking v3's documented allocation-free real-time pattern.
+    track_state = track!(
         measurement,
         track_state,
         sampling_freq;
