@@ -5,7 +5,7 @@ using GNSSSignals
 using Unitful
 using Unitful: Hz, ms, s
 using Tracking
-using Acquisition: AcquisitionPlan
+using Acquisition: plan_acquire
 using GNSSDecoder
 using PositionVelocityTime
 using Dictionaries
@@ -33,10 +33,9 @@ const RUN_LABEL = "$(uconvert(u"s", N_RUN * CHUNK / SAMPLING_FREQ)) signal"
 
 const DC = Tracking.CPUThreadedDownconvertAndCorrelator(Val(SAMPLING_FREQ))
 
-_process(rs, acq_plan, fast, meas; kwargs...) = process(
+_process(rs, acq_plan, meas; kwargs...) = process(
     rs,
     acq_plan,
-    fast,
     meas,
     SYSTEM,
     SAMPLING_FREQ;
@@ -46,18 +45,20 @@ _process(rs, acq_plan, fast, meas; kwargs...) = process(
     kwargs...,
 )
 
-function make_receiver_and_plans()
+function make_receiver_and_plan()
     nacq = round(
         Int,
         get_code_length(SYSTEM) * upreferred(SAMPLING_FREQ / get_code_frequency(SYSTEM)) *
         ACQ_CODE_CYCLES,
     )
     rs = ReceiverState(ComplexF32, SYSTEM; num_ants = NumAnts(1), num_samples_for_acquisition = nacq)
-    acq_plan = AcquisitionPlan(SYSTEM, nacq, float(SAMPLING_FREQ); prns = 1:32)
-    coarse_step = 2 * SAMPLING_FREQ / nacq
-    fine_step = 1 / 4 / (nacq / SAMPLING_FREQ)
-    fast = AcquisitionPlan(SYSTEM, nacq, SAMPLING_FREQ; dopplers = -coarse_step:fine_step:coarse_step, prns = 1:32)
-    return rs, acq_plan, fast
+    acq_plan = plan_acquire(
+        SYSTEM,
+        float(SAMPLING_FREQ),
+        collect(1:32);
+        num_coherently_integrated_code_periods = ACQ_CODE_CYCLES,
+    )
+    return rs, acq_plan
 end
 
 # Load `nchunks` consecutive 4 ms chunks of the recording as ComplexF32 vectors.
@@ -84,27 +85,27 @@ end
 # All chunks needed: LOCK_SECONDS of setup followed by RUN_SECONDS of timed run.
 const CHUNKS = load_chunks(N_LOCK + N_RUN)
 
-run_process(rs, acq_plan, fast, chunks, acquire_every) =
-    foldl((s, c) -> _process(s, acq_plan, fast, c; acquire_every), chunks; init = rs)
+run_process(rs, acq_plan, chunks, acquire_every) =
+    foldl((s, c) -> _process(s, acq_plan, c; acquire_every), chunks; init = rs)
 
 # ── Benchmark: process without acquisition over RUN_SECONDS ───────────────
 # Acquire and lock over the first LOCK_SECONDS (setup, not timed), then benchmark
 # processing the following RUN_SECONDS with acquire_every huge — no acquisition in
 # the timed run. A fix is obtained partway through, so PVT runs too.
 function bench_process_without_acquisition()
-    rs, acq_plan, fast = make_receiver_and_plans()
-    locked = run_process(rs, acq_plan, fast, @view(CHUNKS[1:N_LOCK]), NEVER)
+    rs, acq_plan = make_receiver_and_plan()
+    locked = run_process(rs, acq_plan, @view(CHUNKS[1:N_LOCK]), NEVER)
     timed_chunks = CHUNKS[N_LOCK+1:N_LOCK+N_RUN]
-    @benchmarkable run_process($locked, $acq_plan, $fast, $timed_chunks, NEVER)
+    @benchmarkable run_process($locked, $acq_plan, $timed_chunks, NEVER)
 end
 
 # ── Benchmark: process with acquisition every 10 sec over RUN_SECONDS ─────
 # Process RUN_SECONDS from a fresh receiver, re-acquiring every 10 s as in normal
 # operation — acquire, lock, decode, and reach a position fix.
 function bench_process_with_acquisition()
-    rs, acq_plan, fast = make_receiver_and_plans()
+    rs, acq_plan = make_receiver_and_plan()
     timed_chunks = CHUNKS[1:N_RUN]
-    @benchmarkable run_process($rs, $acq_plan, $fast, $timed_chunks, 10u"s")
+    @benchmarkable run_process($rs, $acq_plan, $timed_chunks, 10u"s")
 end
 
 # ── Register benchmarks ───────────────────────────────────────────────────

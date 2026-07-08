@@ -25,7 +25,7 @@ Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
 
 [compat]
 Accessors = "0.1.42"
-Acquisition = "~1.6"
+Acquisition = "2"
 AstroTime = "0.7"
 Dates = "1"
 Dictionaries = "0.4.5"

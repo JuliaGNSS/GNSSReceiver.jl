@@ -15,7 +15,9 @@ function receive(
     system,
     sampling_freq;
     num_ants::NumAnts{N} = NumAnts(1),
-    num_code_cycles_for_acquisition = 1,
+    acquisition_num_coherent_code_periods = 4,
+    acquisition_num_noncoherent_accumulations = 1,
+    bit_edge_search_steps = 1,
     acquire_every = 10u"s",
     receiver_state = ReceiverState(
         T,
@@ -25,11 +27,12 @@ function receive(
             Int,
             get_code_length(system) *
             upreferred(sampling_freq / get_code_frequency(system)) *
-            num_code_cycles_for_acquisition,
+            acquisition_num_coherent_code_periods *
+            acquisition_num_noncoherent_accumulations,
         ),
     ),
     downconvert_and_correlator = CPUThreadedDownconvertAndCorrelator(Val(sampling_freq)),
-    acq_threshold = get_default_acq_threshold(system),
+    acquisition_false_alarm_probability = 1e-4,
     code_lock_cn0_threshold = get_default_code_lock_cn0_threshold(system),
     time_in_lock_before_calculating_pvt = 2u"s",
     pvt_update_interval = 100u"ms",
@@ -42,17 +45,13 @@ function receive(
     num_channels == N ||
         throw(ArgumentError("The number of antenna channels must match num_ants"))
 
-    acq_num_samples = receiver_state.acquisition_buffer.max_length
-    acq_plan = AcquisitionPlan(system, acq_num_samples, float(sampling_freq); prns)
-    coarse_step = 2 * sampling_freq / acq_num_samples
-    fine_step = 1 / 4 / (acq_num_samples / sampling_freq)
-    fine_doppler_range = -coarse_step:fine_step:coarse_step
-    fast_re_acq_plan = AcquisitionPlan(
+    acq_plan = plan_acquire(
         system,
-        acq_num_samples,
-        sampling_freq;
-        dopplers = fine_doppler_range,
-        prns,
+        float(sampling_freq),
+        collect(Int, prns);
+        num_coherently_integrated_code_periods = acquisition_num_coherent_code_periods,
+        num_noncoherent_accumulations = acquisition_num_noncoherent_accumulations,
+        bit_edge_search_steps,
     )
 
     sat_data_type =
@@ -67,14 +66,13 @@ function receive(
                     receiver_state = process(
                     receiver_state,
                     acq_plan,
-                    fast_re_acq_plan,
                     num_channels == N == 1 ? vec(measurement) : measurement,
                     system,
                     sampling_freq;
                     downconvert_and_correlator,
                     num_ants,
                     acquire_every,
-                    acq_threshold,
+                    acquisition_false_alarm_probability,
                     code_lock_cn0_threshold,
                     time_in_lock_before_calculating_pvt,
                     pvt_update_interval,
