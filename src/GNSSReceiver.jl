@@ -60,7 +60,7 @@ function ReceiverSatState(
 end
 
 function ReceiverSatState(
-    system::AbstractGNSS,
+    system::AbstractGNSSSignal,
     prn::Int,
     code_lock_cn0_threshold::typeof(1.0u"dBHz") = get_default_code_lock_cn0_threshold(system),
 )
@@ -107,7 +107,7 @@ function increment_num_unsuccessful_reacquisition(state::ReceiverSatState)
 end
 
 const MultipleReceiverSatStates{N,I,DS} =
-    Tracking.MultipleSystemSatType{N,I,ReceiverSatState{DS}}
+    NTuple{N,Dictionary{I,ReceiverSatState{DS}}}
 
 struct ReceiverState{
     RS<:MultipleReceiverSatStates,
@@ -142,12 +142,25 @@ function ReceiverState(
         num_ants,
     ),
     post_corr_filter = create_post_corr_filter(num_ants),
-    doppler_estimator::Tracking.AbstractDopplerEstimator = ConventionalPLLAndDLL((
-        SystemSatsState(system, SatState{typeof(correlator),typeof(post_corr_filter)}[]),
-    )),
+    doppler_estimator::Tracking.AbstractDopplerEstimator = ConventionalPLLAndDLL(),
 ) where {T,N}
-    track_state =
-        TrackState(system, SatState{typeof(correlator),typeof(post_corr_filter)}[]; doppler_estimator)
+    # Build an empty TrackState whose satellite slot type is pinned to the
+    # requested correlator / post-corr-filter / estimator. Sats handed over
+    # from acquisition later (`create_sat_state_from_acq`) are built the same
+    # way, so `merge_sats` sees a matching slot type.
+    template_sat = TrackedSat(
+        system,
+        0,
+        0.0,
+        0.0u"Hz";
+        num_ants,
+        correlator,
+        post_corr_filter,
+        doppler_estimator,
+    )
+    satellites = Dictionary{Int,typeof(template_sat)}(Int[], typeof(template_sat)[])
+    signal_group = SignalGroup(get_band(system), satellites, (system,), num_ants)
+    track_state = TrackState((; default = signal_group), doppler_estimator)
     decoder = GNSSDecoderState(system, 1)
     receiver_sat_states = (Dictionary{Int64,ReceiverSatState{typeof(decoder)}}(),)
     pvt = PositionVelocityTime.PVTSolution()
@@ -172,7 +185,7 @@ include("save_data.jl")
 include("soapy_sdr_helper.jl")
 
 function gnss_receiver_gui(;
-    system = GPSL1(),
+    system = GPSL1CA(),
     sampling_freq = 2e6u"Hz",
     acquisition_time = 4u"ms", # A longer time increases the SNR for satellite acquisition, but also increases the computational load. Must be longer than 1ms
     run_time = 40u"s",
@@ -225,7 +238,7 @@ function gnss_receiver_gui(;
 end
 
 function gnss_write_to_file(;
-    system = GPSL1(),
+    system = GPSL1CA(),
     sampling_freq = 2e6u"Hz",
     run_time = 4u"s",
     dev_args = first(Devices()),
@@ -251,7 +264,7 @@ end
 function receive_and_gui(
     files;
     clock_drift = 0.0,
-    system = GPSL1(),
+    system = GPSL1CA(),
     sampling_freq = 5e6u"Hz",
     type = Complex{Int16},
     num_ants = NumAnts(4),

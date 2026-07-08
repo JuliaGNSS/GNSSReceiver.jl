@@ -10,7 +10,7 @@ using GNSSReceiver, GNSSSignals, Unitful, Tracking, SoapySDR
 
 # You'll might want to run it twice for optimal performance.
 gnss_receiver_gui(;
-    system = GPSL1(),
+    system = GPSL1CA(),
     sampling_freq = 2e6u"Hz",
     acquisition_time = 4u"ms", # A longer time increases the SNR for satellite acquisition, but also increases the computational load. Must be longer than 1ms
     run_time = 40u"s",

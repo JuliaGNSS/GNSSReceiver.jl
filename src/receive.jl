@@ -31,7 +31,7 @@ function receive(
             acquisition_num_noncoherent_accumulations,
         ),
     ),
-    downconvert_and_correlator = CPUThreadedDownconvertAndCorrelator(Val(sampling_freq)),
+    downconvert_and_correlator = CPUThreadedDownconvertAndCorrelator(),
     acquisition_false_alarm_probability = 1e-4,
     code_lock_cn0_threshold = get_default_code_lock_cn0_threshold(system),
     time_in_lock_before_calculating_pvt = 2u"s",
@@ -82,7 +82,7 @@ function receive(
                 )
                 sat_data = Dict{Int,sat_data_type}(
                     sat_state.prn => SatelliteDataOfInterest(
-                        estimate_cn0(system, sat_state),
+                        estimate_cn0(sat_state),
                         get_prompt(get_last_fully_integrated_correlator(sat_state)),
                         is_sat_healthy(
                             receiver_state.receiver_sat_states[1][sat_state.prn].decoder,

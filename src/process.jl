@@ -1,13 +1,13 @@
-get_default_code_lock_cn0_threshold(system::GPSL1) = 30.0u"dBHz"
+get_default_code_lock_cn0_threshold(system::GPSL1CA) = 30.0u"dBHz"
 get_default_code_lock_cn0_threshold(system::GalileoE1B) = 30.0u"dBHz"
 
 function process(
     receiver_state::ReceiverState{RS,TS,AB,P},
     acq_plan,
     measurement,
-    system::AbstractGNSS,
+    system::AbstractGNSSSignal,
     sampling_freq;
-    downconvert_and_correlator = CPUThreadedDownconvertAndCorrelator(Val(sampling_freq)),
+    downconvert_and_correlator = CPUThreadedDownconvertAndCorrelator(),
     num_ants::NumAnts{N} = NumAnts(1),
     acquire_every = 10u"s",
     acquisition_false_alarm_probability = 1e-4,
@@ -108,7 +108,11 @@ function filter_in_lock_sats(receiver_sat_states, track_state)
     out_of_lock = Iterators.filter(should_remove, receiver_sat_states)
     prns_to_remove = Int[rs.prn for rs in out_of_lock]
 
-    isempty(prns_to_remove) ? track_state : filter_out_sats(track_state, prns_to_remove)
+    # Tracking v3 dropped `filter_out_sats`; remove PRNs one at a time,
+    # threading the returned TrackState through each removal.
+    foldl(prns_to_remove; init = track_state) do ts, prn
+        remove_satellite(ts; prn)
+    end
 end
 
 function update_pvt(
@@ -154,9 +158,11 @@ function update_receiver_sat_states(receiver_sat_states, track_state, signal_dur
             prn = receiver_sat_state.prn
             ReceiverSatState(
                 prn,
+                # GNSSDecoder decodes soft symbols; Tracking v3's `get_bits`
+                # returns packed hard bits, so hand it the soft-bit buffer.
                 decode(
                     receiver_sat_state.decoder,
-                    get_bits(track_state, prn),
+                    get_soft_bits(track_state, prn),
                     get_num_bits(track_state, prn),
                 ),
                 update(
@@ -188,15 +194,18 @@ function create_sat_state_from_acq(
     track_state::TrackState,
     num_ants::NumAnts{N},
 ) where {N}
-    # Use Tracking's public keyword constructor rather than the positional one so
-    # this stays robust to SatState field-layout changes across Tracking versions.
-    SatState(
+    # Build the TrackedSat with the same estimator the TrackState uses, so its
+    # doppler_estimator_state type matches the group's slot type and `merge_sats`
+    # accepts it. Correlator / post-corr-filter default to the same values the
+    # empty TrackState was templated with (see the ReceiverState constructor).
+    TrackedSat(
         acq.system,
         acq.prn,
         acq.code_phase,
         acq.carrier_doppler;
         num_ants,
         post_corr_filter = create_post_corr_filter(num_ants),
+        doppler_estimator = track_state.doppler_estimator,
     )
 end
 
@@ -229,7 +238,7 @@ function update_states_from_acquisition_results(
         )
     end
 
-    new_sat_states = eltype(track_state.multiple_system_sats_state[1].states)[
+    new_sat_states = eltype(get_sat_states(track_state))[
         create_sat_state_from_acq(acq, track_state, num_ants) for acq in acq_res_valids
     ]
 
@@ -281,7 +290,7 @@ function acquire_satellites(
         )
         acq_res = acquire!(
             acq_plan,
-            get_samples(acquisition_buffer),
+            SampleBuffers.get_samples(acquisition_buffer),
             missing_satellites;
             interm_freq,
         )
@@ -347,7 +356,7 @@ function try_to_reacquire_lost_satellites(
     prns_to_reacquire = collect(Int, keys(out_of_lock_receiver_sat_states))
     acq_res = acquire!(
         acq_plan,
-        get_samples(acquisition_buffer),
+        SampleBuffers.get_samples(acquisition_buffer),
         prns_to_reacquire;
         interm_freq,
     )

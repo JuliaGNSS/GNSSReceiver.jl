@@ -119,10 +119,14 @@ function construct_gui_panels(gui_data, num_dots)
             width = length(cn0_panel_title) + 5,
         )
     if !isnothing(pvt.time)
-        sat_enus = map(sat -> get_sat_enu(pvt.position, sat.position), values(pvt.sats))
+        # PVT v4's `sats` is a Dictionaries.Dictionary; `map` over its values
+        # would return a Dictionary, so collect to a plain Vector first.
+        sat_enus =
+            map(sat -> get_sat_enu(pvt.position, sat.position), collect(values(pvt.sats)))
         azs = map(x -> x.θ, sat_enus)
         els = map(x -> x.ϕ, sat_enus)
-        prn_markers = map(prn -> PRNMARKERS[prn], collect(keys(pvt.sats)))
+        # PVT v4 keys `sats` by `(signal, prn)`; the marker is per PRN.
+        prn_markers = map(key -> PRNMARKERS[last(key)], collect(keys(pvt.sats)))
         panels *= panel(
             polarplot(
                 azs,
