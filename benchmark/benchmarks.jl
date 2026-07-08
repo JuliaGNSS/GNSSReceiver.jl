@@ -1,11 +1,11 @@
 using BenchmarkTools
 using GNSSReceiver
-using GNSSReceiver: ReceiverState, ReceiverSatState, process, NumAnts, SampleBuffer
+using GNSSReceiver: ReceiverState, NumAnts, SampleBuffer, process
+using GNSSReceiver.SampleBuffers: buffer
 using GNSSSignals
-using Unitful: Hz, s, ms
 using Unitful
+using Unitful: Hz, ms, s
 using Tracking
-using Tracking: SatState, SystemSatsState, TrackState, EarlyPromptLateCorrelator, BitBuffer
 using Acquisition: AcquisitionPlan
 using GNSSDecoder
 using PositionVelocityTime
@@ -14,168 +14,115 @@ using StaticArrays
 
 const SUITE = BenchmarkGroup()
 
-# All `process` benchmarks handle one chunk of 20000 samples at 5 MHz. Surface that
-# chunk's real-time duration in the labels so the measured time can be compared
-# against real time: the receiver is real-time capable iff time per call < this.
-const CHUNK_DURATION = uconvert(u"ms", 20000 / 5e6u"Hz")   # 4.0 ms
-const CHUNK_LABEL = "$(CHUNK_DURATION) signal"
+# ── Real signal ───────────────────────────────────────────────────────────
+# A 60 s ION RTL-SDR GPS L1 recording (2.048 MS/s, 8-bit unsigned offset-binary
+# I/Q). Same recording the integration test uses. We only need the first few
+# seconds, so we fetch a byte range rather than the whole 246 MB file.
+const SIGNAL_URL = "https://sdr.ion.org/RTL_SDR/RTLSDR_Bands-L1.uint8"
+const SAMPLING_FREQ = 2.048e6u"Hz"
+const SYSTEM = GPSL1()
+# One process() call handles a 4 ms chunk; the label surfaces that so the
+# measured time can be compared against real time (real-time capable iff
+# time-per-call < chunk duration).
+const CHUNK = Int(upreferred(SAMPLING_FREQ * 4u"ms"))            # 8192 samples
+const CHUNK_LABEL = "$(uconvert(u"ms", CHUNK / SAMPLING_FREQ)) signal"
+# Coherent-integration length for acquisition (10 ms locks the full healthy set).
+const ACQ_CODE_CYCLES = 10
+# Seconds of signal to load: enough to fill the acq buffer, let acquisition fire,
+# and let the sats reach lock for the steady-state benchmark.
+const SETUP_SECONDS = 3.0
 
-# ── Helper: build a ReceiverState with N satellites already tracked ────────
-
-function make_receiver_state(;
-    system = GPSL1(),
-    num_samples = 20000,
-    sampling_freq = 5e6Hz,
-    num_ants = 1,
-    num_sats = 0,
-    fill_acq_buffer = false,
-    runtime = 0.0u"s",
-    last_time_acquisition_ran = -Inf * 1.0u"s",
-)
-    prns = 1:num_sats
-    correlator = Tracking.get_default_correlator(system, NumAnts(num_ants))
-    post_corr_filter = GNSSReceiver.create_post_corr_filter(NumAnts(num_ants))
-
-    correlator_type = typeof(correlator)
-    filter_type = typeof(post_corr_filter)
-    sat_states = SatState{correlator_type,filter_type}[
-        SatState(
-            system,
-            prn,
-            10.5 + prn * 0.1,
-            (1000.0 + prn * 10) * Hz;
-            num_ants = NumAnts(num_ants),
-            post_corr_filter,
-        ) for prn in prns
+# Read the first `n` complex samples of the recording as centered ComplexF32.
+function load_ion_signal(n)
+    cache = joinpath(tempdir(), "gnssreceiver_bench_RTLSDR_Bands-L1.uint8")
+    if !isfile(cache) || filesize(cache) < 2n
+        # Fetch just the bytes we need (curl is available on CI runners).
+        run(`curl -sfL -r 0-$(2n - 1) -o $cache $SIGNAL_URL`)
+    end
+    raw = Vector{UInt8}(undef, 2n)
+    open(cache) do io
+        read!(io, raw)
+    end
+    return ComplexF32[
+        ComplexF32(Float32(raw[2i-1]) - 127.5f0, Float32(raw[2i]) - 127.5f0) for i = 1:n
     ]
-
-    track_state = TrackState(system, sat_states)
-
-    decoder_type = typeof(GNSSDecoder.GNSSDecoderState(system, 1))
-    receiver_sat_states_dict = Dictionary(
-        collect(prns),
-        ReceiverSatState{decoder_type}[ReceiverSatState(system, prn) for prn in prns],
-    )
-
-    acquisition_buffer = SampleBuffer(ComplexF32, num_samples)
-    if fill_acq_buffer
-        # Fill the buffer so acquisition can fire
-        acquisition_buffer =
-            GNSSReceiver.SampleBuffers.buffer(acquisition_buffer, randn(ComplexF32, num_samples))
-    end
-
-    pvt = PositionVelocityTime.PVTSolution()
-
-    ReceiverState(
-        track_state,
-        (receiver_sat_states_dict,),
-        acquisition_buffer,
-        pvt,
-        runtime,
-        last_time_acquisition_ran,
-        -Inf * 1.0u"s",
-        0,
-    )
 end
 
-function make_acq_plans(; system = GPSL1(), num_samples = 20000, sampling_freq = 5e6Hz)
-    acq_plan = AcquisitionPlan(system, num_samples, float(sampling_freq))
-    coarse_step = 2 * sampling_freq / num_samples
-    fine_step = 1 / 4 / (num_samples / sampling_freq)
-    fine_doppler_range = -coarse_step:fine_step:coarse_step
+# Split a flat signal vector into consecutive 4 ms chunks (column vectors, 1 antenna).
+chunks_of(sig) = [sig[(k-1)*CHUNK+1:k*CHUNK] for k = 1:(length(sig)÷CHUNK)]
+
+# Build a receiver state + acquisition plans mirroring `receive`.
+function make_receiver_and_plans()
+    nacq = round(
+        Int,
+        get_code_length(SYSTEM) * upreferred(SAMPLING_FREQ / get_code_frequency(SYSTEM)) *
+        ACQ_CODE_CYCLES,
+    )
+    receiver_state = ReceiverState(
+        ComplexF32,
+        SYSTEM;
+        num_ants = NumAnts(1),
+        num_samples_for_acquisition = nacq,
+    )
+    acq_plan = AcquisitionPlan(SYSTEM, nacq, float(SAMPLING_FREQ); prns = 1:32)
+    coarse_step = 2 * SAMPLING_FREQ / nacq
+    fine_step = 1 / 4 / (nacq / SAMPLING_FREQ)
     fast_re_acq_plan =
-        AcquisitionPlan(system, num_samples, sampling_freq; dopplers = fine_doppler_range)
-    acq_plan, fast_re_acq_plan
+        AcquisitionPlan(SYSTEM, nacq, SAMPLING_FREQ; dopplers = -coarse_step:fine_step:coarse_step, prns = 1:32)
+    return receiver_state, acq_plan, fast_re_acq_plan, nacq
 end
 
-# Check if process supports downconvert_and_correlator keyword
-const _process_supports_dc = any(methods(GNSSReceiver.process)) do m
-    :downconvert_and_correlator in Base.kwarg_decl(m)
+const DC = Tracking.CPUThreadedDownconvertAndCorrelator(Val(SAMPLING_FREQ))
+
+_process(rs, acq_plan, fast, meas; kwargs...) = process(
+    rs,
+    acq_plan,
+    fast,
+    meas,
+    SYSTEM,
+    SAMPLING_FREQ;
+    downconvert_and_correlator = DC,
+    num_ants = NumAnts(1),
+    approximate_year = 2017,
+    kwargs...,
+)
+
+# ── Benchmark: process WITH acquisition (real signal) ─────────────────────
+# The acquisition buffer is pre-filled with real signal, and the state is set so
+# acquisition fires on the benchmarked call.
+function bench_process_with_acquisition()
+    _, acq_plan, fast, nacq = make_receiver_and_plans()
+    sig = load_ion_signal(nacq + CHUNK)
+    receiver_state = ReceiverState(
+        ComplexF32,
+        SYSTEM;
+        num_ants = NumAnts(1),
+        num_samples_for_acquisition = nacq,
+        acquisition_buffer = buffer(SampleBuffer(ComplexF32, nacq), sig[1:nacq]),
+    )
+    measurement = sig[nacq+1:nacq+CHUNK]
+    # acquire_every default (10 s) with last_time_acquisition_ran = -Inf → fires now.
+    @benchmarkable _process($receiver_state, $acq_plan, $fast, $measurement)
 end
 
-function _process_kwargs(; num_ants, sampling_freq)
-    kwargs = Dict{Symbol,Any}(:num_ants => NumAnts(num_ants))
-    if _process_supports_dc
-        kwargs[:downconvert_and_correlator] =
-            Tracking.CPUThreadedDownconvertAndCorrelator(Val(sampling_freq))
+# ── Benchmark: steady-state tracking on real signal (no re-acquisition) ───
+# Acquire once and let tracking lock, then benchmark a single tracking step with
+# acquire_every set so large that acquisition never fires again.
+function bench_process_steady_state()
+    receiver_state, acq_plan, fast, nacq = make_receiver_and_plans()
+    n = ceil(Int, upreferred(SAMPLING_FREQ * (SETUP_SECONDS * u"s")))
+    chunks = chunks_of(load_ion_signal(n + CHUNK))
+    # Setup (not benchmarked): run through the real signal so sats acquire and lock.
+    for chunk in chunks
+        receiver_state = _process(receiver_state, acq_plan, fast, chunk)
     end
-    return pairs(kwargs)
+    locked = receiver_state
+    measurement = chunks[end]
+    # acquire_every huge → acquisition (and reacquisition buffering) never fires;
+    # this measures pure tracking + the periodic PVT solve on the locked sats.
+    @benchmarkable _process($locked, $acq_plan, $fast, $measurement; acquire_every = 1_000_000u"s")
 end
 
-# ── Benchmark: initialization with acquisition ────────────────────────────
-
-function bench_process_with_acquisition(; num_ants = 1)
-    system = GPSL1()
-    num_samples = 20000
-    sampling_freq = 5e6Hz
-
-    receiver_state = make_receiver_state(;
-        system,
-        num_samples,
-        sampling_freq,
-        num_ants,
-        num_sats = 0,
-        fill_acq_buffer = true,
-        runtime = 10.0u"s",
-        last_time_acquisition_ran = 0.0u"s",
-    )
-    acq_plan, fast_re_acq_plan = make_acq_plans(; system, num_samples, sampling_freq)
-    measurement =
-        num_ants == 1 ? randn(ComplexF32, num_samples) :
-        randn(ComplexF32, num_samples, num_ants)
-    kwargs = _process_kwargs(; num_ants, sampling_freq)
-
-    @benchmarkable GNSSReceiver.process(
-        $receiver_state,
-        $acq_plan,
-        $fast_re_acq_plan,
-        $measurement,
-        $system,
-        $sampling_freq;
-        $kwargs...,
-    )
-end
-
-# ── Benchmark: steady-state tracking (no acquisition) ─────────────────────
-
-function bench_process_steady_state(; num_ants = 1, num_sats = 8)
-    system = GPSL1()
-    num_samples = 20000
-    sampling_freq = 5e6Hz
-
-    # Runtime is 5s, last acquisition at 0s, acquire_every defaults to 10s
-    # → no acquisition fires. Buffer not full → reacquisition also skipped.
-    receiver_state = make_receiver_state(;
-        system,
-        num_samples,
-        sampling_freq,
-        num_ants,
-        num_sats,
-        fill_acq_buffer = false,
-        runtime = 5.0u"s",
-        last_time_acquisition_ran = 0.0u"s",
-    )
-    acq_plan, fast_re_acq_plan = make_acq_plans(; system, num_samples, sampling_freq)
-    measurement =
-        num_ants == 1 ? randn(ComplexF32, num_samples) :
-        randn(ComplexF32, num_samples, num_ants)
-    kwargs = _process_kwargs(; num_ants, sampling_freq)
-
-    @benchmarkable GNSSReceiver.process(
-        $receiver_state,
-        $acq_plan,
-        $fast_re_acq_plan,
-        $measurement,
-        $system,
-        $sampling_freq;
-        $kwargs...,
-    )
-end
-
-# ── Register benchmarks ──────────────────────────────────────────────────
-
-SUITE["process with acquisition ($CHUNK_LABEL)"]["1-ant"] = bench_process_with_acquisition(; num_ants = 1)
-SUITE["process with acquisition ($CHUNK_LABEL)"]["4-ant"] = bench_process_with_acquisition(; num_ants = 4)
-
-SUITE["process steady-state 8sat ($CHUNK_LABEL)"]["1-ant"] = bench_process_steady_state(; num_ants = 1)
-SUITE["process steady-state 8sat ($CHUNK_LABEL)"]["4-ant"] = bench_process_steady_state(; num_ants = 4)
+# ── Register benchmarks ───────────────────────────────────────────────────
+SUITE["process with acquisition ($CHUNK_LABEL)"]["1-ant"] = bench_process_with_acquisition()
+SUITE["process steady-state ($CHUNK_LABEL)"]["1-ant"] = bench_process_steady_state()
