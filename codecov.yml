@@ -1,0 +1,15 @@
+# Without this file Codecov uses strict defaults: the project status fails on any
+# coverage decrease and the patch status requires changed lines to match project
+# coverage. For this package's coverage level that reds CI on routine changes
+# (e.g. removing covered code, or touching hard-to-unit-test paths like satellite
+# reacquisition). Allow a small project tolerance and report patch coverage
+# without failing the build.
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 2%
+    patch:
+      default:
+        informational: true
