@@ -6,7 +6,7 @@
     # Ground truth (publisher's PRN list): {5, 13, 15, 20, 21, 28, 30}.
     url = "https://sdr.ion.org/RTL_SDR/RTLSDR_Bands-L1.uint8"
     sampling_freq = 2.048e6u"Hz"
-    system = GPSL1()
+    system = GPSL1CA()
     # 4 ms chunks = 8192 samples at 2.048 MHz
     num_samples = Int(upreferred(sampling_freq * 4u"ms"))
     num_ants = 1
@@ -108,15 +108,21 @@
     # Tightened end-to-end check: assert the final PVT against captured
     # baseline values so any regression in tracking, decoding, or PVT shows up.
     # Recording: Sep 10, 2017, Oegstgeest, NL (52.177°N 4.490°E, ~74 m).
-    expected_position = [3.9074204357e6, 3.0684049951e5, 5.0149765219e6]  # ECEF metres
+    # Baselines captured on the Tracking v3 / PVT v4 stack. Versus the earlier
+    # Tracking 1.5 / PVT 1 baseline the horizontal position is unchanged (~1.6 m)
+    # but the altitude dropped ~21 m (74 m → 53 m): PVT v4 now applies the
+    # Klobuchar ionospheric and Saastamoinen tropospheric corrections, which are
+    # common-mode across satellites and so land almost entirely in the vertical.
+    # That also redistributes HDOP/VDOP while GDOP/PDOP/TDOP stay put.
+    expected_position = [3.9074084447e6, 3.0683808164e5, 5.0149597259e6]  # ECEF metres
     expected_velocity = [0.610, 0.209, 3.577]                             # m/s
     expected_time = TAIEpoch(2017, 9, 10, 22, 57, 20.697)                 # final-fix epoch (TAI)
-    expected_time_correction = -2.0226528177e7                            # receiver clock bias (seconds)
+    expected_time_correction = -2.0226547144e7u"m"                        # receiver clock bias (metres; PVT v4 made this Unitful)
     expected_relative_clock_drift = 7.40e-7                               # dimensionless
     expected_gdop = 1.62
     expected_pdop = 1.45
-    expected_hdop = 0.83
-    expected_vdop = 1.20
+    expected_hdop = 0.91
+    expected_vdop = 1.13
     expected_tdop = 0.72
     expected_cn0_dbhz = Dict(
         5 => 51.2, 7 => 41.9, 8 => 40.8, 13 => 46.9, 15 => 48.5,

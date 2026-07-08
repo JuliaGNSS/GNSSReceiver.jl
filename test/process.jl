@@ -1,6 +1,6 @@
 @testset "Process measurement with number of antennas $i" for i in [1, 4]
     measurement = randn(ComplexF64, 20000, i)
-    system = GPSL1()
+    system = GPSL1CA()
     receiver_state = GNSSReceiver.ReceiverState(
         ComplexF64,
         system;
@@ -25,7 +25,7 @@
     receiver_sat_states = (Dictionary([1], [GNSSReceiver.ReceiverSatState(system, 1)]),)
 
     track_state =
-        TrackState(system, [SatState(system, 1, 0.0, 20u"Hz"; num_ants = NumAnts(i))])
+        TrackState(system, [TrackedSat(system, 1, 0.0, 20u"Hz"; num_ants = NumAnts(i))])
 
     acquisition_buffer = GNSSReceiver.SampleBuffer(ComplexF64, 20000)
 

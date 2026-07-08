@@ -4,7 +4,7 @@
     Complex{Int16},
 ]
     sampling_freq = 5e6Hz
-    system = GPSL1()
+    system = GPSL1CA()
     num_samples = 20000
     num_ants = 4
 
@@ -37,7 +37,7 @@
     receiver_sat_states = (Dictionary([1], [GNSSReceiver.ReceiverSatState(system, 1)]),)
 
     track_state =
-        TrackState(system, [SatState(system, 1, 0.0, 20u"Hz"; num_ants = NumAnts(4))])
+        TrackState(system, [TrackedSat(system, 1, 0.0, 20u"Hz"; num_ants = NumAnts(4))])
 
     acquisition_buffer = GNSSReceiver.SampleBuffer(ComplexF64, 20000)
 

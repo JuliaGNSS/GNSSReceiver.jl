@@ -73,18 +73,21 @@ end
                     true,
                 ),
             ),
-            PositionVelocityTime.PVTSolution(
-                ECEF(4.0e6, 3.9e5, 4.9e6),
-                ECEF(2.0e6, 2.9e5, 1.9e6),
-                4.5e6,
-                TAIEpoch(2022, 10, 8),
-                0.1e-6,
-                PositionVelocityTime.DOP(1.0, 1.0, 1.0, 1.0, 1.0),
-                Dict(
-                    3 => PositionVelocityTime.SatInfo(ECEF(5e6, 3e6, 1e6), 0.0),
-                    12 => PositionVelocityTime.SatInfo(ECEF(3e6, 3e6, 2e6), 0.0),
-                    23 => PositionVelocityTime.SatInfo(ECEF(2e6, 5e6, 1e6), 0.0),
-                    10 => PositionVelocityTime.SatInfo(ECEF(3e6, 1e6, 1e6), 0.0),
+            PositionVelocityTime.PVTSolution(;
+                position = ECEF(4.0e6, 3.9e5, 4.9e6),
+                velocity = ECEF(2.0e6, 2.9e5, 1.9e6),
+                time_correction = 4.5e6u"m",
+                time = TAIEpoch(2022, 10, 8),
+                relative_clock_drift = 0.1e-6,
+                dop = PositionVelocityTime.DOP(1.0, 1.0, 1.0, 1.0, 1.0),
+                sats = Dictionary(
+                    [(:GPSL1CA, 3), (:GPSL1CA, 12), (:GPSL1CA, 23), (:GPSL1CA, 10)],
+                    [
+                        PositionVelocityTime.SatInfo(ECEF(5e6, 3e6, 1e6), 0.0, 0.0u"m"),
+                        PositionVelocityTime.SatInfo(ECEF(3e6, 3e6, 2e6), 0.0, 0.0u"m"),
+                        PositionVelocityTime.SatInfo(ECEF(2e6, 5e6, 1e6), 0.0, 0.0u"m"),
+                        PositionVelocityTime.SatInfo(ECEF(3e6, 1e6, 1e6), 0.0, 0.0u"m"),
+                    ],
                 ),
             ),
             10.0u"s",
