@@ -57,11 +57,11 @@ function make_receiver_state(;
         ReceiverSatState{decoder_type}[ReceiverSatState(system, prn) for prn in prns],
     )
 
-    acquisition_buffer = SampleBuffer(ComplexF64, num_samples)
+    acquisition_buffer = SampleBuffer(ComplexF32, num_samples)
     if fill_acq_buffer
         # Fill the buffer so acquisition can fire
         acquisition_buffer =
-            GNSSReceiver.SampleBuffers.buffer(acquisition_buffer, randn(ComplexF64, num_samples))
+            GNSSReceiver.SampleBuffers.buffer(acquisition_buffer, randn(ComplexF32, num_samples))
     end
 
     pvt = PositionVelocityTime.PVTSolution()
@@ -121,8 +121,8 @@ function bench_process_with_acquisition(; num_ants = 1)
     )
     acq_plan, fast_re_acq_plan = make_acq_plans(; system, num_samples, sampling_freq)
     measurement =
-        num_ants == 1 ? randn(ComplexF64, num_samples) :
-        randn(ComplexF64, num_samples, num_ants)
+        num_ants == 1 ? randn(ComplexF32, num_samples) :
+        randn(ComplexF32, num_samples, num_ants)
     kwargs = _process_kwargs(; num_ants, sampling_freq)
 
     @benchmarkable GNSSReceiver.process(
@@ -157,8 +157,8 @@ function bench_process_steady_state(; num_ants = 1, num_sats = 8)
     )
     acq_plan, fast_re_acq_plan = make_acq_plans(; system, num_samples, sampling_freq)
     measurement =
-        num_ants == 1 ? randn(ComplexF64, num_samples) :
-        randn(ComplexF64, num_samples, num_ants)
+        num_ants == 1 ? randn(ComplexF32, num_samples) :
+        randn(ComplexF32, num_samples, num_ants)
     kwargs = _process_kwargs(; num_ants, sampling_freq)
 
     @benchmarkable GNSSReceiver.process(
