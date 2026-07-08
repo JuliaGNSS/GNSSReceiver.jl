@@ -1,20 +1,16 @@
-get_default_acq_threshold(system::GPSL1) = 45
-get_default_acq_threshold(system::GalileoE1B) = 37
-
 get_default_code_lock_cn0_threshold(system::GPSL1) = 30.0u"dBHz"
 get_default_code_lock_cn0_threshold(system::GalileoE1B) = 30.0u"dBHz"
 
 function process(
     receiver_state::ReceiverState{RS,TS,AB,P},
     acq_plan,
-    fast_re_acq_plan,
     measurement,
     system::AbstractGNSS,
     sampling_freq;
     downconvert_and_correlator = CPUThreadedDownconvertAndCorrelator(Val(sampling_freq)),
     num_ants::NumAnts{N} = NumAnts(1),
     acquire_every = 10u"s",
-    acq_threshold = get_default_acq_threshold(system),
+    acquisition_false_alarm_probability = 1e-4,
     code_lock_cn0_threshold = get_default_code_lock_cn0_threshold(system),
     time_in_lock_before_calculating_pvt = 2u"s",
     pvt_update_interval = 100u"ms",
@@ -47,12 +43,11 @@ function process(
     prev_last_time_acquisition_ran = last_time_acquisition_ran
     track_state, receiver_sat_states, last_time_acquisition_ran = acquire_satellites(
         acq_plan,
-        fast_re_acq_plan,
         acquisition_buffer,
         track_state,
         receiver_sat_states,
         interm_freq,
-        acq_threshold,
+        acquisition_false_alarm_probability,
         code_lock_cn0_threshold,
         runtime,
         num_ants,
@@ -207,7 +202,7 @@ end
 
 function update_states_from_acquisition_results(
     acquisition_results,
-    acq_threshold,
+    acquisition_false_alarm_probability,
     code_lock_cn0_threshold,
     track_state,
     receiver_sat_states,
@@ -216,7 +211,13 @@ function update_states_from_acquisition_results(
     # Early return if no results to process
     isempty(acquisition_results) && return track_state, receiver_sat_states
 
-    acq_res_valids = filter(res -> res.CN0 > acq_threshold, acquisition_results)
+    # Acquisition v2 uses a CFAR detector: a result is a detection when its
+    # peak-to-noise ratio exceeds the CFAR threshold for the given false-alarm
+    # probability (rather than a fixed CN0 threshold).
+    acq_res_valids = filter(
+        res -> is_detected(res; pfa = acquisition_false_alarm_probability),
+        acquisition_results,
+    )
     isempty(acq_res_valids) && return track_state, receiver_sat_states
 
     new_receiver_sat_states = map(acq_res_valids) do res
@@ -241,22 +242,15 @@ function update_states_from_acquisition_results(
     new_track_state, new_receiver_sat_states_dictionary
 end
 
-function get_available_prn_channels(acq_plan::AcquisitionPlan)
-    return acq_plan.avail_prn_channels
-end
-
-function get_available_prn_channels(acq_plan::CoarseFineAcquisitionPlan)
-    return acq_plan.coarse_plan.avail_prn_channels
-end
+get_available_prn_channels(acq_plan::AcquisitionPlan) = acq_plan.avail_prns
 
 function acquire_satellites(
     acq_plan,
-    fast_re_acq_plan,
     acquisition_buffer,
     track_state,
     receiver_sat_states,
     interm_freq,
-    acq_threshold,
+    acquisition_false_alarm_probability,
     code_lock_cn0_threshold,
     runtime,
     num_ants,
@@ -265,12 +259,12 @@ function acquire_satellites(
     num_samples_processed,
 )
     track_state, receiver_sat_states = try_to_reacquire_lost_satellites(
-        fast_re_acq_plan,
+        acq_plan,
         track_state,
         receiver_sat_states,
         acquisition_buffer,
         interm_freq,
-        acq_threshold,
+        acquisition_false_alarm_probability,
         code_lock_cn0_threshold,
         num_ants,
         num_samples_processed,
@@ -292,7 +286,7 @@ function acquire_satellites(
             interm_freq,
         )
 
-        corrected_acq_res = Acquisition.AcquisitionResults[
+        corrected_acq_res = eltype(acq_res)[
             advance_code_phase(
                 res,
                 num_samples_processed - (get_first_sample_counter(acquisition_buffer) - 1),
@@ -301,7 +295,7 @@ function acquire_satellites(
 
         track_state, receiver_sat_states = update_states_from_acquisition_results(
             corrected_acq_res,
-            acq_threshold,
+            acquisition_false_alarm_probability,
             code_lock_cn0_threshold,
             track_state,
             receiver_sat_states,
@@ -314,24 +308,16 @@ function acquire_satellites(
 end
 
 function advance_code_phase(acq_res::Acquisition.AcquisitionResults, num_samples)
-    code_phase = mod(
+    advanced_code_phase = mod(
         (
             get_code_frequency(acq_res.system) +
             acq_res.carrier_doppler * get_code_center_frequency_ratio(acq_res.system)
         ) * num_samples / acq_res.sampling_frequency + acq_res.code_phase,
         get_code_length(acq_res.system),
     )
-    Acquisition.AcquisitionResults(
-        acq_res.system,
-        acq_res.prn,
-        acq_res.sampling_frequency,
-        acq_res.carrier_doppler,
-        code_phase,
-        acq_res.CN0,
-        acq_res.noise_power,
-        acq_res.power_bins,
-        acq_res.dopplers,
-    )
+    # AcquisitionResults gained fields in Acquisition v2; copy all of them and only
+    # override the advanced code phase instead of reconstructing positionally.
+    @set acq_res.code_phase = advanced_code_phase
 end
 
 function should_reacquire(state)
@@ -341,12 +327,12 @@ function should_reacquire(state)
 end
 
 function try_to_reacquire_lost_satellites(
-    fast_re_acq_plan,
+    acq_plan,
     track_state,
     receiver_sat_states,
     acquisition_buffer,
     interm_freq,
-    acq_threshold,
+    acquisition_false_alarm_probability,
     code_lock_cn0_threshold,
     num_ants,
     num_samples_processed,
@@ -358,24 +344,24 @@ function try_to_reacquire_lost_satellites(
     # Only now allocate the filtered Dictionary (preserves type stability)
     out_of_lock_receiver_sat_states = filter(should_reacquire, receiver_sat_states)
 
-    acq_res = map(out_of_lock_receiver_sat_states.values) do receiver_sat_state
-        acquire!(
-            fast_re_acq_plan,
-            get_samples(acquisition_buffer),
-            receiver_sat_state.prn;
-            interm_freq,
-            doppler_offset = receiver_sat_state.carrier_doppler_for_reacquisition,
-        )
-    end
+    prns_to_reacquire = collect(Int, keys(out_of_lock_receiver_sat_states))
+    acq_res = acquire!(
+        acq_plan,
+        get_samples(acquisition_buffer),
+        prns_to_reacquire;
+        interm_freq,
+    )
 
-    corrected_acq_res = Acquisition.AcquisitionResults[
+    corrected_acq_res = eltype(acq_res)[
         advance_code_phase(
             res,
             num_samples_processed - (get_first_sample_counter(acquisition_buffer) - 1),
         ) for res in acq_res
     ]
 
-    invalid_acq_res_prns = get_prns(filter(res -> res.CN0 <= acq_threshold, acq_res))
+    invalid_acq_res_prns = get_prns(
+        filter(res -> !is_detected(res; pfa = acquisition_false_alarm_probability), acq_res),
+    )
     if !isempty(invalid_acq_res_prns)
         receiver_sat_states = map(receiver_sat_states) do state
             state.prn in invalid_acq_res_prns ?
@@ -385,7 +371,7 @@ function try_to_reacquire_lost_satellites(
 
     return update_states_from_acquisition_results(
         corrected_acq_res,
-        acq_threshold,
+        acquisition_false_alarm_probability,
         code_lock_cn0_threshold,
         track_state,
         receiver_sat_states,

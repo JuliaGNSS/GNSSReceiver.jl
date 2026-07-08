@@ -9,21 +9,11 @@
     )
     sampling_freq = 5e6Hz
 
-    acq_plan = AcquisitionPlan(system, size(measurement, 1), float(sampling_freq))
-    coarse_step = 2 * sampling_freq / size(measurement, 1)
-    fine_step = 1 / 4 / (size(measurement, 1) / sampling_freq)
-    fine_doppler_range = -coarse_step:fine_step:coarse_step
-    fast_re_acq_plan = AcquisitionPlan(
-        system,
-        size(measurement, 1),
-        sampling_freq;
-        dopplers = fine_doppler_range,
-    )
+    acq_plan = plan_acquire(system, float(sampling_freq), collect(1:32))
 
     next_receiver_state = GNSSReceiver.process(
         receiver_state,
         acq_plan,
-        fast_re_acq_plan,
         measurement,
         system,
         sampling_freq;
@@ -55,7 +45,6 @@
     next_receiver_state = GNSSReceiver.process(
         receiver_state,
         acq_plan,
-        fast_re_acq_plan,
         measurement,
         system,
         sampling_freq;

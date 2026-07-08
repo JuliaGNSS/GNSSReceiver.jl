@@ -51,10 +51,9 @@
         end
     end
 
-    # `num_code_cycles_for_acquisition = 10` gives 10 ms coherent integration for
-    # the v1 acquisition (`AcquisitionPlan` + CN0 threshold). At ≥8 ms this locks
-    # the full healthy set of 11 sats on this signal (4 ms only reaches 8); 10 ms
-    # keeps a comfortable margin above that threshold.
+    # 10 ms coherent integration (`acquisition_num_coherent_code_periods = 10`) with
+    # the v2 acquisition (`plan_acquire` + CFAR detection) locks the full healthy
+    # set of 11 sats on this signal.
     # `approximate_year = 2017` resolves the GPS L1 1024-week rollover for this
     # 2017-09-10 recording (without it, the default `year(now(UTC))` picks the
     # wrong cycle and reports a date offset by ~19.6 years).
@@ -64,7 +63,7 @@
         sampling_freq;
         num_ants = NumAnts(num_ants),
         interm_freq = 0.0u"Hz",
-        num_code_cycles_for_acquisition = 10,
+        acquisition_num_coherent_code_periods = 10,
         approximate_year = 2017,
     )
 
