@@ -39,10 +39,8 @@ const SUITE = BenchmarkGroup()
 # speedup, present on both revisions, so it is not a base/head difference.
 const SIGNAL_URL = "https://sdr.ion.org/RTL_SDR/RTLSDR_Bands-L1.uint8"
 const SAMPLING_FREQ = 2.048e6u"Hz"
-# GNSSSignals v3 renamed GPSL1 -> GPSL1CA. Feature-detect so this one script runs
-# against both the v3 head and a pre-v3 base (benchpkg --bench-on=head).
-const SYSTEM =
-    isdefined(GNSSSignals, :GPSL1CA) ? GNSSSignals.GPSL1CA() : GNSSSignals.GPSL1()
+const SYSTEM = GPSL1CA()
+const INTERM_FREQ = 0.0u"Hz"
 const CHUNK = Int(upreferred(SAMPLING_FREQ * 4u"ms"))        # 8192 samples per process() call
 const ACQ_CODE_CYCLES = 10        # 10 ms coherent integration locks the full healthy set
 
@@ -67,11 +65,7 @@ const STAGE_LABEL = "$(uconvert(u"s", N_1S * CHUNK / SAMPLING_FREQ)) signal"
 const COHERENT_INTEGRATION =
     uconvert(u"ms", ACQ_CODE_CYCLES * get_code_length(SYSTEM) / get_code_frequency(SYSTEM))
 
-# Tracking v3 dropped the `Val(sampling_freq)` constructor argument.
-const DC =
-    hasmethod(Tracking.CPUThreadedDownconvertAndCorrelator, Tuple{}) ?
-    Tracking.CPUThreadedDownconvertAndCorrelator() :
-    Tracking.CPUThreadedDownconvertAndCorrelator(Val(SAMPLING_FREQ))
+const DC = Tracking.CPUThreadedDownconvertAndCorrelator()
 
 # Fast integer backend for the `Complex{Int16}` benchmark variants, passed
 # explicitly (unlike `receive`, `process` doesn't auto-select). `max_meas = 2^7`
@@ -84,44 +78,42 @@ const DC_INT16 = Tracking.Int16ThreadedDownconvertAndCorrelator(2^7)
 # receive benchmark below). Same `max_meas = 2^7` as `DC_INT16`.
 const DC_INT16_NOTHREAD = Tracking.Int16DownconvertAndCorrelator(2^7)
 
-# Feature-detect the acquisition API so this one script runs against both the
-# Acquisition-v2 head (plan_acquire, single plan) and a pre-v2 base (AcquisitionPlan
-# + a fine-Doppler reacquisition plan). Lets `benchpkg --bench-on=head` compute a
-# real base-vs-head ratio across this API-breaking bump.
-const _HAS_V2_ACQ = isdefined(Acquisition, :plan_acquire)
+# Feature-detect the multi-band API so this one script runs against both the
+# multi-constellation head and the single-band base: on the head, `process` takes
+# tuples of measurements / systems / intermediate frequencies plus an
+# acquisition-plan NamedTuple keyed by the group's signal id, and the PVT year
+# keyword is `pvt_approximate_year` (was `approximate_year`). Lets
+# `benchpkg --bench-on=head` compute a real base-vs-head ratio across this
+# API-breaking bump.
+const _IS_MULTIBAND = isdefined(GNSSReceiver, :CombinedSignal)
 
-# `receive` renamed its acquisition-length keyword across the v3 bump
-# (`num_code_cycles_for_acquisition` -> `acquisition_num_coherent_code_periods`).
-# Pick whichever the loaded `receive` method declares so the receive benchmark
-# below runs against both the pre-v3 base and the v3 head.
-const _ACQ_CYCLES_KW =
-    :acquisition_num_coherent_code_periods in Base.kwarg_decl(first(methods(receive))) ?
-    (; acquisition_num_coherent_code_periods = ACQ_CODE_CYCLES) :
-    (; num_code_cycles_for_acquisition = ACQ_CODE_CYCLES)
-
-# The `receive` benchmark feeds `Complex{Int16}` chunks and lets `receive`
-# auto-select the downconvert-and-correlator from the element type. On the head
-# revision that resolves to Tracking's fast integer backend, which needs
-# `max_meas` (the front-end full-scale). The ION recording is 8-bit offset-binary
-# recentred on 128, so |real|/|imag| ≤ 128 → `max_meas = 2^7`. The pre-`max_meas`
-# base revision has no such keyword, so feature-detect it: base then falls back to
-# its CPU-on-Int16 default and the base/head ratio shows the integer-backend win.
-const _MAX_MEAS_KW =
-    :max_meas in Base.kwarg_decl(first(methods(receive))) ? (; max_meas = 2^7) : (;)
-
-# `plan_args` splat into `process` so the same call handles both signatures:
-# v2 process(rs, acq_plan, meas, …); v1 process(rs, acq_plan, fast_re_acq_plan, meas, …).
-_process(rs, plan_args, meas, dc; kwargs...) = process(
-    rs,
-    plan_args...,
-    meas,
-    SYSTEM,
-    SAMPLING_FREQ;
-    downconvert_and_correlator = dc,
-    num_ants = NumAnts(1),
-    approximate_year = 2017,
-    kwargs...,
-)
+_process(rs, acq_plans, meas, dc; kwargs...) =
+    if _IS_MULTIBAND
+        process(
+            rs,
+            acq_plans,
+            (meas,),
+            ((SYSTEM,),),
+            SAMPLING_FREQ,
+            (INTERM_FREQ,);
+            downconvert_and_correlator = dc,
+            num_ants = NumAnts(1),
+            pvt_approximate_year = 2017,
+            kwargs...,
+        )
+    else
+        process(
+            rs,
+            acq_plans...,
+            meas,
+            SYSTEM,
+            SAMPLING_FREQ;
+            downconvert_and_correlator = dc,
+            num_ants = NumAnts(1),
+            approximate_year = 2017,
+            kwargs...,
+        )
+    end
 
 function make_receiver_and_plan(::Type{T}) where {T}
     nacq = round(
@@ -130,27 +122,18 @@ function make_receiver_and_plan(::Type{T}) where {T}
         ACQ_CODE_CYCLES,
     )
     rs = ReceiverState(T, SYSTEM; num_ants = NumAnts(1), num_samples_for_acquisition = nacq)
-    plan_args = if _HAS_V2_ACQ
-        (Acquisition.plan_acquire(
-            SYSTEM,
-            float(SAMPLING_FREQ),
-            collect(1:32);
-            num_coherently_integrated_code_periods = ACQ_CODE_CYCLES,
-        ),)
-    else
-        acq_plan = Acquisition.AcquisitionPlan(SYSTEM, nacq, float(SAMPLING_FREQ); prns = 1:32)
-        coarse_step = 2 * SAMPLING_FREQ / nacq
-        fine_step = 1 / 4 / (nacq / SAMPLING_FREQ)
-        fast = Acquisition.AcquisitionPlan(
-            SYSTEM,
-            nacq,
-            SAMPLING_FREQ;
-            dopplers = -coarse_step:fine_step:coarse_step,
-            prns = 1:32,
-        )
-        (acq_plan, fast)
-    end
-    return rs, plan_args
+    plan = Acquisition.plan_acquire(
+        SYSTEM,
+        float(SAMPLING_FREQ),
+        collect(1:32);
+        num_coherently_integrated_code_periods = ACQ_CODE_CYCLES,
+    )
+    # The multi-band head selects each band's plans from a NamedTuple keyed by the
+    # group's signal id; the single-band base takes the plan positionally.
+    acq_plans =
+        _IS_MULTIBAND ? NamedTuple{(GNSSReceiver.signal_group_key(SYSTEM),)}((plan,)) :
+        (plan,)
+    return rs, acq_plans
 end
 
 # Load `nchunks` consecutive 4 ms chunks of the recording as ComplexF32 vectors.
@@ -190,9 +173,9 @@ const CHUNKS_INT16 =
 # temporaries that `Tracking.track!` builds each chunk, so they get heap-allocated
 # (~4x the real allocation). A `for` loop keeps `process` in one frame where those
 # temporaries are elided, matching real-world `receive` behaviour.
-function run_process(rs, plan_args, chunks, dc, acquire_every)
+function run_process(rs, acq_plans, chunks, dc, acquire_every)
     for c in chunks
-        rs = _process(rs, plan_args, c, dc; acquire_every)
+        rs = _process(rs, acq_plans, c, dc; acquire_every)
     end
     return rs
 end
@@ -207,14 +190,14 @@ has_fix(rs) = !isnothing(rs.pvt.time)
 num_in_lock(rs) = count(is_in_lock, rs.receiver_sat_states[1])
 
 function capture_stage_snapshots(::Type{T}, dc, chunks) where {T}
-    rs, plan_args = make_receiver_and_plan(T)
+    rs, acq_plans = make_receiver_and_plan(T)
     acq_snapshot = deepcopy(rs)          # fresh receiver = the start of acquisition
     track_snapshot = nothing
     track_start = 0
     pvt_snapshot = nothing
     pvt_start = 0
     for (i, c) in enumerate(chunks)
-        rs = _process(rs, plan_args, c, dc; acquire_every = ACQUIRE_EVERY)
+        rs = _process(rs, acq_plans, c, dc; acquire_every = ACQUIRE_EVERY)
         # Stage 2 starts once a PVT-capable number of sats (4) are locked and being
         # decoded — but no fix yet (the full ephemeris takes ~30 s to decode).
         if isnothing(track_snapshot) && num_in_lock(rs) >= 4 && !has_fix(rs)
@@ -235,7 +218,7 @@ function capture_stage_snapshots(::Type{T}, dc, chunks) where {T}
     pvt_start + N_1S <= length(chunks) ||
         error("need $(pvt_start + N_1S) chunks for the stage-3 window; only $(length(chunks)) loaded")
     return (;
-        plan_args,
+        acq_plans,
         acq_snapshot,
         acq_chunks = chunks[1:N_1S],
         track_snapshot,
@@ -259,9 +242,9 @@ const STAGES_INT16 = capture_stage_snapshots(Complex{Int16}, DC_INT16, CHUNKS_IN
 # Fresh receiver, `acquire_every = ACQUIRE_EVERY`: the buffer fills within ~12 ms,
 # `acquire!` searches all 32 PRNs, and the first sats lock — the cold-start second.
 function bench_acquisition_stage(stages, dc)
-    (; plan_args, acq_snapshot, acq_chunks) = stages
+    (; acq_plans, acq_snapshot, acq_chunks) = stages
     @benchmarkable(
-        run_process(state, $plan_args, $acq_chunks, $dc, $ACQUIRE_EVERY),
+        run_process(state, $acq_plans, $acq_chunks, $dc, $ACQUIRE_EVERY),
         setup = (state = deepcopy($acq_snapshot)),
         evals = 1,
     )
@@ -271,9 +254,9 @@ end
 # Sats already locked; `acquire_every = NEVER` so no acquisition fires — pure
 # tracking + nav-bit decoding, no PVT yet.
 function bench_tracking_stage(stages, dc)
-    (; plan_args, track_snapshot, track_chunks) = stages
+    (; acq_plans, track_snapshot, track_chunks) = stages
     @benchmarkable(
-        run_process(state, $plan_args, $track_chunks, $dc, $NEVER),
+        run_process(state, $acq_plans, $track_chunks, $dc, $NEVER),
         setup = (state = deepcopy($track_snapshot)),
         evals = 1,
     )
@@ -283,21 +266,24 @@ end
 # Post-fix steady state; `acquire_every = NEVER`. Tracking + decoding + `calc_pvt`
 # every `pvt_update_interval` (100 ms) → ~10 PVT solves in the 1 s window.
 function bench_pvt_stage(stages, dc)
-    (; plan_args, pvt_snapshot, pvt_chunks) = stages
+    (; acq_plans, pvt_snapshot, pvt_chunks) = stages
     @benchmarkable(
-        run_process(state, $plan_args, $pvt_chunks, $dc, $NEVER),
+        run_process(state, $acq_plans, $pvt_chunks, $dc, $NEVER),
         setup = (state = deepcopy($pvt_snapshot)),
         evals = 1,
     )
 end
 
-# ── Stage 3 through the public `receive` pipeline ───────────────────────────
+# ── Cold start through the public `receive` pipeline ────────────────────────
 # `receive` consumes (CHUNK × 1) matrix chunks off a `SignalChannel`, spawns
 # its own tracking task, and builds the per-chunk `sat_data` / `ReceiverDataOfInterest`
-# — plumbing the direct-`process` benchmarks don't exercise. Feed it the post-fix
-# `Int16` snapshot + the same 1 s of chunks (element type `Complex{Int16}`) to
-# measure steady-state end-to-end cost (channel + sat_data build + PVT) rather than
-# a 45 s cold start.
+# — plumbing the direct-`process` benchmarks don't exercise. The multi-band `receive`
+# builds its own fresh `ReceiverState` internally (it has no `receiver_state`
+# keyword), so the end-to-end benchmark measures the *cold-start* second — buffer
+# fill, first `acquire!`, first locks — over the acquisition-window chunks, on both
+# revisions. Both run their default acquisition length (the base's keyword default
+# and the head's internally derived value are both 4 coherent code periods), so the
+# rows compare like-for-like.
 #
 # Two correlator variants:
 #   • threaded     — `dc = nothing` lets `receive` auto-select the integer backend,
@@ -310,7 +296,7 @@ end
 # The non-threaded correlator removes that nesting, trading throughput for a more
 # reproducible measurement.
 # Materialise the 1 s of `Complex{Int16}` chunks once as (CHUNK × 1) matrices.
-const RECEIVE_STEADY_CHUNKS = [reshape(c, CHUNK, 1) for c in STAGES_INT16.pvt_chunks]
+const RECEIVE_CHUNKS = [reshape(c, CHUNK, 1) for c in STAGES_INT16.acq_chunks]
 
 function make_measurement_channel(chunks)
     GNSSReceiver.SignalChannel{Complex{Int16},1}(CHUNK) do ch
@@ -320,7 +306,7 @@ function make_measurement_channel(chunks)
     end
 end
 
-function run_receive_steady(chunks, receiver_state, dc)
+function run_receive_cold_start(chunks, dc)
     measurement_channel = make_measurement_channel(chunks)
     # dc === nothing → let `receive` auto-select (threaded); otherwise force it.
     dc_kw = dc === nothing ? (;) : (; downconvert_and_correlator = dc)
@@ -329,28 +315,23 @@ function run_receive_steady(chunks, receiver_state, dc)
         SYSTEM,
         SAMPLING_FREQ;
         num_ants = NumAnts(1),
-        acquire_every = NEVER,
-        receiver_state,
-        _ACQ_CYCLES_KW...,
-        _MAX_MEAS_KW...,
+        acquire_every = ACQUIRE_EVERY,
+        max_meas = 2^7,
         dc_kw...,
     )
     GNSSReceiver.consume_channel(_ -> nothing, data_channel)
     return nothing
 end
 
-function bench_receive_steady(dc)
-    pvt_snapshot = STAGES_INT16.pvt_snapshot
+function bench_receive_cold_start(dc)
     # `receive` spawns its tracking task, so a single sample is sensitive to
     # scheduler/thread-pool jitter on shared CI runners. With the default 5 s budget
-    # that yields only ~50-100 (deepcopy + run) samples, and the reported *minimum*
-    # can still land in a busy window. Give it a longer budget so it collects several
-    # hundred samples — enough to catch a least-disturbed one and make the min stable.
-    # (`evals = 1` is preserved: each sample must start from a fresh deepcopy, since
-    # `process` mutates the receiver state in place.)
+    # that yields only ~50-100 samples, and the reported *minimum* can still land
+    # in a busy window. Give it a longer budget so it collects several hundred
+    # samples — enough to catch a least-disturbed one and make the min stable.
+    # (`evals = 1` is preserved: each sample builds its own fresh receiver state.)
     @benchmarkable(
-        run_receive_steady($RECEIVE_STEADY_CHUNKS, state, $dc),
-        setup = (state = deepcopy($pvt_snapshot)),
+        run_receive_cold_start($RECEIVE_CHUNKS, $dc),
         evals = 1,
         samples = 1000,
         seconds = 30,
@@ -370,6 +351,6 @@ SUITE["tracking + PVT ($STAGE_LABEL)"]["1-ant float"] = bench_pvt_stage(STAGES_F
 SUITE["tracking + PVT ($STAGE_LABEL)"]["1-ant Int16"] = bench_pvt_stage(STAGES_INT16, DC_INT16)
 # Threaded (auto-selected) and single-threaded correlator variants, to compare
 # their run-to-run reliability through the spawned receive pipeline.
-SUITE["receive steady-state ($STAGE_LABEL)"]["1-ant Int16 threaded"] = bench_receive_steady(nothing)
-SUITE["receive steady-state ($STAGE_LABEL)"]["1-ant Int16 non-threaded"] =
-    bench_receive_steady(DC_INT16_NOTHREAD)
+SUITE["receive cold-start ($STAGE_LABEL)"]["1-ant Int16 threaded"] = bench_receive_cold_start(nothing)
+SUITE["receive cold-start ($STAGE_LABEL)"]["1-ant Int16 non-threaded"] =
+    bench_receive_cold_start(DC_INT16_NOTHREAD)

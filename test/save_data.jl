@@ -3,7 +3,7 @@
     data_channel = Channel{GNSSReceiver.ReceiverDataOfInterest{sat_data_type}}() do ch
         foreach(1:20) do i
             data = GNSSReceiver.ReceiverDataOfInterest{sat_data_type}(
-                Dictionary{Int,sat_data_type}(),
+                Dictionary{Tuple{Symbol,Int},sat_data_type}(),
                 GNSSReceiver.PVTSolution(),
                 (i - 1) * 1ms,
             )
@@ -45,7 +45,7 @@ end
             put!(
                 ch,
                 GNSSReceiver.ReceiverDataOfInterest{sat_data_type}(
-                    Dictionary{Int,sat_data_type}(),
+                    Dictionary{Tuple{Symbol,Int},sat_data_type}(),
                     GNSSReceiver.PVTSolution(),
                     (i - 1) * 1ms,
                 ),

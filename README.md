@@ -24,7 +24,9 @@ pkg> add GNSSReceiver
 
 See the **[documentation](https://JuliaGNSS.github.io/GNSSReceiver.jl/dev)** for usage —
 all examples there are run automatically when the docs are built, so they stay in sync
-with the code:
+with the code. Multiple constellations that share one RF band and sample stream (e.g.
+`receive(measurement_channel, (GPSL1CA(), GalileoE1B()), sampling_freq)`) are fused into a
+single multi-GNSS PVT solution:
 
 - [Getting Started](https://JuliaGNSS.github.io/GNSSReceiver.jl/dev/getting_started/) —
   receive live from an SDR or replay from a file.
