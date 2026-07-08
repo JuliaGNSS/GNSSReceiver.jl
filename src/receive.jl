@@ -36,6 +36,7 @@ function receive(
     interm_freq = 0.0u"Hz",
     always_buffer = false,
     prns = 1:32,
+    approximate_year::Integer = year(now(UTC)),
 ) where {N,T}
     num_channels = measurement_channel.num_antenna_channels
     num_channels == N ||
@@ -61,8 +62,9 @@ function receive(
 
     Base.errormonitor(
         Threads.@spawn begin
-            consume_channel(measurement_channel) do measurement
-                receiver_state = process(
+            try
+                consume_channel(measurement_channel) do measurement
+                    receiver_state = process(
                     receiver_state,
                     acq_plan,
                     fast_re_acq_plan,
@@ -78,6 +80,7 @@ function receive(
                     pvt_update_interval,
                     interm_freq,
                     always_buffer,
+                    approximate_year,
                 )
                 sat_data = Dict{Int,sat_data_type}(
                     sat_state.prn => SatelliteDataOfInterest(
@@ -96,8 +99,10 @@ function receive(
                         receiver_state.runtime,
                     ),
                 )
+                end
+            finally
+                close(data_channel)
             end
-            close(data_channel)
         end
     )
     data_channel

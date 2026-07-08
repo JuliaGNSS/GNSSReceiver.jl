@@ -9,16 +9,20 @@
     num_ants = 4
 
     measurement_channel = GNSSReceiver.MatrixSizedChannel{type}(num_samples, num_ants) do ch
+        # Seed a local RNG so the noise — and hence any acquisition false alarms — is
+        # deterministic and this test isn't flaky. An explicit Xoshiro avoids the
+        # task-local RNG nondeterminism of the producer running in a spawned task.
+        rng = Random.Xoshiro(1234)
         if type <: Complex{Int16}
             foreach(
                 i -> put!(
                     ch,
-                    type.(round.(randn(ComplexF32, num_samples, num_ants) * 512)),
+                    type.(round.(randn(rng, ComplexF32, num_samples, num_ants) * 512)),
                 ),
                 1:20,
             )
         else
-            foreach(i -> put!(ch, randn(type, num_samples, num_ants) * 512), 1:20)
+            foreach(i -> put!(ch, randn(rng, type, num_samples, num_ants) * 512), 1:20)
         end
     end
 
@@ -51,16 +55,20 @@
     )
 
     measurement_channel = GNSSReceiver.MatrixSizedChannel{type}(num_samples, num_ants) do ch
+        # Seed a local RNG so the noise — and hence any acquisition false alarms — is
+        # deterministic and this test isn't flaky. An explicit Xoshiro avoids the
+        # task-local RNG nondeterminism of the producer running in a spawned task.
+        rng = Random.Xoshiro(1234)
         if type <: Complex{Int16}
             foreach(
                 i -> put!(
                     ch,
-                    type.(round.(randn(ComplexF32, num_samples, num_ants) * 512)),
+                    type.(round.(randn(rng, ComplexF32, num_samples, num_ants) * 512)),
                 ),
                 1:20,
             )
         else
-            foreach(i -> put!(ch, randn(type, num_samples, num_ants) * 512), 1:20)
+            foreach(i -> put!(ch, randn(rng, type, num_samples, num_ants) * 512), 1:20)
         end
     end
 

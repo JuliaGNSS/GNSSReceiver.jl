@@ -20,6 +20,7 @@ function process(
     pvt_update_interval = 100u"ms",
     interm_freq = 0.0u"Hz",
     always_buffer = false,
+    approximate_year::Integer = year(now(UTC)),
 ) where {N,RS,TS,AB,P}
     num_samples = size(measurement, 1)
     signal_duration = num_samples / sampling_freq
@@ -85,6 +86,7 @@ function process(
         time_in_lock_before_calculating_pvt,
         last_time_pvt_ran,
         pvt_update_interval,
+        approximate_year,
     )
 
     track_state = filter_in_lock_sats(receiver_sat_states, track_state)
@@ -123,6 +125,7 @@ function update_pvt(
     time_in_lock_before_calculating_pvt,
     last_time_pvt_ran,
     pvt_update_interval,
+    approximate_year::Integer = year(now(UTC)),
 )
     if runtime - last_time_pvt_ran >= pvt_update_interval
         receiver_sat_states_ready_for_pvt =
@@ -141,7 +144,7 @@ function update_pvt(
             end
 
         if length(pvt_satellite_states) >= 4
-            pvt = calc_pvt(pvt_satellite_states, pvt)
+            pvt = calc_pvt(pvt_satellite_states, pvt; approximate_year)
         end
 
         last_time_pvt_ran = runtime
@@ -190,22 +193,15 @@ function create_sat_state_from_acq(
     track_state::TrackState,
     num_ants::NumAnts{N},
 ) where {N}
-    correlator = Tracking.get_default_correlator(acq.system, num_ants)
-    eltype(track_state.multiple_system_sats_state[1].states)(
+    # Use Tracking's public keyword constructor rather than the positional one so
+    # this stays robust to SatState field-layout changes across Tracking versions.
+    SatState(
+        acq.system,
         acq.prn,
         acq.code_phase,
-        acq.carrier_doppler * get_code_center_frequency_ratio(acq.system),
-        0.0,
-        acq.carrier_doppler,
-        0,
-        1,
-        false,
-        correlator,
-        correlator,
-        complex(0.0, 0.0),
-        Tracking.MomentsCN0Estimator(100),
-        Tracking.BitBuffer(),
-        create_post_corr_filter(num_ants),
+        acq.carrier_doppler;
+        num_ants,
+        post_corr_filter = create_post_corr_filter(num_ants),
     )
 end
 
