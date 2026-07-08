@@ -15,19 +15,21 @@ const SUITE = BenchmarkGroup()
 
 # ── Real signal ───────────────────────────────────────────────────────────
 # The 60 s ION RTL-SDR GPS L1 recording used by the integration test (2.048 MS/s,
-# 8-bit unsigned offset-binary I/Q). We warm up over the first ~45 s — long enough
-# to acquire, lock, decode the ephemeris and get a real position fix — then
-# benchmark a single 4 ms `process` step on that realistic navigating state.
+# 8-bit unsigned offset-binary I/Q). Each benchmark processes RUN_SECONDS of it in
+# 4 ms chunks; the label reports that duration so the measured time can be judged
+# against real time (real-time capable iff time < RUN_SECONDS).
 const SIGNAL_URL = "https://sdr.ion.org/RTL_SDR/RTLSDR_Bands-L1.uint8"
 const SAMPLING_FREQ = 2.048e6u"Hz"
 const SYSTEM = GPSL1()
 const CHUNK = Int(upreferred(SAMPLING_FREQ * 4u"ms"))        # 8192 samples per process() call
-# Label surfaces the chunk's real-time duration so time-per-call can be judged
-# against real time (real-time capable iff time-per-call < this).
-const CHUNK_LABEL = "$(uconvert(u"ms", CHUNK / SAMPLING_FREQ)) signal"
 const ACQ_CODE_CYCLES = 10        # 10 ms coherent integration locks the full healthy set
-const SETUP_SECONDS = 45          # long enough to decode ephemeris and get a fix (~35 s)
+const RUN_SECONDS = 45            # benchmarked duration (enough to get a position fix, ~35 s)
+const LOCK_SECONDS = 3            # steady-state setup: lock the sats before the timed run
 const NEVER = 1_000_000u"s"       # acquire_every large enough that (re)acquisition never fires
+
+const N_RUN = floor(Int, upreferred(SAMPLING_FREQ * (RUN_SECONDS * u"s")) / CHUNK)
+const N_LOCK = floor(Int, upreferred(SAMPLING_FREQ * (LOCK_SECONDS * u"s")) / CHUNK)
+const RUN_LABEL = "$(uconvert(u"s", N_RUN * CHUNK / SAMPLING_FREQ)) signal"
 
 const DC = Tracking.CPUThreadedDownconvertAndCorrelator(Val(SAMPLING_FREQ))
 
@@ -44,22 +46,7 @@ _process(rs, acq_plan, fast, meas; kwargs...) = process(
     kwargs...,
 )
 
-# Ensure the first `nsamples` complex samples of the recording are cached (byte-range
-# download so we don't fetch the whole 246 MB file).
-function ensure_signal(nsamples)
-    cache = joinpath(tempdir(), "gnssreceiver_bench_RTLSDR_Bands-L1.uint8")
-    if !isfile(cache) || filesize(cache) < 2 * nsamples
-        run(`curl -sfL -r 0-$(2 * nsamples - 1) -o $cache $SIGNAL_URL`)
-    end
-    return cache
-end
-
-# Warm a receiver over SETUP_SECONDS of real signal: acquire once (acquire_every = NEVER),
-# keeping the acquisition buffer fresh (always_buffer) so the acquisition benchmark can
-# re-fire. By SETUP_SECONDS the ephemeris is decoded and a PVT fix obtained, so this is a
-# true steady state (locked + navigating), not merely "locked".
-# Returns (receiver_state, acq_plan, fast_re_acq_plan, last_chunk).
-function warm_up()
+function make_receiver_and_plans()
     nacq = round(
         Int,
         get_code_length(SYSTEM) * upreferred(SAMPLING_FREQ / get_code_frequency(SYSTEM)) *
@@ -70,31 +57,56 @@ function warm_up()
     coarse_step = 2 * SAMPLING_FREQ / nacq
     fine_step = 1 / 4 / (nacq / SAMPLING_FREQ)
     fast = AcquisitionPlan(SYSTEM, nacq, SAMPLING_FREQ; dopplers = -coarse_step:fine_step:coarse_step, prns = 1:32)
-
-    nchunks = ceil(Int, upreferred(SAMPLING_FREQ * (SETUP_SECONDS * u"s")) / CHUNK)
-    cache = ensure_signal((nchunks + 1) * CHUNK)
-    raw = Vector{UInt8}(undef, 2 * CHUNK)
-    last_chunk = ComplexF32[]
-    open(cache) do io
-        for _ = 1:nchunks
-            readbytes!(io, raw, 2 * CHUNK) == 2 * CHUNK || break
-            chunk = ComplexF32[
-                ComplexF32(Float32(raw[2i-1]) - 127.5f0, Float32(raw[2i]) - 127.5f0) for i = 1:CHUNK
-            ]
-            rs = _process(rs, acq_plan, fast, chunk; acquire_every = NEVER, always_buffer = true)
-            last_chunk = chunk
-        end
-    end
-    return rs, acq_plan, fast, last_chunk
+    return rs, acq_plan, fast
 end
 
-const WARM_RS, WARM_ACQ_PLAN, WARM_FAST, WARM_CHUNK = warm_up()
+# Load `nchunks` consecutive 4 ms chunks of the recording as ComplexF32 vectors.
+# Fetches only the needed byte range (not the whole 246 MB file).
+function load_chunks(nchunks)
+    cache = joinpath(tempdir(), "gnssreceiver_bench_RTLSDR_Bands-L1.uint8")
+    nbytes = 2 * nchunks * CHUNK
+    if !isfile(cache) || filesize(cache) < nbytes
+        run(`curl -sfL -r 0-$(nbytes - 1) -o $cache $SIGNAL_URL`)
+    end
+    chunks = Vector{Vector{ComplexF32}}(undef, nchunks)
+    raw = Vector{UInt8}(undef, 2 * CHUNK)
+    open(cache) do io
+        for k = 1:nchunks
+            read!(io, raw)
+            chunks[k] = ComplexF32[
+                ComplexF32(Float32(raw[2i-1]) - 127.5f0, Float32(raw[2i]) - 127.5f0) for i = 1:CHUNK
+            ]
+        end
+    end
+    return chunks
+end
 
-# ── Register benchmarks (same warmed, navigating receiver for both) ────────
-# Steady-state: track the locked+navigating receiver, no (re)acquisition.
-SUITE["process steady-state ($CHUNK_LABEL)"]["1-ant"] =
-    @benchmarkable _process($WARM_RS, $WARM_ACQ_PLAN, $WARM_FAST, $WARM_CHUNK; acquire_every = NEVER)
-# With acquisition: identical state, but acquisition fires on this step (re-acquisition
-# over all PRNs while the locked sats keep tracking).
-SUITE["process with acquisition ($CHUNK_LABEL)"]["1-ant"] =
-    @benchmarkable _process($WARM_RS, $WARM_ACQ_PLAN, $WARM_FAST, $WARM_CHUNK; acquire_every = 0u"s")
+# All chunks needed: LOCK_SECONDS of setup followed by RUN_SECONDS of timed run.
+const CHUNKS = load_chunks(N_LOCK + N_RUN)
+
+run_process(rs, acq_plan, fast, chunks, acquire_every) =
+    foldl((s, c) -> _process(s, acq_plan, fast, c; acquire_every), chunks; init = rs)
+
+# ── Benchmark: steady-state tracking over RUN_SECONDS (no re-acquisition) ──
+# Acquire and lock over the first LOCK_SECONDS (setup, not timed), then benchmark
+# tracking the following RUN_SECONDS with acquire_every huge — no acquisition in
+# the timed run. A fix is obtained partway through, so PVT runs too.
+function bench_process_steady_state()
+    rs, acq_plan, fast = make_receiver_and_plans()
+    locked = run_process(rs, acq_plan, fast, @view(CHUNKS[1:N_LOCK]), NEVER)
+    timed_chunks = CHUNKS[N_LOCK+1:N_LOCK+N_RUN]
+    @benchmarkable run_process($locked, $acq_plan, $fast, $timed_chunks, NEVER)
+end
+
+# ── Benchmark: full pipeline over RUN_SECONDS (with acquisition) ───────────
+# Process RUN_SECONDS from a fresh receiver, re-acquiring periodically (10 s) as
+# in normal operation — acquire, lock, decode, and reach a position fix.
+function bench_process_with_acquisition()
+    rs, acq_plan, fast = make_receiver_and_plans()
+    timed_chunks = CHUNKS[1:N_RUN]
+    @benchmarkable run_process($rs, $acq_plan, $fast, $timed_chunks, 10u"s")
+end
+
+# ── Register benchmarks ───────────────────────────────────────────────────
+SUITE["process steady-state ($RUN_LABEL)"]["1-ant"] = bench_process_steady_state()
+SUITE["process with acquisition ($RUN_LABEL)"]["1-ant"] = bench_process_with_acquisition()
