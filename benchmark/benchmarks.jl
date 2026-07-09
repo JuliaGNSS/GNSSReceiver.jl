@@ -137,7 +137,19 @@ function bench_process_without_acquisition()
     rs, plan_args = make_receiver_and_plan()
     locked = run_process(rs, plan_args, @view(CHUNKS[1:N_LOCK]), NEVER)
     timed_chunks = CHUNKS[N_LOCK+1:N_LOCK+N_RUN]
-    @benchmarkable run_process($locked, $plan_args, $timed_chunks, NEVER)
+    # `process` mutates the receiver state in place — the in-place `track!`
+    # (c1c8b26) and the in-place `map!` in `update_receiver_sat_states`. If every
+    # BenchmarkTools evaluation re-ran the *same* `locked` object, each one would
+    # start from the previous run's already-advanced state: the satellites fall
+    # out of lock and later evaluations track almost nothing, collapsing the
+    # reported minimum time and memory to a meaningless (tiny) value. Give each
+    # sample a fresh `deepcopy` of the locked state and pin `evals=1`, so every
+    # measured sample is one honest 45 s forward pass over the full sat set.
+    @benchmarkable(
+        run_process(state, $plan_args, $timed_chunks, NEVER),
+        setup = (state = deepcopy($locked)),
+        evals = 1,
+    )
 end
 
 # ── Benchmark: process with acquisition every 10 sec over RUN_SECONDS ─────
@@ -146,7 +158,16 @@ end
 function bench_process_with_acquisition()
     rs, plan_args = make_receiver_and_plan()
     timed_chunks = CHUNKS[1:N_RUN]
-    @benchmarkable run_process($rs, $plan_args, $timed_chunks, 10u"s")
+    # Same in-place-mutation caveat as above: hand each sample a fresh deepcopy
+    # of the (empty) starting receiver and pin evals=1 so every sample is one
+    # honest 45 s run that acquires and locks from scratch. The acquisition plan
+    # holds only reusable FFT scratch (overwritten each `acquire!`), so it is
+    # shared across samples rather than copied.
+    @benchmarkable(
+        run_process(state, $plan_args, $timed_chunks, 10u"s"),
+        setup = (state = deepcopy($rs)),
+        evals = 1,
+    )
 end
 
 # `receive` consumes (CHUNK × 1) matrix chunks off a `MatrixSizedChannel`, whereas
