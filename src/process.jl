@@ -2,7 +2,7 @@ get_default_code_lock_cn0_threshold(system::GPSL1CA) = 30.0u"dBHz"
 get_default_code_lock_cn0_threshold(system::GalileoE1B) = 30.0u"dBHz"
 
 function process(
-    receiver_state::ReceiverState{RS,TS,AB,P},
+    receiver_state::ReceiverState{RS,TS,AB,P,PB},
     acq_plan,
     measurement,
     system::AbstractGNSSSignal,
@@ -17,7 +17,7 @@ function process(
     interm_freq = 0.0u"Hz",
     always_buffer = false,
     approximate_year::Integer = year(now(UTC)),
-) where {N,RS,TS,AB,P}
+) where {N,RS,TS,AB,P,PB}
     num_samples = size(measurement, 1)
     signal_duration = num_samples / sampling_freq
     # Currently this only supports a single system. Hence [1]
@@ -78,9 +78,14 @@ function process(
     receiver_sat_states =
         update_receiver_sat_states(receiver_sat_states, track_state, signal_duration)
 
+    # `pvt_sat_state_buffer` is reused (refilled in place) by `update_pvt` and
+    # threaded back into the next ReceiverState, so no fresh SatelliteState
+    # vector is allocated per PVT cycle in steady state.
+    pvt_sat_state_buffer = receiver_state.pvt_sat_state_buffer
     pvt, last_time_pvt_ran = update_pvt(
         system,
         receiver_state.pvt,
+        pvt_sat_state_buffer,
         receiver_sat_states,
         track_state,
         runtime,
@@ -92,11 +97,12 @@ function process(
 
     track_state = filter_in_lock_sats(receiver_sat_states, track_state)
 
-    ReceiverState{RS,TS,AB,P}(
+    ReceiverState{RS,TS,AB,P,PB}(
         track_state,
         (receiver_sat_states,),
         acquisition_buffer,
         pvt,
+        pvt_sat_state_buffer,
         receiver_state.runtime + signal_duration,
         last_time_acquisition_ran,
         last_time_pvt_ran,
@@ -124,6 +130,7 @@ end
 function update_pvt(
     system,
     pvt,
+    pvt_sat_state_buffer,
     receiver_sat_states,
     track_state,
     runtime,
@@ -133,23 +140,29 @@ function update_pvt(
     approximate_year::Integer = year(now(UTC)),
 )
     if runtime - last_time_pvt_ran >= pvt_update_interval
-        receiver_sat_states_ready_for_pvt =
-            filter(receiver_sat_states) do receiver_sat_state
-                is_in_lock(receiver_sat_state) &&
-                    receiver_sat_state.time_in_lock > time_in_lock_before_calculating_pvt
-            end
-
-        pvt_satellite_states =
-            map(receiver_sat_states_ready_for_pvt.values) do receiver_sat_state
-                SatelliteState(
-                    receiver_sat_state.decoder,
-                    system,
-                    get_sat_state(track_state, receiver_sat_state.prn),
+        # Select the PVT-ready satellites and build their `SatelliteState`s in a
+        # single pass, refilling the reused buffer in place. This avoids both the
+        # intermediate filtered `Dictionary{Int,ReceiverSatState}` (which grew from
+        # empty, rehashing the large 1,832-byte structs) and a fresh
+        # `Vector{SatelliteState}` per cycle. `empty!` keeps the buffer's capacity,
+        # so in steady state the refill is allocation-free.
+        empty!(pvt_sat_state_buffer)
+        for receiver_sat_state in receiver_sat_states
+            if is_in_lock(receiver_sat_state) &&
+               receiver_sat_state.time_in_lock > time_in_lock_before_calculating_pvt
+                push!(
+                    pvt_sat_state_buffer,
+                    SatelliteState(
+                        receiver_sat_state.decoder,
+                        system,
+                        get_sat_state(track_state, receiver_sat_state.prn),
+                    ),
                 )
             end
+        end
 
-        if length(pvt_satellite_states) >= 4
-            pvt = calc_pvt(pvt_satellite_states, pvt; approximate_year)
+        if length(pvt_sat_state_buffer) >= 4
+            pvt = calc_pvt(pvt_sat_state_buffer, pvt; approximate_year)
         end
 
         last_time_pvt_ran = runtime
