@@ -114,11 +114,15 @@ struct ReceiverState{
     TS<:TrackState,
     AB<:SampleBuffer,
     P<:PVTSolution,
+    PB<:AbstractVector{<:SatelliteState},
 }
     track_state::TS
     receiver_sat_states::RS
     acquisition_buffer::AB
     pvt::P
+    # Reused across PVT cycles: `update_pvt` refills this in place each cycle
+    # instead of allocating a fresh `Vector{SatelliteState}` (see `update_pvt`).
+    pvt_sat_state_buffer::PB
     runtime::typeof(1.0u"s")
     last_time_acquisition_ran::typeof(1.0u"s")
     last_time_pvt_ran::typeof(1.0u"s")
@@ -164,11 +168,16 @@ function ReceiverState(
     decoder = GNSSDecoderState(system, 1)
     receiver_sat_states = (Dictionary{Int64,ReceiverSatState{typeof(decoder)}}(),)
     pvt = PositionVelocityTime.PVTSolution()
+    # Preallocated (empty) buffer reused by `update_pvt`. `SatelliteState`'s code
+    # phase / carrier phase are `Float64`; it embeds the decoder by value, so the
+    # element type is pinned to this receiver's decoder and system types.
+    pvt_sat_state_buffer = SatelliteState{Float64,typeof(decoder),typeof(system)}[]
     ReceiverState(
         track_state,
         receiver_sat_states,
         acquisition_buffer,
         pvt,
+        pvt_sat_state_buffer,
         0.0u"s",
         -Inf * 1.0u"s",
         -Inf * 1.0u"s",

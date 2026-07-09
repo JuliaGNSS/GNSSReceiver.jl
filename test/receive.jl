@@ -43,11 +43,15 @@
 
     pvt = PositionVelocityTime.PVTSolution()
 
+    decoder = GNSSDecoderState(system, 1)
+    pvt_sat_state_buffer = SatelliteState{Float64,typeof(decoder),typeof(system)}[]
+
     receiver_state = ReceiverState(
         track_state,
         receiver_sat_states,
         acquisition_buffer,
         pvt,
+        pvt_sat_state_buffer,
         0.0u"s",
         -Inf * 1.0u"s",
         -Inf * 1.0u"s",
