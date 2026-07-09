@@ -159,7 +159,16 @@ function update_pvt(
 end
 
 function update_receiver_sat_states(receiver_sat_states, track_state, signal_duration)
-    return map(receiver_sat_states) do receiver_sat_state
+    # In-place `map!` reuses the storage `receiver_sat_states` already owns
+    # instead of `map`, which calls `similar(d)` and allocates a fresh
+    # `Memory{ReceiverSatState}` (~20 KB / frame) every call. Input and output
+    # alias the same dictionary: `map!` reads the old value at each token,
+    # computes the new one, then writes it back at that token, so aliasing is
+    # safe. The immutable `ReceiverSatState` is built in registers and memcpied
+    # into the slot it already occupies — no per-frame heap allocation. Mirrors
+    # the in-place `track!` adopted in c1c8b26; the previous frame's state is
+    # discarded each frame, so mutating in place is not observable downstream.
+    return map!(receiver_sat_states, receiver_sat_states) do receiver_sat_state
         if is_in_lock(receiver_sat_state)
             prn = receiver_sat_state.prn
             ReceiverSatState(
