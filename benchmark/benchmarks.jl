@@ -1,6 +1,6 @@
 using BenchmarkTools
 using GNSSReceiver
-using GNSSReceiver: ReceiverState, NumAnts, process, receive
+using GNSSReceiver: ReceiverState, NumAnts, process
 using GNSSSignals
 using Unitful
 using Unitful: Hz, ms, s
@@ -45,6 +45,25 @@ const DC =
 # + a fine-Doppler reacquisition plan). Lets `benchpkg --bench-on=head` compute a
 # real base-vs-head ratio across this API-breaking bump.
 const _HAS_V2_ACQ = isdefined(Acquisition, :plan_acquire)
+
+# `receive` renamed its acquisition-length keyword across the v3 bump
+# (`num_code_cycles_for_acquisition` -> `acquisition_num_coherent_code_periods`).
+# Pick whichever the loaded `receive` method declares so the receive benchmark
+# below runs against both the pre-v3 base and the v3 head.
+const _ACQ_CYCLES_KW =
+    :acquisition_num_coherent_code_periods in Base.kwarg_decl(first(methods(receive))) ?
+    (; acquisition_num_coherent_code_periods = ACQ_CODE_CYCLES) :
+    (; num_code_cycles_for_acquisition = ACQ_CODE_CYCLES)
+
+# The `receive` benchmark feeds `Complex{Int16}` chunks and lets `receive`
+# auto-select the downconvert-and-correlator from the element type. On the head
+# revision that resolves to Tracking's fast integer backend, which needs
+# `max_meas` (the front-end full-scale). The ION recording is 8-bit offset-binary
+# recentred on 128, so |real|/|imag| ≤ 128 → `max_meas = 2^7`. The pre-`max_meas`
+# base revision has no such keyword, so feature-detect it: base then falls back to
+# its CPU-on-Int16 default and the base/head ratio shows the integer-backend win.
+const _MAX_MEAS_KW =
+    :max_meas in Base.kwarg_decl(first(methods(receive))) ? (; max_meas = 2^7) : (;)
 
 # `plan_args` splat into `process` so the same call handles both signatures:
 # v2 process(rs, acq_plan, meas, …); v1 process(rs, acq_plan, fast_re_acq_plan, meas, …).
@@ -114,6 +133,17 @@ end
 # All chunks needed: LOCK_SECONDS of setup followed by RUN_SECONDS of timed run.
 const CHUNKS = load_chunks(N_LOCK + N_RUN)
 
+# `receive` consumes matrix chunks (num_samples × num_ants) off a channel, whereas
+# the direct-`process` benchmarks fold over plain vectors. Materialise the first
+# N_RUN chunks as (CHUNK, 1) `Complex{Int16}` matrices once, so the timed feed only
+# enqueues them — and so `receive` auto-selects the integer backend from the
+# element type. The float `CHUNKS` are the 8-bit source recentred on 127.5; round
+# to `Int16` (values within ±128, matching `_MAX_MEAS_KW`'s `2^7`).
+const MATRIX_CHUNKS = [
+    complex.(round.(Int16, real.(m)), round.(Int16, imag.(m))) for
+    m in (reshape(c, CHUNK, 1) for c in @view CHUNKS[1:N_RUN])
+]
+
 # Drive `process` with a plain reassignment `for` loop rather than `foldl`. This
 # mirrors how `receive` actually calls `process`. It matters for allocation: the
 # `process`/`foldl` combination is fully type-stable (the fold operator infers a
@@ -127,6 +157,33 @@ function run_process(rs, plan_args, chunks, acquire_every)
         rs = _process(rs, plan_args, c; acquire_every)
     end
     return rs
+end
+
+# Drive the full public `receive` pipeline: a producer task feeds `Complex{Int16}`
+# chunks onto a MatrixSizedChannel, `receive` spawns its own acquisition+tracking
+# task, and the resulting data channel is drained here. No `downconvert_and_correlator`
+# is passed, so `receive` auto-selects it from the element type — the integer
+# backend on head (via `_MAX_MEAS_KW`), the CPU fallback on the pre-`max_meas` base.
+# The base/head delta is the integer-backend speedup diluted by the channel
+# producer/consumer plumbing and per-chunk ReceiverState churn that the
+# `process`-only benchmarks bypass.
+function run_receive(chunks, acquire_every)
+    measurement_channel = GNSSReceiver.MatrixSizedChannel{Complex{Int16}}(CHUNK, 1) do ch
+        for c in chunks
+            put!(ch, c)
+        end
+    end
+    data_channel = receive(
+        measurement_channel,
+        SYSTEM,
+        SAMPLING_FREQ;
+        num_ants = NumAnts(1),
+        acquire_every,
+        _ACQ_CYCLES_KW...,
+        _MAX_MEAS_KW...,
+    )
+    GNSSReceiver.consume_channel(_ -> nothing, data_channel)
+    return nothing
 end
 
 # ── Benchmark: process without acquisition over RUN_SECONDS ───────────────
@@ -170,46 +227,13 @@ function bench_process_with_acquisition()
     )
 end
 
-# `receive` consumes (CHUNK × 1) matrix chunks off a `MatrixSizedChannel`, whereas
-# the direct-`process` benchmarks fold over plain vectors. Materialise the first
-# N_RUN chunks as matrices once, so the timed feed only enqueues them.
-const RECEIVE_CHUNKS = [reshape(c, CHUNK, 1) for c in @view CHUNKS[1:N_RUN]]
-
-make_measurement_channel(chunks) =
-    GNSSReceiver.MatrixSizedChannel{ComplexF32}(CHUNK, 1) do ch
-        for c in chunks
-            put!(ch, c)
-        end
-    end
-
-# Drive the full public `receive` pipeline: a producer task feeds chunks onto the
-# measurement channel, `receive` spawns its own acquisition + tracking task, and the
-# resulting data channel is drained here with a no-op consumer. Unlike the
-# `process`-only benchmarks, this exercises the per-chunk `sat_data` /
-# `ReceiverDataOfInterest` construction and the channel plumbing, so it tracks the
-# receiver's real end-to-end allocation (where the `receiver_state`-boxing fix lands).
-function run_receive(chunks, acquire_every)
-    measurement_channel = make_measurement_channel(chunks)
-    data_channel = receive(
-        measurement_channel,
-        SYSTEM,
-        SAMPLING_FREQ;
-        num_ants = NumAnts(1),
-        acquire_every,
-        acquisition_num_coherent_code_periods = ACQ_CODE_CYCLES,
-        approximate_year = 2017,
-    )
-    GNSSReceiver.consume_channel(_ -> nothing, data_channel)
-    return nothing
-end
-
 # ── Benchmark: full receive() pipeline with acquisition every 10 sec ──────
 # End-to-end analogue of `bench_process_with_acquisition`, but through the public
-# `receive` entry point (channel producer/consumer + spawned tracking task + the
-# per-chunk `sat_data` build) rather than a direct `process` loop. Fresh receiver,
-# re-acquiring every 10 s.
+# `receive` entry point (channel producer/consumer + spawned tracking task)
+# instead of a direct `process` fold — so it captures the plumbing overhead the
+# process benchmarks isolate away. Fresh receiver, re-acquiring every 10 s.
 function bench_receive_with_acquisition()
-    @benchmarkable run_receive($RECEIVE_CHUNKS, 10u"s")
+    @benchmarkable run_receive($MATRIX_CHUNKS, 10u"s")
 end
 
 # ── Register benchmarks ───────────────────────────────────────────────────
