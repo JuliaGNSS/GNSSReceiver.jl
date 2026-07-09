@@ -15,6 +15,8 @@ using StaticArrays,
     Dictionaries,
     Dates
 
+using FixedSizeArrays: FixedSizeMatrixDefault
+
 export ReceiverState,
     receive,
     reset_but_keep_decoders_and_pvt,
@@ -185,6 +187,7 @@ function ReceiverState(
     )
 end
 
+include("pipe_channel.jl")
 include("channel.jl")
 include("read_file.jl")
 include("receive.jl")
@@ -276,7 +279,7 @@ function gnss_write_to_file(;
         # Getting samples in chunks of `mtu`
         data_stream = stream_data(stream, eval_num_samples)
 
-        write_to_file(data_stream, output_file)
+        wait(write_to_file(data_stream, output_file))
     end
 end
 

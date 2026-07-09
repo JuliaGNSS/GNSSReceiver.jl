@@ -5,13 +5,11 @@ function read_files(
     type = Complex{Int16},
 )
     num_ants = files isa AbstractVector ? length(files) : 1
-    return spawn_channel_thread(; T = type, num_samples, num_antenna_channels = num_ants) do out
-        # Use two chunks to avoid race condition (One to fill and one to read)
-        chunk_idx = 1
-        chunks = [
-            Matrix{type}(undef, num_samples, num_ants),
-            Matrix{type}(undef, num_samples, num_ants),
-        ]
+    return spawn_signal_channel_thread(;
+        T = type,
+        num_samples,
+        num_antenna_channels = num_ants,
+    ) do out
         streams = open.(files)
         num_read_samples = 0
         try
@@ -20,10 +18,13 @@ function read_files(
                    end_condition isa Base.Event && end_condition.set
                     break
                 end
-                read_measurement!(streams, chunks[chunk_idx])
+                # Allocate a fresh buffer per chunk: the lock-free SignalChannel is
+                # buffered, so the consumer may still hold a previously enqueued
+                # buffer while we fill the next one.
+                chunk = FixedSizeMatrixDefault{type}(undef, num_samples, num_ants)
+                read_measurement!(streams, chunk)
                 num_read_samples += num_samples
-                push!(out, chunks[chunk_idx])
-                chunk_idx = mod1(chunk_idx + 1, length(chunks))
+                put!(out, chunk)
             end
         catch e
             if e isa EOFError
