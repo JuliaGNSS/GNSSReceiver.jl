@@ -10,6 +10,36 @@ struct ReceiverDataOfInterest{S<:SatelliteDataOfInterest}
     runtime::typeof(1.0u"s")
 end
 
+# Pick the downconvert-and-correlator backend from the sample element type at
+# compile time (the measurement channel's `T`). `Complex{Int16}` inputs get
+# Tracking's fast integer backend automatically; every other element type (float
+# samples) keeps the general CPU backend. The type is known upfront from the
+# channel, so this needs no runtime probing and stays type-stable — and callers
+# can still override the whole choice via the `downconvert_and_correlator` keyword.
+#
+# The integer backend needs `max_meas` (the front-end full-scale, e.g. `2^11` for
+# a 12-bit ADC) — the largest `|real|`/`|imag|` any sample takes. It can't be
+# inferred from the element type (an `Int16` buffer may be 8-bit, 12-bit or
+# full-scale data), and Tracking deliberately gives it no default because
+# under-declaring it silently overflows the Int16 carrier wipe and corrupts the
+# correlation. So require it explicitly for `Complex{Int16}` and fail loudly when
+# it's missing rather than guessing.
+default_downconvert_and_correlator(::Type, max_meas) =
+    CPUThreadedDownconvertAndCorrelator()
+function default_downconvert_and_correlator(::Type{Complex{Int16}}, max_meas)
+    max_meas === nothing && throw(
+        ArgumentError(
+            "Complex{Int16} measurements use Tracking's fast integer downconvert " *
+            "and correlator, which needs `max_meas` — the front end's full-scale " *
+            "(largest |real|/|imag| of any sample, e.g. `2^11` for a 12-bit ADC). " *
+            "Pass it as `receive(...; max_meas = ...)`, or pass an explicit " *
+            "`downconvert_and_correlator`. It has no default because under-" *
+            "declaring it silently corrupts the correlation.",
+        ),
+    )
+    Int16ThreadedDownconvertAndCorrelator(max_meas)
+end
+
 function receive(
     measurement_channel::MatrixSizedChannel{T},
     system,
@@ -31,7 +61,8 @@ function receive(
             acquisition_num_noncoherent_accumulations,
         ),
     ),
-    downconvert_and_correlator = CPUThreadedDownconvertAndCorrelator(),
+    max_meas = nothing,
+    downconvert_and_correlator = default_downconvert_and_correlator(T, max_meas),
     acquisition_false_alarm_probability = 1e-4,
     code_lock_cn0_threshold = get_default_code_lock_cn0_threshold(system),
     time_in_lock_before_calculating_pvt = 2u"s",
