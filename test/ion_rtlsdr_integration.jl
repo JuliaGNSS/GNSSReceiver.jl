@@ -20,22 +20,17 @@ _ion_sample(::Type{Complex{Int16}}, i::UInt8, q::UInt8) =
 function _ion_produce!(ch, ::Type{T}, dat_file, num_samples, num_ants) where {T}
     io = open(dat_file)
     raw_buf = Vector{UInt8}(undef, 2 * num_samples)
-    # Two ping-pong chunks so the consumer can hold one while we fill the other.
-    chunks = [
-        Matrix{T}(undef, num_samples, num_ants),
-        Matrix{T}(undef, num_samples, num_ants),
-    ]
-    chunk_idx = 1
     try
         while !eof(io)
             n = readbytes!(io, raw_buf)
             n < 2 * num_samples && break
-            chunk = chunks[chunk_idx]
+            # Fresh buffer per chunk: the lock-free SignalChannel is buffered, so the
+            # consumer may still hold a previously enqueued buffer while we fill this one.
+            chunk = GNSSReceiver.FixedSizeMatrixDefault{T}(undef, num_samples, num_ants)
             @inbounds for i = 1:num_samples
                 chunk[i, 1] = _ion_sample(T, raw_buf[2i-1], raw_buf[2i])
             end
             put!(ch, chunk)
-            chunk_idx = mod1(chunk_idx + 1, length(chunks))
         end
     finally
         close(io)
@@ -73,7 +68,7 @@ let
         expected_prns = Set([5, 13, 15, 20, 21, 28, 30])
 
         measurement_channel =
-            GNSSReceiver.MatrixSizedChannel{type}(num_samples, num_ants) do ch
+            GNSSReceiver.SignalChannel{type,num_ants}(num_samples) do ch
                 _ion_produce!(ch, type, dat_file, num_samples, num_ants)
             end
 

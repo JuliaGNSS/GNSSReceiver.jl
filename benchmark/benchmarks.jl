@@ -309,14 +309,39 @@ end
 # benchmarks call the threaded correlator with no wrapping task and stay stable).
 # The non-threaded correlator removes that nesting, trading throughput for a more
 # reproducible measurement.
-const RECEIVE_STEADY_CHUNKS = [reshape(c, CHUNK, 1) for c in STAGES_INT16.pvt_chunks]
+# The measurement channel changed from the `Channel`-backed `MatrixSizedChannel` to
+# the lock-free `SignalChannel` (which carries `FixedSizeMatrixDefault` buffers).
+# Feature-detect which the loaded build provides so this one head script benchmarks
+# both revisions: build the matching channel type and chunk buffers for whichever
+# `GNSSReceiver` is loaded.
+const _HAS_SIGNAL_CHANNEL = isdefined(GNSSReceiver, :SignalChannel)
 
-function run_receive_steady(chunks, receiver_state, dc)
-    measurement_channel = GNSSReceiver.MatrixSizedChannel{Complex{Int16}}(CHUNK, 1) do ch
-        for c in chunks
-            put!(ch, c)
+# `SignalChannel` requires `FixedSizeMatrixDefault` buffers; `MatrixSizedChannel`
+# takes plain matrices. Materialise the 1 s of chunks once, in the right buffer type.
+const RECEIVE_STEADY_CHUNKS =
+    let mats = [reshape(c, CHUNK, 1) for c in STAGES_INT16.pvt_chunks]
+        _HAS_SIGNAL_CHANNEL ?
+        [GNSSReceiver.FixedSizeMatrixDefault{Complex{Int16}}(m) for m in mats] : mats
+    end
+
+function make_measurement_channel(chunks)
+    if _HAS_SIGNAL_CHANNEL
+        GNSSReceiver.SignalChannel{Complex{Int16},1}(CHUNK) do ch
+            for c in chunks
+                put!(ch, c)
+            end
+        end
+    else
+        GNSSReceiver.MatrixSizedChannel{Complex{Int16}}(CHUNK, 1) do ch
+            for c in chunks
+                put!(ch, c)
+            end
         end
     end
+end
+
+function run_receive_steady(chunks, receiver_state, dc)
+    measurement_channel = make_measurement_channel(chunks)
     # dc === nothing → let `receive` auto-select (threaded); otherwise force it.
     dc_kw = dc === nothing ? (;) : (; downconvert_and_correlator = dc)
     data_channel = receive(
@@ -343,6 +368,20 @@ function bench_receive_steady(dc)
     )
 end
 
+# ── Measurement-channel transport only (no tracking) ────────────────────────
+# Feed the chunks through the measurement channel and drain them with a no-op
+# consumer — no tracking/acquisition. This isolates the per-chunk channel overhead
+# the lock-free `SignalChannel` change targets, which the tracking-dominated
+# `receive`/`process` benchmarks bury. Being sub-second it gets many samples, so its
+# ratio is far less noisy than the multi-second end-to-end runs.
+function run_channel_transport(chunks)
+    channel = make_measurement_channel(chunks)
+    GNSSReceiver.consume_channel(_ -> nothing, channel)
+    return nothing
+end
+
+bench_channel_transport() = @benchmarkable run_channel_transport($RECEIVE_STEADY_CHUNKS)
+
 # ── Register benchmarks ───────────────────────────────────────────────────
 # Float and Int16 variants of each process-stage benchmark so float-vs-Int16 is
 # compared like-for-like within a single build.
@@ -359,3 +398,6 @@ SUITE["tracking + PVT ($STAGE_LABEL)"]["1-ant Int16"] = bench_pvt_stage(STAGES_I
 SUITE["receive steady-state ($STAGE_LABEL)"]["1-ant Int16 threaded"] = bench_receive_steady(nothing)
 SUITE["receive steady-state ($STAGE_LABEL)"]["1-ant Int16 non-threaded"] =
     bench_receive_steady(DC_INT16_NOTHREAD)
+# Isolated channel transport (no tracking): directly shows the per-chunk overhead
+# the lock-free channel reduces, with low run-to-run noise (sub-second, many samples).
+SUITE["channel transport ($STAGE_LABEL)"]["1-ant"] = bench_channel_transport()

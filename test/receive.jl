@@ -8,7 +8,7 @@
     num_samples = 20000
     num_ants = 4
 
-    measurement_channel = GNSSReceiver.MatrixSizedChannel{type}(num_samples, num_ants) do ch
+    measurement_channel = GNSSReceiver.SignalChannel{type,num_ants}(num_samples) do ch
         # Seed a local RNG so the noise — and hence any acquisition false alarms — is
         # deterministic and this test isn't flaky. An explicit Xoshiro avoids the
         # task-local RNG nondeterminism of the producer running in a spawned task.
@@ -17,12 +17,22 @@
             foreach(
                 i -> put!(
                     ch,
-                    type.(round.(randn(rng, ComplexF32, num_samples, num_ants) * 512)),
+                    GNSSReceiver.FixedSizeMatrixDefault{type}(
+                        type.(round.(randn(rng, ComplexF32, num_samples, num_ants) * 512)),
+                    ),
                 ),
                 1:20,
             )
         else
-            foreach(i -> put!(ch, randn(rng, type, num_samples, num_ants) * 512), 1:20)
+            foreach(
+                i -> put!(
+                    ch,
+                    GNSSReceiver.FixedSizeMatrixDefault{type}(
+                        randn(rng, type, num_samples, num_ants) * 512,
+                    ),
+                ),
+                1:20,
+            )
         end
     end
 
@@ -66,7 +76,7 @@
         0,
     )
 
-    measurement_channel = GNSSReceiver.MatrixSizedChannel{type}(num_samples, num_ants) do ch
+    measurement_channel = GNSSReceiver.SignalChannel{type,num_ants}(num_samples) do ch
         # Seed a local RNG so the noise — and hence any acquisition false alarms — is
         # deterministic and this test isn't flaky. An explicit Xoshiro avoids the
         # task-local RNG nondeterminism of the producer running in a spawned task.
@@ -75,12 +85,22 @@
             foreach(
                 i -> put!(
                     ch,
-                    type.(round.(randn(rng, ComplexF32, num_samples, num_ants) * 512)),
+                    GNSSReceiver.FixedSizeMatrixDefault{type}(
+                        type.(round.(randn(rng, ComplexF32, num_samples, num_ants) * 512)),
+                    ),
                 ),
                 1:20,
             )
         else
-            foreach(i -> put!(ch, randn(rng, type, num_samples, num_ants) * 512), 1:20)
+            foreach(
+                i -> put!(
+                    ch,
+                    GNSSReceiver.FixedSizeMatrixDefault{type}(
+                        randn(rng, type, num_samples, num_ants) * 512,
+                    ),
+                ),
+                1:20,
+            )
         end
     end
 

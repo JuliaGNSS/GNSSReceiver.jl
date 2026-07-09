@@ -46,7 +46,7 @@ const PRNMARKERS = (
 )
 
 function get_gui_data_channel(
-    data_channel::Channel{<:ReceiverDataOfInterest},
+    data_channel::AbstractChannel{<:ReceiverDataOfInterest},
     push_gui_data_roughly_every = 500u"ms",
 )
     gui_data_channel = Channel{GUIData}()
