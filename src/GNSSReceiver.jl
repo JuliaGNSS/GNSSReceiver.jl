@@ -203,6 +203,10 @@ function gnss_receiver_gui(;
     interm_freq = 0.0u"Hz",
     gain::Union{Nothing,<:Unitful.Gain} = nothing,
     antenna = nothing,
+    # Front-end full-scale for the integer downconvert-and-correlator, required
+    # when the SDR's `native_stream_format` is `Complex{Int16}` (see `receive`).
+    # Leave `nothing` for float-native devices.
+    max_meas = nothing,
 )
     num_samples_acquisition = Int(upreferred(sampling_freq * acquisition_time))
     eval_num_samples = Int(upreferred(sampling_freq * run_time))
@@ -236,8 +240,14 @@ function gnss_receiver_gui(;
         reshunked_stream = rechunk(buffered_stream, num_samples_acquisition)
 
         # Performing GNSS acquisition and tracking
-        data_channel =
-            receive(reshunked_stream, system, sampling_freq; num_ants, interm_freq)
+        data_channel = receive(
+            reshunked_stream,
+            system,
+            sampling_freq;
+            num_ants,
+            interm_freq,
+            max_meas,
+        )
 
         gui_channel = get_gui_data_channel(data_channel)
 
@@ -277,6 +287,10 @@ function receive_and_gui(
     sampling_freq = 5e6u"Hz",
     type = Complex{Int16},
     num_ants = NumAnts(4),
+    # Front-end full-scale for the integer downconvert-and-correlator, required
+    # for the default `Complex{Int16}` file type (see `receive`). Leave `nothing`
+    # for float file types.
+    max_meas = nothing,
 )
     #    files = map(i -> "/mnt/data_disk/measurementComplex{Int16}$i.dat", 1:2)
     close_stream_event = Base.Event()
@@ -293,6 +307,7 @@ function receive_and_gui(
         adjusted_sample_freq;
         num_ants,
         interm_freq = clock_drift * get_center_frequency(system),
+        max_meas,
     )
     # Get gui channel from data channel
     gui_channel = get_gui_data_channel(data_channel)

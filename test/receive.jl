@@ -26,8 +26,16 @@
         end
     end
 
-    data_channel =
-        receive(measurement_channel, system, sampling_freq; num_ants = NumAnts(num_ants))
+    # Samples are `randn * 512`, so |real|/|imag| stays well under 2^12; declare
+    # that as the Int16 full-scale. `max_meas` is ignored for float element types.
+    max_meas = 2^12
+    data_channel = receive(
+        measurement_channel,
+        system,
+        sampling_freq;
+        num_ants = NumAnts(num_ants),
+        max_meas,
+    )
 
     GNSSReceiver.consume_channel(data_channel) do data
         @test length(data.sat_data) == 0
@@ -82,6 +90,7 @@
         sampling_freq;
         num_ants = NumAnts(num_ants),
         receiver_state,
+        max_meas,
     )
 
     GNSSReceiver.consume_channel(data_channel) do data
