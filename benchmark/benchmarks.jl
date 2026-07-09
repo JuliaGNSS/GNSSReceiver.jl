@@ -40,6 +40,13 @@ const DC =
     Tracking.CPUThreadedDownconvertAndCorrelator() :
     Tracking.CPUThreadedDownconvertAndCorrelator(Val(SAMPLING_FREQ))
 
+# Fast integer backend for the `Complex{Int16}` benchmark variants, passed
+# explicitly (unlike `receive`, `process` doesn't auto-select). `max_meas = 2^7`
+# matches the 8-bit ION source recentred on 128. Available on both revisions
+# (both use Tracking v3), so the Int16 rows compare like-for-like across base/head
+# and the float-vs-Int16 gap within a column is the integer-backend speedup.
+const DC_INT16 = Tracking.Int16ThreadedDownconvertAndCorrelator(2^7)
+
 # Feature-detect the acquisition API so this one script runs against both the
 # Acquisition-v2 head (plan_acquire, single plan) and a pre-v2 base (AcquisitionPlan
 # + a fine-Doppler reacquisition plan). Lets `benchpkg --bench-on=head` compute a
@@ -67,25 +74,25 @@ const _MAX_MEAS_KW =
 
 # `plan_args` splat into `process` so the same call handles both signatures:
 # v2 process(rs, acq_plan, meas, …); v1 process(rs, acq_plan, fast_re_acq_plan, meas, …).
-_process(rs, plan_args, meas; kwargs...) = process(
+_process(rs, plan_args, meas, dc; kwargs...) = process(
     rs,
     plan_args...,
     meas,
     SYSTEM,
     SAMPLING_FREQ;
-    downconvert_and_correlator = DC,
+    downconvert_and_correlator = dc,
     num_ants = NumAnts(1),
     approximate_year = 2017,
     kwargs...,
 )
 
-function make_receiver_and_plan()
+function make_receiver_and_plan(::Type{T}) where {T}
     nacq = round(
         Int,
         get_code_length(SYSTEM) * upreferred(SAMPLING_FREQ / get_code_frequency(SYSTEM)) *
         ACQ_CODE_CYCLES,
     )
-    rs = ReceiverState(ComplexF32, SYSTEM; num_ants = NumAnts(1), num_samples_for_acquisition = nacq)
+    rs = ReceiverState(T, SYSTEM; num_ants = NumAnts(1), num_samples_for_acquisition = nacq)
     plan_args = if _HAS_V2_ACQ
         (Acquisition.plan_acquire(
             SYSTEM,
@@ -133,16 +140,17 @@ end
 # All chunks needed: LOCK_SECONDS of setup followed by RUN_SECONDS of timed run.
 const CHUNKS = load_chunks(N_LOCK + N_RUN)
 
+# `Complex{Int16}` copies of the same chunks for the integer-backend variants. The
+# float `CHUNKS` are the 8-bit source recentred on 127.5; round to `Int16` (values
+# within ±128, matching `DC_INT16`'s `max_meas = 2^7`).
+const CHUNKS_INT16 =
+    [complex.(round.(Int16, real.(c)), round.(Int16, imag.(c))) for c in CHUNKS]
+
 # `receive` consumes matrix chunks (num_samples × num_ants) off a channel, whereas
 # the direct-`process` benchmarks fold over plain vectors. Materialise the first
-# N_RUN chunks as (CHUNK, 1) `Complex{Int16}` matrices once, so the timed feed only
-# enqueues them — and so `receive` auto-selects the integer backend from the
-# element type. The float `CHUNKS` are the 8-bit source recentred on 127.5; round
-# to `Int16` (values within ±128, matching `_MAX_MEAS_KW`'s `2^7`).
-const MATRIX_CHUNKS = [
-    complex.(round.(Int16, real.(m)), round.(Int16, imag.(m))) for
-    m in (reshape(c, CHUNK, 1) for c in @view CHUNKS[1:N_RUN])
-]
+# N_RUN Int16 chunks as (CHUNK, 1) matrices once, so the timed feed only enqueues
+# them — and so `receive` auto-selects the integer backend from the element type.
+const MATRIX_CHUNKS = [reshape(c, CHUNK, 1) for c in @view CHUNKS_INT16[1:N_RUN]]
 
 # Drive `process` with a plain reassignment `for` loop rather than `foldl`. This
 # mirrors how `receive` actually calls `process`. It matters for allocation: the
@@ -152,9 +160,9 @@ const MATRIX_CHUNKS = [
 # temporaries that `Tracking.track!` builds each chunk, so they get heap-allocated
 # (~4x the real allocation). A `for` loop keeps `process` in one frame where those
 # temporaries are elided, matching real-world `receive` behaviour.
-function run_process(rs, plan_args, chunks, acquire_every)
+function run_process(rs, plan_args, chunks, dc, acquire_every)
     for c in chunks
-        rs = _process(rs, plan_args, c; acquire_every)
+        rs = _process(rs, plan_args, c, dc; acquire_every)
     end
     return rs
 end
@@ -189,11 +197,13 @@ end
 # ── Benchmark: process without acquisition over RUN_SECONDS ───────────────
 # Acquire and lock over the first LOCK_SECONDS (setup, not timed), then benchmark
 # processing the following RUN_SECONDS with acquire_every huge — no acquisition in
-# the timed run. A fix is obtained partway through, so PVT runs too.
-function bench_process_without_acquisition()
-    rs, plan_args = make_receiver_and_plan()
-    locked = run_process(rs, plan_args, @view(CHUNKS[1:N_LOCK]), NEVER)
-    timed_chunks = CHUNKS[N_LOCK+1:N_LOCK+N_RUN]
+# the timed run. A fix is obtained partway through, so PVT runs too. Parameterized
+# on sample element type + correlator so the float and Int16 variants time the same
+# work through their respective backends (fair like-for-like within each column).
+function bench_process_without_acquisition(::Type{T}, dc, chunks) where {T}
+    rs, plan_args = make_receiver_and_plan(T)
+    locked = run_process(rs, plan_args, @view(chunks[1:N_LOCK]), dc, NEVER)
+    timed_chunks = chunks[N_LOCK+1:N_LOCK+N_RUN]
     # `process` mutates the receiver state in place — the in-place `track!`
     # (c1c8b26) and the in-place `map!` in `update_receiver_sat_states`. If every
     # BenchmarkTools evaluation re-ran the *same* `locked` object, each one would
@@ -203,7 +213,7 @@ function bench_process_without_acquisition()
     # sample a fresh `deepcopy` of the locked state and pin `evals=1`, so every
     # measured sample is one honest 45 s forward pass over the full sat set.
     @benchmarkable(
-        run_process(state, $plan_args, $timed_chunks, NEVER),
+        run_process(state, $plan_args, $timed_chunks, $dc, NEVER),
         setup = (state = deepcopy($locked)),
         evals = 1,
     )
@@ -211,17 +221,18 @@ end
 
 # ── Benchmark: process with acquisition every 10 sec over RUN_SECONDS ─────
 # Process RUN_SECONDS from a fresh receiver, re-acquiring every 10 s as in normal
-# operation — acquire, lock, decode, and reach a position fix.
-function bench_process_with_acquisition()
-    rs, plan_args = make_receiver_and_plan()
-    timed_chunks = CHUNKS[1:N_RUN]
+# operation — acquire, lock, decode, and reach a position fix. Parameterized like
+# `bench_process_without_acquisition`.
+function bench_process_with_acquisition(::Type{T}, dc, chunks) where {T}
+    rs, plan_args = make_receiver_and_plan(T)
+    timed_chunks = chunks[1:N_RUN]
     # Same in-place-mutation caveat as above: hand each sample a fresh deepcopy
     # of the (empty) starting receiver and pin evals=1 so every sample is one
     # honest 45 s run that acquires and locks from scratch. The acquisition plan
     # holds only reusable FFT scratch (overwritten each `acquire!`), so it is
     # shared across samples rather than copied.
     @benchmarkable(
-        run_process(state, $plan_args, $timed_chunks, 10u"s"),
+        run_process(state, $plan_args, $timed_chunks, $dc, 10u"s"),
         setup = (state = deepcopy($rs)),
         evals = 1,
     )
@@ -237,6 +248,15 @@ function bench_receive_with_acquisition()
 end
 
 # ── Register benchmarks ───────────────────────────────────────────────────
-SUITE["process without acquisition ($RUN_LABEL)"]["1-ant"] = bench_process_without_acquisition()
-SUITE["process with acquisition every 10 sec ($RUN_LABEL)"]["1-ant"] = bench_process_with_acquisition()
+# Float and Int16 variants of each process benchmark so float-vs-Int16 is compared
+# like-for-like within a single build (the integer-backend speedup is a Tracking
+# feature present on both revisions, not a base/head difference).
+SUITE["process without acquisition ($RUN_LABEL)"]["1-ant float"] =
+    bench_process_without_acquisition(ComplexF32, DC, CHUNKS)
+SUITE["process without acquisition ($RUN_LABEL)"]["1-ant Int16"] =
+    bench_process_without_acquisition(Complex{Int16}, DC_INT16, CHUNKS_INT16)
+SUITE["process with acquisition every 10 sec ($RUN_LABEL)"]["1-ant float"] =
+    bench_process_with_acquisition(ComplexF32, DC, CHUNKS)
+SUITE["process with acquisition every 10 sec ($RUN_LABEL)"]["1-ant Int16"] =
+    bench_process_with_acquisition(Complex{Int16}, DC_INT16, CHUNKS_INT16)
 SUITE["receive with acquisition every 10 sec ($RUN_LABEL)"]["1-ant"] = bench_receive_with_acquisition()
