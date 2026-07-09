@@ -43,7 +43,17 @@ function fmt_time(ns)
     string(round(ns / div; sigdigits = 3), " ", unit)
 end
 
-fmt_mem(node) = string(round(Int, node["allocs"]), " allocs: ", round(Int, node["memory"]), " B")
+# Human-readable byte sizes (binary units) so the memory table isn't a wall of raw bytes.
+function fmt_bytes(bytes)
+    b = Float64(bytes)
+    unit, div = b < 1024 ? ("B", 1.0) :
+                b < 1024^2 ? ("KiB", 1024.0) :
+                b < 1024^3 ? ("MiB", 1024.0^2) : ("GiB", 1024.0^3)
+    string(round(b / div; sigdigits = 3), " ", unit)
+end
+
+membytes(node) = Float64(node["memory"])
+fmt_mem(node) = string(round(Int, node["allocs"]), " allocs: ", fmt_bytes(node["memory"]))
 
 base = leaves!(Dict{String,Any}(), readrev(base_rev))
 head = leaves!(Dict{String,Any}(), readrev(head_rev))
@@ -96,13 +106,22 @@ println(io)
 # --- memory table ---
 println(io, "<details><summary>Memory benchmarks</summary>")
 println(io)
-println(io, "|  | $baselbl | $headlbl |")
-println(io, "|:--|--:|--:|")
+println(io, "Ratio = $baselbl / $headlbl **memory**: >1 means the PR allocates less. ",
+            "✅ ≥ 5 % less, ⚠️ ≥ 5 % more.")
+println(io)
+println(io, "|  | $baselbl | $headlbl | $baselbl / $headlbl |")
+println(io, "|:--|--:|--:|--:|")
 for n in names
     b = get(base, n, nothing); h = get(head, n, nothing)
     bcell = b === nothing ? "" : fmt_mem(b)
     hcell = h === nothing ? "" : fmt_mem(h)
-    println(io, "| $n | $bcell | $hcell |")
+    if b !== nothing && h !== nothing
+        ratio = round(membytes(b) / membytes(h); sigdigits = 3)
+        rcell = ratio >= 1.05 ? "$ratio ✅" : ratio <= 0.95 ? "$ratio ⚠️" : "$ratio"
+    else
+        rcell = h === nothing ? "🗑" : "🆕"
+    end
+    println(io, "| $n | $bcell | $hcell | $rcell |")
 end
 println(io)
 println(io, "</details>")
