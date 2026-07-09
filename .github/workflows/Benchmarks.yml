@@ -75,14 +75,19 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           mkdir -p results
+          # Run the benchmark subprocess with all available threads (`-t auto`), passed
+          # through benchpkg's --exeflags. The tracking hot loop uses a
+          # CPUThreadedDownconvertAndCorrelator, so single-threaded numbers understate
+          # real multi-core throughput; `auto` matches the runner's core count (and both
+          # head and base get the same flag, so the ratio stays comparable).
           # Benchmark head and base independently so a broken *base* revision (e.g. a
           # base branch that doesn't build against the current registry deps) still
           # yields the PR's own numbers instead of aborting the whole run. The head rev
           # must succeed (it's the PR's code); a base failure is only a warning.
           benchpkg GNSSReceiver --url="$URL" --rev="$HEAD" --bench-on="$HEAD" \
-            --add="$ADD" --output-dir=results/ --tune
+            --add="$ADD" --output-dir=results/ --tune --exeflags="-t auto"
           benchpkg GNSSReceiver --url="$URL" --rev="$BASE" --bench-on="$HEAD" \
-            --add="$ADD" --output-dir=results/ --tune \
+            --add="$ADD" --output-dir=results/ --tune --exeflags="-t auto" \
             || echo "::warning::base rev $BASE could not be benchmarked (does it build against current deps?)"
 
       - name: Build minimum-time comparison table
