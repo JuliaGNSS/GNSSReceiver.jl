@@ -114,8 +114,20 @@ end
 # All chunks needed: LOCK_SECONDS of setup followed by RUN_SECONDS of timed run.
 const CHUNKS = load_chunks(N_LOCK + N_RUN)
 
-run_process(rs, plan_args, chunks, acquire_every) =
-    foldl((s, c) -> _process(s, plan_args, c; acquire_every), chunks; init = rs)
+# Drive `process` with a plain reassignment `for` loop rather than `foldl`. This
+# mirrors how `receive` actually calls `process`. It matters for allocation: the
+# `process`/`foldl` combination is fully type-stable (the fold operator infers a
+# concrete return equal to its input), but reaching `process` through `foldl`'s
+# higher-order reduction defeats the optimizer's escape analysis for the immutable
+# temporaries that `Tracking.track!` builds each chunk, so they get heap-allocated
+# (~4x the real allocation). A `for` loop keeps `process` in one frame where those
+# temporaries are elided, matching real-world `receive` behaviour.
+function run_process(rs, plan_args, chunks, acquire_every)
+    for c in chunks
+        rs = _process(rs, plan_args, c; acquire_every)
+    end
+    return rs
+end
 
 # ── Benchmark: process without acquisition over RUN_SECONDS ───────────────
 # Acquire and lock over the first LOCK_SECONDS (setup, not timed), then benchmark
