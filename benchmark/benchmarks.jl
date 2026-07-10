@@ -1,6 +1,6 @@
 using BenchmarkTools
 using GNSSReceiver
-using GNSSReceiver: ReceiverState, NumAnts, process
+using GNSSReceiver: ReceiverState, NumAnts, process, is_in_lock
 using GNSSSignals
 using Unitful
 using Unitful: Hz, ms, s
@@ -15,9 +15,28 @@ const SUITE = BenchmarkGroup()
 
 # ── Real signal ───────────────────────────────────────────────────────────
 # The 60 s ION RTL-SDR GPS L1 recording used by the integration test (2.048 MS/s,
-# 8-bit unsigned offset-binary I/Q). Each benchmark processes RUN_SECONDS of it in
-# 4 ms chunks; the label reports that duration so the measured time can be judged
-# against real time (real-time capable iff time < RUN_SECONDS).
+# 8-bit unsigned offset-binary I/Q).
+#
+# A receiver run passes through three cost regimes, and each is benchmarked
+# separately over just **1 second** of signal (`N_1S` chunks):
+#
+#   1. acquisition        — buffer fills, `acquire!` searches the PRNs, first locks.
+#   2. tracking pre-decode — sats are locked and their nav bits are being decoded,
+#                            but not enough ephemeris yet for a fix (no PVT).
+#   3. tracking + PVT      — steady state: tracking, decoding, and `calc_pvt` every
+#                            `pvt_update_interval`.
+#
+# Why 1 s per stage: BenchmarkTools takes samples until its time budget (default
+# 5 s) is spent, but always at least one. A single 45 s pass costs more than the
+# whole budget, so exactly ONE sample was collected — and the CI's "report the
+# minimum" strategy then has nothing to pick a minimum from, so it just echoes one
+# noisy run. A ~1 s timed sample fits many times into the budget, so the reported
+# minimum is a real least-disturbed sample. The state that starts each stage is
+# built once in an untimed setup pre-roll (`capture_stage_snapshots`), not timed.
+#
+# Each stage is run in a float and an `Int16` variant (like the earlier process
+# benchmarks): the float-vs-Int16 gap within a build is the integer-backend
+# speedup, present on both revisions, so it is not a base/head difference.
 const SIGNAL_URL = "https://sdr.ion.org/RTL_SDR/RTLSDR_Bands-L1.uint8"
 const SAMPLING_FREQ = 2.048e6u"Hz"
 # GNSSSignals v3 renamed GPSL1 -> GPSL1CA. Feature-detect so this one script runs
@@ -26,13 +45,21 @@ const SYSTEM =
     isdefined(GNSSSignals, :GPSL1CA) ? GNSSSignals.GPSL1CA() : GNSSSignals.GPSL1()
 const CHUNK = Int(upreferred(SAMPLING_FREQ * 4u"ms"))        # 8192 samples per process() call
 const ACQ_CODE_CYCLES = 10        # 10 ms coherent integration locks the full healthy set
-const RUN_SECONDS = 45            # benchmarked duration (enough to get a position fix, ~35 s)
-const LOCK_SECONDS = 3            # steady-state setup: lock the sats before the timed run
-const NEVER = 1_000_000u"s"       # acquire_every large enough that (re)acquisition never fires
 
-const N_RUN = floor(Int, upreferred(SAMPLING_FREQ * (RUN_SECONDS * u"s")) / CHUNK)
-const N_LOCK = floor(Int, upreferred(SAMPLING_FREQ * (LOCK_SECONDS * u"s")) / CHUNK)
-const RUN_LABEL = "$(uconvert(u"s", N_RUN * CHUNK / SAMPLING_FREQ)) signal"
+# Each stage is timed over N_1S chunks (~1 s of signal).
+const N_1S = floor(Int, upreferred(SAMPLING_FREQ * 1u"s") / CHUNK)   # 250 chunks
+# Signal to load for the untimed setup pre-roll: enough to reach a PVT fix (~35 s
+# on this recording) plus the 1 s stage-3 window, with margin.
+const MAX_SECONDS = 45
+const N_CHUNKS = floor(Int, upreferred(SAMPLING_FREQ * (MAX_SECONDS * u"s")) / CHUNK)
+
+const NEVER = 1_000_000u"s"       # acquire_every large enough that (re)acquisition never fires
+# Realistic periodic-acquisition cadence, used both for the setup pre-roll and for
+# the acquisition-stage timed run (so the acquisition-stage second contains a real
+# `acquire!` event, as at cold start).
+const ACQUIRE_EVERY = 10u"s"
+
+const STAGE_LABEL = "$(uconvert(u"s", N_1S * CHUNK / SAMPLING_FREQ)) signal"
 
 # Tracking v3 dropped the `Val(sampling_freq)` constructor argument.
 const DC =
@@ -137,20 +164,13 @@ function load_chunks(nchunks)
     return chunks
 end
 
-# All chunks needed: LOCK_SECONDS of setup followed by RUN_SECONDS of timed run.
-const CHUNKS = load_chunks(N_LOCK + N_RUN)
+const CHUNKS = load_chunks(N_CHUNKS)
 
 # `Complex{Int16}` copies of the same chunks for the integer-backend variants. The
 # float `CHUNKS` are the 8-bit source recentred on 127.5; round to `Int16` (values
 # within ±128, matching `DC_INT16`'s `max_meas = 2^7`).
 const CHUNKS_INT16 =
     [complex.(round.(Int16, real.(c)), round.(Int16, imag.(c))) for c in CHUNKS]
-
-# `receive` consumes matrix chunks (num_samples × num_ants) off a channel, whereas
-# the direct-`process` benchmarks fold over plain vectors. Materialise the first
-# N_RUN Int16 chunks as (CHUNK, 1) matrices once, so the timed feed only enqueues
-# them — and so `receive` auto-selects the integer backend from the element type.
-const MATRIX_CHUNKS = [reshape(c, CHUNK, 1) for c in @view CHUNKS_INT16[1:N_RUN]]
 
 # Drive `process` with a plain reassignment `for` loop rather than `foldl`. This
 # mirrors how `receive` actually calls `process`. It matters for allocation: the
@@ -167,15 +187,110 @@ function run_process(rs, plan_args, chunks, dc, acquire_every)
     return rs
 end
 
-# Drive the full public `receive` pipeline: a producer task feeds `Complex{Int16}`
-# chunks onto a MatrixSizedChannel, `receive` spawns its own acquisition+tracking
-# task, and the resulting data channel is drained here. No `downconvert_and_correlator`
-# is passed, so `receive` auto-selects it from the element type — the integer
-# backend on head (via `_MAX_MEAS_KW`), the CPU fallback on the pre-`max_meas` base.
-# The base/head delta is the integer-backend speedup diluted by the channel
-# producer/consumer plumbing and per-chunk ReceiverState churn that the
-# `process`-only benchmarks bypass.
-function run_receive(chunks, acquire_every)
+# ── Stage snapshots (untimed setup) ─────────────────────────────────────────
+# Drive one fresh receiver forward through the recording and deepcopy-snapshot the
+# receiver state at the start of each pipeline stage, together with the N_1S chunks
+# that follow that snapshot. This whole pre-roll is setup — it is not part of any
+# timed sample. Run once per sample element type (float / Int16) since each uses a
+# different receiver-state and correlator type.
+has_fix(rs) = !isnothing(rs.pvt.time)
+num_in_lock(rs) = count(is_in_lock, rs.receiver_sat_states[1])
+
+function capture_stage_snapshots(::Type{T}, dc, chunks) where {T}
+    rs, plan_args = make_receiver_and_plan(T)
+    acq_snapshot = deepcopy(rs)          # fresh receiver = the start of acquisition
+    track_snapshot = nothing
+    track_start = 0
+    pvt_snapshot = nothing
+    pvt_start = 0
+    for (i, c) in enumerate(chunks)
+        rs = _process(rs, plan_args, c, dc; acquire_every = ACQUIRE_EVERY)
+        # Stage 2 starts once a PVT-capable number of sats (4) are locked and being
+        # decoded — but no fix yet (the full ephemeris takes ~30 s to decode).
+        if isnothing(track_snapshot) && num_in_lock(rs) >= 4 && !has_fix(rs)
+            track_snapshot = deepcopy(rs)
+            track_start = i
+        end
+        # Stage 3 starts at the first PVT fix.
+        if isnothing(pvt_snapshot) && has_fix(rs)
+            pvt_snapshot = deepcopy(rs)
+            pvt_start = i
+            break
+        end
+    end
+    isnothing(track_snapshot) &&
+        error("setup ($T): never reached the tracking stage (>= 4 sats in lock) in $MAX_SECONDS s")
+    isnothing(pvt_snapshot) &&
+        error("setup ($T): never reached a PVT fix in $MAX_SECONDS s of signal")
+    pvt_start + N_1S <= length(chunks) ||
+        error("need $(pvt_start + N_1S) chunks for the stage-3 window; only $(length(chunks)) loaded")
+    return (;
+        plan_args,
+        acq_snapshot,
+        acq_chunks = chunks[1:N_1S],
+        track_snapshot,
+        track_chunks = chunks[track_start+1:track_start+N_1S],
+        pvt_snapshot,
+        pvt_chunks = chunks[pvt_start+1:pvt_start+N_1S],
+    )
+end
+
+const STAGES_FLOAT = capture_stage_snapshots(ComplexF32, DC, CHUNKS)
+const STAGES_INT16 = capture_stage_snapshots(Complex{Int16}, DC_INT16, CHUNKS_INT16)
+
+# Every stage benchmark hands each BenchmarkTools sample a fresh `deepcopy` of its
+# snapshot and pins `evals = 1`. `process` mutates the receiver state in place (the
+# in-place `track!` and the `map!` in `update_receiver_sat_states`), so re-running
+# the same object would start each sample from the previous one's already-advanced
+# state — sats fall out of lock and later samples measure almost nothing. A fresh
+# deepcopy per sample makes every measured sample one honest 1 s forward pass.
+
+# ── Stage 1: acquisition ────────────────────────────────────────────────────
+# Fresh receiver, `acquire_every = ACQUIRE_EVERY`: the buffer fills within ~12 ms,
+# `acquire!` searches all 32 PRNs, and the first sats lock — the cold-start second.
+function bench_acquisition_stage(stages, dc)
+    (; plan_args, acq_snapshot, acq_chunks) = stages
+    @benchmarkable(
+        run_process(state, $plan_args, $acq_chunks, $dc, $ACQUIRE_EVERY),
+        setup = (state = deepcopy($acq_snapshot)),
+        evals = 1,
+    )
+end
+
+# ── Stage 2: tracking, pre-decode ───────────────────────────────────────────
+# Sats already locked; `acquire_every = NEVER` so no acquisition fires — pure
+# tracking + nav-bit decoding, no PVT yet.
+function bench_tracking_stage(stages, dc)
+    (; plan_args, track_snapshot, track_chunks) = stages
+    @benchmarkable(
+        run_process(state, $plan_args, $track_chunks, $dc, $NEVER),
+        setup = (state = deepcopy($track_snapshot)),
+        evals = 1,
+    )
+end
+
+# ── Stage 3: tracking + PVT ─────────────────────────────────────────────────
+# Post-fix steady state; `acquire_every = NEVER`. Tracking + decoding + `calc_pvt`
+# every `pvt_update_interval` (100 ms) → ~10 PVT solves in the 1 s window.
+function bench_pvt_stage(stages, dc)
+    (; plan_args, pvt_snapshot, pvt_chunks) = stages
+    @benchmarkable(
+        run_process(state, $plan_args, $pvt_chunks, $dc, $NEVER),
+        setup = (state = deepcopy($pvt_snapshot)),
+        evals = 1,
+    )
+end
+
+# ── Stage 3 through the public `receive` pipeline ───────────────────────────
+# `receive` consumes (CHUNK × 1) matrix chunks off a `MatrixSizedChannel`, spawns
+# its own tracking task, and builds the per-chunk `sat_data` / `ReceiverDataOfInterest`
+# — plumbing the direct-`process` benchmarks don't exercise. Feed it the post-fix
+# `Int16` snapshot + the same 1 s of chunks (element type `Complex{Int16}`, so
+# `receive` auto-selects the integer backend) to measure steady-state end-to-end
+# cost (channel + sat_data build + PVT) rather than a 45 s cold start.
+const RECEIVE_STEADY_CHUNKS = [reshape(c, CHUNK, 1) for c in STAGES_INT16.pvt_chunks]
+
+function run_receive_steady(chunks, receiver_state)
     measurement_channel = GNSSReceiver.MatrixSizedChannel{Complex{Int16}}(CHUNK, 1) do ch
         for c in chunks
             put!(ch, c)
@@ -186,7 +301,8 @@ function run_receive(chunks, acquire_every)
         SYSTEM,
         SAMPLING_FREQ;
         num_ants = NumAnts(1),
-        acquire_every,
+        acquire_every = NEVER,
+        receiver_state,
         _ACQ_CYCLES_KW...,
         _MAX_MEAS_KW...,
     )
@@ -194,69 +310,22 @@ function run_receive(chunks, acquire_every)
     return nothing
 end
 
-# ── Benchmark: process without acquisition over RUN_SECONDS ───────────────
-# Acquire and lock over the first LOCK_SECONDS (setup, not timed), then benchmark
-# processing the following RUN_SECONDS with acquire_every huge — no acquisition in
-# the timed run. A fix is obtained partway through, so PVT runs too. Parameterized
-# on sample element type + correlator so the float and Int16 variants time the same
-# work through their respective backends (fair like-for-like within each column).
-function bench_process_without_acquisition(::Type{T}, dc, chunks) where {T}
-    rs, plan_args = make_receiver_and_plan(T)
-    locked = run_process(rs, plan_args, @view(chunks[1:N_LOCK]), dc, NEVER)
-    timed_chunks = chunks[N_LOCK+1:N_LOCK+N_RUN]
-    # `process` mutates the receiver state in place — the in-place `track!`
-    # (c1c8b26) and the in-place `map!` in `update_receiver_sat_states`. If every
-    # BenchmarkTools evaluation re-ran the *same* `locked` object, each one would
-    # start from the previous run's already-advanced state: the satellites fall
-    # out of lock and later evaluations track almost nothing, collapsing the
-    # reported minimum time and memory to a meaningless (tiny) value. Give each
-    # sample a fresh `deepcopy` of the locked state and pin `evals=1`, so every
-    # measured sample is one honest 45 s forward pass over the full sat set.
+function bench_receive_steady()
+    pvt_snapshot = STAGES_INT16.pvt_snapshot
     @benchmarkable(
-        run_process(state, $plan_args, $timed_chunks, $dc, NEVER),
-        setup = (state = deepcopy($locked)),
+        run_receive_steady($RECEIVE_STEADY_CHUNKS, state),
+        setup = (state = deepcopy($pvt_snapshot)),
         evals = 1,
     )
-end
-
-# ── Benchmark: process with acquisition every 10 sec over RUN_SECONDS ─────
-# Process RUN_SECONDS from a fresh receiver, re-acquiring every 10 s as in normal
-# operation — acquire, lock, decode, and reach a position fix. Parameterized like
-# `bench_process_without_acquisition`.
-function bench_process_with_acquisition(::Type{T}, dc, chunks) where {T}
-    rs, plan_args = make_receiver_and_plan(T)
-    timed_chunks = chunks[1:N_RUN]
-    # Same in-place-mutation caveat as above: hand each sample a fresh deepcopy
-    # of the (empty) starting receiver and pin evals=1 so every sample is one
-    # honest 45 s run that acquires and locks from scratch. The acquisition plan
-    # holds only reusable FFT scratch (overwritten each `acquire!`), so it is
-    # shared across samples rather than copied.
-    @benchmarkable(
-        run_process(state, $plan_args, $timed_chunks, $dc, 10u"s"),
-        setup = (state = deepcopy($rs)),
-        evals = 1,
-    )
-end
-
-# ── Benchmark: full receive() pipeline with acquisition every 10 sec ──────
-# End-to-end analogue of `bench_process_with_acquisition`, but through the public
-# `receive` entry point (channel producer/consumer + spawned tracking task)
-# instead of a direct `process` fold — so it captures the plumbing overhead the
-# process benchmarks isolate away. Fresh receiver, re-acquiring every 10 s.
-function bench_receive_with_acquisition()
-    @benchmarkable run_receive($MATRIX_CHUNKS, 10u"s")
 end
 
 # ── Register benchmarks ───────────────────────────────────────────────────
-# Float and Int16 variants of each process benchmark so float-vs-Int16 is compared
-# like-for-like within a single build (the integer-backend speedup is a Tracking
-# feature present on both revisions, not a base/head difference).
-SUITE["process without acquisition ($RUN_LABEL)"]["1-ant float"] =
-    bench_process_without_acquisition(ComplexF32, DC, CHUNKS)
-SUITE["process without acquisition ($RUN_LABEL)"]["1-ant Int16"] =
-    bench_process_without_acquisition(Complex{Int16}, DC_INT16, CHUNKS_INT16)
-SUITE["process with acquisition every 10 sec ($RUN_LABEL)"]["1-ant float"] =
-    bench_process_with_acquisition(ComplexF32, DC, CHUNKS)
-SUITE["process with acquisition every 10 sec ($RUN_LABEL)"]["1-ant Int16"] =
-    bench_process_with_acquisition(Complex{Int16}, DC_INT16, CHUNKS_INT16)
-SUITE["receive with acquisition every 10 sec ($RUN_LABEL)"]["1-ant"] = bench_receive_with_acquisition()
+# Float and Int16 variants of each process-stage benchmark so float-vs-Int16 is
+# compared like-for-like within a single build.
+SUITE["acquisition ($STAGE_LABEL)"]["1-ant float"] = bench_acquisition_stage(STAGES_FLOAT, DC)
+SUITE["acquisition ($STAGE_LABEL)"]["1-ant Int16"] = bench_acquisition_stage(STAGES_INT16, DC_INT16)
+SUITE["tracking pre-decode ($STAGE_LABEL)"]["1-ant float"] = bench_tracking_stage(STAGES_FLOAT, DC)
+SUITE["tracking pre-decode ($STAGE_LABEL)"]["1-ant Int16"] = bench_tracking_stage(STAGES_INT16, DC_INT16)
+SUITE["tracking + PVT ($STAGE_LABEL)"]["1-ant float"] = bench_pvt_stage(STAGES_FLOAT, DC)
+SUITE["tracking + PVT ($STAGE_LABEL)"]["1-ant Int16"] = bench_pvt_stage(STAGES_INT16, DC_INT16)
+SUITE["receive steady-state ($STAGE_LABEL)"]["1-ant Int16"] = bench_receive_steady()
