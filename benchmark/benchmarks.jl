@@ -1,6 +1,6 @@
 using BenchmarkTools
 using GNSSReceiver
-using GNSSReceiver: ReceiverState, NumAnts, process
+using GNSSReceiver: ReceiverState, NumAnts, process, receive
 using GNSSSignals
 using Unitful
 using Unitful: Hz, ms, s
@@ -149,6 +149,49 @@ function bench_process_with_acquisition()
     @benchmarkable run_process($rs, $plan_args, $timed_chunks, 10u"s")
 end
 
+# `receive` consumes (CHUNK × 1) matrix chunks off a `MatrixSizedChannel`, whereas
+# the direct-`process` benchmarks fold over plain vectors. Materialise the first
+# N_RUN chunks as matrices once, so the timed feed only enqueues them.
+const RECEIVE_CHUNKS = [reshape(c, CHUNK, 1) for c in @view CHUNKS[1:N_RUN]]
+
+make_measurement_channel(chunks) =
+    GNSSReceiver.MatrixSizedChannel{ComplexF32}(CHUNK, 1) do ch
+        for c in chunks
+            put!(ch, c)
+        end
+    end
+
+# Drive the full public `receive` pipeline: a producer task feeds chunks onto the
+# measurement channel, `receive` spawns its own acquisition + tracking task, and the
+# resulting data channel is drained here with a no-op consumer. Unlike the
+# `process`-only benchmarks, this exercises the per-chunk `sat_data` /
+# `ReceiverDataOfInterest` construction and the channel plumbing, so it tracks the
+# receiver's real end-to-end allocation (where the `receiver_state`-boxing fix lands).
+function run_receive(chunks, acquire_every)
+    measurement_channel = make_measurement_channel(chunks)
+    data_channel = receive(
+        measurement_channel,
+        SYSTEM,
+        SAMPLING_FREQ;
+        num_ants = NumAnts(1),
+        acquire_every,
+        acquisition_num_coherent_code_periods = ACQ_CODE_CYCLES,
+        approximate_year = 2017,
+    )
+    GNSSReceiver.consume_channel(_ -> nothing, data_channel)
+    return nothing
+end
+
+# ── Benchmark: full receive() pipeline with acquisition every 10 sec ──────
+# End-to-end analogue of `bench_process_with_acquisition`, but through the public
+# `receive` entry point (channel producer/consumer + spawned tracking task + the
+# per-chunk `sat_data` build) rather than a direct `process` loop. Fresh receiver,
+# re-acquiring every 10 s.
+function bench_receive_with_acquisition()
+    @benchmarkable run_receive($RECEIVE_CHUNKS, 10u"s")
+end
+
 # ── Register benchmarks ───────────────────────────────────────────────────
 SUITE["process without acquisition ($RUN_LABEL)"]["1-ant"] = bench_process_without_acquisition()
 SUITE["process with acquisition every 10 sec ($RUN_LABEL)"]["1-ant"] = bench_process_with_acquisition()
+SUITE["receive with acquisition every 10 sec ($RUN_LABEL)"]["1-ant"] = bench_receive_with_acquisition()
