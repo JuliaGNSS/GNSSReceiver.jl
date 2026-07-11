@@ -80,6 +80,10 @@ const DC =
 # and the float-vs-Int16 gap within a column is the integer-backend speedup.
 const DC_INT16 = Tracking.Int16ThreadedDownconvertAndCorrelator(2^7)
 
+# Single-threaded integer backend, for the non-threaded `receive` variant (see the
+# receive benchmark below). Same `max_meas = 2^7` as `DC_INT16`.
+const DC_INT16_NOTHREAD = Tracking.Int16DownconvertAndCorrelator(2^7)
+
 # Feature-detect the acquisition API so this one script runs against both the
 # Acquisition-v2 head (plan_acquire, single plan) and a pre-v2 base (AcquisitionPlan
 # + a fine-Doppler reacquisition plan). Lets `benchpkg --bench-on=head` compute a
@@ -291,17 +295,30 @@ end
 # `receive` consumes (CHUNK × 1) matrix chunks off a `MatrixSizedChannel`, spawns
 # its own tracking task, and builds the per-chunk `sat_data` / `ReceiverDataOfInterest`
 # — plumbing the direct-`process` benchmarks don't exercise. Feed it the post-fix
-# `Int16` snapshot + the same 1 s of chunks (element type `Complex{Int16}`, so
-# `receive` auto-selects the integer backend) to measure steady-state end-to-end
-# cost (channel + sat_data build + PVT) rather than a 45 s cold start.
+# `Int16` snapshot + the same 1 s of chunks (element type `Complex{Int16}`) to
+# measure steady-state end-to-end cost (channel + sat_data build + PVT) rather than
+# a 45 s cold start.
+#
+# Two correlator variants:
+#   • threaded     — `dc = nothing` lets `receive` auto-select the integer backend,
+#                    i.e. the multi-threaded `Int16ThreadedDownconvertAndCorrelator`.
+#   • non-threaded — pass the single-threaded `Int16DownconvertAndCorrelator`.
+# `receive` runs its per-chunk loop inside a `Threads.@spawn` task; nesting the
+# threaded correlator's fan-out inside that task causes thread-pool contention that
+# makes the end-to-end *time* noisy on shared runners (the direct-`process`
+# benchmarks call the threaded correlator with no wrapping task and stay stable).
+# The non-threaded correlator removes that nesting, trading throughput for a more
+# reproducible measurement.
 const RECEIVE_STEADY_CHUNKS = [reshape(c, CHUNK, 1) for c in STAGES_INT16.pvt_chunks]
 
-function run_receive_steady(chunks, receiver_state)
+function run_receive_steady(chunks, receiver_state, dc)
     measurement_channel = GNSSReceiver.MatrixSizedChannel{Complex{Int16}}(CHUNK, 1) do ch
         for c in chunks
             put!(ch, c)
         end
     end
+    # dc === nothing → let `receive` auto-select (threaded); otherwise force it.
+    dc_kw = dc === nothing ? (;) : (; downconvert_and_correlator = dc)
     data_channel = receive(
         measurement_channel,
         SYSTEM,
@@ -311,15 +328,16 @@ function run_receive_steady(chunks, receiver_state)
         receiver_state,
         _ACQ_CYCLES_KW...,
         _MAX_MEAS_KW...,
+        dc_kw...,
     )
     GNSSReceiver.consume_channel(_ -> nothing, data_channel)
     return nothing
 end
 
-function bench_receive_steady()
+function bench_receive_steady(dc)
     pvt_snapshot = STAGES_INT16.pvt_snapshot
     @benchmarkable(
-        run_receive_steady($RECEIVE_STEADY_CHUNKS, state),
+        run_receive_steady($RECEIVE_STEADY_CHUNKS, state, $dc),
         setup = (state = deepcopy($pvt_snapshot)),
         evals = 1,
     )
@@ -336,4 +354,8 @@ SUITE["tracking pre-decode ($STAGE_LABEL)"]["1-ant float"] = bench_tracking_stag
 SUITE["tracking pre-decode ($STAGE_LABEL)"]["1-ant Int16"] = bench_tracking_stage(STAGES_INT16, DC_INT16)
 SUITE["tracking + PVT ($STAGE_LABEL)"]["1-ant float"] = bench_pvt_stage(STAGES_FLOAT, DC)
 SUITE["tracking + PVT ($STAGE_LABEL)"]["1-ant Int16"] = bench_pvt_stage(STAGES_INT16, DC_INT16)
-SUITE["receive steady-state ($STAGE_LABEL)"]["1-ant Int16"] = bench_receive_steady()
+# Threaded (auto-selected) and single-threaded correlator variants, to compare
+# their run-to-run reliability through the spawned receive pipeline.
+SUITE["receive steady-state ($STAGE_LABEL)"]["1-ant Int16 threaded"] = bench_receive_steady(nothing)
+SUITE["receive steady-state ($STAGE_LABEL)"]["1-ant Int16 non-threaded"] =
+    bench_receive_steady(DC_INT16_NOTHREAD)
