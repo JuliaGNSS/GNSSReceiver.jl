@@ -26,7 +26,7 @@ function _ion_produce!(ch, ::Type{T}, dat_file, num_samples, num_ants) where {T}
             n < 2 * num_samples && break
             # Fresh buffer per chunk: the lock-free SignalChannel is buffered, so the
             # consumer may still hold a previously enqueued buffer while we fill this one.
-            chunk = GNSSReceiver.FixedSizeMatrixDefault{T}(undef, num_samples, num_ants)
+            chunk = Matrix{T}(undef, num_samples, num_ants)
             @inbounds for i = 1:num_samples
                 chunk[i, 1] = _ion_sample(T, raw_buf[2i-1], raw_buf[2i])
             end

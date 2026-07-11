@@ -24,7 +24,7 @@ function generate_stream(
         buffers_in_flight,
     ) do c
         wrapper() do
-            buff = FixedSizeMatrixDefault{T}(undef, num_samples, num_antenna_channels)
+            buff = Matrix{T}(undef, num_samples, num_antenna_channels)
 
             # Keep on generating buffers until `gen_buff!()` returns `false`.
             while gen_buff!(buff)
@@ -52,7 +52,7 @@ function stream_data(
 ) where {T<:Number}
     # Wrapper to activate/deactivate `s_rx`
     wrapper = (f) -> begin
-        buff = FixedSizeMatrixDefault{T}(undef, s_rx.mtu, s_rx.nchannels)
+        buff = Matrix{T}(undef, s_rx.mtu, s_rx.nchannels)
 
         # Let the stream come online for a bit
         SoapySDR.activate!(s_rx) do

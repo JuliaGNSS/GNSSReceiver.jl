@@ -310,19 +310,13 @@ end
 # The non-threaded correlator removes that nesting, trading throughput for a more
 # reproducible measurement.
 # The measurement channel changed from the `Channel`-backed `MatrixSizedChannel` to
-# the lock-free `SignalChannel` (which carries `FixedSizeMatrixDefault` buffers).
-# Feature-detect which the loaded build provides so this one head script benchmarks
-# both revisions: build the matching channel type and chunk buffers for whichever
-# `GNSSReceiver` is loaded.
+# the lock-free `SignalChannel`. Both carry plain `Matrix` chunks, so only the
+# channel *constructor* differs; feature-detect which the loaded build provides so
+# this one head script benchmarks both revisions.
 const _HAS_SIGNAL_CHANNEL = isdefined(GNSSReceiver, :SignalChannel)
 
-# `SignalChannel` requires `FixedSizeMatrixDefault` buffers; `MatrixSizedChannel`
-# takes plain matrices. Materialise the 1 s of chunks once, in the right buffer type.
-const RECEIVE_STEADY_CHUNKS =
-    let mats = [reshape(c, CHUNK, 1) for c in STAGES_INT16.pvt_chunks]
-        _HAS_SIGNAL_CHANNEL ?
-        [GNSSReceiver.FixedSizeMatrixDefault{Complex{Int16}}(m) for m in mats] : mats
-    end
+# Materialise the 1 s of `Complex{Int16}` chunks once as (CHUNK × 1) matrices.
+const RECEIVE_STEADY_CHUNKS = [reshape(c, CHUNK, 1) for c in STAGES_INT16.pvt_chunks]
 
 function make_measurement_channel(chunks)
     if _HAS_SIGNAL_CHANNEL

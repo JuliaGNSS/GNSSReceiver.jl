@@ -1,5 +1,4 @@
 import Base.close, Base.put!, Base.isempty
-using FixedSizeArrays: FixedSizeMatrixDefault
 
 """
     SignalChannel{T,N} <: AbstractChannel{T}
@@ -8,8 +7,8 @@ A specialized channel type that enforces matrix dimensions for multi-channel
 signal data. The number of antenna channels `N` is a type parameter, enabling
 compile-time specialization for zero-allocation performance in tight loops.
 
-Data is always stored as a fixed-size matrix with dimensions `(num_samples, N)`.
-For single-channel signals (`N = 1`) this is a column vector represented as an
+Data is always stored as a `Matrix{T}` with dimensions `(num_samples, N)`. For
+single-channel signals (`N = 1`) this is a column vector represented as an
 `(num_samples, 1)` matrix.
 
 Uses a lock-free [`PipeChannel`](@ref) internally, which eliminates the
@@ -24,9 +23,9 @@ consumer thread may call `take!`. Multiple producers or consumers cause data rac
 """
 struct SignalChannel{T,N} <: AbstractChannel{T}
     num_samples::Int
-    channel::PipeChannel{FixedSizeMatrixDefault{T}}
+    channel::PipeChannel{Matrix{T}}
     function SignalChannel{T,N}(num_samples::Integer, sz::Integer = 16) where {T,N}
-        return new{T,N}(num_samples, PipeChannel{FixedSizeMatrixDefault{T}}(sz))
+        return new{T,N}(num_samples, PipeChannel{Matrix{T}}(sz))
     end
 end
 
@@ -74,12 +73,12 @@ SignalChannel{T}(
 ) where {T} = SignalChannel{T,1}(func, num_samples, size; taskref, spawn)
 
 """
-    put!(c::SignalChannel{T,N}, v::FixedSizeMatrixDefault{T})
+    put!(c::SignalChannel{T,N}, v::Matrix{T})
 
-Put a fixed-size matrix into the channel, validating that its dimensions match
-the channel's `num_samples` and `N`.
+Put a matrix into the channel, validating that its dimensions match the channel's
+`num_samples` and `N`.
 """
-function Base.put!(c::SignalChannel{T,N}, v::FixedSizeMatrixDefault{T}) where {T,N}
+function Base.put!(c::SignalChannel{T,N}, v::Matrix{T}) where {T,N}
     if size(v, 1) != c.num_samples || size(v, 2) != N
         throw(
             ArgumentError(
@@ -90,25 +89,28 @@ function Base.put!(c::SignalChannel{T,N}, v::FixedSizeMatrixDefault{T}) where {T
     Base.put!(c.channel, v)
 end
 
-# Reject plain matrices: only FixedSizeMatrixDefault is allowed for performance.
+# The channel stores `Matrix{T}` (a producer must hand ownership of a fresh, densely
+# stored buffer — the lock-free channel is buffered, so it may still be in flight).
+# Reject other `AbstractMatrix{T}` (views, reshapes of non-Arrays, adjoints) with a
+# clear error rather than a bare `MethodError`.
 function Base.put!(c::SignalChannel{T,N}, v::AbstractMatrix{T}) where {T,N}
     throw(
         ArgumentError(
-            "SignalChannel only accepts FixedSizeMatrixDefault for performance. " *
-            "Got $(typeof(v)). Convert with: FixedSizeMatrixDefault{$T}(your_matrix)",
+            "SignalChannel stores Matrix{$T}; got $(typeof(v)). " *
+            "Materialise it with Matrix{$T}(your_matrix).",
         ),
     )
 end
 
 """
-    put!(c::SignalChannel{T,N}, values::AbstractVector{<:FixedSizeMatrixDefault{T}})
+    put!(c::SignalChannel{T,N}, values::AbstractVector{<:Matrix{T}})
 
-Add multiple fixed-size matrices to the channel in a single batch operation,
-using the underlying `PipeChannel`'s batch `put!` to reduce atomic overhead.
+Add multiple matrices to the channel in a single batch operation, using the
+underlying `PipeChannel`'s batch `put!` to reduce atomic overhead.
 """
 function Base.put!(
     c::SignalChannel{T,N},
-    values::AbstractVector{<:FixedSizeMatrixDefault{T}},
+    values::AbstractVector{<:Matrix{T}},
 ) where {T,N}
     for (i, v) in enumerate(values)
         if size(v, 1) != c.num_samples || size(v, 2) != N
@@ -126,7 +128,7 @@ end
 Base.bind(c::SignalChannel, task::Task) = Base.bind(c.channel, task)
 Base.take!(c::SignalChannel) = Base.take!(c.channel)
 Base.take!(c::SignalChannel, n::Integer) = Base.take!(c.channel, n)
-Base.take!(c::SignalChannel{T,N}, output::AbstractVector{<:FixedSizeMatrixDefault{T}}) where {T,N} =
+Base.take!(c::SignalChannel{T,N}, output::AbstractVector{<:Matrix{T}}) where {T,N} =
     Base.take!(c.channel, output)
 Base.close(c::SignalChannel, excp::Exception = Base.closed_exception()) =
     Base.close(c.channel, excp)
@@ -136,7 +138,7 @@ Base.isempty(c::SignalChannel) = Base.isempty(c.channel)
 Base.n_avail(c::SignalChannel) = Base.n_avail(c.channel)
 isfull(c::SignalChannel) = isfull(c.channel)
 Base.wait(c::SignalChannel) = Base.wait(c.channel)
-Base.eltype(::Type{SignalChannel{T,N}}) where {T,N} = FixedSizeMatrixDefault{T}
+Base.eltype(::Type{SignalChannel{T,N}}) where {T,N} = Matrix{T}
 
 # Iterator support: allows `for buffer in channel` syntax. The @inline annotation
 # is critical to avoid heap allocation of the (value, state) tuple.
@@ -197,10 +199,10 @@ unrolls at compile time.
 """
 mutable struct RechunkState{T,N}
     output_chunk_size::Int
-    buffer_pool::Vector{FixedSizeMatrixDefault{T}}
+    buffer_pool::Vector{Matrix{T}}
     buffer_idx::Int
     chunk_filled::Int
-    output_vector::Vector{FixedSizeMatrixDefault{T}}
+    output_vector::Vector{Matrix{T}}
     output_count::Int
 
     function RechunkState{T,N}(
@@ -209,8 +211,8 @@ mutable struct RechunkState{T,N}
         max_outputs_per_input::Integer,
     ) where {T,N}
         buffer_pool =
-            [FixedSizeMatrixDefault{T}(undef, output_chunk_size, N) for _ = 1:num_buffers]
-        output_vector = Vector{FixedSizeMatrixDefault{T}}(undef, max_outputs_per_input)
+            [Matrix{T}(undef, output_chunk_size, N) for _ = 1:num_buffers]
+        output_vector = Vector{Matrix{T}}(undef, max_outputs_per_input)
         return new{T,N}(output_chunk_size, buffer_pool, 1, 0, output_vector, 0)
     end
 end
@@ -302,7 +304,7 @@ end
 end
 
 """
-    rechunk!(state::RechunkState{T,N}, input::FixedSizeMatrixDefault{T})
+    rechunk!(state::RechunkState{T,N}, input::Matrix{T})
 
 Process an input buffer through the rechunk state, returning a view of completed
 output buffers (valid until the next call). Uses per-channel `copyto!` with
@@ -314,7 +316,7 @@ caller must not reuse it while the output is still in use.
 """
 @inline function rechunk!(
     state::RechunkState{T,N},
-    input::FixedSizeMatrixDefault{T},
+    input::Matrix{T},
 ) where {T,N}
     output_count = rechunk_one!(state, input, 0)
     state.output_count = output_count
@@ -463,7 +465,7 @@ function read_from_file(
         streams = [open("$file_path$type_string$i.dat", "r") for i = 1:num_antenna_channels]
         try
             while !any(eof, streams)
-                buff = FixedSizeMatrixDefault{T}(undef, num_samples, num_antenna_channels)
+                buff = Matrix{T}(undef, num_samples, num_antenna_channels)
                 all_complete = true
                 for (idx, stream) in enumerate(streams)
                     column = view(buff, :, idx)

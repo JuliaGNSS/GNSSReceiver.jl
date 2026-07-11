@@ -15,7 +15,6 @@ using StaticArrays,
     Dictionaries,
     Dates
 
-using FixedSizeArrays: FixedSizeMatrixDefault
 
 export ReceiverState,
     receive,

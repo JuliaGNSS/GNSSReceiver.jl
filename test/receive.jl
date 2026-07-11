@@ -17,9 +17,7 @@
             foreach(
                 i -> put!(
                     ch,
-                    GNSSReceiver.FixedSizeMatrixDefault{type}(
-                        type.(round.(randn(rng, ComplexF32, num_samples, num_ants) * 512)),
-                    ),
+                    type.(round.(randn(rng, ComplexF32, num_samples, num_ants) * 512)),
                 ),
                 1:20,
             )
@@ -27,9 +25,7 @@
             foreach(
                 i -> put!(
                     ch,
-                    GNSSReceiver.FixedSizeMatrixDefault{type}(
-                        randn(rng, type, num_samples, num_ants) * 512,
-                    ),
+                    randn(rng, type, num_samples, num_ants) * 512,
                 ),
                 1:20,
             )
@@ -85,9 +81,7 @@
             foreach(
                 i -> put!(
                     ch,
-                    GNSSReceiver.FixedSizeMatrixDefault{type}(
-                        type.(round.(randn(rng, ComplexF32, num_samples, num_ants) * 512)),
-                    ),
+                    type.(round.(randn(rng, ComplexF32, num_samples, num_ants) * 512)),
                 ),
                 1:20,
             )
@@ -95,9 +89,7 @@
             foreach(
                 i -> put!(
                     ch,
-                    GNSSReceiver.FixedSizeMatrixDefault{type}(
-                        randn(rng, type, num_samples, num_ants) * 512,
-                    ),
+                    randn(rng, type, num_samples, num_ants) * 512,
                 ),
                 1:20,
             )
