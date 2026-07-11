@@ -61,6 +61,12 @@ const ACQUIRE_EVERY = 10u"s"
 
 const STAGE_LABEL = "$(uconvert(u"s", N_1S * CHUNK / SAMPLING_FREQ)) signal"
 
+# Coherent integration time (ACQ_CODE_CYCLES code periods) — the main driver of
+# `acquire!` cost, so it goes in the acquisition benchmark's label. Derived from
+# the system's code length / chip rate rather than hard-coded.
+const COHERENT_INTEGRATION =
+    uconvert(u"ms", ACQ_CODE_CYCLES * get_code_length(SYSTEM) / get_code_frequency(SYSTEM))
+
 # Tracking v3 dropped the `Val(sampling_freq)` constructor argument.
 const DC =
     hasmethod(Tracking.CPUThreadedDownconvertAndCorrelator, Tuple{}) ?
@@ -322,8 +328,10 @@ end
 # ── Register benchmarks ───────────────────────────────────────────────────
 # Float and Int16 variants of each process-stage benchmark so float-vs-Int16 is
 # compared like-for-like within a single build.
-SUITE["acquisition ($STAGE_LABEL)"]["1-ant float"] = bench_acquisition_stage(STAGES_FLOAT, DC)
-SUITE["acquisition ($STAGE_LABEL)"]["1-ant Int16"] = bench_acquisition_stage(STAGES_INT16, DC_INT16)
+SUITE["acquisition ($STAGE_LABEL, $COHERENT_INTEGRATION coherent integration)"]["1-ant float"] =
+    bench_acquisition_stage(STAGES_FLOAT, DC)
+SUITE["acquisition ($STAGE_LABEL, $COHERENT_INTEGRATION coherent integration)"]["1-ant Int16"] =
+    bench_acquisition_stage(STAGES_INT16, DC_INT16)
 SUITE["tracking pre-decode ($STAGE_LABEL)"]["1-ant float"] = bench_tracking_stage(STAGES_FLOAT, DC)
 SUITE["tracking pre-decode ($STAGE_LABEL)"]["1-ant Int16"] = bench_tracking_stage(STAGES_INT16, DC_INT16)
 SUITE["tracking + PVT ($STAGE_LABEL)"]["1-ant float"] = bench_pvt_stage(STAGES_FLOAT, DC)
