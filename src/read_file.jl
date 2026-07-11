@@ -21,7 +21,7 @@ function read_files(
                 # Allocate a fresh buffer per chunk: the lock-free SignalChannel is
                 # buffered, so the consumer may still hold a previously enqueued
                 # buffer while we fill the next one.
-                chunk = FixedSizeMatrixDefault{type}(undef, num_samples, num_ants)
+                chunk = Matrix{type}(undef, num_samples, num_ants)
                 read_measurement!(streams, chunk)
                 num_read_samples += num_samples
                 put!(out, chunk)

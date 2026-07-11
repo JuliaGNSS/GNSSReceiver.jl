@@ -1,7 +1,6 @@
 using GNSSReceiver:
     PipeChannel,
     SignalChannel,
-    FixedSizeMatrixDefault,
     consume_channel,
     tee,
     rechunk,
@@ -46,15 +45,18 @@ end
 @testset "SignalChannel dimensions and validation" begin
     ch = SignalChannel{ComplexF32,2}(8)
     @test num_antenna_channels(ch) == 2
-    @test eltype(typeof(ch)) == FixedSizeMatrixDefault{ComplexF32}
-    buf = FixedSizeMatrixDefault{ComplexF32}(undef, 8, 2)
+    @test eltype(typeof(ch)) == Matrix{ComplexF32}
+    buf = Matrix{ComplexF32}(undef, 8, 2)
     fill!(buf, ComplexF32(1))
     put!(ch, buf)
     @test size(take!(ch)) == (8, 2)
-    # plain Matrix rejected for performance
-    @test_throws ArgumentError put!(ch, ones(ComplexF32, 8, 2))
+    # a plain Matrix of the right size is accepted
+    put!(ch, ones(ComplexF32, 8, 2))
+    @test size(take!(ch)) == (8, 2)
     # wrong dimensions rejected
-    @test_throws ArgumentError put!(ch, FixedSizeMatrixDefault{ComplexF32}(undef, 4, 2))
+    @test_throws ArgumentError put!(ch, Matrix{ComplexF32}(undef, 4, 2))
+    # a non-Matrix AbstractMatrix (e.g. a view) is rejected — the channel stores Matrix
+    @test_throws ArgumentError put!(ch, view(ones(ComplexF32, 8, 2), :, :))
     close(ch)
 end
 
@@ -65,7 +67,7 @@ end
         num_antenna_channels = 2,
     ) do out
         for i = 1:5
-            b = FixedSizeMatrixDefault{ComplexF32}(undef, 4, 2)
+            b = Matrix{ComplexF32}(undef, 4, 2)
             fill!(b, ComplexF32(i))
             put!(out, b)
         end
@@ -82,7 +84,7 @@ end
     # 5 input chunks of 3 samples -> rechunk to 5 -> three 5-sample chunks (15 total)
     src = spawn_signal_channel_thread(; T = Float32, num_samples = 3) do out
         for i = 1:5
-            b = FixedSizeMatrixDefault{Float32}(undef, 3, 1)
+            b = Matrix{Float32}(undef, 3, 1)
             b .= Float32.((i - 1) * 3 .+ (1:3))
             put!(out, b)
         end
@@ -100,7 +102,7 @@ end
 @testset "tee duplicates and membuffer forwards" begin
     src = spawn_signal_channel_thread(; T = Float32, num_samples = 2) do out
         for i = 1:4
-            b = FixedSizeMatrixDefault{Float32}(undef, 2, 1)
+            b = Matrix{Float32}(undef, 2, 1)
             fill!(b, Float32(i))
             put!(out, b)
         end
@@ -125,7 +127,7 @@ end
         num_antenna_channels = 2,
     ) do out
         for i = 1:3
-            b = FixedSizeMatrixDefault{ComplexF32}(undef, 4, 2)
+            b = Matrix{ComplexF32}(undef, 4, 2)
             b .= ComplexF32(i)
             put!(out, b)
         end
