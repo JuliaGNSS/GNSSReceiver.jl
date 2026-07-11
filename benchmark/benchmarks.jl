@@ -355,10 +355,19 @@ end
 
 function bench_receive_steady(dc)
     pvt_snapshot = STAGES_INT16.pvt_snapshot
+    # `receive` spawns its tracking task, so a single sample is sensitive to
+    # scheduler/thread-pool jitter on shared CI runners. With the default 5 s budget
+    # that yields only ~50-100 (deepcopy + run) samples, and the reported *minimum*
+    # can still land in a busy window. Give it a longer budget so it collects several
+    # hundred samples — enough to catch a least-disturbed one and make the min stable.
+    # (`evals = 1` is preserved: each sample must start from a fresh deepcopy, since
+    # `process` mutates the receiver state in place.)
     @benchmarkable(
         run_receive_steady($RECEIVE_STEADY_CHUNKS, state, $dc),
         setup = (state = deepcopy($pvt_snapshot)),
         evals = 1,
+        samples = 1000,
+        seconds = 30,
     )
 end
 
