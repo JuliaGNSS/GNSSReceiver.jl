@@ -90,11 +90,25 @@ function receive(
         SatelliteDataOfInterest{SVector{N,ComplexF64}}
     data_channel = PipeChannel{ReceiverDataOfInterest{sat_data_type}}(100)
 
+    # Thread `receiver_state` through the per-chunk loop via a *typed* `Ref` rather
+    # than reassigning a captured variable inside the spawned task. A variable
+    # captured by that closure and reassigned would be lowered to an untyped
+    # `Core.Box` (static type `Any`) — `Core.Box` is not parameterised, so it discards
+    # the fact that `receiver_state`'s type never actually changes. Every
+    # `receiver_state.…` access in the per-chunk `sat_data` build would then be a
+    # dynamic, allocating `getproperty` (~71 KB/chunk — the receiver's dominant
+    # allocation). A `Ref{typeof(receiver_state)}` is instead a *typed* cell: it is
+    # captured but never reassigned (only its contents are), so it is not boxed; its
+    # `[]` reads are type-stable; and `[] =` `convert`s to that type, so if `process`
+    # ever returned a different `ReceiverState` type it would error loudly (surfacing
+    # the type-instability regression) instead of silently deoptimising.
+    receiver_state_ref = Ref(receiver_state)
+
     # Iterate the lock-free measurement channel directly in a spawned tracking task.
     task = Threads.@spawn begin
         for measurement in measurement_channel
-            receiver_state = process(
-                receiver_state,
+            receiver_state_ref[] = process(
+                receiver_state_ref[],
                 acq_plan,
                 num_channels == N == 1 ? vec(measurement) : measurement,
                 system,
@@ -110,23 +124,15 @@ function receive(
                 always_buffer,
                 approximate_year,
             )
+            rs = receiver_state_ref[]
             sat_data = Dict{Int,sat_data_type}(
                 sat_state.prn => SatelliteDataOfInterest(
                     estimate_cn0(sat_state),
                     get_prompt(get_last_fully_integrated_correlator(sat_state)),
-                    is_sat_healthy(
-                        receiver_state.receiver_sat_states[1][sat_state.prn].decoder,
-                    ),
-                ) for sat_state in get_sat_states(receiver_state.track_state)
+                    is_sat_healthy(rs.receiver_sat_states[1][sat_state.prn].decoder),
+                ) for sat_state in get_sat_states(rs.track_state)
             )
-            put!(
-                data_channel,
-                ReceiverDataOfInterest(
-                    sat_data,
-                    receiver_state.pvt,
-                    receiver_state.runtime,
-                ),
-            )
+            put!(data_channel, ReceiverDataOfInterest(sat_data, rs.pvt, rs.runtime))
         end
         close(data_channel)
     end
