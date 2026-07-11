@@ -371,20 +371,6 @@ function bench_receive_steady(dc)
     )
 end
 
-# ── Measurement-channel transport only (no tracking) ────────────────────────
-# Feed the chunks through the measurement channel and drain them with a no-op
-# consumer — no tracking/acquisition. This isolates the per-chunk channel overhead
-# the lock-free `SignalChannel` change targets, which the tracking-dominated
-# `receive`/`process` benchmarks bury. Being sub-second it gets many samples, so its
-# ratio is far less noisy than the multi-second end-to-end runs.
-function run_channel_transport(chunks)
-    channel = make_measurement_channel(chunks)
-    GNSSReceiver.consume_channel(_ -> nothing, channel)
-    return nothing
-end
-
-bench_channel_transport() = @benchmarkable run_channel_transport($RECEIVE_STEADY_CHUNKS)
-
 # ── Register benchmarks ───────────────────────────────────────────────────
 # Float and Int16 variants of each process-stage benchmark so float-vs-Int16 is
 # compared like-for-like within a single build.
@@ -401,6 +387,3 @@ SUITE["tracking + PVT ($STAGE_LABEL)"]["1-ant Int16"] = bench_pvt_stage(STAGES_I
 SUITE["receive steady-state ($STAGE_LABEL)"]["1-ant Int16 threaded"] = bench_receive_steady(nothing)
 SUITE["receive steady-state ($STAGE_LABEL)"]["1-ant Int16 non-threaded"] =
     bench_receive_steady(DC_INT16_NOTHREAD)
-# Isolated channel transport (no tracking): directly shows the per-chunk overhead
-# the lock-free channel reduces, with low run-to-run noise (sub-second, many samples).
-SUITE["channel transport ($STAGE_LABEL)"]["1-ant"] = bench_channel_transport()
