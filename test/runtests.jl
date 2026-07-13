@@ -15,7 +15,6 @@ using Test,
 
 using Unitful: Hz, dBHz, ms
 
-include("channel.jl")
 include("beamformer.jl")
 include("process.jl")
 include("gui.jl")

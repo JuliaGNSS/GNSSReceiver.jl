@@ -14,8 +14,10 @@ GNSSSignals = "52c80523-2a4e-5c38-8979-05588f836870"
 Geodesy = "0ef565a4-170c-5f04-8de2-149903a85f3d"
 JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+PipeChannels = "316ea068-b8d4-4418-b34f-158552ec34f5"
 PositionVelocityTime = "52ec0b5e-ee36-11ea-211c-3d844fc5682d"
 REPL = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
+SignalChannels = "59ec5e11-ed95-4167-ad38-35055440f478"
 SoapySDR = "4fa426e6-03fd-45b2-b2dd-25f726820c03"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Term = "22787eb5-b846-44ae-b979-8e399b8463ab"
@@ -33,14 +35,22 @@ GNSSDecoder = "3"
 GNSSSignals = "3"
 Geodesy = "1.1.0"
 JLD2 = "0.6"
+PipeChannels = "0.1"
 PositionVelocityTime = "4"
+SignalChannels = "6.2"
 SoapySDR = "0.5"
 StaticArrays = "1"
 Term = "2"
 Tracking = "3"
 UnicodePlots = "3.3.0"
 Unitful = "1"
-julia = "1.10"
+julia = "1.12"
+
+# TEMPORARY: SignalChannels PR #32 (Matrix-default buffers) is not registered yet.
+# Point at its branch for now; drop this `[sources]` entry and bump the `SignalChannels`
+# compat to the registered version once it lands.
+[sources]
+SignalChannels = {url = "https://github.com/JuliaGNSS/SignalChannels.jl", rev = "drop-fixedsizearrays"}
 
 [extras]
 AstroTime = "c61b5328-d09d-5e37-a9a8-0eb41c39009c"

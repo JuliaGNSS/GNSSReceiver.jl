@@ -15,6 +15,19 @@ using StaticArrays,
     Dictionaries,
     Dates
 
+# Lock-free channel primitives now live in their own packages. Import only what the
+# receiver uses; notably NOT `stream_data`, which `soapy_sdr_helper.jl` defines with
+# its own `SoapySDR.Stream` signature.
+using PipeChannels: PipeChannel
+using SignalChannels:
+    SignalChannel,
+    consume_channel,
+    num_antenna_channels,
+    rechunk,
+    membuffer,
+    spawn_signal_channel_thread,
+    write_to_file
+
 
 export ReceiverState,
     receive,
@@ -186,8 +199,6 @@ function ReceiverState(
     )
 end
 
-include("pipe_channel.jl")
-include("channel.jl")
 include("read_file.jl")
 include("receive.jl")
 include("process.jl")
