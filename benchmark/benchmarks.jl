@@ -292,7 +292,7 @@ function bench_pvt_stage(stages, dc)
 end
 
 # ── Stage 3 through the public `receive` pipeline ───────────────────────────
-# `receive` consumes (CHUNK × 1) matrix chunks off a `MatrixSizedChannel`, spawns
+# `receive` consumes (CHUNK × 1) matrix chunks off a `SignalChannel`, spawns
 # its own tracking task, and builds the per-chunk `sat_data` / `ReceiverDataOfInterest`
 # — plumbing the direct-`process` benchmarks don't exercise. Feed it the post-fix
 # `Int16` snapshot + the same 1 s of chunks (element type `Complex{Int16}`) to
@@ -309,27 +309,13 @@ end
 # benchmarks call the threaded correlator with no wrapping task and stay stable).
 # The non-threaded correlator removes that nesting, trading throughput for a more
 # reproducible measurement.
-# The measurement channel changed from the `Channel`-backed `MatrixSizedChannel` to
-# the lock-free `SignalChannel`. Both carry plain `Matrix` chunks, so only the
-# channel *constructor* differs; feature-detect which the loaded build provides so
-# this one head script benchmarks both revisions.
-const _HAS_SIGNAL_CHANNEL = isdefined(GNSSReceiver, :SignalChannel)
-
 # Materialise the 1 s of `Complex{Int16}` chunks once as (CHUNK × 1) matrices.
 const RECEIVE_STEADY_CHUNKS = [reshape(c, CHUNK, 1) for c in STAGES_INT16.pvt_chunks]
 
 function make_measurement_channel(chunks)
-    if _HAS_SIGNAL_CHANNEL
-        GNSSReceiver.SignalChannel{Complex{Int16},1}(CHUNK) do ch
-            for c in chunks
-                put!(ch, c)
-            end
-        end
-    else
-        GNSSReceiver.MatrixSizedChannel{Complex{Int16}}(CHUNK, 1) do ch
-            for c in chunks
-                put!(ch, c)
-            end
+    GNSSReceiver.SignalChannel{Complex{Int16},1}(CHUNK) do ch
+        for c in chunks
+            put!(ch, c)
         end
     end
 end
