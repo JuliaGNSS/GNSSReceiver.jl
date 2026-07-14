@@ -102,7 +102,7 @@ let
         GNSSReceiver.consume_channel(data_channel) do data
             num_sats = length(data.sat_data)
             max_sats_seen = max(max_sats_seen, num_sats)
-            for (prn, sd) in data.sat_data
+            for (prn, sd) in pairs(data.sat_data)
                 push!(acquired_prns, prn)
                 if sd.is_healthy
                     push!(healthy_prns, prn)

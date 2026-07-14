@@ -3,12 +3,13 @@
     data_channel = Channel{GNSSReceiver.ReceiverDataOfInterest{sat_data_type}}() do ch
         foreach(1:100) do i
             data = GNSSReceiver.ReceiverDataOfInterest{sat_data_type}(
-                Dict{Int,sat_data_type}(
-                    1 => sat_data_type(
+                Dictionary(
+                    [1],
+                    [sat_data_type(
                         45.0dBHz,
                         SVector(complex(1.0, 2.0), complex(2.0, 3.0)),
                         true,
-                    ),
+                    )],
                 ),
                 GNSSReceiver.PVTSolution(),
                 (i - 1) * 0.004u"s",
@@ -32,7 +33,7 @@ end
     gui_data_channel = Channel{GNSSReceiver.GUIData}() do ch
         sat_data_type = GNSSReceiver.SatelliteDataOfInterest{SVector{2,ComplexF64}}
         gui_data = GNSSReceiver.GUIData(
-            Dict{Int,sat_data_type}(),
+            Dictionary{Int,sat_data_type}(),
             GNSSReceiver.PVTSolution(),
             0.0u"s",
         )
@@ -51,27 +52,30 @@ end
     sat_data_type = GNSSReceiver.SatelliteDataOfInterest{SVector{2,ComplexF64}}
     gui_data_channel = Channel{GNSSReceiver.GUIData}() do ch
         gui_data = GNSSReceiver.GUIData(
-            Dict{Int,sat_data_type}(
-                3 => GNSSReceiver.SatelliteDataOfInterest(
-                    46.3453dBHz,
-                    zeros(SVector{2,ComplexF64}),
-                    true,
-                ),
-                12 => GNSSReceiver.SatelliteDataOfInterest(
-                    42.233dBHz,
-                    zeros(SVector{2,ComplexF64}),
-                    true,
-                ),
-                23 => GNSSReceiver.SatelliteDataOfInterest(
-                    43.23123dBHz,
-                    zeros(SVector{2,ComplexF64}),
-                    true,
-                ),
-                10 => GNSSReceiver.SatelliteDataOfInterest(
-                    45.123467dBHz,
-                    zeros(SVector{2,ComplexF64}),
-                    true,
-                ),
+            Dictionary(
+                [3, 12, 23, 10],
+                [
+                    GNSSReceiver.SatelliteDataOfInterest(
+                        46.3453dBHz,
+                        zeros(SVector{2,ComplexF64}),
+                        true,
+                    ),
+                    GNSSReceiver.SatelliteDataOfInterest(
+                        42.233dBHz,
+                        zeros(SVector{2,ComplexF64}),
+                        true,
+                    ),
+                    GNSSReceiver.SatelliteDataOfInterest(
+                        43.23123dBHz,
+                        zeros(SVector{2,ComplexF64}),
+                        true,
+                    ),
+                    GNSSReceiver.SatelliteDataOfInterest(
+                        45.123467dBHz,
+                        zeros(SVector{2,ComplexF64}),
+                        true,
+                    ),
+                ],
             ),
             PositionVelocityTime.PVTSolution(;
                 position = ECEF(4.0e6, 3.9e5, 4.9e6),
