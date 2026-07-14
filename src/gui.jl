@@ -2,7 +2,7 @@ using UnicodePlots, Term
 import REPL
 
 struct GUIData{S<:SatelliteDataOfInterest}
-    sat_data::Dict{Int,S}
+    sat_data::Dictionary{Int,S}
     pvt::PVTSolution
     runtime::typeof(1.0u"s")
 end
@@ -86,15 +86,19 @@ function gui(gui_data_channel, io::IO = stdout; construct_gui_panels = construct
 end
 
 function construct_gui_panels(gui_data, num_dots)
-    prn_strings = string.(keys(gui_data.sat_data))
+    # `sat_data` is a Dictionaries.Dictionary; collect its keys/values to plain
+    # Vectors (as with `pvt.sats` below) so UnicodePlots gets vectors and the
+    # three arrays stay index-aligned.
+    prn_strings = string.(collect(keys(gui_data.sat_data)))
+    sat_values = collect(values(gui_data.sat_data))
     cn0s = map(
         x -> round(
             10 * log10(linear(x.cn0 == (Inf)u"Hz" ? 1u"Hz" : x.cn0) / u"Hz");
             digits = 1,
         ),
-        values(gui_data.sat_data),
+        sat_values,
     )
-    colors = map(x -> x.is_healthy ? :green : :red, values(gui_data.sat_data))
+    colors = map(x -> x.is_healthy ? :green : :red, sat_values)
     pvt = gui_data.pvt
     sat_doa_panel_title = "Satellite Direction-of-Arrival (DOA)"
     position_panel_title = "User position"

@@ -5,7 +5,7 @@ struct SatelliteDataOfInterest{P<:Union{<:Complex,<:AbstractVector{<:Complex}}}
 end
 
 struct ReceiverDataOfInterest{S<:SatelliteDataOfInterest}
-    sat_data::Dict{Int,S}
+    sat_data::Dictionary{Int,S}
     pvt::PVTSolution
     runtime::typeof(1.0u"s")
 end
@@ -125,13 +125,17 @@ function receive(
                 approximate_year,
             )
             rs = receiver_state_ref[]
-            sat_data = Dict{Int,sat_data_type}(
-                sat_state.prn => SatelliteDataOfInterest(
+            # Tracking's `get_sat_states` is a `Dictionary` keyed by PRN, so `map`
+            # over it keeps those PRN keys and only transforms each satellite into
+            # the data of interest — no keys to rebuild, and the result is already
+            # the `Dictionary{Int,sat_data_type}` the channel expects.
+            sat_data = map(get_sat_states(rs.track_state)) do sat_state
+                SatelliteDataOfInterest(
                     estimate_cn0(sat_state),
                     get_prompt(get_last_fully_integrated_correlator(sat_state)),
                     is_sat_healthy(rs.receiver_sat_states[1][sat_state.prn].decoder),
-                ) for sat_state in get_sat_states(rs.track_state)
-            )
+                )
+            end
             put!(data_channel, ReceiverDataOfInterest(sat_data, rs.pvt, rs.runtime))
         end
         close(data_channel)
