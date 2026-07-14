@@ -1,6 +1,16 @@
 using Documenter
 using GNSSReceiver
 
+# The GUI screenshot lives once in the repo at `media/output.png` (also used by the
+# README). Copy it into the docs assets at build time rather than committing a second
+# copy, so there is a single source of truth. The generated copy is git-ignored.
+let src = joinpath(@__DIR__, "..", "media", "output.png"),
+    dst = joinpath(@__DIR__, "src", "assets", "gui.png")
+
+    mkpath(dirname(dst))
+    cp(src, dst; force = true)
+end
+
 makedocs(
     sitename = "GNSSReceiver.jl",
     modules = [GNSSReceiver],
