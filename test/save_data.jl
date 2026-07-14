@@ -11,14 +11,31 @@
         end
     end
 
-    @sync begin
-        save_data(data_channel; filename = "/tmp/data.jld2")
-    end
-    #    sleep(1.0)
-    #    data_over_time = load("/tmp/data.jld2", "data_over_time")
+    filename = joinpath(mktempdir(), "data.jld2")
+    # `save_data` returns its spawned writer task; wait on it so the JLD2 file is
+    # fully written before we read it back.
+    wait(save_data(data_channel; filename))
 
-    #    @test length(data_over_time) == 20
-    #    @test length(last(data_over_time).sat_data) == 0
+    data_over_time = load(filename, "data_over_time")
+    @test length(data_over_time) == 20
+    @test length(last(data_over_time).sat_data) == 0
+    @test data_over_time[1].runtime == 0ms
+    @test data_over_time[end].runtime == 19ms
+end
+
+@testset "Save data with a custom extract payload" begin
+    # A channel of a custom (non-ReceiverDataOfInterest) payload, as produced via
+    # `receive`'s `extract` keyword. `save_data` must handle it just like `collect_data`.
+    data_channel = Channel{@NamedTuple{runtime::typeof(1.0ms)}}() do ch
+        foreach(i -> put!(ch, (; runtime = (i - 1) * 1.0ms)), 1:20)
+    end
+
+    filename = joinpath(mktempdir(), "custom.jld2")
+    wait(save_data(data_channel; filename))
+
+    data_over_time = load(filename, "data_over_time")
+    @test length(data_over_time) == 20
+    @test data_over_time[end].runtime == 19ms
 end
 
 @testset "Collect data" begin

@@ -1,16 +1,17 @@
 """
-    save_data(data_channel; filename)
+    save_data(data_channel; filename) -> Task
 
-Consume every [`ReceiverDataOfInterest`](@ref) from `data_channel` on a spawned task
-and, once the channel closes, write the collected vector to `filename` as a JLD2 file
-under the key `"data_over_time"`. Returns immediately; the write happens when the
-producer finishes.
+Consume every element of `data_channel` on a spawned task and, once the channel closes,
+write the collected vector to `filename` as a JLD2 file under the key `"data_over_time"`.
+
+This is the on-disk counterpart to [`collect_data`](@ref): like it, `save_data` works
+with the default [`ReceiverDataOfInterest`](@ref) channel from [`receive`](@ref) as well
+as a channel of a custom payload produced via `receive`'s `extract` keyword. Returns the
+writer task immediately (the write happens when the producer finishes); `wait` on it if
+you need to block until the file is on disk.
 """
-function save_data(
-    data_channel::AbstractChannel{T};
-    filename,
-) where {T<:ReceiverDataOfInterest}
-    data_over_time = Vector{T}()
+function save_data(data_channel::AbstractChannel; filename)
+    data_over_time = Vector{eltype(data_channel)}()
     Base.errormonitor(Threads.@spawn begin
         consume_channel(data_channel) do data
             push!(data_over_time, data)
