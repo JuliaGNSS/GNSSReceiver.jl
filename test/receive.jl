@@ -86,3 +86,40 @@ end
         @test isnothing(data.pvt.time)
     end
 end
+
+@testset "Receive with a custom extract hook" begin
+    sampling_freq = 5e6Hz
+    system = GPSL1CA()
+    num_samples = 20000
+    num_ants = 4
+    max_meas = 2^12
+
+    measurement_channel = make_noise_channel(Complex{Int16}, num_samples, num_ants)
+
+    # A custom payload instead of the default ReceiverDataOfInterest: the runtime and
+    # the number of currently tracked satellites.
+    my_extract(rs) =
+        (runtime = rs.runtime, num_sats = length(Tracking.get_sat_states(rs.track_state)))
+
+    data_channel = receive(
+        measurement_channel,
+        system,
+        sampling_freq;
+        num_ants = NumAnts(num_ants),
+        max_meas,
+        extract = my_extract,
+    )
+
+    # The channel element type is inferred from `extract`, concretely, and is no longer
+    # a ReceiverDataOfInterest.
+    @test isconcretetype(eltype(data_channel))
+    @test eltype(data_channel) <: NamedTuple
+    @test !(eltype(data_channel) <: GNSSReceiver.ReceiverDataOfInterest)
+
+    # collect_data works on the custom-payload channel too.
+    data = collect_data(data_channel)
+    @test eltype(data) == eltype(data_channel)
+    @test !isempty(data)
+    @test all(d -> d.num_sats == 0, data)                # pure noise ⇒ nothing tracked
+    @test issorted([d.runtime for d in data])            # runtime advances monotonically
+end
