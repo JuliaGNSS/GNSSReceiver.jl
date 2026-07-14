@@ -1,5 +1,20 @@
+"""
+    AbstractLockDetector
+
+Supertype for the receiver's per-satellite lock detectors. A concrete detector is
+advanced with `update` and queried with [`is_in_lock`](@ref); a satellite is treated
+as locked only while both its code and carrier detectors report lock.
+"""
 abstract type AbstractLockDetector end
 
+"""
+    CodeLockDetector <: AbstractLockDetector
+
+Declares code lock from the estimated carrier-to-noise density ratio. After a
+`wait_counter_threshold`-update warm-up it increments an out-of-lock counter each time
+the CN0 is below `cn0_threshold` (and decrements it otherwise); lock is lost once that
+counter reaches `num_out_of_lock_threshold`.
+"""
 struct CodeLockDetector <: AbstractLockDetector
     cn0_threshold::typeof(1.0u"dBHz")
     num_out_of_lock::Int
@@ -34,10 +49,24 @@ function update(lock_detector::CodeLockDetector, cn0)
     )
 end
 
+"""
+    is_in_lock(lock_detector::AbstractLockDetector)
+
+Return `true` while the detector's out-of-lock counter is below its threshold.
+"""
 function is_in_lock(lock_detector::AbstractLockDetector)
     lock_detector.num_out_of_lock < lock_detector.num_out_of_lock_threshold
 end
 
+"""
+    CarrierLockDetector <: AbstractLockDetector
+
+Declares carrier lock from the prompt correlator using the standard low-pass filtered
+in-phase/quadrature amplitude test. Over each 20-integration block it compares the
+filtered in-phase amplitude against the filtered quadrature amplitude; too little
+in-phase dominance increments the out-of-lock counter, and lock is lost once it reaches
+`num_out_of_lock_threshold`.
+"""
 struct CarrierLockDetector <: AbstractLockDetector
     prev_filtered_inphase::Float64
     prev_filtered_quadrature::Float64

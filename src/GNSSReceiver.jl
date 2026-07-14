@@ -1,3 +1,15 @@
+"""
+    GNSSReceiver
+
+A software GNSS receiver: it acquires, tracks, decodes and computes a
+position/velocity/time (PVT) solution from GNSS signal samples, whether streamed live
+from a SoapySDR device or replayed from recorded files.
+
+The high-level entry points are [`gnss_receiver_gui`](@ref) (live device + terminal
+GUI), [`gnss_write_to_file`](@ref) (record raw samples) and [`receive`](@ref) (the
+acquire → track → decode → PVT pipeline over a sample channel). Results can be shown
+with [`get_gui_data_channel`](@ref) or persisted with [`save_data`](@ref).
+"""
 module GNSSReceiver
 
 using StaticArrays,
@@ -28,10 +40,8 @@ using SignalChannels:
     spawn_signal_channel_thread,
     write_to_file
 
-
 export ReceiverState,
     receive,
-    reset_but_keep_decoders_and_pvt,
     read_files,
     save_data,
     get_gui_data_channel,
@@ -59,12 +69,14 @@ end
 function ReceiverSatState(
     acq::Acquisition.AcquisitionResults,
     decoder::Tracking.Maybe{<:GNSSDecoderState} = nothing,
-    code_lock_cn0_threshold::typeof(1.0u"dBHz") = get_default_code_lock_cn0_threshold(acq.system),
+    code_lock_cn0_threshold::typeof(1.0u"dBHz") = get_default_code_lock_cn0_threshold(
+        acq.system,
+    ),
 )
     ReceiverSatState(
         acq.prn,
         isnothing(decoder) ? GNSSDecoderState(acq.system, acq.prn) : decoder,
-        CodeLockDetector(cn0_threshold = code_lock_cn0_threshold),
+        CodeLockDetector(; cn0_threshold = code_lock_cn0_threshold),
         CarrierLockDetector(),
         0.0u"s",
         0.0u"s",
@@ -76,12 +88,14 @@ end
 function ReceiverSatState(
     system::AbstractGNSSSignal,
     prn::Int,
-    code_lock_cn0_threshold::typeof(1.0u"dBHz") = get_default_code_lock_cn0_threshold(system),
+    code_lock_cn0_threshold::typeof(1.0u"dBHz") = get_default_code_lock_cn0_threshold(
+        system,
+    ),
 )
     ReceiverSatState(
         prn,
         GNSSDecoderState(system, prn),
-        CodeLockDetector(cn0_threshold = code_lock_cn0_threshold),
+        CodeLockDetector(; cn0_threshold = code_lock_cn0_threshold),
         CarrierLockDetector(),
         0.0u"s",
         0.0u"s",
@@ -95,33 +109,18 @@ function is_in_lock(state::ReceiverSatState)
 end
 
 function increase_time_out_of_lock(state::ReceiverSatState, time::Unitful.Time)
-    ReceiverSatState(
-        state.prn,
-        state.decoder,
-        state.code_lock_detector,
-        state.carrier_lock_detector,
-        0.0u"s",
-        state.time_out_of_lock + time,
-        0,
-        state.carrier_doppler_for_reacquisition,
-    )
+    @reset state.time_in_lock = 0.0u"s"
+    @reset state.time_out_of_lock = state.time_out_of_lock + time
+    @reset state.num_unsuccessful_reacquisition = 0
+    return state
 end
 
 function increment_num_unsuccessful_reacquisition(state::ReceiverSatState)
-    ReceiverSatState(
-        state.prn,
-        state.decoder,
-        state.code_lock_detector,
-        state.carrier_lock_detector,
-        state.time_in_lock,
-        state.time_out_of_lock,
-        state.num_unsuccessful_reacquisition + 1,
-        state.carrier_doppler_for_reacquisition,
-    )
+    @reset state.num_unsuccessful_reacquisition = state.num_unsuccessful_reacquisition + 1
+    return state
 end
 
-const MultipleReceiverSatStates{N,I,DS} =
-    NTuple{N,Dictionary{I,ReceiverSatState{DS}}}
+const MultipleReceiverSatStates{N,I,DS} = NTuple{N,Dictionary{I,ReceiverSatState{DS}}}
 
 struct ReceiverState{
     RS<:MultipleReceiverSatStates,
@@ -149,6 +148,18 @@ create_post_corr_filter(num_ants::NumAnts{N}) where {N} =
     EigenBeamformer(get_num_ants(num_ants))
 create_post_corr_filter(num_ants::NumAnts{1}) = Tracking.DefaultPostCorrFilter()
 
+"""
+    ReceiverState(T, system; num_samples_for_acquisition, num_ants = NumAnts(1), kwargs...)
+
+Build the initial receiver state for tracking `system`, where `T` is the element type
+of the incoming signal samples (e.g. `ComplexF64` or `Complex{Int16}`).
+
+`num_samples_for_acquisition` sizes the acquisition sample buffer. `num_ants` selects
+single- versus multi-antenna processing and, together with `correlator`,
+`post_corr_filter` and `doppler_estimator`, pins the concrete satellite-slot type so
+that satellites handed over from acquisition merge into the track state without
+introducing type instability.
+"""
 function ReceiverState(
     ::Type{T}, # Must be the same type as the incoming signal
     system;
@@ -206,6 +217,21 @@ include("gui.jl")
 include("save_data.jl")
 include("soapy_sdr_helper.jl")
 
+"""
+    gnss_receiver_gui(; system = GPSL1CA(), sampling_freq = 2e6u"Hz", kwargs...)
+
+Acquire, track and compute a PVT solution from a live SoapySDR device and display the
+result in a live terminal GUI. Blocks until the stream ends.
+
+The device selected by `dev_args` is configured for `sampling_freq`, tuned to
+`system`'s centre frequency and streamed for `run_time`. Satellite acquisition uses
+`acquisition_time` of signal — a longer time improves the acquisition SNR at a higher
+computational cost and must exceed one code period. Set `gain` to a fixed value or
+leave it `nothing` for automatic gain control; `antenna`, `interm_freq` and `num_ants`
+override the RF front end and antenna-channel count. `max_meas` (the front-end
+full-scale) is required when the device streams `Complex{Int16}` samples and may be
+left `nothing` for float-native devices.
+"""
 function gnss_receiver_gui(;
     system = GPSL1CA(),
     sampling_freq = 2e6u"Hz",
@@ -269,6 +295,14 @@ function gnss_receiver_gui(;
     end
 end
 
+"""
+    gnss_write_to_file(; system = GPSL1CA(), sampling_freq = 2e6u"Hz", run_time = 4u"s",
+                       dev_args = first(Devices()), output_file = "gnss_test_data")
+
+Stream `run_time` of raw `Complex{Int16}` samples from a SoapySDR device to
+`output_file`, for later offline replay with [`read_files`](@ref) and
+[`receive`](@ref). Blocks until the recording finishes.
+"""
 function gnss_write_to_file(;
     system = GPSL1CA(),
     sampling_freq = 2e6u"Hz",
@@ -293,6 +327,18 @@ function gnss_write_to_file(;
     end
 end
 
+"""
+    receive_and_gui(files; system = GPSL1CA(), sampling_freq = 5e6u"Hz", kwargs...)
+
+Replay recorded sample `files` through the receiver and show the live terminal GUI,
+returning once any key is pressed (which stops the stream).
+
+`files` holds one path per antenna channel (`num_ants` must match). Samples are read
+as `type` elements; `max_meas` (the front-end full-scale) is required for the default
+`Complex{Int16}` recordings and ignored for float types. `clock_drift` rescales the
+sampling and intermediate frequencies to compensate for a known front-end clock
+offset.
+"""
 function receive_and_gui(
     files;
     clock_drift = 0.0,

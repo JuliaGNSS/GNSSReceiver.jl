@@ -1,3 +1,15 @@
+"""
+    read_files(files, num_samples, end_condition = nothing; type = Complex{Int16})
+
+Return a `SignalChannel` that yields `num_samples`-long chunks read from `files`, one
+file per antenna channel (a single path is treated as one channel). Samples are read
+as `type` elements.
+
+The read runs on a spawned task that stops when `end_condition` is reached: an
+`Integer` sample count, a notified `Base.Event`, or end-of-file (`nothing` reads until
+EOF). Each chunk is a freshly allocated buffer, since the lock-free channel may still
+hold a previously enqueued chunk.
+"""
 function read_files(
     files,
     num_samples,

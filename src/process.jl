@@ -1,6 +1,20 @@
 get_default_code_lock_cn0_threshold(system::GPSL1CA) = 30.0u"dBHz"
 get_default_code_lock_cn0_threshold(system::GalileoE1B) = 30.0u"dBHz"
 
+"""
+    process(receiver_state, acq_plan, measurement, system, sampling_freq; kwargs...)
+
+Advance the receiver by one `measurement` chunk and return the next `ReceiverState`.
+
+A single chunk runs the whole per-cycle pipeline: it (re)acquires satellites via
+`acq_plan` at most every `acquire_every` (buffering samples only when acquisition could
+fire, unless `always_buffer` is set), tracks the current satellites, updates their
+lock detectors and, once enough have been locked for
+`time_in_lock_before_calculating_pvt`, recomputes the PVT solution every
+`pvt_update_interval`. Satellites that drop out of lock are removed from the track
+state. This is the function [`receive`](@ref) calls for each chunk; see it for the
+meaning of the remaining keyword arguments.
+"""
 function process(
     receiver_state::ReceiverState{RS,TS,AB,P,PB},
     acq_plan,
@@ -30,7 +44,8 @@ function process(
     # acquisition could plausibly fire. This avoids ~46 μs of memcpy on
     # every steady-state frame. When always_buffer is true, the buffer is
     # kept up to date for fast reacquisition of lost satellites.
-    needs_buffering = always_buffer ||
+    needs_buffering =
+        always_buffer ||
         runtime - last_time_acquisition_ran >= acquire_every ||
         any(should_reacquire, receiver_sat_states)
     acquisition_buffer = if needs_buffering
@@ -214,8 +229,6 @@ end
 
 get_prns(acquisition_results::AbstractVector{<:Acquisition.AcquisitionResults}) =
     map(res -> res.prn, acquisition_results)
-get_prns(receiver_sat_states::Dictionary{<:Any,<:ReceiverSatState}) =
-    map(receiver_sat_state -> receiver_sat_state.prn, collect(receiver_sat_states))
 
 function create_sat_state_from_acq(
     acq::Acquisition.AcquisitionResults,
@@ -323,12 +336,8 @@ function acquire_satellites(
             interm_freq,
         )
 
-        corrected_acq_res = eltype(acq_res)[
-            advance_code_phase(
-                res,
-                num_samples_processed - (get_first_sample_counter(acquisition_buffer) - 1),
-            ) for res in acq_res
-        ]
+        corrected_acq_res =
+            correct_acquired_code_phases(acq_res, acquisition_buffer, num_samples_processed)
 
         track_state, receiver_sat_states = update_states_from_acquisition_results(
             corrected_acq_res,
@@ -342,6 +351,16 @@ function acquire_satellites(
         last_time_acquisition_ran = runtime
     end
     track_state, receiver_sat_states, last_time_acquisition_ran
+end
+
+# Acquisition reports each code phase relative to the first sample of the
+# acquisition buffer. Advance every result by the number of samples between that
+# first buffered sample and the most recently processed sample, so the handed-over
+# code phases line up with the live tracking state.
+function correct_acquired_code_phases(acq_res, acquisition_buffer, num_samples_processed)
+    sample_offset =
+        num_samples_processed - (get_first_sample_counter(acquisition_buffer) - 1)
+    return eltype(acq_res)[advance_code_phase(res, sample_offset) for res in acq_res]
 end
 
 function advance_code_phase(acq_res::Acquisition.AcquisitionResults, num_samples)
@@ -359,8 +378,8 @@ end
 
 function should_reacquire(state)
     !is_in_lock(state) &&
-    state.num_unsuccessful_reacquisition <= 10 &&
-    state.num_unsuccessful_reacquisition^2 * 100u"ms" >= state.time_out_of_lock
+        state.num_unsuccessful_reacquisition <= 10 &&
+        state.num_unsuccessful_reacquisition^2 * 100u"ms" >= state.time_out_of_lock
 end
 
 function try_to_reacquire_lost_satellites(
@@ -389,15 +408,14 @@ function try_to_reacquire_lost_satellites(
         interm_freq,
     )
 
-    corrected_acq_res = eltype(acq_res)[
-        advance_code_phase(
-            res,
-            num_samples_processed - (get_first_sample_counter(acquisition_buffer) - 1),
-        ) for res in acq_res
-    ]
+    corrected_acq_res =
+        correct_acquired_code_phases(acq_res, acquisition_buffer, num_samples_processed)
 
     invalid_acq_res_prns = get_prns(
-        filter(res -> !is_detected(res; pfa = acquisition_false_alarm_probability), acq_res),
+        filter(
+            res -> !is_detected(res; pfa = acquisition_false_alarm_probability),
+            acq_res,
+        ),
     )
     if !isempty(invalid_acq_res_prns)
         receiver_sat_states = map(receiver_sat_states) do state

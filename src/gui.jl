@@ -45,6 +45,14 @@ const PRNMARKERS = (
     '\U325F',
 )
 
+"""
+    get_gui_data_channel(data_channel, push_gui_data_roughly_every = 500u"ms")
+
+Return a `Channel{GUIData}` that downsamples `data_channel` for display: a spawned task
+consumes every [`ReceiverDataOfInterest`](@ref) but only forwards one roughly every
+`push_gui_data_roughly_every` of signal runtime (plus the very first), so the GUI is
+refreshed at a human rate rather than once per processed chunk.
+"""
 function get_gui_data_channel(
     data_channel::AbstractChannel{<:ReceiverDataOfInterest},
     push_gui_data_roughly_every = 500u"ms",
@@ -71,6 +79,13 @@ _cursor_hide(io::IO) = print(io, "\x1b[?25l")
 _cursor_show(io::IO) = print(io, "\x1b[?25h")
 panel(plot; kw...) = Panel(string(plot; color = true); fit = true, kw...)
 
+"""
+    gui(gui_data_channel, io = stdout; construct_gui_panels = construct_gui_panels)
+
+Render the receiver GUI to `io`, consuming each `GUIData` from `gui_data_channel` and
+redrawing the terminal in place until the channel closes. `construct_gui_panels`
+builds the panel layout for one frame and can be overridden to customise the display.
+"""
 function gui(gui_data_channel, io::IO = stdout; construct_gui_panels = construct_gui_panels)
     terminal = REPL.Terminals.TTYTerminal("", stdin, io, stderr)
     num_dots = 0
