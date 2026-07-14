@@ -123,3 +123,34 @@ end
     @test all(d -> d.num_sats == 0, data)                # pure noise ⇒ nothing tracked
     @test issorted([d.runtime for d in data])            # runtime advances monotonically
 end
+
+@testset "Receive falls back to a runtime call for a non-inferrable extract" begin
+    sampling_freq = 5e6Hz
+    system = GPSL1CA()
+    num_samples = 20000
+    num_ants = 4
+    max_meas = 2^12
+
+    measurement_channel = make_noise_channel(Complex{Int16}, num_samples, num_ants)
+
+    # An extract whose return type inference can't pin down concretely (the
+    # inference barrier hides it as `Any`), even though every call returns an `Int`.
+    # `Base.promote_op` yields a non-concrete type, so `receive` falls back to
+    # calling `extract` on the initial state to learn the concrete payload type.
+    opaque_extract(rs) = Base.inferencebarrier(rs.num_samples_processed)::Any
+
+    data_channel = receive(
+        measurement_channel,
+        system,
+        sampling_freq;
+        num_ants = NumAnts(num_ants),
+        max_meas,
+        extract = opaque_extract,
+    )
+
+    # The fallback pins the concrete element type from the initial state's payload.
+    @test eltype(data_channel) == Int
+    data = collect_data(data_channel)
+    @test !isempty(data)
+    @test eltype(data) == Int
+end

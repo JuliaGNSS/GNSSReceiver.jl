@@ -214,6 +214,29 @@ using GNSSReceiver.SampleBuffers
         @test SampleBuffers.isfull(buf_counter)
     end
 
+    @testset "Non-evicting append wraps around the end of the store" begin
+        # Construct a partially-filled buffer whose live window already starts partway
+        # into the backing store, so appending samples that still fit (no eviction)
+        # wraps past the physical end of the store.
+        base = SampleBuffer(Float64, 5, Val(2))
+        buf = SampleBuffers.SampleBuffer{Float64,Matrix{Float64}}(
+            base.buffer,
+            base.fifo_buffer,
+            5,   # max_length
+            1,   # current_length
+            3,   # start_index -> end_index = 3
+            1,   # first_sample_counter
+        )
+        buf.buffer[3, :] = [99.0, 98.0]
+
+        # 3 new samples: end_index (3) + 3 > max_length (5), so the write wraps.
+        new_samples = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+        buf = buffer(buf, new_samples)
+        @test buf.current_length == 4
+        @test !SampleBuffers.isfull(buf)
+        @test get_samples(buf) == [99.0 98.0; 1.0 2.0; 3.0 4.0; 5.0 6.0]
+    end
+
     @testset "Helper functions for first sample counter" begin
         buf = SampleBuffer(Float64, 10, Val(2))
 
