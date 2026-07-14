@@ -1,0 +1,15 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+Downloads = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
+GNSSReceiver = "c84cffac-6943-4fe6-9449-f6d23817af8b"
+GNSSSignals = "52c80523-2a4e-5c38-8979-05588f836870"
+PositionVelocityTime = "52ec0b5e-ee36-11ea-211c-3d844fc5682d"
+Tracking = "10b2438b-ffd4-5096-aa58-44041d5c8f3b"
+UnicodePlots = "b8865327-cd53-5732-bb35-84acbb429228"
+Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
+
+[compat]
+Documenter = "1"
+
+[sources]
+GNSSReceiver = {path = ".."}

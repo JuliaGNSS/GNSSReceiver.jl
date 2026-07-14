@@ -1,5 +1,16 @@
 # GNSSReceiver (WIP)
 
+[![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://JuliaGNSS.github.io/GNSSReceiver.jl/stable)
+[![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://JuliaGNSS.github.io/GNSSReceiver.jl/dev)
+
+A software-defined GNSS receiver in pure Julia: it acquires, tracks, decodes and computes
+a position/velocity/time (PVT) solution from GNSS signal samples — streamed live from a
+SoapySDR device or replayed from a file.
+
+📖 **[Read the documentation](https://JuliaGNSS.github.io/GNSSReceiver.jl/dev)** for a
+guided introduction, the full list of acquisition/tracking parameters, and a worked
+example that computes a real position fix from a public recording.
+
 ![Exemplary output](media/output.png)
 
 ## Installation
@@ -15,32 +26,36 @@ pkg> add GNSSReceiver
 
 ```julia
 using GNSSSignals, Tracking, GNSSReceiver, Unitful
-using Unitful:Hz, ms
-gpsl1 = GPSL1()
+using Unitful: Hz, ms
+system = GPSL1CA()
 files = map(i -> "antenna$i.dat", 1:4) # Could also be a single file for a single antenna channel
 sampling_freq = 5e6Hz
-# The number of samples must be integer multiples of 1ms.
-# The number of samples determines the length of the signal that
-# is passed to the acquisition of the satellites.
-# Higher values result into higher chance of acquisition, but also
-# demand a larger computing power.
+# The number of samples must be an integer multiple of 1ms. It sets how much signal each
+# acquisition attempt sees: higher values raise the acquisition sensitivity, but also
+# demand more computing power.
 num_samples = Int(upreferred(sampling_freq * 4ms))
-measurement_channel = read_files(files, num_samples, type = Complex{Int16})
-# Let's receive GPS L1 signals
-data_channel = receive(measurement_channel, gpsl1, sampling_freq; num_ants = NumAnts(4))
+measurement_channel = read_files(files, num_samples; type = Complex{Int16})
+# Let's receive GPS L1 signals. `Complex{Int16}` samples use Tracking's fast integer
+# backend, which needs `max_meas` — the front end's full-scale (largest |real|/|imag|).
+data_channel = receive(measurement_channel, system, sampling_freq; num_ants = NumAnts(4), max_meas = 2^11)
 # Get gui channel from data channel
 gui_channel = get_gui_data_channel(data_channel)
 # Hook up GUI
 GNSSReceiver.gui(gui_channel)
 # If you'd like to save the data as well, you will have to split the data channel:
+# using PipeChannels: tee
 # data_channel1, data_channel2 = tee(data_channel)
-# data_task = @async save_data(data_channel1)
+# data_task = @async save_data(data_channel1; filename = "run.jld2")
 # gui_channel = get_gui_data_channel(data_channel2)
 # GNSSReceiver.gui(gui_channel)
-# data = fetch(data_task)
+# fetch(data_task)
 ```
 
 That's it. You can watch the GUI being updated in real time.
+
+See the [documentation](https://JuliaGNSS.github.io/GNSSReceiver.jl/dev) for reading raw
+8-bit offset-binary recordings with `read_uint8_iq_file`, the full list of
+acquisition/tracking parameters, and a runnable end-to-end example on real data.
 
 ### Example to read from SDR
 
