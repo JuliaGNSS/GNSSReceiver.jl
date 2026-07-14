@@ -122,6 +122,18 @@ function filter_in_lock_sats(receiver_sat_states, track_state)
 
     # Tracking v3 dropped `filter_out_sats`; remove PRNs one at a time,
     # threading the returned TrackState through each removal.
+    #
+    # Use the *functional* `remove_satellite` (and, in the acquisition path,
+    # `merge_sats`), NOT the in-place `remove_satellite!` / `add_satellite!`.
+    # `receive` builds the user-facing `sat_data` with `map(get_sat_states(...))`,
+    # and Dictionaries' `map` *shares the source's key `Indices` object* with the
+    # emitted payload (only the values vector is fresh). Those payloads then sit in
+    # `data_channel` and are re-forwarded downstream (e.g. into `GUIData`), so the
+    # previous chunk's key set is still referenced elsewhere. The functional
+    # mutators build a *fresh* `Dictionary`, leaving that shared `Indices`
+    # untouched; the in-place `!` variants would mutate it and retroactively
+    # corrupt every in-flight payload sharing it (its keys and values vectors would
+    # disagree in length → `BoundsError` when a consumer iterates it).
     foldl(prns_to_remove; init = track_state) do ts, prn
         remove_satellite(ts; prn)
     end
