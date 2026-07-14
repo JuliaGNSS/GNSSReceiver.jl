@@ -223,10 +223,12 @@ function update_receiver_sat_states(receiver_sat_states, track_state, signal_dur
                 update(
                     receiver_sat_state.code_lock_detector,
                     estimate_cn0(track_state, prn),
+                    signal_duration,
                 ),
                 update(
                     receiver_sat_state.carrier_lock_detector,
                     get_last_fully_integrated_filtered_prompt(track_state, prn),
+                    signal_duration,
                 ),
                 receiver_sat_state.time_in_lock + signal_duration,
                 0.0u"s",
