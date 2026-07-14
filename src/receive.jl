@@ -129,6 +129,14 @@ function receive(
             # over it keeps those PRN keys and only transforms each satellite into
             # the data of interest — no keys to rebuild, and the result is already
             # the `Dictionary{Int,sat_data_type}` the channel expects.
+            #
+            # Note: `map` *shares* the source's key `Indices` with this payload
+            # (only the values vector is fresh), and the payload outlives this
+            # iteration (it queues in `data_channel` and is re-forwarded downstream).
+            # This is safe only because `process` mutates the sat set exclusively
+            # through the functional `remove_satellite` / `merge_sats`, which build a
+            # fresh `Dictionary` rather than mutating the shared `Indices` in place.
+            # See the load-bearing comment in `filter_in_lock_sats` (process.jl).
             sat_data = map(get_sat_states(rs.track_state)) do sat_state
                 SatelliteDataOfInterest(
                     estimate_cn0(sat_state),
