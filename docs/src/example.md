@@ -128,5 +128,82 @@ map:
 println("https://www.google.com/maps/search/$(ustrip(lla.lat)),$(ustrip(lla.lon))")
 ```
 
+## Getting data beyond the summary
+
+[`receive`](@ref) reports a deliberately compact summary. Each snapshot is a
+[`ReceiverDataOfInterest`](@ref GNSSReceiver.ReceiverDataOfInterest) with three fields —
+`sat_data`, `pvt` and `runtime` — and each entry of `sat_data` is a
+[`SatelliteDataOfInterest`](@ref GNSSReceiver.SatelliteDataOfInterest) carrying only the
+CN0, the prompt correlator value and a health flag. The PVT solution, however, is the full
+`PositionVelocityTime.PVTSolution`, so a lot is already available without any extra work:
+
+```@example iondata
+pvt = final.pvt
+println("Velocity (ECEF):     ", round.(pvt.velocity; digits = 2), " m/s")
+println("Clock drift:         ", pvt.relative_clock_drift)
+println("GDOP / HDOP / VDOP:  ", round(pvt.dop.GDOP; digits = 2), " / ",
+        round(pvt.dop.HDOP; digits = 2), " / ", round(pvt.dop.VDOP; digits = 2))
+println("Prompt (PRN 5):      ", final.sat_data[5].prompt)
+```
+
+If you need a quantity that the summary does **not** carry — the raw carrier Doppler, code
+phase or carrier phase of the tracking loops, or the decoded navigation data — pass your
+own `extract` function to [`receive`](@ref). Each processed chunk, `receive` calls
+`extract(receiver_state)` on the full [`ReceiverState`](@ref) and puts the result on the
+channel; the default is [`default_data_of_interest`](@ref
+GNSSReceiver.default_data_of_interest), which builds the `ReceiverDataOfInterest` you have
+been using. Your function can return anything (the channel's element type is inferred from
+it) — read the extra fields with the accessors from
+[Tracking](https://github.com/JuliaGNSS/Tracking.jl) and
+[GNSSDecoder](https://github.com/JuliaGNSS/GNSSDecoder.jl):
+
+```@example iondata
+using Tracking
+
+# Emit per-satellite carrier Doppler and code phase — neither is in the default summary.
+function doppler_and_code_phase(receiver_state)
+    track_state = receiver_state.track_state
+    sats = Dict(
+        prn => (
+            doppler = get_carrier_doppler(track_state, prn),
+            code_phase = get_code_phase(track_state, prn),
+        ) for prn in keys(get_sat_states(track_state))
+    )
+    return (; runtime = receiver_state.runtime, sats)
+end
+
+data_channel = receive(
+    read_uint8_iq_file(file, num_samples),
+    system,
+    sampling_freq;
+    acquisition_num_coherent_code_periods = 10,
+    approximate_year = 2017,
+    max_meas = 2^7,
+    extract = doppler_and_code_phase,
+)
+
+custom = collect_data(data_channel)   # a Vector of our named tuples
+
+last_snapshot = last(custom)
+for prn in sort(collect(keys(last_snapshot.sats)))
+    s = last_snapshot.sats[prn]
+    println(
+        "PRN ", lpad(prn, 2),
+        "   carrier Doppler ", round(ustrip(u"Hz", s.doppler); digits = 1), " Hz",
+        "   code phase ", round(s.code_phase; digits = 1),
+    )
+end
+```
+
+`extract` must be read-only and return an immutable value: it runs inside the tracking
+loop on a `ReceiverState` that the next chunk mutates in place. The full state also holds
+the per-satellite decoder states in `receiver_state.receiver_sat_states[1]`, from which
+you can read the decoded ephemeris and health
+(`GNSSReceiver.is_sat_healthy(receiver_state.receiver_sat_states[1][prn].decoder)`), so an
+`extract` can surface those too.
+
+Because your channel carries whatever `extract` returns, you can feed it straight to
+[`collect_data`](@ref) (as above) or [`save_data`](@ref), just like the default one.
+
 To watch this unfold live instead of post-processing it, hand the data channel to the
 [Graphical User Interface](@ref) rather than to [`collect_data`](@ref).

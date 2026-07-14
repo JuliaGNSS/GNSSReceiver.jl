@@ -55,15 +55,58 @@ function default_downconvert_and_correlator(::Type{Complex{Int16}}, max_meas)
 end
 
 """
+    default_data_of_interest(receiver_state) -> ReceiverDataOfInterest
+
+Condense a [`ReceiverState`](@ref) into the default per-chunk summary emitted by
+[`receive`](@ref): each tracked satellite's CN0, prompt correlator value and health, the
+current PVT solution and the runtime.
+
+This is the default `extract` function of [`receive`](@ref). Pass your own
+`extract(receiver_state)` to emit a different payload (see the `extract` keyword of
+[`receive`](@ref)); it must be read-only and return an immutable value, since it runs
+inside the tracking loop on a `ReceiverState` that the next chunk mutates in place.
+"""
+function default_data_of_interest(receiver_state)
+    # Tracking's `get_sat_states` is a `Dictionary` keyed by PRN, so `map` over it keeps
+    # those PRN keys and only transforms each satellite into the data of interest — no
+    # keys to rebuild, and the result is already the `Dictionary{Int,…}` the payload
+    # wants.
+    #
+    # Note: `map` *shares* the source's key `Indices` with this payload (only the values
+    # vector is fresh), and the payload outlives this iteration (it queues in the data
+    # channel and is re-forwarded downstream). This is safe only because `process`
+    # mutates the sat set exclusively through the functional `remove_satellite` /
+    # `merge_sats`, which build a fresh `Dictionary` rather than mutating the shared
+    # `Indices` in place. See the load-bearing comment in `filter_in_lock_sats`
+    # (process.jl).
+    sat_data = map(get_sat_states(receiver_state.track_state)) do sat_state
+        SatelliteDataOfInterest(
+            estimate_cn0(sat_state),
+            get_prompt(get_last_fully_integrated_correlator(sat_state)),
+            is_sat_healthy(receiver_state.receiver_sat_states[1][sat_state.prn].decoder),
+        )
+    end
+    ReceiverDataOfInterest(sat_data, receiver_state.pvt, receiver_state.runtime)
+end
+
+"""
     receive(measurement_channel, system, sampling_freq; num_ants = NumAnts(1), kwargs...)
 
 Run the full acquire → track → decode → PVT pipeline over the samples arriving on
-`measurement_channel` and return a channel of [`ReceiverDataOfInterest`](@ref).
+`measurement_channel` and return a channel of per-chunk results (by default
+[`ReceiverDataOfInterest`](@ref); see `extract` below).
 
 Sampled at `sampling_freq`, each chunk read from `measurement_channel` is processed by
-[`process`](@ref) in a spawned task; the per-chunk satellite CN0s, prompts and PVT
-solution are pushed onto the returned channel. The number of antenna channels in
-`measurement_channel` must equal `N` in `num_ants`.
+[`process`](@ref) in a spawned task; the result of `extract(receiver_state)` is pushed
+onto the returned channel. The number of antenna channels in `measurement_channel` must
+equal `N` in `num_ants`.
+
+`extract` defaults to [`default_data_of_interest`](@ref), which emits the per-chunk
+satellite CN0s, prompts, health and PVT solution as a [`ReceiverDataOfInterest`](@ref).
+To collect other quantities (e.g. raw carrier Doppler, code phase or decoded navigation
+data) pass your own `extract(receiver_state)`; the returned channel's element type is
+inferred from what it returns. It runs inside the tracking loop on a `ReceiverState` that
+the next chunk mutates in place, so it must be read-only and return an immutable value.
 
 The downconvert-and-correlator backend is selected from the sample element type `T`:
 `Complex{Int16}` inputs use Tracking's fast integer backend, which requires `max_meas`
@@ -109,6 +152,7 @@ function receive(
     always_buffer = false,
     prns = 1:32,
     approximate_year::Integer = year(now(UTC)),
+    extract = default_data_of_interest,
 ) where {N,T}
     num_channels = num_antenna_channels(measurement_channel)
     num_channels == N ||
@@ -123,10 +167,16 @@ function receive(
         bit_edge_search_steps,
     )
 
-    sat_data_type =
-        N == 1 ? SatelliteDataOfInterest{ComplexF64} :
-        SatelliteDataOfInterest{SVector{N,ComplexF64}}
-    data_channel = PipeChannel{ReceiverDataOfInterest{sat_data_type}}(100)
+    # The channel carries whatever `extract` returns. Infer that type without running
+    # user code where possible (`promote_op`); for the default `extract` this is the
+    # concrete `ReceiverDataOfInterest{SatelliteDataOfInterest{…}}`. Fall back to
+    # actually calling `extract` on the (empty) initial state only if inference can't pin
+    # a concrete type, so the channel element type stays concrete.
+    payload_type = Base.promote_op(extract, typeof(receiver_state))
+    if !isconcretetype(payload_type)
+        payload_type = typeof(extract(receiver_state))
+    end
+    data_channel = PipeChannel{payload_type}(100)
 
     # Thread `receiver_state` through the per-chunk loop via a *typed* `Ref` rather
     # than reassigning a captured variable inside the spawned task. A variable
@@ -162,27 +212,10 @@ function receive(
                 always_buffer,
                 approximate_year,
             )
-            rs = receiver_state_ref[]
-            # Tracking's `get_sat_states` is a `Dictionary` keyed by PRN, so `map`
-            # over it keeps those PRN keys and only transforms each satellite into
-            # the data of interest — no keys to rebuild, and the result is already
-            # the `Dictionary{Int,sat_data_type}` the channel expects.
-            #
-            # Note: `map` *shares* the source's key `Indices` with this payload
-            # (only the values vector is fresh), and the payload outlives this
-            # iteration (it queues in `data_channel` and is re-forwarded downstream).
-            # This is safe only because `process` mutates the sat set exclusively
-            # through the functional `remove_satellite` / `merge_sats`, which build a
-            # fresh `Dictionary` rather than mutating the shared `Indices` in place.
-            # See the load-bearing comment in `filter_in_lock_sats` (process.jl).
-            sat_data = map(get_sat_states(rs.track_state)) do sat_state
-                SatelliteDataOfInterest(
-                    estimate_cn0(sat_state),
-                    get_prompt(get_last_fully_integrated_correlator(sat_state)),
-                    is_sat_healthy(rs.receiver_sat_states[1][sat_state.prn].decoder),
-                )
-            end
-            put!(data_channel, ReceiverDataOfInterest(sat_data, rs.pvt, rs.runtime))
+            # Condense the (in-place-mutated) ReceiverState into an immutable payload to
+            # queue. `extract` defaults to `default_data_of_interest`; see its comment for
+            # why the built payload is safe to forward downstream.
+            put!(data_channel, extract(receiver_state_ref[]))
         end
         close(data_channel)
     end

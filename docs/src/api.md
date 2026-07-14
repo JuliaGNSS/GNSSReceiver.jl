@@ -28,6 +28,7 @@ documentation.
 
 ```@docs
 get_gui_data_channel
+default_data_of_interest
 save_data
 collect_data
 gui
