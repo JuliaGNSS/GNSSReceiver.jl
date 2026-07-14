@@ -37,6 +37,42 @@ function _ion_produce!(ch, ::Type{T}, dat_file, num_samples, num_ants) where {T}
     end
 end
 
+# Like `_ion_produce!`, but drops `slip_samples` samples right after `slip_after_chunk`
+# chunks (shifting the rest of the stream by that many samples) and stops after
+# `stop_after_chunk` chunks. Used to force a mid-stream timing slip so the tracking
+# loops lose lock and the receiver has to reacquire.
+function _ion_produce_with_slip!(
+    ch,
+    ::Type{T},
+    dat_file,
+    num_samples,
+    num_ants;
+    slip_after_chunk,
+    slip_samples,
+    stop_after_chunk,
+) where {T}
+    io = open(dat_file)
+    raw_buf = Vector{UInt8}(undef, 2 * num_samples)
+    slip_buf = Vector{UInt8}(undef, 2 * slip_samples)
+    try
+        chunk_i = 0
+        while !eof(io)
+            n = readbytes!(io, raw_buf)
+            n < 2 * num_samples && break
+            chunk = Matrix{T}(undef, num_samples, num_ants)
+            @inbounds for i = 1:num_samples
+                chunk[i, 1] = _ion_sample(T, raw_buf[2i-1], raw_buf[2i])
+            end
+            put!(ch, chunk)
+            chunk_i += 1
+            chunk_i == slip_after_chunk && readbytes!(io, slip_buf)
+            chunk_i >= stop_after_chunk && break
+        end
+    finally
+        close(io)
+    end
+end
+
 # ION SDR sample data: 2.048 MS/s, 8-bit unsigned offset-binary I/Q, 60 s, GPS L1.
 # Source:  https://sdr.ion.org/api-sample-data.html
 # Ground truth (publisher's PRN list): {5, 13, 15, 20, 21, 28, 30}.
@@ -59,7 +95,7 @@ let
     # backend for `ComplexF32` and Tracking's fast integer backend for
     # `Complex{Int16}`; both must reach the same fix on the same recording.
     @testset "ION RTL-SDR signal integration test ($type)" for type in
-                                                                [ComplexF32, Complex{Int16}]
+                                                               [ComplexF32, Complex{Int16}]
         sampling_freq = 2.048e6u"Hz"
         system = GPSL1CA()
         # 4 ms chunks = 8192 samples at 2.048 MHz
@@ -67,10 +103,9 @@ let
         num_ants = 1
         expected_prns = Set([5, 13, 15, 20, 21, 28, 30])
 
-        measurement_channel =
-            GNSSReceiver.SignalChannel{type,num_ants}(num_samples) do ch
-                _ion_produce!(ch, type, dat_file, num_samples, num_ants)
-            end
+        measurement_channel = GNSSReceiver.SignalChannel{type,num_ants}(num_samples) do ch
+            _ion_produce!(ch, type, dat_file, num_samples, num_ants)
+        end
 
         # 10 ms coherent integration (`acquisition_num_coherent_code_periods = 10`) with
         # the v2 acquisition (`plan_acquire` + CFAR detection) locks the full healthy
@@ -150,8 +185,17 @@ let
         expected_vdop = 1.13
         expected_tdop = 0.72
         expected_cn0_dbhz = Dict(
-            5 => 51.2, 7 => 41.9, 8 => 40.8, 13 => 46.9, 15 => 48.5,
-            18 => 40.8, 20 => 44.1, 21 => 41.9, 24 => 40.2, 28 => 49.4, 30 => 49.1,
+            5 => 51.2,
+            7 => 41.9,
+            8 => 40.8,
+            13 => 46.9,
+            15 => 48.5,
+            18 => 40.8,
+            20 => 44.1,
+            21 => 41.9,
+            24 => 40.2,
+            28 => 49.4,
+            30 => 49.1,
         )
 
         # Position: 1 m tolerance (LSQ + ephemeris noise is sub-mm; tolerance
@@ -174,7 +218,11 @@ let
 
         # Receiver clock bias and drift
         @test isapprox(last_pvt.time_correction, expected_time_correction, rtol = 1e-4)
-        @test isapprox(last_pvt.relative_clock_drift, expected_relative_clock_drift, rtol = 0.05)
+        @test isapprox(
+            last_pvt.relative_clock_drift,
+            expected_relative_clock_drift,
+            rtol = 0.05,
+        )
 
         # DOPs depend only on satellite geometry; reproducible to ~1%.
         @test isapprox(last_pvt.dop.GDOP, expected_gdop, rtol = 0.05)
@@ -194,5 +242,63 @@ let
             cn0_dbhz = ustrip(last_sat_data[prn].cn0)
             @test isapprox(cn0_dbhz, expected_dbhz, atol = 2.0)
         end
+    end
+
+    # Drive the reacquisition path with the real recording: once the full set is
+    # locked, drop a few samples so the code phase slips out of the correlator's
+    # pull-in range. Satellites lose lock and the receiver reacquires them (a single
+    # dropped sample is only a ~0.5-chip step the DLL absorbs, and a full 2048-sample
+    # code period would realign exactly — a ~1.5-chip, 3-sample slip reliably knocks
+    # them out).
+    @testset "Reacquisition after a mid-stream sample slip" begin
+        sampling_freq = 2.048e6u"Hz"
+        system = GPSL1CA()
+        num_samples = Int(upreferred(sampling_freq * 4u"ms"))
+        # Slip ~6 s in (well after the full set is locked) and stop ~8.8 s in — before
+        # the 10 s periodic acquisition, so any recovery is via reacquisition of the
+        # lost satellites rather than the periodic full search.
+        slip_after_chunk = 1500
+        stop_after_chunk = 2200
+
+        measurement_channel = GNSSReceiver.SignalChannel{ComplexF32,1}(num_samples) do ch
+            _ion_produce_with_slip!(
+                ch,
+                ComplexF32,
+                dat_file,
+                num_samples,
+                1;
+                slip_after_chunk,
+                slip_samples = 3,
+                stop_after_chunk,
+            )
+        end
+
+        data_channel = receive(
+            measurement_channel,
+            system,
+            sampling_freq;
+            num_ants = NumAnts(1),
+            interm_freq = 0.0u"Hz",
+            acquisition_num_coherent_code_periods = 10,
+            approximate_year = 2017,
+            max_meas = 2^7,
+        )
+
+        sat_counts = Int[]
+        GNSSReceiver.consume_channel(data_channel) do data
+            push!(sat_counts, length(data.sat_data))
+        end
+
+        before_slip = sat_counts[1:slip_after_chunk]
+        after_slip = sat_counts[(slip_after_chunk+1):end]
+        @info "Reacquisition slip" locked_before = maximum(before_slip) min_after =
+            minimum(after_slip) final = sat_counts[end]
+
+        # The full healthy set is locked before the slip.
+        @test maximum(before_slip) == 11
+        # The slip knocks satellites out of lock (they are removed from the track state).
+        @test minimum(after_slip) < maximum(before_slip)
+        # Reacquisition brings satellites back before the run ends.
+        @test sat_counts[end] > minimum(after_slip)
     end
 end

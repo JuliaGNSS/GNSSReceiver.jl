@@ -5,11 +5,13 @@
             data = GNSSReceiver.ReceiverDataOfInterest{sat_data_type}(
                 Dictionary(
                     [1],
-                    [sat_data_type(
-                        45.0dBHz,
-                        SVector(complex(1.0, 2.0), complex(2.0, 3.0)),
-                        true,
-                    )],
+                    [
+                        sat_data_type(
+                            45.0dBHz,
+                            SVector(complex(1.0, 2.0), complex(2.0, 3.0)),
+                            true,
+                        ),
+                    ],
                 ),
                 GNSSReceiver.PVTSolution(),
                 (i - 1) * 0.004u"s",
@@ -111,4 +113,33 @@ end
     @test occursin("46.3", out)
     @test occursin("50.830894797269906", out)
     @test occursin("5.568737077976637", out)
+end
+
+@testset "GUI while decoding (enough sats but no PVT yet)" begin
+    sat_data_type = GNSSReceiver.SatelliteDataOfInterest{SVector{2,ComplexF64}}
+    gui_data_channel = Channel{GNSSReceiver.GUIData}() do ch
+        gui_data = GNSSReceiver.GUIData(
+            Dictionary(
+                [3, 12, 23, 10],
+                [
+                    GNSSReceiver.SatelliteDataOfInterest(
+                        45.0dBHz,
+                        zeros(SVector{2,ComplexF64}),
+                        true,
+                    ) for _ = 1:4
+                ],
+            ),
+            GNSSReceiver.PVTSolution(),  # no fix yet: pvt.time === nothing
+            10.0u"s",
+        )
+        foreach(i -> put!(ch, gui_data), 1:20)
+    end
+
+    buf = IOBuffer()
+    GNSSReceiver.gui(gui_data_channel, buf)
+    out = String(take!(buf))
+    # Four tracked sats show up in the CN0 barplot, but with no PVT fix the DOA and
+    # position panels report that decoding is still in progress.
+    @test occursin("Decoding satellites", out)
+    @test !occursin("Not enough satellites", out)
 end
