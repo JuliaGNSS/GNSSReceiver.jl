@@ -1,4 +1,4 @@
-# GNSSReceiver (WIP)
+# GNSSReceiver
 
 [![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://JuliaGNSS.github.io/GNSSReceiver.jl/stable)
 [![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://JuliaGNSS.github.io/GNSSReceiver.jl/dev)
