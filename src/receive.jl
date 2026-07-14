@@ -1,9 +1,24 @@
+"""
+    SatelliteDataOfInterest
+
+Per-satellite summary emitted for each processed chunk: the estimated carrier-to-noise
+density ratio `cn0`, the latest fully integrated `prompt` correlator value (a scalar
+for single-antenna, an `SVector` for multi-antenna) and whether the satellite reports
+itself `is_healthy`.
+"""
 struct SatelliteDataOfInterest{P<:Union{<:Complex,<:AbstractVector{<:Complex}}}
     cn0::typeof(1.0u"dBHz")
     prompt::P
     is_healthy::Bool
 end
 
+"""
+    ReceiverDataOfInterest
+
+Snapshot of the receiver after a processed chunk: `sat_data` maps each tracked PRN to
+its [`SatelliteDataOfInterest`](@ref), `pvt` is the current PVT solution and `runtime`
+is the elapsed signal time. This is the element type produced by [`receive`](@ref).
+"""
 struct ReceiverDataOfInterest{S<:SatelliteDataOfInterest}
     sat_data::Dictionary{Int,S}
     pvt::PVTSolution
@@ -24,8 +39,7 @@ end
 # under-declaring it silently overflows the Int16 carrier wipe and corrupts the
 # correlation. So require it explicitly for `Complex{Int16}` and fail loudly when
 # it's missing rather than guessing.
-default_downconvert_and_correlator(::Type, max_meas) =
-    CPUThreadedDownconvertAndCorrelator()
+default_downconvert_and_correlator(::Type, max_meas) = CPUThreadedDownconvertAndCorrelator()
 function default_downconvert_and_correlator(::Type{Complex{Int16}}, max_meas)
     max_meas === nothing && throw(
         ArgumentError(
@@ -40,6 +54,30 @@ function default_downconvert_and_correlator(::Type{Complex{Int16}}, max_meas)
     Int16ThreadedDownconvertAndCorrelator(max_meas)
 end
 
+"""
+    receive(measurement_channel, system, sampling_freq; num_ants = NumAnts(1), kwargs...)
+
+Run the full acquire → track → decode → PVT pipeline over the samples arriving on
+`measurement_channel` and return a channel of [`ReceiverDataOfInterest`](@ref).
+
+Sampled at `sampling_freq`, each chunk read from `measurement_channel` is processed by
+[`process`](@ref) in a spawned task; the per-chunk satellite CN0s, prompts and PVT
+solution are pushed onto the returned channel. The number of antenna channels in
+`measurement_channel` must equal `N` in `num_ants`.
+
+The downconvert-and-correlator backend is selected from the sample element type `T`:
+`Complex{Int16}` inputs use Tracking's fast integer backend, which requires `max_meas`
+(the front-end full-scale); every other element type uses the general CPU backend and
+ignores `max_meas`. Pass `downconvert_and_correlator` to override this choice.
+
+Acquisition runs every `acquire_every` over `acquisition_num_coherent_code_periods`
+coherently integrated code periods (times `acquisition_num_noncoherent_accumulations`),
+searching `prns` and detecting at `acquisition_false_alarm_probability`. A satellite is
+declared locked once its CN0 exceeds `code_lock_cn0_threshold`, and contributes to the
+PVT solution — recomputed every `pvt_update_interval` — after
+`time_in_lock_before_calculating_pvt`. `approximate_year` resolves the GPS week-number
+rollover for old recordings. Reuse a prior `receiver_state` to continue a run.
+"""
 function receive(
     measurement_channel::SignalChannel{T},
     system,
