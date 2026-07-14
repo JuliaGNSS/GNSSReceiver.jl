@@ -56,6 +56,23 @@ results = collect_data(data_channel)
 length(results)   # number of processed chunks
 ```
 
+!!! note "Where `max_meas = 2^7` comes from"
+    The raw file stores each I and Q value as an 8-bit **unsigned** byte (`0…255`) in
+    *offset-binary* form: the zero-signal level sits at the middle of the range, `128`,
+    rather than at `0`. So a byte of `128` means ≈ zero amplitude, `255` means maximum
+    positive and `0` means maximum negative.
+
+    [`read_uint8_iq_file`](@ref) turns that into normal signed baseband samples by
+    **recentring on 128** — subtracting `128` from every byte — which maps the range
+    `0…255` to `−128…+127`. The largest magnitude any component can then reach is `128`
+    (from byte `0` → `−128`), i.e. `|real|, |imag| ≤ 128`.
+
+    That maximum is exactly the front-end full-scale [`receive`](@ref) needs for
+    `Complex{Int16}` samples, so we pass `max_meas = 2^7 = 128`. (Subtracting the integer
+    `128` leaves a harmless ~0.5-LSB DC offset that the carrier loop removes; for exact
+    midscale recentring in floating point use `read_uint8_iq_file(...; center = 127.5,
+    type = ComplexF32)`, which uses the float backend and needs no `max_meas`.)
+
 `results` is a `Vector` of [`ReceiverDataOfInterest`](@ref
 GNSSReceiver.ReceiverDataOfInterest) snapshots. The last one is the final state of the
 receiver:
