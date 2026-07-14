@@ -27,17 +27,17 @@ using StaticArrays,
     Dictionaries,
     Dates
 
-# Lock-free channel primitives now live in their own packages. Import only what the
-# receiver uses; notably NOT `stream_data`, which `soapy_sdr_helper.jl` defines with
-# its own `SoapySDR.Stream` signature.
+# Lock-free channel primitives now live in their own packages. The SoapySDR device
+# streaming (`stream_data` / `SDRChannelConfig`) comes from SignalChannels' SoapySDR
+# extension, which `using SoapySDR` above loads.
 using PipeChannels: PipeChannel
 using SignalChannels:
     SignalChannel,
+    SDRChannelConfig,
     consume_channel,
     num_antenna_channels,
-    rechunk,
-    membuffer,
     spawn_signal_channel_thread,
+    stream_data,
     write_to_file
 
 export ReceiverState,
@@ -217,7 +217,6 @@ include("receive.jl")
 include("process.jl")
 include("gui.jl")
 include("save_data.jl")
-include("soapy_sdr_helper.jl")
 
 """
     gnss_receiver_gui(; system = GPSL1CA(), sampling_freq = 2e6u"Hz", kwargs...)
@@ -226,13 +225,18 @@ Acquire, track and compute a PVT solution from a live SoapySDR device and displa
 result in a live terminal GUI. Blocks until the stream ends.
 
 The device selected by `dev_args` is configured for `sampling_freq`, tuned to
-`system`'s centre frequency and streamed for `run_time`. Satellite acquisition uses
-`acquisition_time` of signal — a longer time improves the acquisition SNR at a higher
-computational cost and must exceed one code period. Set `gain` to a fixed value or
-leave it `nothing` for automatic gain control; `antenna`, `interm_freq` and `num_ants`
-override the RF front end and antenna-channel count. `max_meas` (the front-end
-full-scale) is required when the device streams `Complex{Int16}` samples and may be
-left `nothing` for float-native devices.
+`system`'s centre frequency and streamed for `run_time` — all handled by SignalChannels'
+`stream_data`, which also buffers a few seconds of signal for acquisition headroom and
+rechunks to the acquisition length. Satellite acquisition uses `acquisition_time` of
+signal — a longer time improves the acquisition SNR at a higher computational cost and
+must exceed one code period. Set `gain` to a fixed value or leave it `nothing` for
+automatic gain control; `antenna`, `interm_freq` and `num_ants` override the RF front end
+and antenna-channel count (one identical channel config is used per antenna).
+
+Samples are streamed as `stream_type` (default `ComplexF32`). Pass `stream_type =
+Complex{Int16}` to use Tracking's fast integer backend on an Int16-native device, in
+which case `max_meas` (the front-end full-scale) is required; it is ignored for float
+stream types.
 """
 function gnss_receiver_gui(;
     system = GPSL1CA(),
@@ -244,66 +248,66 @@ function gnss_receiver_gui(;
     interm_freq = 0.0u"Hz",
     gain::Union{Nothing,<:Unitful.Gain} = nothing,
     antenna = nothing,
-    # Front-end full-scale for the integer downconvert-and-correlator, required
-    # when the SDR's `native_stream_format` is `Complex{Int16}` (see `receive`).
-    # Leave `nothing` for float-native devices.
+    stream_type = ComplexF32,
+    # Front-end full-scale for the integer downconvert-and-correlator, required only
+    # when `stream_type` is `Complex{Int16}` (see `receive`).
     max_meas = nothing,
 )
     num_samples_acquisition = Int(upreferred(sampling_freq * acquisition_time))
     eval_num_samples = Int(upreferred(sampling_freq * run_time))
-    Device(dev_args) do dev
-        for crx in dev.rx
-            if !isnothing(antenna)
-                crx.antenna = antenna
-            end
-            crx.sample_rate = sampling_freq
-            crx.bandwidth = sampling_freq
-            if isnothing(gain)
-                crx.gain_mode = true
-            else
-                crx.gain = gain
-            end
-            crx.frequency = get_center_frequency(system)
-        end
 
-        stream = SoapySDR.Stream(first(dev.rx).native_stream_format, first(dev.rx))
+    # One identical RX config per antenna channel. SignalChannels' `stream_data` opens
+    # and configures the device (sample rate, bandwidth, centre frequency, gain / AGC,
+    # antenna), buffers `buffer_time` of signal for acquisition headroom, and rechunks
+    # the stream to the acquisition length.
+    channel_config = SDRChannelConfig(;
+        sample_rate = sampling_freq,
+        frequency = get_center_frequency(system),
+        bandwidth = sampling_freq,
+        gain,
+        antenna,
+    )
+    configs = ntuple(_ -> channel_config, get_num_ants(num_ants))
 
-        # Getting samples in chunks of `mtu`
-        data_stream = stream_data(stream, eval_num_samples)
-
-        # Satellite acquisition takes about 1s to process on a recent laptop
-        # Let's take a buffer length of 5s to be on the safe side
-        buffer_length = 5u"s"
-        buffered_stream =
-            membuffer(data_stream, ceil(Int, buffer_length * sampling_freq / stream.mtu))
-
-        # Resizing the chunks to acquisition length
-        reshunked_stream = rechunk(buffered_stream, num_samples_acquisition)
-
-        # Performing GNSS acquisition and tracking
-        data_channel = receive(
-            reshunked_stream,
-            system,
-            sampling_freq;
-            num_ants,
-            interm_freq,
-            max_meas,
-        )
-
-        gui_channel = get_gui_data_channel(data_channel)
-
-        # Display the GUI and block
-        GNSSReceiver.gui(gui_channel)
+    data_stream, warning_channel = stream_data(
+        stream_type,
+        dev_args,
+        configs,
+        eval_num_samples;
+        chunk_size = num_samples_acquisition,
+        buffer_time = 5u"s",
+    )
+    # Surface SDR overflow/timeout warnings without blocking the pipeline.
+    warning_task = Threads.@spawn for w in warning_channel
+        @warn "SDR stream warning" type = w.type time = w.time_str
     end
+    Base.errormonitor(warning_task)
+
+    # Performing GNSS acquisition and tracking
+    data_channel = receive(
+        data_stream,
+        system,
+        sampling_freq;
+        num_ants,
+        interm_freq,
+        max_meas,
+    )
+
+    gui_channel = get_gui_data_channel(data_channel)
+
+    # Display the GUI and block
+    GNSSReceiver.gui(gui_channel)
 end
 
 """
     gnss_write_to_file(; system = GPSL1CA(), sampling_freq = 2e6u"Hz", run_time = 4u"s",
-                       dev_args = first(Devices()), output_file = "gnss_test_data")
+                       dev_args = first(Devices()), output_file = "gnss_test_data",
+                       gain = 50u"dB")
 
-Stream `run_time` of raw `Complex{Int16}` samples from a SoapySDR device to
-`output_file`, for later offline replay with [`read_files`](@ref) and
-[`receive`](@ref). Blocks until the recording finishes.
+Stream `run_time` of raw `Complex{Int16}` samples from a SoapySDR device (tuned to
+`system`'s centre frequency, at `gain` or AGC when `gain === nothing`) to `output_file`,
+for later offline replay with [`read_files`](@ref) and [`receive`](@ref). Blocks until the
+recording finishes.
 """
 function gnss_write_to_file(;
     system = GPSL1CA(),
@@ -311,21 +315,25 @@ function gnss_write_to_file(;
     run_time = 4u"s",
     dev_args = first(Devices()),
     output_file = "gnss_test_data",
+    gain::Union{Nothing,<:Unitful.Gain} = 50u"dB",
 )
     eval_num_samples = Int(upreferred(sampling_freq * run_time))
-    Device(dev_args) do dev
-        rx = dev.rx[1]
-        rx.frequency = 2.4e9u"Hz"
-        rx.sample_rate = sampling_freq
-        rx.bandwidth = sampling_freq
-        rx.gain = 50u"dB"
 
-        stream = SoapySDR.Stream(Complex{Int16}, rx)
+    channel_config = SDRChannelConfig(;
+        sample_rate = sampling_freq,
+        frequency = get_center_frequency(system),
+        bandwidth = sampling_freq,
+        gain,
+    )
+    # Record raw Complex{Int16} samples, matching `read_files`' default element type.
+    data_stream, warning_channel =
+        stream_data(Complex{Int16}, dev_args, channel_config, eval_num_samples)
 
-        # Getting samples in chunks of `mtu`
-        data_stream = stream_data(stream, eval_num_samples)
+    wait(write_to_file(data_stream, output_file))
 
-        wait(write_to_file(data_stream, output_file))
+    # Recording is done and the stream is closed; drain any SDR warnings.
+    for w in warning_channel
+        @warn "SDR stream warning" type = w.type time = w.time_str
     end
 end
 
