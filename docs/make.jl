@@ -24,6 +24,7 @@ makedocs(
         "Getting Started" => "getting_started.md",
         "Acquisition & Tracking Parameters" => "parameters.md",
         "Worked Example (Real Data)" => "example.md",
+        "Custom Receiver Output" => "custom_output.md",
         "Graphical User Interface" => "gui.md",
         "API Reference" => "api.md",
     ],

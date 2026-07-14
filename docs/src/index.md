@@ -74,5 +74,7 @@ these docs are built.
   integration length, false-alarm probability, lock thresholds, correlator, …) and how
   to set it.
 - [Worked Example (Real Data)](@ref) — a complete, runnable end-to-end fix on real data.
+- [Custom Receiver Output](@ref) — emit your own per-chunk payload (raw carrier Doppler,
+  code phase, decoded data, …) instead of the default summary.
 - [Graphical User Interface](@ref) — the live terminal GUI.
 - [API Reference](@ref) — every exported function.
