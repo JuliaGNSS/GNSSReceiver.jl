@@ -14,45 +14,48 @@ sampling_freq = 2.048e6u&quot;Hz&quot;
 system = GPSL1CA()
 num_samples = Int(upreferred(sampling_freq * 4u&quot;ms&quot;))   # 4 ms chunks
 
-measurement_channel = read_uint8_iq_file(file, num_samples)
+measurement_channel =
+    read_uint8_iq_file(file, num_samples; center = 127.5, type = ComplexF32)
 
 data_channel = receive(
     measurement_channel,
     system,
     sampling_freq;
-    acquisition_num_coherent_code_periods = 10,   # 10 ms coherent integration
-    approximate_year = 2017,                       # resolves the GPS week rollover
-    max_meas = 2^7,                                # bytes recentred on 128 ⇒ |sample| ≤ 128
+    pvt_approximate_year = 2017,   # resolves the GPS week-number rollover for old data
 )
 
 results = collect_data(data_channel)
-length(results)   # number of processed chunks</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">11779</code></pre><div class="admonition is-info" id="Where-max_meas-27-comes-from-28bc766384375b2f"><header class="admonition-header">Where `max_meas = 2^7` comes from<a class="admonition-anchor" href="#Where-max_meas-27-comes-from-28bc766384375b2f" title="Permalink"></a></header><div class="admonition-body"><p>The raw file stores each I and Q value as an 8-bit <strong>unsigned</strong> byte (<code>0…255</code>) in <em>offset-binary</em> form: the zero-signal level sits at the middle of the range, <code>128</code>, rather than at <code>0</code>. So a byte of <code>128</code> means ≈ zero amplitude, <code>255</code> means maximum positive and <code>0</code> means maximum negative.</p><p><a href="../api/#GNSSReceiver.read_uint8_iq_file"><code>read_uint8_iq_file</code></a> turns that into normal signed baseband samples by <strong>recentring on 128</strong> — subtracting <code>128</code> from every byte — which maps the range <code>0…255</code> to <code>−128…+127</code>. The largest magnitude any component can then reach is <code>128</code> (from byte <code>0</code> → <code>−128</code>), i.e. <code>|real|, |imag| ≤ 128</code>.</p><p>That maximum is exactly the front-end full-scale <a href="../api/#GNSSReceiver.receive"><code>receive</code></a> needs for <code>Complex{Int16}</code> samples, so we pass <code>max_meas = 2^7 = 128</code>. (Subtracting the integer <code>128</code> leaves a harmless ~0.5-LSB DC offset that the carrier loop removes; for exact midscale recentring in floating point use <code>read_uint8_iq_file(...; center = 127.5, type = ComplexF32)</code>, which uses the float backend and needs no <code>max_meas</code>.)</p></div></div><p><code>results</code> is a <code>Vector</code> of <a href="../api/#GNSSReceiver.ReceiverDataOfInterest"><code>ReceiverDataOfInterest</code></a> snapshots. The last one is the final state of the receiver:</p><pre><code class="language-julia hljs">final = last(results)
-final.runtime</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">47.115999999995644 s</code></pre><h2 id="Carrier-to-noise-ratio-per-satellite"><a class="docs-heading-anchor" href="#Carrier-to-noise-ratio-per-satellite">Carrier-to-noise ratio per satellite</a><a id="Carrier-to-noise-ratio-per-satellite-1"></a><a class="docs-heading-anchor-permalink" href="#Carrier-to-noise-ratio-per-satellite" title="Permalink"></a></h2><p>The estimated CN0 of every tracked satellite — this is the same information the live GUI shows as a bar chart:</p><pre><code class="language-julia hljs">using UnicodePlots
+length(results)   # one snapshot per `pvt_update_interval`, plus the final state</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">462</code></pre><div class="admonition is-info" id="Reading-the-raw-offset-binary-file-8271bca4712f2a22"><header class="admonition-header">Reading the raw offset-binary file<a class="admonition-anchor" href="#Reading-the-raw-offset-binary-file-8271bca4712f2a22" title="Permalink"></a></header><div class="admonition-body"><p>The raw file stores each I and Q value as an 8-bit <strong>unsigned</strong> byte (<code>0…255</code>) in <em>offset-binary</em> form: the zero-signal level sits at the middle of the range, <code>128</code>, rather than at <code>0</code>. So a byte of <code>128</code> means ≈ zero amplitude, <code>255</code> means maximum positive and <code>0</code> means maximum negative.</p><p><a href="../api/#GNSSReceiver.read_uint8_iq_file"><code>read_uint8_iq_file</code></a> turns that into normal signed baseband samples by <strong>recentring</strong> — subtracting <code>center</code> from every byte. Reading as <code>ComplexF32</code> with <code>center = 127.5</code> recentres exactly on midscale and produces float baseband samples, so <a href="../api/#GNSSReceiver.receive"><code>receive</code></a>&#39;s default <code>CPUThreadedDownconvertAndCorrelator()</code> processes them with no extra configuration.</p></div></div><p><code>results</code> is a <code>Vector</code> of <a href="../api/#GNSSReceiver.ReceiverDataOfInterest"><code>ReceiverDataOfInterest</code></a> snapshots. The last one is the final state of the receiver:</p><pre><code class="language-julia hljs">final = last(results)
+final.runtime</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">47.115999999995644 s</code></pre><h2 id="Carrier-to-noise-ratio-per-satellite"><a class="docs-heading-anchor" href="#Carrier-to-noise-ratio-per-satellite">Carrier-to-noise ratio per satellite</a><a id="Carrier-to-noise-ratio-per-satellite-1"></a><a class="docs-heading-anchor-permalink" href="#Carrier-to-noise-ratio-per-satellite" title="Permalink"></a></h2><p>The estimated CN0 of every tracked satellite — this is the same information the live GUI shows as a bar chart:</p><p><code>sat_data</code> is a <code>Dictionaries.Dictionary</code> keyed by <code>(signal_id, prn)</code>, so iterate it with <code>pairs</code>:</p><pre><code class="language-julia hljs">using UnicodePlots
 
-prns = collect(keys(final.sat_data))
-cn0s = [ustrip(sd.cn0) for sd in values(final.sat_data)]
+labels = String[]
+cn0s = Float64[]
+for ((signal_id, prn), sd) in pairs(final.sat_data)
+    push!(labels, string(signal_id, &quot; &quot;, prn))
+    push!(cn0s, ustrip(sd.cn0))
+end
 
 barplot(
-    string.(prns),
+    labels,
     round.(cn0s; digits = 1);
     xlabel = &quot;CN0 [dBHz]&quot;,
-    ylabel = &quot;PRN&quot;,
+    ylabel = &quot;Satellite&quot;,
     title = &quot;Carrier-to-Noise-Density Ratio&quot;,
-)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">                <span class="sgr97"><span class="sgr1">Carrier-to-Noise-Density Ratio</span></span>       
-          <span class="sgr90">┌                                        ┐</span> 
-        5 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 53.7 <span class="sgr90"> </span> 
-        7 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 41.6         <span class="sgr90"> </span> 
-        8 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 41.5         <span class="sgr90"> </span> 
-       13 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 47.7     <span class="sgr90"> </span> 
-       15 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 49.1    <span class="sgr90"> </span> 
-   PRN 18 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 41.3         <span class="sgr90"> </span> 
-       20 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 40.9         <span class="sgr90"> </span> 
-       21 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 44.5       <span class="sgr90"> </span> 
-       24 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 40.7         <span class="sgr90"> </span> 
-       28 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 48.6    <span class="sgr90"> </span> 
-       30 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 49.2    <span class="sgr90"> </span> 
-          <span class="sgr90">└                                        ┘</span> 
-                          CN0 [dBHz]                 </code></pre><h2 id="The-position-fix"><a class="docs-heading-anchor" href="#The-position-fix">The position fix</a><a id="The-position-fix-1"></a><a class="docs-heading-anchor-permalink" href="#The-position-fix" title="Permalink"></a></h2><p>Ephemeris decoding takes about half a minute, so the first PVT solution appears roughly 35 seconds into the recording. Here is the final fix:</p><pre><code class="language-julia hljs">using PositionVelocityTime: get_LLA
+)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">                              <span class="sgr97"><span class="sgr1">Carrier-to-Noise-Density Ratio</span></span>       
+                        <span class="sgr90">┌                                        ┐</span> 
+              GPSL1CA 5 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 53.7 <span class="sgr90"> </span> 
+             GPSL1CA 13 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 47.6     <span class="sgr90"> </span> 
+             GPSL1CA 15 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 49.2    <span class="sgr90"> </span> 
+             GPSL1CA 20 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 41           <span class="sgr90"> </span> 
+             GPSL1CA 21 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 44.5       <span class="sgr90"> </span> 
+   Satellite GPSL1CA 28 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 48.6    <span class="sgr90"> </span> 
+             GPSL1CA 30 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 49.2    <span class="sgr90"> </span> 
+             GPSL1CA 18 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 41.3         <span class="sgr90"> </span> 
+             GPSL1CA 24 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 40.7         <span class="sgr90"> </span> 
+              GPSL1CA 7 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 41.5         <span class="sgr90"> </span> 
+              GPSL1CA 8 <span class="sgr90">┤</span><span class="sgr32">■■■■■■■■■■■■■■■■■■■■■■■■■■</span> 41.4         <span class="sgr90"> </span> 
+                        <span class="sgr90">└                                        ┘</span> 
+                                        CN0 [dBHz]                 </code></pre><h2 id="The-position-fix"><a class="docs-heading-anchor" href="#The-position-fix">The position fix</a><a id="The-position-fix-1"></a><a class="docs-heading-anchor-permalink" href="#The-position-fix" title="Permalink"></a></h2><p>Ephemeris decoding takes about half a minute, so the first PVT solution appears roughly 35 seconds into the recording. Here is the final fix:</p><pre><code class="language-julia hljs">using PositionVelocityTime: get_LLA
 
 lla = get_LLA(final.pvt)
 
@@ -62,16 +65,18 @@ println(&quot;Longitude:         &quot;, lla.lon)
 println(&quot;Altitude:          &quot;, round(lla.alt; digits = 1), &quot; m&quot;)
 println(&quot;Satellites in fix: &quot;, length(final.pvt.sats))
 println(&quot;Position DOP:      &quot;, round(final.pvt.dop.PDOP; digits = 2))</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">Time (TAI):        2017-09-10T22:57:07.801 TAI
-Latitude:          52.17721770435846
-Longitude:         4.490057947284441
-Altitude:          47.8 m
-Satellites in fix: 11
-Position DOP:      1.45</code></pre><p>The recording was made at roughly <strong>52.177° N, 4.490° E</strong> in Oegstgeest, Netherlands — which is exactly what the receiver reports. You can drop those coordinates straight into a map:</p><pre><code class="language-julia hljs">println(&quot;https://www.google.com/maps/search/$(ustrip(lla.lat)),$(ustrip(lla.lon))&quot;)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">https://www.google.com/maps/search/52.17721770435846,4.490057947284441</code></pre><h2 id="There&#39;s-more-in-each-snapshot"><a class="docs-heading-anchor" href="#There&#39;s-more-in-each-snapshot">There&#39;s more in each snapshot</a><a id="There&#39;s-more-in-each-snapshot-1"></a><a class="docs-heading-anchor-permalink" href="#There&#39;s-more-in-each-snapshot" title="Permalink"></a></h2><p>The summary is compact, but the PVT solution it carries is the full <code>PositionVelocityTime.PVTSolution</code>, so a lot more is available from the same snapshot without any extra work:</p><pre><code class="language-julia hljs">pvt = final.pvt
+Latitude:          52.17720555653652
+Longitude:         4.490038996553116
+Altitude:          49.7 m
+Satellites in fix: 9
+Position DOP:      1.79</code></pre><p>The recording was made at roughly <strong>52.177° N, 4.490° E</strong> in Oegstgeest, Netherlands — which is exactly what the receiver reports. You can drop those coordinates straight into a map:</p><pre><code class="language-julia hljs">println(&quot;https://www.google.com/maps/search/$(ustrip(lla.lat)),$(ustrip(lla.lon))&quot;)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">https://www.google.com/maps/search/52.17720555653652,4.490038996553116</code></pre><h2 id="There&#39;s-more-in-each-snapshot"><a class="docs-heading-anchor" href="#There&#39;s-more-in-each-snapshot">There&#39;s more in each snapshot</a><a id="There&#39;s-more-in-each-snapshot-1"></a><a class="docs-heading-anchor-permalink" href="#There&#39;s-more-in-each-snapshot" title="Permalink"></a></h2><p>The summary is compact, but the PVT solution it carries is the full <code>PositionVelocityTime.PVTSolution</code>, so a lot more is available from the same snapshot without any extra work:</p><pre><code class="language-julia hljs">pvt = final.pvt
 println(&quot;Velocity (ECEF):     &quot;, round.(pvt.velocity; digits = 2), &quot; m/s&quot;)
 println(&quot;Clock drift:         &quot;, pvt.relative_clock_drift)
 println(&quot;GDOP / HDOP / VDOP:  &quot;, round(pvt.dop.GDOP; digits = 2), &quot; / &quot;,
         round(pvt.dop.HDOP; digits = 2), &quot; / &quot;, round(pvt.dop.VDOP; digits = 2))
-println(&quot;Prompt (PRN 5):      &quot;, final.sat_data[5].prompt)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">Velocity (ECEF):     [-0.4, -0.14, 2.87] m/s
-Clock drift:         7.334888191560452e-7
-GDOP / HDOP / VDOP:  1.62 / 0.91 / 1.13
-Prompt (PRN 5):      71022.17322834645 - 8591.456692913385im</code></pre><p>If you need a quantity that the summary does <strong>not</strong> carry at all — the raw carrier Doppler, code phase or carrier phase of the tracking loops, or the decoded navigation data — you can have <a href="../api/#GNSSReceiver.receive"><code>receive</code></a> emit a payload of your own. See <a href="../custom_output/#Custom-Receiver-Output">Custom Receiver Output</a>.</p><p>To watch this unfold live instead of post-processing it, hand the data channel to the <a href="../gui/#Graphical-User-Interface">Graphical User Interface</a> rather than to <a href="../api/#GNSSReceiver.collect_data"><code>collect_data</code></a>.</p></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../parameters/">« Acquisition &amp; Tracking Parameters</a><a class="docs-footer-nextpage" href="../custom_output/">Custom Receiver Output »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.17.0 on <span class="colophon-date" title="Tuesday 14 July 2026 19:22">Tuesday 14 July 2026</span>. Using Julia version 1.12.6.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
+# `sat_data` is keyed by (signal_id, prn):
+some_key = first(keys(final.sat_data))
+println(&quot;Prompt ($some_key):  &quot;, final.sat_data[some_key].prompt)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">Velocity (ECEF):     [-0.26, 0.06, 2.55] m/s
+Clock drift:         7.323423659225547e-7
+GDOP / HDOP / VDOP:  2.06 / 1.1 / 1.42
+Prompt ((:GPSL1CA, 5)):  -71386.95263671875 + 5856.454010009766im</code></pre><p>If you need a quantity that the summary does <strong>not</strong> carry at all — the raw carrier Doppler, code phase or carrier phase of the tracking loops, or the decoded navigation data — you can have <a href="../api/#GNSSReceiver.receive"><code>receive</code></a> emit a payload of your own. See <a href="../custom_output/#Custom-Receiver-Output">Custom Receiver Output</a>.</p><p>To watch this unfold live instead of post-processing it, hand the data channel to the <a href="../gui/#Graphical-User-Interface">Graphical User Interface</a> rather than to <a href="../api/#GNSSReceiver.collect_data"><code>collect_data</code></a>.</p></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../parameters/">« Acquisition &amp; Tracking Parameters</a><a class="docs-footer-nextpage" href="../custom_output/">Custom Receiver Output »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.17.0 on <span class="colophon-date" title="Sunday 19 July 2026 21:32">Sunday 19 July 2026</span>. Using Julia version 1.12.6.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
