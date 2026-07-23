@@ -52,6 +52,53 @@ function gui_model(gui_data; show_diagnostics = false)
     m
 end
 
+@testset "GUI input handling (update!)" begin
+    using Tachikoma: KeyEvent
+
+    # Quit on q / Q / Esc.
+    for e in (KeyEvent('q'), KeyEvent('Q'), KeyEvent(:escape))
+        m = GNSSReceiver.ReceiverModel()
+        GNSSReceiver.update!(m, e)
+        @test m.quit
+    end
+
+    # `d` toggles the diagnostics section.
+    m = GNSSReceiver.ReceiverModel()
+    @test !m.show_diagnostics
+    GNSSReceiver.update!(m, KeyEvent('d'))
+    @test m.show_diagnostics
+    GNSSReceiver.update!(m, KeyEvent('d'))
+    @test !m.show_diagnostics
+
+    # Map zoom: `+`/`-`, clamped to [1, 18].
+    m = GNSSReceiver.ReceiverModel()
+    z0 = m.map_zoom
+    GNSSReceiver.update!(m, KeyEvent('+'))
+    @test m.map_zoom == z0 + 1
+    GNSSReceiver.update!(m, KeyEvent('-'))
+    @test m.map_zoom == z0
+    foreach(_ -> GNSSReceiver.update!(m, KeyEvent('-')), 1:30)
+    @test m.map_zoom == 1
+    foreach(_ -> GNSSReceiver.update!(m, KeyEvent('+')), 1:30)
+    @test m.map_zoom == 18
+
+    # Map pan: hjkl move the centre offset; `0` recenters and resets zoom.
+    m = GNSSReceiver.ReceiverModel()
+    GNSSReceiver.update!(m, KeyEvent('l'))
+    @test m.map_dlon > 0
+    GNSSReceiver.update!(m, KeyEvent('h'))
+    @test isapprox(m.map_dlon, 0.0; atol = 1e-9)
+    GNSSReceiver.update!(m, KeyEvent('k'))
+    @test m.map_dlat > 0
+    GNSSReceiver.update!(m, KeyEvent('j'))
+    @test isapprox(m.map_dlat, 0.0; atol = 1e-9)
+    m.map_zoom = 5
+    GNSSReceiver.update!(m, KeyEvent('k'))
+    GNSSReceiver.update!(m, KeyEvent('0'))
+    @test m.map_zoom == 13 && m.map_dlon == 0.0 && m.map_dlat == 0.0
+    @test !m.quit   # panning/zooming never quits
+end
+
 @testset "GUI with no data" begin
     sat_data_type = GNSSReceiver.SatelliteDataOfInterest{SVector{2,ComplexF64}}
     gui_data = GNSSReceiver.GUIData(

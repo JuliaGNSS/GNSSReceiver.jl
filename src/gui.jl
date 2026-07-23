@@ -338,7 +338,7 @@ should_quit(m::ReceiverModel) = m.quit
 """
     gui(gui_data_channel; fps = 12)
 
-Display the receiver dashboard, consuming each [`GUIData`](@ref) from `gui_data_channel`
+Display the receiver dashboard, consuming each `GUIData` from `gui_data_channel`
 until the channel closes. Runs a Tachikoma terminal app: a background task keeps the model
 fed with the latest frame while the app renders the CN0 bars, the direction-of-arrival sky
 plot and the Position/Velocity/Time block (with a live OpenStreetMap map). Blocks until the
