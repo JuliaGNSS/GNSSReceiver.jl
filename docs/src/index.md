@@ -25,8 +25,8 @@ a terminal GUI, persist to disk, or post-process in Julia.
 - Live reception from any **SoapySDR** device (RTL-SDR, LimeSDR, BladeRF, USRP, …).
 - Offline **replay from files**, including raw 8-bit offset-binary I/Q recordings.
 - **Multi-antenna** processing with eigen-beamforming.
-- A live **terminal GUI** showing per-satellite carrier-to-noise ratios, a satellite sky
-  plot, and the computed position.
+- A live, interactive **terminal dashboard** showing per-satellite carrier-to-noise
+  ratios, a satellite sky plot, and the computed position on an OpenStreetMap map.
 - Configurable acquisition cadence, lock-detection and PVT parameters — see
   [Acquisition & Tracking Parameters](@ref).
 
