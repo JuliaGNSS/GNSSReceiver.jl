@@ -29,6 +29,13 @@ using StaticArrays,
 
 using Unitful: m, s, ms, Hz, dBHz, dB, °
 
+# The live terminal GUI is a Tachikoma app (see `gui.jl`). `@tachikoma_app` imports the
+# framework's `view` / `update!` / `should_quit` (etc.) so the GUI can add methods to them;
+# `UnicodeMaps.worldmap` renders the OpenStreetMap tile shown in the PVT panel.
+using Tachikoma
+@tachikoma_app
+using UnicodeMaps: worldmap
+
 # Lock-free channel primitives and SoapySDR device streaming now live in their own
 # packages (they replaced the vendored `channel.jl` / `soapy_sdr_helper.jl`). The
 # SDR streaming (`stream_data` / `SDRChannelConfig`) comes from SignalChannels'
@@ -707,36 +714,11 @@ function receive_and_gui(
         interm_freq = clock_drift * get_center_frequency(first(systems)),
         max_meas,
     )
-    # Get gui channel from data channel
+    # Get gui channel from data channel and display the dashboard. `gui` owns the terminal
+    # and blocks until the stream ends or the user quits (`q`); then stop the file reader.
     gui_channel = get_gui_data_channel(data_channel)
-    # Hook up GUI
-    Base.errormonitor(
-        @async GNSSReceiver.gui(
-            gui_channel;
-            construct_gui_panels = make_construct_gui_panels(),
-        )
-    )
-
-    # Read any input to close
-    t = REPL.TerminalMenus.terminal
-    REPL.Terminals.raw!(t, true)
-    char = read(stdin, Char)
-    REPL.Terminals.raw!(t, false)
+    GNSSReceiver.gui(gui_channel)
     notify(close_stream_event)
-end
-function make_construct_gui_panels()
-    function construct_gui_panels(gui_data, num_dots)
-        panels = GNSSReceiver.construct_gui_panels(gui_data, num_dots)
-        nanoseconds = isnothing(gui_data.pvt.time) ? nothing : nanosecond(gui_data.pvt.time)
-        microseconds =
-            isnothing(gui_data.pvt.time) ? nothing : microsecond(gui_data.pvt.time)
-        milliseconds =
-            isnothing(gui_data.pvt.time) ? nothing : millisecond(gui_data.pvt.time)
-        panels / Panel(
-            "Runtime: $(gui_data.runtime)\nTime: $(gui_data.pvt.time)\nMilliseconds: $milliseconds\nMicroseconds: $microseconds\nNanoseconds: $nanoseconds";
-            fit = true,
-        )
-    end
 end
 
 end
