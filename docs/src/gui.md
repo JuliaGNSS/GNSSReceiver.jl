@@ -1,14 +1,34 @@
 # Graphical User Interface
 
-GNSSReceiver.jl ships a live **terminal GUI** that redraws in place as the receiver
-processes samples. It shows three panels:
+GNSSReceiver.jl ships a live, interactive **terminal dashboard** (built on
+[Tachikoma.jl](https://github.com/kahliburke/Tachikoma.jl)) that updates as the receiver
+processes samples. It lays out four panels:
 
-- **Carrier-to-Noise-Density Ratio (CN0)** — a bar per tracked satellite, coloured green
-  when the satellite is healthy and red otherwise.
-- **Satellite Direction-of-Arrival** — a sky plot of the satellites in view.
-- **User position** — latitude/longitude/altitude and a ready-to-click Google Maps link.
+- **Carrier-to-Noise-Density Ratio (CN0)** — a bar per tracked satellite (labelled with
+  the RINEX-style satellite id and band, e.g. `G05 L1`), coloured green when the satellite
+  is healthy and red otherwise.
+- **Satellite Direction-of-Arrival** — a sky plot of the satellites in view, each drawn at
+  its azimuth/elevation and labelled with its PRN, coloured by constellation (green GPS,
+  blue Galileo, red GLONASS, yellow BeiDou), with a legend below.
+- **Position Velocity Time (PVT)** — the fix as time (UTC), coordinates, altitude, ground
+  speed and heading. Press `d` to fold in the solution diagnostics (GDOP, inter-system and
+  inter-frequency biases, pseudorange-residual RMS).
+- **Map** — the fix on an OpenStreetMap tile (via
+  [UnicodeMaps.jl](https://github.com/JuliaGNSS/UnicodeMaps.jl)), rendered in the
+  background. This needs network access to fetch tiles; without it (or before the first
+  fix) the panel falls back to the coordinates and a ready-to-click Google Maps link.
 
 ![The GNSSReceiver terminal GUI](assets/gui.png)
+
+## Keys
+
+| Key | Action |
+|-----|--------|
+| `q` / `Ctrl-C` | quit |
+| `d` | toggle the PVT diagnostics |
+| `+` / `-` | zoom the map in / out |
+| `h` `j` `k` `l` | pan the map (west / south / north / east) |
+| `0` | recenter the map on the fix and reset the zoom |
 
 ## Launching the GUI
 
@@ -69,9 +89,12 @@ GNSSReceiver.gui(gui_channel)
 wait(data_task)   # `save_data` returns its writer task; wait until the file is on disk
 ```
 
-## Customising the display
+## Refresh rate
 
-`gui` accepts an `io` argument and a `construct_gui_panels` function, so you can render to
-a different stream or lay the panels out differently. See the docstrings for
+`gui` accepts an `fps` keyword (default `12`) that sets the dashboard's redraw rate; the
+underlying `GUIData` stream is already down-sampled to a human refresh rate by
+[`get_gui_data_channel`](@ref). For the smoothest display, start Julia with an interactive
+thread (`julia -t auto,1`) — `gui` runs its render loop on the interactive threadpool when
+one is available, so it is never starved by the streaming/DSP work. See the docstrings for
 [`get_gui_data_channel`](@ref) and [`gui`](@ref GNSSReceiver.gui) in the
 [API Reference](@ref).
