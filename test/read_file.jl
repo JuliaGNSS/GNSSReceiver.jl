@@ -26,5 +26,16 @@
         @test chunks[1][1, 1] == ComplexF32(-127.5, -126.5)
     end
 
+    @testset "Real-time replay pacing (sample_rate)" begin
+        # 6 chunks of 4 samples at 1 kHz ⇒ 4 ms/chunk ⇒ ≳ 24 ms of sleeps; loose lower
+        # bound avoids CI-timing flakiness while still proving pacing happens. Same data.
+        t = @elapsed chunks = collect(read_uint8_iq_file(tmp, 4; sample_rate = 1000u"Hz"))
+        @test length(chunks) == 6
+        @test chunks[1][1, 1] == complex(Int16(-128), Int16(-127))
+        @test t >= 0.012
+        # Without pacing the same read returns effectively instantly.
+        @test (@elapsed collect(read_uint8_iq_file(tmp, 4))) < t
+    end
+
     rm(tmp; force = true)
 end
