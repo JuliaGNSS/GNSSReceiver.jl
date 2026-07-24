@@ -13,10 +13,8 @@ processes samples. It lays out four panels:
 - **Position Velocity Time (PVT)** — the fix as time (UTC), coordinates, altitude, ground
   speed and heading. Press `d` to fold in the solution diagnostics (GDOP, inter-system and
   inter-frequency biases, pseudorange-residual RMS).
-- **Map** — the fix on an OpenStreetMap tile (via
-  [UnicodeMaps.jl](https://github.com/JuliaGNSS/UnicodeMaps.jl)), rendered in the
-  background. This needs network access to fetch tiles; without it (or before the first
-  fix) the panel falls back to the coordinates and a ready-to-click Google Maps link.
+- **Location** — the fix's coordinates and a ready-to-click Google Maps link. (A rendered
+  in-terminal map view is coming as a follow-up.)
 
 ![The GNSSReceiver terminal GUI](assets/gui.png)
 
@@ -26,9 +24,6 @@ processes samples. It lays out four panels:
 |-----|--------|
 | `q` / `Ctrl-C` | quit |
 | `d` | toggle the PVT diagnostics |
-| `+` / `-` | zoom the map in / out |
-| `h` `j` `k` `l` | pan the map (west / south / north / east) |
-| `0` | recenter the map on the fix and reset the zoom |
 
 ## Launching the GUI
 

@@ -306,11 +306,11 @@ end
 #
 # The GUI is a Tachikoma app (Elm-style Model/update!/view). A background task drains
 # the `GUIData` channel into the model; `view` lays out four panels — CN0 bars and a
-# direction-of-arrival sky plot on top, a Position/Velocity/Time block and an
-# OpenStreetMap map below — and paints them each frame. The CN0 bars and the sky plot
-# are still drawn by `UnicodePlots` (`barplot`/`polarplot`); their colour string is
+# direction-of-arrival sky plot on top, a Position/Velocity/Time block and a location
+# block (coordinates + a maps link) below — and paints them each frame. The CN0 bars and
+# the sky plot are drawn by `UnicodePlots` (`barplot`/`polarplot`); their colour string is
 # painted into the panel via `_paint_plot!`. Interactivity: `d` toggles the PVT
-# diagnostics, `+`/`-`/`hjkl`/`0` drive the map, `q`/Ctrl-C quit.
+# diagnostics, `q`/Ctrl-C quit.
 
 mutable struct ReceiverModel <: Model
     quit::Bool
@@ -319,19 +319,9 @@ mutable struct ReceiverModel <: Model
     gui::Union{GUIData,Nothing}     # latest frame from the receiver
     last_fix::Union{GUIData,Nothing}# last frame that carried a real PVT fix
     show_diagnostics::Bool          # PVT diagnostics section (toggled with `d`)
-    # Map state (PVT panel). `map_want` is what `view` requests; `_spawn_map` renders it
-    # and caches the parsed span-lines in `map_lines`/`map_key`.
-    map_zoom::Int
-    map_dlon::Float64               # pan offset from the fix, degrees longitude
-    map_dlat::Float64               # pan offset from the fix, degrees latitude
-    map_lines::Any                  # Vector{Vector{Span}} | nothing
-    map_key::Any                    # request key the cached map corresponds to | nothing
-    map_want::Any                   # request key the PVT panel wants | nothing
 end
 
-ReceiverModel() = ReceiverModel(
-    false, 0, ReentrantLock(), nothing, nothing, false, 13, 0.0, 0.0, nothing, nothing, nothing,
-)
+ReceiverModel() = ReceiverModel(false, 0, ReentrantLock(), nothing, nothing, false)
 
 should_quit(m::ReceiverModel) = m.quit
 
@@ -341,9 +331,8 @@ should_quit(m::ReceiverModel) = m.quit
 Display the receiver dashboard, consuming each `GUIData` from `gui_data_channel`
 until the channel closes. Runs a Tachikoma terminal app: a background task keeps the model
 fed with the latest frame while the app renders the CN0 bars, the direction-of-arrival sky
-plot and the Position/Velocity/Time block (with a live OpenStreetMap map). Blocks until the
-stream ends or the user quits (`q`). Keys: `d` toggles the PVT diagnostics; `+`/`-` zoom and
-`hjkl` pan the map, `0` recenters it.
+plot and the Position/Velocity/Time block. Blocks until the stream ends or the user quits
+(`q`). Press `d` to toggle the PVT diagnostics.
 """
 function gui(gui_data_channel; fps::Int = 12)
     m = ReceiverModel()
@@ -359,7 +348,6 @@ function gui(gui_data_channel; fps::Int = 12)
             @lock m.lk (m.quit = true)
         end
     )
-    _spawn_map(m)
     # Prefer the interactive threadpool (`julia -t auto,1`) so the render loop is not
     # starved by the streaming/DSP tasks on the default pool.
     if Threads.nthreads(:interactive) > 0
@@ -379,30 +367,6 @@ function update!(m::ReceiverModel, e::KeyEvent)
         @lock m.lk (m.show_diagnostics = !m.show_diagnostics)
         return
     end
-    # Map controls: `+`/`-` zoom, `hjkl` pan (vim), `0` recenter. `←/→` are free for
-    # future navigation; the map uses hjkl to avoid clobbering them.
-    if e.key == :char
-        c = e.char
-        if c == '+' || c == '='
-            @lock m.lk (m.map_zoom = clamp(m.map_zoom + 1, 1, 18))
-        elseif c == '-' || c == '_'
-            @lock m.lk (m.map_zoom = clamp(m.map_zoom - 1, 1, 18))
-        elseif c == '0'
-            @lock m.lk begin
-                m.map_zoom = 13
-                m.map_dlon = 0.0
-                m.map_dlat = 0.0
-            end
-        elseif c == 'h' || c == 'j' || c == 'k' || c == 'l'
-            @lock m.lk begin
-                step = 0.35 * 360.0 / 2.0^m.map_zoom   # ~⅓ view per press, scales with zoom
-                c == 'h' && (m.map_dlon -= step)       # west
-                c == 'l' && (m.map_dlon += step)       # east
-                c == 'k' && (m.map_dlat += step)       # north
-                c == 'j' && (m.map_dlat -= step)       # south
-            end
-        end
-    end
     return
 end
 
@@ -412,7 +376,7 @@ update!(::ReceiverModel, ::Event) = nothing
 const CN0_PANEL_TITLE = "Carrier-to-Noise-Density-Ratio (CN0)"
 const DOA_PANEL_TITLE = "Satellite Direction-of-Arrival (DOA)"
 const PVT_PANEL_TITLE = "Position Velocity Time (PVT)"
-const MAP_PANEL_TITLE = "Map"
+const LOCATION_PANEL_TITLE = "Location"
 const NOT_ENOUGH_SATS_TEXT = "Not enough satellites to calculate position."
 
 function view(m::ReceiverModel, f::Frame)
@@ -434,20 +398,18 @@ function view(m::ReceiverModel, f::Frame)
     set_string!(buf, header.x, header.y, rpad(hdr, header.width),
         tstyle(:title, bold = true); max_x = right(header))
 
-    # Body: CN0 | DOA (top), PVT | Map (bottom) — the same 2×2 proportions as the
-    # presentation's PVT slide.
+    # Body: CN0 | DOA (top), PVT | Location (bottom).
     toprow, botrow = split_layout(Layout(Vertical, [Percent(50), Fill()]), body)
     topcols = split_layout(Layout(Horizontal, [Percent(50), Fill()]), toprow)
     botcols = split_layout(Layout(Horizontal, [Percent(42), Fill()]), botrow)
     _render_cn0(buf, topcols[1], gui_data, num_dots)
     _render_skyplot(buf, topcols[2], gui_data, num_dots)
     _render_position(buf, botcols[1], gui_data, last_fix, show_diag, fresh)
-    _render_map(m, buf, botcols[2], last_fix)
+    _render_location(buf, botcols[2], last_fix)
 
     diaghint = show_diag ? "[d] hide diagnostics" : "[d] diagnostics"
     render(StatusBar(
-            left = [Span(" [+/-] zoom  [hjkl] pan  [0] recenter  ", tstyle(:text_dim)),
-                Span(diaghint, tstyle(:text_dim))],
+            left = [Span(" ", tstyle(:text_dim)), Span(diaghint, tstyle(:text_dim))],
             right = [Span("  [q] quit ", tstyle(:text_dim))],
         ), footer, buf)
     return
@@ -627,11 +589,12 @@ function _render_position(buf, area::Rect, gui_data, last_fix, show_diag, fresh)
     return
 end
 
-# ── Map ───────────────────────────────────────────────────────────────────────
-function _render_map(m::ReceiverModel, buf, area::Rect, last_fix)
-    inner = render(Block(; title = MAP_PANEL_TITLE, border_style = tstyle(:border),
+# ── Location ────────────────────────────────────────────────────────────────
+# The fix's coordinates and a ready-to-click Google Maps link. (A rendered map view is
+# coming as a follow-up.)
+function _render_location(buf, area::Rect, last_fix)
+    inner = render(Block(; title = LOCATION_PANEL_TITLE, border_style = tstyle(:border),
             title_style = tstyle(:accent, bold = true)), area, buf)
-    (inner.width < 8 || inner.height < 4) && return
     if last_fix === nothing
         set_string!(buf, inner.x + 1, inner.y, "awaiting fix…", tstyle(:text_dim);
             max_x = right(inner))
@@ -643,69 +606,10 @@ function _render_map(m::ReceiverModel, buf, area::Rect, last_fix)
         nothing
     end
     lla === nothing && return
-    zoom, dlon, dlat = @lock m.lk (m.map_zoom, m.map_dlon, m.map_dlat)
-    clon = lla.lon + dlon
-    clat = lla.lat + dlat
-    marker = dlon == 0.0 && dlat == 0.0          # the pin marks the map centre = the fix
-    want = (round(clat; digits = 5), round(clon; digits = 5),
-        inner.width, inner.height, zoom, marker)
-    lines = @lock m.lk begin
-        m.map_want = want
-        m.map_lines
-    end
-    if lines === nothing
-        # No cached tile yet: show the coordinates + a maps link as a graceful fallback
-        # (also what stays on screen when there is no network).
-        set_string!(buf, inner.x + 1, inner.y, "loading map…", tstyle(:text_dim);
-            max_x = right(inner))
-        set_string!(buf, inner.x + 1, inner.y + 1,
-            "$(round(clat; digits = 5)), $(round(clon; digits = 5))",
-            tstyle(:success, bold = true); max_x = right(inner))
-        set_string!(buf, inner.x + 1, inner.y + 2,
-            "maps.google.com/?q=$(round(clat; digits = 5)),$(round(clon; digits = 5))",
-            tstyle(:text_dim); max_x = right(inner))
-        return
-    end
-    for (i, spans) in enumerate(lines)
-        yy = inner.y + i - 1
-        yy > bottom(inner) && break
-        xx = inner.x
-        for sp in spans
-            xx > right(inner) && break
-            set_string!(buf, xx, yy, sp.content, sp.style; max_x = right(inner))
-            xx += max(1, textwidth(sp.content))
-        end
-    end
+    lat, lon = round(lla.lat; digits = 5), round(lla.lon; digits = 5)
+    set_string!(buf, inner.x + 1, inner.y, "$lat, $lon",
+        tstyle(:success, bold = true); max_x = right(inner))
+    set_string!(buf, inner.x + 1, inner.y + 1, "maps.google.com/?q=$lat,$lon",
+        tstyle(:text_dim); max_x = right(inner))
     return
-end
-
-# Render the map on a background task (network tile download + ANSI parse, a few seconds),
-# once per (position, panel-size, zoom); the PVT panel only ever paints the cached span
-# lines. On any failure (offline, tile error) the panel keeps showing the coordinate
-# fallback, and we mark the request done so a failing request is not retried in a tight loop.
-function _spawn_map(m::ReceiverModel)
-    Base.errormonitor(
-        Threads.@spawn begin
-            while !m.quit
-                want, have = @lock m.lk (m.map_want, m.map_key)
-                if want !== nothing && want != have
-                    lat, lon, w, h, zoom, marker = want
-                    if w >= 8 && h >= 4
-                        try
-                            img = worldmap(; center = (lon, lat), zoom = Int(zoom),
-                                size = (Int(w), Int(h)), marker = marker)
-                            parsed = [parse_ansi(String(l)) for l in split(sprint(show, img), "\n")]
-                            @lock m.lk begin
-                                m.map_lines = parsed
-                                m.map_key = want
-                            end
-                        catch
-                            @lock m.lk (m.map_key = want)   # don't retry a failing request
-                        end
-                    end
-                end
-                sleep(0.5)
-            end
-        end
-    )
 end

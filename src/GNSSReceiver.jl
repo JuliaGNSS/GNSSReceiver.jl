@@ -30,11 +30,9 @@ using StaticArrays,
 using Unitful: m, s, ms, Hz, dBHz, dB, °
 
 # The live terminal GUI is a Tachikoma app (see `gui.jl`). `@tachikoma_app` imports the
-# framework's `view` / `update!` / `should_quit` (etc.) so the GUI can add methods to them;
-# `UnicodeMaps.worldmap` renders the OpenStreetMap tile shown in the PVT panel.
+# framework's `view` / `update!` / `should_quit` (etc.) so the GUI can add methods to them.
 using Tachikoma
 @tachikoma_app
-using UnicodeMaps: worldmap
 
 # Lock-free channel primitives and SoapySDR device streaming now live in their own
 # packages (they replaced the vendored `channel.jl` / `soapy_sdr_helper.jl`). The
