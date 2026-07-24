@@ -569,7 +569,8 @@ include("save_data.jl")
     gnss_receiver_gui(; system = GPSL1CA(), sampling_freq = 2e6Hz, kwargs...)
 
 Acquire, track and compute a PVT solution from a live SoapySDR device and display the
-result in a live terminal GUI. Blocks until the stream ends.
+result in a live terminal GUI. When the stream ends the final frame stays on screen; the
+call blocks until you quit the dashboard with `q`.
 
 `system` is a single system or a tuple of systems sharing one RF band (see
 [`receive`](@ref) / [`CombinedSignal`](@ref)). The device selected by `dev_args` is

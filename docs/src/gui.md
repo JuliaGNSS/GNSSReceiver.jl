@@ -60,6 +60,7 @@ measurement_channel = read_uint8_iq_file(
     Int(upreferred(2.048e6u"Hz" * 4u"ms"));
     center = 127.5,
     type = ComplexF32,
+    sample_rate = 2.048e6u"Hz",    # replay in real time so the dashboard is watchable
 )
 data_channel = receive(
     measurement_channel, GPSL1CA(), 2.048e6u"Hz";

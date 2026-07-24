@@ -72,6 +72,21 @@ end
     @test !m.quit && !m.show_diagnostics
 end
 
+@testset "GUI header flags stream ended" begin
+    sat_data_type = GNSSReceiver.SatelliteDataOfInterest{SVector{2,ComplexF64}}
+    gui_data = GNSSReceiver.GUIData(
+        Dictionary{Tuple{Symbol,Int},sat_data_type}(),
+        GNSSReceiver.PVTSolution(),
+        5.0u"s",
+        true,
+    )
+    m = gui_model(gui_data)
+    m.stream_ended = true   # channel closed: the last frame is held, not stale
+    out = render_gui_text(m)
+    @test occursin("stream ended", out)
+    @test !occursin("stale", out)
+end
+
 @testset "GUI with no data" begin
     sat_data_type = GNSSReceiver.SatelliteDataOfInterest{SVector{2,ComplexF64}}
     gui_data = GNSSReceiver.GUIData(

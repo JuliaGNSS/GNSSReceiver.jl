@@ -163,8 +163,10 @@ using GNSSReceiver, GNSSSignals, Unitful
 sampling_freq = 2.048e6u"Hz"
 num_samples = Int(upreferred(sampling_freq * 4u"ms"))
 
-measurement_channel =
-    read_uint8_iq_file(file, num_samples; center = 127.5, type = ComplexF32)
+# `sample_rate` paces the file replay to real time, so the dashboard updates at the speed
+# the signal was recorded instead of flashing past and closing immediately.
+measurement_channel = read_uint8_iq_file(
+    file, num_samples; center = 127.5, type = ComplexF32, sample_rate = sampling_freq)
 data_channel = receive(
     measurement_channel, GPSL1CA(), sampling_freq; pvt_approximate_year = 2017)
 
@@ -174,5 +176,6 @@ GNSSReceiver.gui(get_gui_data_channel(data_channel))
 
 This block is not run when the docs are built because the dashboard takes over the
 terminal. Run it in a real terminal — ideally with an interactive thread
-(`julia -t auto,1`) so the render loop is never starved — and the fix fills in after the
-receiver has decoded enough of the navigation message, exactly as computed above.
+(`julia -t auto,1`) so the render loop is never starved. With `sample_rate` set the replay
+runs at real time, so the fix appears after the receiver has decoded enough of the
+navigation message (~35 s in), and the final frame stays on screen until you press `q`.

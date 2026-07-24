@@ -24,6 +24,10 @@ hold a previously enqueued chunk.
 
 A custom `read_measurement!(streams, chunk)` can be supplied to decode packed or
 otherwise-encoded sample formats; see the note above for the contract it must honour.
+
+Pass `sample_rate` (the recording's sampling frequency) to **replay in real time** — the
+reader sleeps one chunk's worth of signal time (`num_samples / sample_rate`) between
+chunks. Left `nothing`, chunks are pushed as fast as the pipeline consumes them.
 """
 function read_files(
     files,
@@ -31,12 +35,14 @@ function read_files(
     end_condition::Union{Nothing,Integer,Base.Event} = nothing;
     type = Complex{Int16},
     read_measurement! = read_measurement!,
+    sample_rate = nothing,
 )
     # Normalize a single path to a one-element vector so `open.(files)` yields a
     # vector of streams (a bare `String` broadcasts to a scalar `IOStream`, which
     # `read_measurement!` does not accept).
     files isa AbstractVector || (files = [files])
     num_ants = length(files)
+    chunk_period = _replay_chunk_period(num_samples, sample_rate)
     return spawn_signal_channel_thread(;
         T = type,
         num_samples,
@@ -57,6 +63,7 @@ function read_files(
                 read_measurement!(streams, chunk)
                 num_read_samples += num_samples
                 put!(out, chunk)
+                isnothing(chunk_period) || sleep(chunk_period)
             end
         catch e
             if e isa EOFError
@@ -90,6 +97,12 @@ for exact midscale recentring and drop `max_meas`.
 
 `end_condition` stops the read exactly like [`read_files`](@ref): an `Integer` sample
 count, a notified `Base.Event`, or `nothing` to read until end-of-file.
+
+Pass `sample_rate` (the recording's sampling frequency) to **replay in real time**: the
+reader then sleeps one chunk's worth of signal time (`num_samples / sample_rate`) between
+chunks, so a file plays back at the pace it was recorded — useful for watching the live
+[`gui`](@ref GNSSReceiver.gui). Left `nothing`, chunks are pushed as fast as the pipeline
+consumes them.
 """
 function read_uint8_iq_file(
     file,
@@ -97,9 +110,11 @@ function read_uint8_iq_file(
     end_condition::Union{Nothing,Integer,Base.Event} = nothing;
     center = 128,
     type = Complex{Int16},
+    sample_rate = nothing,
 )
     RT = real(type)
     c = RT(center)
+    chunk_period = _replay_chunk_period(num_samples, sample_rate)
     return spawn_signal_channel_thread(;
         T = type,
         num_samples,
@@ -125,12 +140,18 @@ function read_uint8_iq_file(
                 end
                 num_read_samples += num_samples
                 put!(out, chunk)
+                isnothing(chunk_period) || sleep(chunk_period)
             end
         finally
             close(io)
         end
     end
 end
+
+# Seconds of signal in one `num_samples` chunk at `sample_rate`, used to pace real-time
+# replay. `nothing` (no `sample_rate`) means "no pacing — push as fast as possible".
+_replay_chunk_period(_, ::Nothing) = nothing
+_replay_chunk_period(num_samples, sample_rate) = ustrip(s, upreferred(num_samples / sample_rate))
 
 function read_measurement!(streams::AbstractVector, measurements)
     foreach(

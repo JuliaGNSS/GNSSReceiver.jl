@@ -319,24 +319,27 @@ mutable struct ReceiverModel <: Model
     gui::Union{GUIData,Nothing}     # latest frame from the receiver
     last_fix::Union{GUIData,Nothing}# last frame that carried a real PVT fix
     show_diagnostics::Bool          # PVT diagnostics section (toggled with `d`)
+    stream_ended::Bool              # set when the data channel closes (stream finished)
 end
 
-ReceiverModel() = ReceiverModel(false, 0, ReentrantLock(), nothing, nothing, false)
+ReceiverModel() = ReceiverModel(false, 0, ReentrantLock(), nothing, nothing, false, false)
 
 should_quit(m::ReceiverModel) = m.quit
 
 """
     gui(gui_data_channel; fps = 12)
 
-Display the receiver dashboard, consuming each `GUIData` from `gui_data_channel`
-until the channel closes. Runs a Tachikoma terminal app: a background task keeps the model
-fed with the latest frame while the app renders the CN0 bars, the direction-of-arrival sky
-plot and the Position/Velocity/Time block. Blocks until the stream ends or the user quits
-(`q`). Press `d` to toggle the PVT diagnostics.
+Display the receiver dashboard, consuming each `GUIData` from `gui_data_channel`. Runs a
+Tachikoma terminal app: a background task keeps the model fed with the latest frame while
+the app renders the CN0 bars, the direction-of-arrival sky plot and the
+Position/Velocity/Time block. When the stream ends the last frame stays on screen (flagged
+"stream ended"); the app blocks until the user quits (`q`). Press `d` to toggle the PVT
+diagnostics.
 """
 function gui(gui_data_channel; fps::Int = 12)
     m = ReceiverModel()
-    # Feed the model from the receiver channel; quit the app when the stream ends.
+    # Feed the model from the receiver channel. When the channel closes, keep the last
+    # frame on screen (flag it) rather than quitting — the user quits with `q`.
     Base.errormonitor(
         Threads.@spawn begin
             consume_channel(gui_data_channel) do gui_data
@@ -345,7 +348,7 @@ function gui(gui_data_channel; fps::Int = 12)
                     isnothing(gui_data.pvt.time) || (m.last_fix = gui_data)
                 end
             end
-            @lock m.lk (m.quit = true)
+            @lock m.lk (m.stream_ended = true)
         end
     )
     # Prefer the interactive threadpool (`julia -t auto,1`) so the render loop is not
@@ -381,7 +384,8 @@ const NOT_ENOUGH_SATS_TEXT = "Not enough satellites to calculate position."
 
 function view(m::ReceiverModel, f::Frame)
     m.tick += 1
-    gui_data, last_fix, show_diag = @lock m.lk (m.gui, m.last_fix, m.show_diagnostics)
+    gui_data, last_fix, show_diag, ended =
+        @lock m.lk (m.gui, m.last_fix, m.show_diagnostics, m.stream_ended)
     buf = f.buffer
     num_dots = mod(m.tick ÷ 4, 4)
 
@@ -390,11 +394,13 @@ function view(m::ReceiverModel, f::Frame)
 
     fresh = gui_data !== nothing && gui_data.pvt_fresh
     # "stale" only once a fix is being held frozen (a re-emitted old solution) — not while
-    # still searching/decoding, where there is simply no fix yet.
+    # still searching/decoding, where there is simply no fix yet. Once the stream has ended
+    # the frozen frame is expected, so show "stream ended" instead of "stale".
     has_fix = gui_data !== nothing && gui_data.pvt !== nothing && !isnothing(gui_data.pvt.time)
     rt = gui_data === nothing ? 0.0 : round(ustrip(s, gui_data.runtime); digits = 1)
-    hdr = " ● GNSSReceiver  │  run time $(rt) s" *
-          (has_fix && !fresh ? "  │  stale (no new fix)" : "")
+    status = ended ? "  │  stream ended (press q to quit)" :
+             (has_fix && !fresh ? "  │  stale (no new fix)" : "")
+    hdr = " ● GNSSReceiver  │  run time $(rt) s" * status
     set_string!(buf, header.x, header.y, rpad(hdr, header.width),
         tstyle(:title, bold = true); max_x = right(header))
 
