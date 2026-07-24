@@ -241,7 +241,9 @@ function pvt_details_lines(pvt)
     lines = String[]
 
     if !isnothing(pvt.dop)
-        push!(lines, "GDOP: $(_fmt2(pvt.dop.GDOP))")
+        d = pvt.dop
+        push!(lines, "GDOP: $(_fmt2(d.GDOP))   PDOP: $(_fmt2(d.PDOP))")
+        push!(lines, "HDOP: $(_fmt2(d.HDOP))   VDOP: $(_fmt2(d.VDOP))   TDOP: $(_fmt2(d.TDOP))")
     end
 
     # Inter-system biases re-anchored on the lowest-ordered time system present (GPS <
@@ -318,11 +320,11 @@ mutable struct ReceiverModel <: Model
     lk::ReentrantLock
     gui::Union{GUIData,Nothing}     # latest frame from the receiver
     last_fix::Union{GUIData,Nothing}# last frame that carried a real PVT fix
-    show_diagnostics::Bool          # PVT diagnostics section (toggled with `d`)
+    show_diagnostics::Bool          # PVT diagnostics section, shown by default (toggle with `d`)
     stream_ended::Bool              # set when the data channel closes (stream finished)
 end
 
-ReceiverModel() = ReceiverModel(false, 0, ReentrantLock(), nothing, nothing, false, false)
+ReceiverModel() = ReceiverModel(false, 0, ReentrantLock(), nothing, nothing, true, false)
 
 should_quit(m::ReceiverModel) = m.quit
 
@@ -494,9 +496,15 @@ function _render_skyplot(buf, area::Rect, gui_data, num_dots)
     end
     # Reserve one row for the legend below the plot.
     plotarea = Rect(inner.x, inner.y, inner.width, max(1, inner.height - 1))
-    plotwidth = clamp(min(plotarea.width, 2 * plotarea.height) - 2, 10, 60)
+    # Size the polarplot canvas 2:1 (columns:rows) so it renders as a round circle: braille
+    # cells are ~square on screen, so equal x/y data range needs twice as many columns as
+    # rows. Leave margin for the axis labels UnicodePlots draws around the canvas (~13 cols,
+    # ~4 rows) so the whole circle fits and is not clipped (which read as "not round").
+    wcanvas = clamp(min(plotarea.width - 13, 2 * (plotarea.height - 4)), 8, 60)
+    hcanvas = max(4, wcanvas ÷ 2)
     doa_plot = polarplot(azs, els_deg; rlim = (0, 90), scatter = true,
-        marker = :circle, color = point_colors, border = :none, width = plotwidth)
+        marker = :circle, color = point_colors, border = :none,
+        width = wcanvas, height = hcanvas)
     # Label each satellite with its PRN number (coloured by constellation) placed exactly
     # on its point. `polarplot` plots θ (az) counter-clockwise from +x at radius r (=el),
     # so the point's Cartesian position is (el·cos az, el·sin az) — annotate there.
@@ -615,7 +623,10 @@ function _render_location(buf, area::Rect, last_fix)
     lat, lon = round(lla.lat; digits = 5), round(lla.lon; digits = 5)
     set_string!(buf, inner.x + 1, inner.y, "$lat, $lon",
         tstyle(:success, bold = true); max_x = right(inner))
-    set_string!(buf, inner.x + 1, inner.y + 1, "maps.google.com/?q=$lat,$lon",
-        tstyle(:text_dim); max_x = right(inner))
+    # A real OSC 8 hyperlink (via the style's `hyperlink`), so the URL is click-to-open in
+    # terminals that support it (and copy-pasteable everywhere).
+    url = "https://www.google.com/maps?q=$lat,$lon"
+    set_string!(buf, inner.x + 1, inner.y + 1, url,
+        tstyle(:text_dim; hyperlink = url); max_x = right(inner))
     return
 end

@@ -11,10 +11,12 @@ processes samples. It lays out four panels:
   its azimuth/elevation and labelled with its PRN, coloured by constellation (green GPS,
   blue Galileo, red GLONASS, yellow BeiDou), with a legend below.
 - **Position Velocity Time (PVT)** — the fix as time (UTC), coordinates, altitude, ground
-  speed and heading. Press `d` to fold in the solution diagnostics (GDOP, inter-system and
-  inter-frequency biases, pseudorange-residual RMS).
-- **Location** — the fix's coordinates and a ready-to-click Google Maps link. (A rendered
-  in-terminal map view is coming as a follow-up.)
+  speed and heading, followed by the solution diagnostics (the full DOP breakdown —
+  GDOP/PDOP/HDOP/VDOP/TDOP — inter-system and inter-frequency biases, and pseudorange-residual
+  RMS). Diagnostics are shown by default; press `d` to hide them.
+- **Location** — the fix's coordinates and a clickable Google Maps link (an OSC 8 terminal
+  hyperlink, so it opens on click in supporting terminals and is copy-pasteable elsewhere).
+  A rendered in-terminal map view is coming as a follow-up.
 
 ![The GNSSReceiver terminal GUI](assets/gui.png)
 
