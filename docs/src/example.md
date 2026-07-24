@@ -151,5 +151,28 @@ Doppler, code phase or carrier phase of the tracking loops, or the decoded navig
 — you can have [`receive`](@ref) emit a payload of your own. See
 [Custom Receiver Output](@ref).
 
+## Watch it live in the terminal
+
 To watch this unfold live instead of post-processing it, hand the data channel to the
-[Graphical User Interface](@ref) rather than to [`collect_data`](@ref).
+live [Graphical User Interface](@ref) instead of [`collect_data`](@ref). Using the same
+`file` and settings as above:
+
+```julia
+using GNSSReceiver, GNSSSignals, Unitful
+
+sampling_freq = 2.048e6u"Hz"
+num_samples = Int(upreferred(sampling_freq * 4u"ms"))
+
+measurement_channel =
+    read_uint8_iq_file(file, num_samples; center = 127.5, type = ComplexF32)
+data_channel = receive(
+    measurement_channel, GPSL1CA(), sampling_freq; pvt_approximate_year = 2017)
+
+# Opens the interactive dashboard (CN0 bars, sky plot, PVT, location). Press `q` to quit.
+GNSSReceiver.gui(get_gui_data_channel(data_channel))
+```
+
+This block is not run when the docs are built because the dashboard takes over the
+terminal. Run it in a real terminal — ideally with an interactive thread
+(`julia -t auto,1`) so the render loop is never starved — and the fix fills in after the
+receiver has decoded enough of the navigation message, exactly as computed above.
