@@ -1,5 +1,4 @@
-using UnicodePlots, Term
-import REPL
+using UnicodePlots
 
 struct GUIData{S<:SatelliteDataOfInterest}
     sat_data::Dictionary{Tuple{Symbol,Int},S}
@@ -147,69 +146,6 @@ function isbs_vs_lowest_system(pvt)
     return out
 end
 
-# Marker for a satellite: the circled-number glyph of its PRN, so the glyph on the
-# sky plot reads as the PRN itself and cross-references the CN0 bar chart's
-# `G05`/`E05` labels directly. The constellation is carried by the point colour
-# (`CONSTELLATION_COLORS`), not the glyph. Wraps around for PRNs beyond the glyph
-# table (circled numbers end at 50).
-# NB: the circled-number glyphs 11-50 use Ambiguous/Wide code points that can render
-# two cells wide in some terminals/fonts (they may look squeezed); the PRN identity
-# they carry is preferred here over that cosmetic risk.
-sat_marker(prn::Integer) = PRNMARKERS[mod1(prn, length(PRNMARKERS))]
-
-const PRNMARKERS = (
-    '\U2780',
-    '\U2781',
-    '\U2782',
-    '\U2783',
-    '\U2784',
-    '\U2785',
-    '\U2786',
-    '\U2787',
-    '\U2788',
-    '\U2789',
-    '\U246A',
-    '\U246B',
-    '\U246C',
-    '\U246D',
-    '\U246E',
-    '\U246F',
-    '\U2470',
-    '\U2471',
-    '\U2472',
-    '\U2473',
-    '\U3251',
-    '\U3252',
-    '\U3253',
-    '\U3254',
-    '\U3255',
-    '\U3256',
-    '\U3257',
-    '\U3258',
-    '\U3259',
-    '\U325A',
-    '\U325B',
-    '\U325C',
-    '\U325D',
-    '\U325E',
-    '\U325F',
-    '\U32B1',
-    '\U32B2',
-    '\U32B3',
-    '\U32B4',
-    '\U32B5',
-    '\U32B6',
-    '\U32B7',
-    '\U32B8',
-    '\U32B9',
-    '\U32BA',
-    '\U32BB',
-    '\U32BC',
-    '\U32BD',
-    '\U32BE',
-    '\U32BF',
-)
-
 # Constellation of a `get_signal_id` symbol, used to group and colour satellites in
 # the DOA plot. Derived from the id prefix so it needs no signal-type instance.
 function constellation_of(signal_id::Symbol)
@@ -280,32 +216,6 @@ function get_gui_data_channel(
         end
     )
     gui_data_channel
-end
-
-_cursor_hide(io::IO) = print(io, "\x1b[?25l")
-_cursor_show(io::IO) = print(io, "\x1b[?25h")
-panel(plot; kw...) = Panel(string(plot; color = true); fit = true, kw...)
-
-"""
-    gui(gui_data_channel, io = stdout; construct_gui_panels = construct_gui_panels)
-
-Render the receiver GUI to `io`, consuming each `GUIData` from `gui_data_channel` and
-redrawing the terminal in place until the channel closes. `construct_gui_panels` builds
-the panel layout for one frame (satellite CN0 bars, sky plot, PVT/position block) and can
-be overridden to customise the display.
-"""
-function gui(gui_data_channel, io::IO = stdout; construct_gui_panels = construct_gui_panels)
-    terminal = REPL.Terminals.TTYTerminal("", stdin, io, stderr)
-    num_dots = 0
-    consume_channel(gui_data_channel) do gui_data
-        panels = construct_gui_panels(gui_data, num_dots)
-        num_dots = mod(num_dots + 1, 4)
-        out = string(panels)
-        REPL.Terminals.clear(terminal)
-        _cursor_hide(io)
-        println(io, out)
-        _cursor_show(io)
-    end
 end
 
 # Root-mean-square of a collection (0 for an empty collection).
@@ -381,166 +291,421 @@ function pvt_details_lines(pvt)
         if n > num_unknowns
             append!(lines, res_lines)
         else
-            # Grey out: no redundancy, residuals ~0 by construction.
+            # No redundancy, residuals ~0 by construction: flag it in the header. The
+            # whole diagnostics block is rendered dimmed anyway (it is secondary info).
             res_lines[1] *= " (insufficient redundancy)"
-            for line in res_lines
-                push!(lines, "{dim}$line{/dim}")
-            end
+            append!(lines, res_lines)
         end
     end
 
     lines
 end
 
-function construct_gui_panels(gui_data, num_dots)
-    # Bars sorted by constellation (GPS, then Galileo, …), then PRN, then band.
-    sorted_keys = sort(collect(keys(gui_data.sat_data)); by = sat_sort_key)
-    prn_strings = [sat_label(key...) for key in sorted_keys]
-    cn0s = map(sorted_keys) do key
-        x = gui_data.sat_data[key]
-        round(10 * log10(linear(x.cn0 == Inf * Hz ? 1Hz : x.cn0) / Hz); digits = 1)
-    end
-    colors = map(key -> gui_data.sat_data[key].is_healthy ? :green : :red, sorted_keys)
-    pvt = gui_data.pvt
-    runtime_row = "Run time: $(round(ustrip(s, gui_data.runtime); digits = 1)) s"
-    sat_doa_panel_title = "Satellite Direction-of-Arrival (DOA)"
-    pvt_panel_title = "Position Velocity Time (PVT)"
-    not_enough_sats_text = "Not enough satellites to calculate position."
-    cn0_panel_title = "Carrier-to-Noise-Density-Ratio (CN0)"
-    cn0_panel =
-        !isempty(prn_strings) ?
-        panel(
-            barplot(
-                prn_strings,
-                cn0s;
-                color = colors,
-                ylabel = "Satellites",
-                xlabel = "Carrier-to-Noise-Density-Ratio (CN0) [dBHz]",
-            );
-            fit = true,
-            title = cn0_panel_title,
-        ) :
-        Panel(
-            "Searching for satellites$(repeat(".", num_dots))";
-            title = cn0_panel_title,
-            width = length(cn0_panel_title) + 5,
-        )
-    if !isnothing(pvt.time)
-        # One point per *physical* satellite: the same satellite tracked on several
-        # signals (e.g. Galileo E1B + E5a) shares an az/el, so keying by
-        # (constellation, PRN) — not (signal, PRN) — stops the duplicates piling
-        # onto each other. Points are coloured by constellation.
-        seen = Set{Tuple{Symbol,Int}}()
-        azs = Float64[]
-        els_deg = Float64[]
-        markers = Char[]
-        point_colors = Symbol[]
-        for (key, info) in pairs(pvt.sats)
-            signal_id, prn = key
-            system = constellation_of(signal_id)
-            (system, prn) in seen && continue
-            push!(seen, (system, prn))
-            enu = get_sat_enu(pvt.position, info.position)
-            push!(azs, enu.θ)
-            push!(els_deg, enu.ϕ * 180 / π)
-            push!(markers, sat_marker(prn))
-            push!(point_colors, get(CONSTELLATION_COLORS, system, :white))
+# ─────────────────────────────────────────────────────────────────────────────
+# Tachikoma dashboard
+#
+# The GUI is a Tachikoma app (Elm-style Model/update!/view). A background task drains
+# the `GUIData` channel into the model; `view` lays out four panels — CN0 bars and a
+# direction-of-arrival sky plot on top, a Position/Velocity/Time block and an
+# OpenStreetMap map below — and paints them each frame. The CN0 bars and the sky plot
+# are still drawn by `UnicodePlots` (`barplot`/`polarplot`); their colour string is
+# painted into the panel via `_paint_plot!`. Interactivity: `d` toggles the PVT
+# diagnostics, `+`/`-`/`hjkl`/`0` drive the map, `q`/Ctrl-C quit.
+
+mutable struct ReceiverModel <: Model
+    quit::Bool
+    tick::Int                       # frame counter, drives the "Searching…" dots
+    lk::ReentrantLock
+    gui::Union{GUIData,Nothing}     # latest frame from the receiver
+    last_fix::Union{GUIData,Nothing}# last frame that carried a real PVT fix
+    show_diagnostics::Bool          # PVT diagnostics section (toggled with `d`)
+    # Map state (PVT panel). `map_want` is what `view` requests; `_spawn_map` renders it
+    # and caches the parsed span-lines in `map_lines`/`map_key`.
+    map_zoom::Int
+    map_dlon::Float64               # pan offset from the fix, degrees longitude
+    map_dlat::Float64               # pan offset from the fix, degrees latitude
+    map_lines::Any                  # Vector{Vector{Span}} | nothing
+    map_key::Any                    # request key the cached map corresponds to | nothing
+    map_want::Any                   # request key the PVT panel wants | nothing
+end
+
+ReceiverModel() = ReceiverModel(
+    false, 0, ReentrantLock(), nothing, nothing, false, 13, 0.0, 0.0, nothing, nothing, nothing,
+)
+
+should_quit(m::ReceiverModel) = m.quit
+
+"""
+    gui(gui_data_channel; fps = 12)
+
+Display the receiver dashboard, consuming each `GUIData` from `gui_data_channel`
+until the channel closes. Runs a Tachikoma terminal app: a background task keeps the model
+fed with the latest frame while the app renders the CN0 bars, the direction-of-arrival sky
+plot and the Position/Velocity/Time block (with a live OpenStreetMap map). Blocks until the
+stream ends or the user quits (`q`). Keys: `d` toggles the PVT diagnostics; `+`/`-` zoom and
+`hjkl` pan the map, `0` recenters it.
+"""
+function gui(gui_data_channel; fps::Int = 12)
+    m = ReceiverModel()
+    # Feed the model from the receiver channel; quit the app when the stream ends.
+    Base.errormonitor(
+        Threads.@spawn begin
+            consume_channel(gui_data_channel) do gui_data
+                @lock m.lk begin
+                    m.gui = gui_data
+                    isnothing(gui_data.pvt.time) || (m.last_fix = gui_data)
+                end
+            end
+            @lock m.lk (m.quit = true)
         end
-        present = sort(unique(constellation_of(first(key)) for key in keys(pvt.sats)))
-        legend = join(
-            [
-                "{$(get(CONSTELLATION_COLORS, c, :white))}●{/$(get(CONSTELLATION_COLORS, c, :white))} $c"
-                for c in present
-            ],
-            "   ",
-        )
-        doa_plot = polarplot(
-            azs,
-            els_deg;
-            rlim = (0, 90),
-            scatter = true,
-            marker = markers,
-            color = point_colors,
-        )
-        # Re-label the angular axis to the GNSS azimuth convention: 0° = North on
-        # top, increasing clockwise (90° = East right, 180° = South bottom,
-        # 270° = West left). `polarplot` labels the ring with math angles (0° right,
-        # counter-clockwise), but the satellite az/el points are already placed
-        # geographically (North up, East right), so only the labels need fixing.
-        grid_color = UnicodePlots.BORDER_COLOR[]
-        mid_row = ceil(Int, UnicodePlots.nrows(doa_plot.graphics) / 2)
-        label!(doa_plot, :t, "0°"; color = grid_color)
-        label!(doa_plot, :r, mid_row, "90°"; color = grid_color)
-        label!(doa_plot, :b, "180°"; color = grid_color)
-        label!(doa_plot, :l, mid_row, "270°"; color = grid_color)
-        doa_panel = Panel(
-            string(doa_plot; color = true) * "\n" * legend;
-            fit = true,
-            title = sat_doa_panel_title,
-        )
-        lla = get_LLA(pvt)
-        lat_hem = lla.lat >= 0 ? "N" : "S"
-        lon_hem = lla.lon >= 0 ? "E" : "W"
-        speed = sqrt(sum(abs2, pvt.velocity))
-        # Time solution first: `pvt.time` is a TAI epoch; show it as UTC (the civil
-        # scale users expect) via AstroTime's leap-aware `to_utc`, to millisecond
-        # precision — the clock-bias solution is far coarser than the sub-second
-        # digits. AstroTime has no UTC epoch *type*, so `to_utc` yields a string.
-        # Format is time-then-date (`HH:MM:SS.sss dd.mm.yyyy`), echoing NMEA's
-        # time/date field ordering — GNSS has no single canonical display format.
-        utc_str = to_utc(String, pvt.time, dateformat"HH:MM:SS.sss dd.mm.yyyy")
-        # Heading = course over ground: the azimuth of the velocity vector (degrees
-        # clockwise from true North), computed by PVT. Only trustworthy while moving,
-        # so grey it out below `MIN_SPEED_FOR_HEADING` — the value stays visible but
-        # dimmed to signal it is noise-dominated, matching how the residuals are greyed.
-        heading = "$(round(ustrip(°, pvt.course_over_ground); digits = 1))°"
-        heading_value = speed >= MIN_SPEED_FOR_HEADING ? heading :
-            "{dim}$heading (low speed){/dim}"
-        # Position/velocity/time rows as (label, value) pairs, Time first. Labels are
-        # padded to a common width so the values line up in a column.
-        pvt_rows = [
-            ("Time", "$utc_str UTC"),
-            (
-                "Coordinates",
-                "$(abs(round(lla.lat; digits = 6)))°$lat_hem, " *
-                "$(abs(round(lla.lon; digits = 6)))°$lon_hem",
-            ),
-            ("Altitude", "$(round(lla.alt; digits = 1)) m"),
-            ("Speed", "$(round(speed; digits = 2)) m/s"),
-            ("Heading", heading_value),
-            ("Run time", "$(round(ustrip(s, gui_data.runtime); digits = 1)) s"),
-        ]
-        labelw = maximum(length(first(r)) for r in pvt_rows) + 1  # +1 for the colon
-        pvt_lines = ["$(rpad(first(r) * ":", labelw)) $(last(r))" for r in pvt_rows]
-        # Append the solution internals (DOP, biases, residuals) below, separated by a
-        # blank line, so position/velocity/time and diagnostics share one PVT block.
-        details = pvt_details_lines(pvt)
-        lines = isempty(details) ? pvt_lines : vcat(pvt_lines, "", details)
-        # If the latest `calc_pvt` produced no new solution, this fix is stale (a re-emitted
-        # old one): grey the whole block and flag it in the title, so a frozen position is
-        # not read as live. `pvt_fresh` is set by `get_gui_data_channel`.
-        if !gui_data.pvt_fresh
-            lines = ["{dim}$line{/dim}" for line in lines]
-        end
-        pvt_title = gui_data.pvt_fresh ? pvt_panel_title : "$pvt_panel_title — stale (no new fix)"
-        pvt_panel = Panel(join(lines, "\n"); fit = true, title = pvt_title)
-    elseif length(prn_strings) < 4
-        doa_panel = Panel(not_enough_sats_text; title = sat_doa_panel_title, fit = true)
-        pvt_panel =
-            Panel("$not_enough_sats_text\n$runtime_row"; title = pvt_panel_title, fit = true)
+    )
+    _spawn_map(m)
+    # Prefer the interactive threadpool (`julia -t auto,1`) so the render loop is not
+    # starved by the streaming/DSP tasks on the default pool.
+    if Threads.nthreads(:interactive) > 0
+        wait(Threads.@spawn :interactive app(m; fps))
     else
-        decoding_text = "Decoding satellites$(repeat(".", num_dots))"
-        doa_panel = Panel(
-            decoding_text;
-            title = sat_doa_panel_title,
-            width = length(not_enough_sats_text) + 5,
-        )
-        pvt_panel = Panel(
-            "$decoding_text\n$runtime_row";
-            title = pvt_panel_title,
-            width = length(not_enough_sats_text) + 5,
-        )
+        app(m; fps)
     end
-    # Layout: CN0 | DOA | the combined Position/Velocity/Time block.
-    cn0_panel * doa_panel * pvt_panel
+end
+
+# ── Input ─────────────────────────────────────────────────────────────────────
+function update!(m::ReceiverModel, e::KeyEvent)
+    if e.key == :ctrl_c || e.key == :escape || (e.key == :char && (e.char == 'q' || e.char == 'Q'))
+        m.quit = true
+        return
+    end
+    if e.key == :char && (e.char == 'd' || e.char == 'D')
+        @lock m.lk (m.show_diagnostics = !m.show_diagnostics)
+        return
+    end
+    # Map controls: `+`/`-` zoom, `hjkl` pan (vim), `0` recenter. `←/→` are free for
+    # future navigation; the map uses hjkl to avoid clobbering them.
+    if e.key == :char
+        c = e.char
+        if c == '+' || c == '='
+            @lock m.lk (m.map_zoom = clamp(m.map_zoom + 1, 1, 18))
+        elseif c == '-' || c == '_'
+            @lock m.lk (m.map_zoom = clamp(m.map_zoom - 1, 1, 18))
+        elseif c == '0'
+            @lock m.lk begin
+                m.map_zoom = 13
+                m.map_dlon = 0.0
+                m.map_dlat = 0.0
+            end
+        elseif c == 'h' || c == 'j' || c == 'k' || c == 'l'
+            @lock m.lk begin
+                step = 0.35 * 360.0 / 2.0^m.map_zoom   # ~⅓ view per press, scales with zoom
+                c == 'h' && (m.map_dlon -= step)       # west
+                c == 'l' && (m.map_dlon += step)       # east
+                c == 'k' && (m.map_dlat += step)       # north
+                c == 'j' && (m.map_dlat -= step)       # south
+            end
+        end
+    end
+    return
+end
+
+update!(::ReceiverModel, ::Event) = nothing
+
+# ── View ────────────────────────────────────────────────────────────────────
+const CN0_PANEL_TITLE = "Carrier-to-Noise-Density-Ratio (CN0)"
+const DOA_PANEL_TITLE = "Satellite Direction-of-Arrival (DOA)"
+const PVT_PANEL_TITLE = "Position Velocity Time (PVT)"
+const MAP_PANEL_TITLE = "Map"
+const NOT_ENOUGH_SATS_TEXT = "Not enough satellites to calculate position."
+
+function view(m::ReceiverModel, f::Frame)
+    m.tick += 1
+    gui_data, last_fix, show_diag = @lock m.lk (m.gui, m.last_fix, m.show_diagnostics)
+    buf = f.buffer
+    num_dots = mod(m.tick ÷ 4, 4)
+
+    rows = split_layout(Layout(Vertical, [Fixed(1), Fill(), Fixed(1)]), f.area)
+    header, body, footer = rows[1], rows[2], rows[3]
+
+    fresh = gui_data !== nothing && gui_data.pvt_fresh
+    # "stale" only once a fix is being held frozen (a re-emitted old solution) — not while
+    # still searching/decoding, where there is simply no fix yet.
+    has_fix = gui_data !== nothing && gui_data.pvt !== nothing && !isnothing(gui_data.pvt.time)
+    rt = gui_data === nothing ? 0.0 : round(ustrip(s, gui_data.runtime); digits = 1)
+    hdr = " ● GNSSReceiver  │  run time $(rt) s" *
+          (has_fix && !fresh ? "  │  stale (no new fix)" : "")
+    set_string!(buf, header.x, header.y, rpad(hdr, header.width),
+        tstyle(:title, bold = true); max_x = right(header))
+
+    # Body: CN0 | DOA (top), PVT | Map (bottom) — the same 2×2 proportions as the
+    # presentation's PVT slide.
+    toprow, botrow = split_layout(Layout(Vertical, [Percent(50), Fill()]), body)
+    topcols = split_layout(Layout(Horizontal, [Percent(50), Fill()]), toprow)
+    botcols = split_layout(Layout(Horizontal, [Percent(42), Fill()]), botrow)
+    _render_cn0(buf, topcols[1], gui_data, num_dots)
+    _render_skyplot(buf, topcols[2], gui_data, num_dots)
+    _render_position(buf, botcols[1], gui_data, last_fix, show_diag, fresh)
+    _render_map(m, buf, botcols[2], last_fix)
+
+    diaghint = show_diag ? "[d] hide diagnostics" : "[d] diagnostics"
+    render(StatusBar(
+            left = [Span(" [+/-] zoom  [hjkl] pan  [0] recenter  ", tstyle(:text_dim)),
+                Span(diaghint, tstyle(:text_dim))],
+            right = [Span("  [q] quit ", tstyle(:text_dim))],
+        ), footer, buf)
+    return
+end
+
+# Paint a UnicodePlots colour string (`string(plot; color=true)`) or any ANSI text into
+# `area`: split into lines, parse each line's ANSI into spans, and lay the spans out
+# left-to-right, clipping at the panel edges. The same technique the map uses.
+function _paint_plot!(buf, area::Rect, str::AbstractString)
+    for (i, line) in enumerate(split(str, '\n'))
+        y = area.y + i - 1
+        y > bottom(area) && break
+        x = area.x
+        for sp in parse_ansi(String(line))
+            x > right(area) && break
+            set_string!(buf, x, y, sp.content, sp.style; max_x = right(area))
+            x += max(1, textwidth(sp.content))
+        end
+    end
+    return
+end
+
+# CN0 in dBHz as a plain rounded number (Inf CN0 → 0 dB reference), matching the old GUI.
+_cn0_db(cn0) = round(10 * log10(Unitful.linear(cn0 == Inf * Hz ? 1Hz : cn0) / Hz); digits = 1)
+
+function _render_cn0(buf, area::Rect, gui_data, num_dots)
+    inner = render(Block(; title = CN0_PANEL_TITLE, border_style = tstyle(:border),
+            title_style = tstyle(:accent, bold = true)), area, buf)
+    if gui_data === nothing || isempty(gui_data.sat_data)
+        set_string!(buf, inner.x + 1, inner.y, "Searching for satellites$(repeat(".", num_dots))",
+            tstyle(:text_dim); max_x = right(inner))
+        return
+    end
+    # Bars sorted by constellation (GPS, then Galileo, …), then PRN, then band; coloured
+    # green (healthy) / red (unhealthy).
+    sorted_keys = sort(collect(keys(gui_data.sat_data)); by = sat_sort_key)
+    labels = [sat_label(key...) for key in sorted_keys]
+    cn0s = [_cn0_db(gui_data.sat_data[key].cn0) for key in sorted_keys]
+    colors = [gui_data.sat_data[key].is_healthy ? :green : :red for key in sorted_keys]
+    labelw = maximum(length, labels)
+    barwidth = clamp(inner.width - labelw - 9, 5, 60)
+    plot = barplot(labels, cn0s; color = colors, border = :none,
+        width = barwidth, maximum = 55)
+    _paint_plot!(buf, inner, string(plot; color = true))
+    return
+end
+
+function _render_skyplot(buf, area::Rect, gui_data, num_dots)
+    inner = render(Block(; title = DOA_PANEL_TITLE, border_style = tstyle(:border),
+            title_style = tstyle(:accent, bold = true)), area, buf)
+    pvt = gui_data === nothing ? nothing : gui_data.pvt
+    if pvt === nothing || isnothing(pvt.time)
+        nsat = gui_data === nothing ? 0 : length(gui_data.sat_data)
+        msg = nsat < 4 ? NOT_ENOUGH_SATS_TEXT : "Decoding satellites$(repeat(".", num_dots))"
+        set_string!(buf, inner.x + 1, inner.y, msg, tstyle(:text_dim); max_x = right(inner))
+        return
+    end
+    # One point per *physical* satellite: the same satellite tracked on several signals
+    # (e.g. Galileo E1B + E5a) shares an az/el, so key by (constellation, PRN) — not
+    # (signal, PRN) — to stop the duplicates piling onto each other. Colour by constellation.
+    seen = Set{Tuple{Symbol,Int}}()
+    azs = Float64[]
+    els_deg = Float64[]
+    prns = Int[]
+    point_colors = Symbol[]
+    for (key, info) in pairs(pvt.sats)
+        signal_id, prn = key
+        system = constellation_of(signal_id)
+        (system, prn) in seen && continue
+        push!(seen, (system, prn))
+        enu = get_sat_enu(pvt.position, info.position)
+        push!(azs, enu.θ)
+        push!(els_deg, enu.ϕ * 180 / π)
+        push!(prns, prn)
+        push!(point_colors, get(CONSTELLATION_COLORS, system, :white))
+    end
+    # Reserve one row for the legend below the plot.
+    plotarea = Rect(inner.x, inner.y, inner.width, max(1, inner.height - 1))
+    plotwidth = clamp(min(plotarea.width, 2 * plotarea.height) - 2, 10, 60)
+    doa_plot = polarplot(azs, els_deg; rlim = (0, 90), scatter = true,
+        marker = :circle, color = point_colors, border = :none, width = plotwidth)
+    # Label each satellite with its PRN number (coloured by constellation) placed exactly
+    # on its point. `polarplot` plots θ (az) counter-clockwise from +x at radius r (=el),
+    # so the point's Cartesian position is (el·cos az, el·sin az) — annotate there.
+    for (az, el, prn, col) in zip(azs, els_deg, prns, point_colors)
+        annotate!(doa_plot, el * cos(az), el * sin(az), string(prn); color = col)
+    end
+    # Re-label the angular axis to the GNSS azimuth convention: 0° = North on top,
+    # increasing clockwise (90° = East right, 180° = South bottom, 270° = West left).
+    grid_color = UnicodePlots.BORDER_COLOR[]
+    mid_row = ceil(Int, UnicodePlots.nrows(doa_plot.graphics) / 2)
+    label!(doa_plot, :t, "0°"; color = grid_color)
+    label!(doa_plot, :r, mid_row, "90°"; color = grid_color)
+    label!(doa_plot, :b, "180°"; color = grid_color)
+    label!(doa_plot, :l, mid_row, "270°"; color = grid_color)
+    _paint_plot!(buf, plotarea, string(doa_plot; color = true))
+    # Legend: a coloured ● per present constellation, matching the point colours exactly.
+    present = sort(unique(constellation_of(first(key)) for key in keys(pvt.sats)))
+    _paint_plot!(buf, Rect(inner.x + 1, bottom(inner), inner.width - 1, 1),
+        _legend_ansi(present))
+    return
+end
+
+# Constellation legend as an ANSI-coloured string (parsed back into spans by `_paint_plot!`),
+# so the legend markers use exactly the same terminal colours as the plotted points.
+function _legend_ansi(present)
+    io = IOContext(IOBuffer(), :color => true)
+    for (i, c) in enumerate(present)
+        i == 1 || print(io, "   ")
+        printstyled(io, "●"; color = get(CONSTELLATION_COLORS, c, :white))
+        print(io, " ", c)
+    end
+    String(take!(io.io))
+end
+
+function _render_position(buf, area::Rect, gui_data, last_fix, show_diag, fresh)
+    inner = render(Block(; title = PVT_PANEL_TITLE, border_style = tstyle(:border),
+            title_style = tstyle(:accent, bold = true)), area, buf)
+    live = gui_data !== nothing && gui_data.pvt !== nothing && !isnothing(gui_data.pvt.time)
+    fix = live ? gui_data : last_fix
+    x, y = inner.x + 1, inner.y
+    if fix === nothing
+        nsat = gui_data === nothing ? 0 : length(gui_data.sat_data)
+        rt = gui_data === nothing ? 0.0 : round(ustrip(s, gui_data.runtime); digits = 1)
+        msg = nsat < 4 ? NOT_ENOUGH_SATS_TEXT : "Decoding satellites…"
+        set_string!(buf, x, y, msg, tstyle(:text_dim); max_x = right(inner))
+        set_string!(buf, x, y + 1, "$nsat satellites tracked   run time $rt s",
+            tstyle(:text_dim); max_x = right(inner))
+        return
+    end
+    pvt = fix.pvt
+    lla = get_LLA(pvt)
+    lat_hem = lla.lat >= 0 ? "N" : "S"
+    lon_hem = lla.lon >= 0 ? "E" : "W"
+    speed = sqrt(sum(abs2, pvt.velocity))
+    # Time solution: `pvt.time` is a TAI epoch shown as UTC (leap-aware `to_utc`) to ms,
+    # time-then-date (HH:MM:SS.sss dd.mm.yyyy).
+    utc_str = to_utc(String, pvt.time, dateformat"HH:MM:SS.sss dd.mm.yyyy")
+    heading = "$(round(ustrip(°, pvt.course_over_ground); digits = 1))°"
+    low_speed = speed < MIN_SPEED_FOR_HEADING
+    heading_value = low_speed ? "$heading (low speed)" : heading
+    rt = gui_data === nothing ? 0.0 : round(ustrip(s, gui_data.runtime); digits = 1)
+    pvt_rows = [
+        ("Time", "$utc_str UTC"),
+        ("Coordinates",
+            "$(abs(round(lla.lat; digits = 6)))°$lat_hem, " *
+            "$(abs(round(lla.lon; digits = 6)))°$lon_hem"),
+        ("Altitude", "$(round(lla.alt; digits = 1)) m"),
+        ("Speed", "$(round(speed; digits = 2)) m/s"),
+        ("Heading", heading_value),
+        ("Run time", "$rt s"),
+    ]
+    labelw = maximum(length(first(r)) for r in pvt_rows) + 1  # +1 for the colon
+    # A stale (re-emitted) fix or a held last-fix is dimmed so a frozen position is not
+    # read as live.
+    base_style = (fresh && live) ? tstyle(:text) : tstyle(:text_dim)
+    if !live
+        set_string!(buf, x, y, "◦ last fix (re-acquiring)", tstyle(:warning); max_x = right(inner))
+        y += 1
+    end
+    for r in pvt_rows
+        y > bottom(inner) && return
+        st = (r[1] == "Heading" && low_speed) ? tstyle(:text_dim) : base_style
+        set_string!(buf, x, y, "$(rpad(first(r) * ":", labelw)) $(last(r))", st; max_x = right(inner))
+        y += 1
+    end
+    # Diagnostics (DOP, biases, pseudorange residuals): shown below on demand, dimmed as
+    # secondary info. Clipped at the panel bottom.
+    if show_diag
+        y += 1
+        for line in pvt_details_lines(pvt)
+            y > bottom(inner) && return
+            set_string!(buf, x, y, line, tstyle(:text_dim); max_x = right(inner))
+            y += 1
+        end
+    end
+    return
+end
+
+# ── Map ───────────────────────────────────────────────────────────────────────
+function _render_map(m::ReceiverModel, buf, area::Rect, last_fix)
+    inner = render(Block(; title = MAP_PANEL_TITLE, border_style = tstyle(:border),
+            title_style = tstyle(:accent, bold = true)), area, buf)
+    (inner.width < 8 || inner.height < 4) && return
+    if last_fix === nothing
+        set_string!(buf, inner.x + 1, inner.y, "awaiting fix…", tstyle(:text_dim);
+            max_x = right(inner))
+        return
+    end
+    lla = try
+        get_LLA(last_fix.pvt)
+    catch
+        nothing
+    end
+    lla === nothing && return
+    zoom, dlon, dlat = @lock m.lk (m.map_zoom, m.map_dlon, m.map_dlat)
+    clon = lla.lon + dlon
+    clat = lla.lat + dlat
+    marker = dlon == 0.0 && dlat == 0.0          # the pin marks the map centre = the fix
+    want = (round(clat; digits = 5), round(clon; digits = 5),
+        inner.width, inner.height, zoom, marker)
+    lines = @lock m.lk begin
+        m.map_want = want
+        m.map_lines
+    end
+    if lines === nothing
+        # No cached tile yet: show the coordinates + a maps link as a graceful fallback
+        # (also what stays on screen when there is no network).
+        set_string!(buf, inner.x + 1, inner.y, "loading map…", tstyle(:text_dim);
+            max_x = right(inner))
+        set_string!(buf, inner.x + 1, inner.y + 1,
+            "$(round(clat; digits = 5)), $(round(clon; digits = 5))",
+            tstyle(:success, bold = true); max_x = right(inner))
+        set_string!(buf, inner.x + 1, inner.y + 2,
+            "maps.google.com/?q=$(round(clat; digits = 5)),$(round(clon; digits = 5))",
+            tstyle(:text_dim); max_x = right(inner))
+        return
+    end
+    for (i, spans) in enumerate(lines)
+        yy = inner.y + i - 1
+        yy > bottom(inner) && break
+        xx = inner.x
+        for sp in spans
+            xx > right(inner) && break
+            set_string!(buf, xx, yy, sp.content, sp.style; max_x = right(inner))
+            xx += max(1, textwidth(sp.content))
+        end
+    end
+    return
+end
+
+# Render the map on a background task (network tile download + ANSI parse, a few seconds),
+# once per (position, panel-size, zoom); the PVT panel only ever paints the cached span
+# lines. On any failure (offline, tile error) the panel keeps showing the coordinate
+# fallback, and we mark the request done so a failing request is not retried in a tight loop.
+function _spawn_map(m::ReceiverModel)
+    Base.errormonitor(
+        Threads.@spawn begin
+            while !m.quit
+                want, have = @lock m.lk (m.map_want, m.map_key)
+                if want !== nothing && want != have
+                    lat, lon, w, h, zoom, marker = want
+                    if w >= 8 && h >= 4
+                        try
+                            img = worldmap(; center = (lon, lat), zoom = Int(zoom),
+                                size = (Int(w), Int(h)), marker = marker)
+                            parsed = [parse_ansi(String(l)) for l in split(sprint(show, img), "\n")]
+                            @lock m.lk begin
+                                m.map_lines = parsed
+                                m.map_key = want
+                            end
+                        catch
+                            @lock m.lk (m.map_key = want)   # don't retry a failing request
+                        end
+                    end
+                end
+                sleep(0.5)
+            end
+        end
+    )
 end
