@@ -48,8 +48,8 @@ gnss_receiver_gui(;
 
 ### From a data channel
 
-If you already have a data channel from [`receive`](@ref) (from a file, say), wrap it with
-[`get_gui_data_channel`](@ref) and pass the result to `gui`. `get_gui_data_channel`
+If you already have a data channel from [`receive`](@ref) (replaying a file, say), wrap it
+with [`get_gui_data_channel`](@ref) and pass the result to `gui`. `get_gui_data_channel`
 down-samples the per-chunk stream to a human refresh rate:
 
 ```julia
@@ -61,11 +61,16 @@ measurement_channel = read_uint8_iq_file(
     center = 127.5,
     type = ComplexF32,
 )
-data_channel = receive(measurement_channel, GPSL1CA(), 2.048e6u"Hz")
+data_channel = receive(
+    measurement_channel, GPSL1CA(), 2.048e6u"Hz";
+    pvt_approximate_year = 2017,   # this recording is from 2017 (GPS week rollover)
+)
 
-gui_channel = get_gui_data_channel(data_channel)
-GNSSReceiver.gui(gui_channel)
+GNSSReceiver.gui(get_gui_data_channel(data_channel))   # press `q` to quit
 ```
+
+For a complete, copy-pasteable walkthrough — downloading a public recording and replaying
+it into the dashboard — see the [Worked Example (Real Data)](@ref) page.
 
 ## Showing the GUI *and* saving the data
 
