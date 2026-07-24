@@ -61,15 +61,15 @@ end
         @test m.quit
     end
 
-    # `d` toggles the diagnostics section; an unbound key is a no-op (and never quits).
+    # Diagnostics are shown by default; `d` toggles them; an unbound key is a no-op.
     m = GNSSReceiver.ReceiverModel()
-    @test !m.show_diagnostics
-    GNSSReceiver.update!(m, KeyEvent('d'))
     @test m.show_diagnostics
     GNSSReceiver.update!(m, KeyEvent('d'))
     @test !m.show_diagnostics
+    GNSSReceiver.update!(m, KeyEvent('d'))
+    @test m.show_diagnostics
     GNSSReceiver.update!(m, KeyEvent('x'))
-    @test !m.quit && !m.show_diagnostics
+    @test !m.quit && m.show_diagnostics
 end
 
 @testset "GUI header flags stream ended" begin
@@ -199,11 +199,15 @@ end
     @test !occursin("low speed", out)
     @test occursin("Run time:", out) && occursin("10.0 s", out)
     # The block is titled "Position Velocity Time (PVT)" and, with diagnostics on, folds in
-    # the solution internals: DOP shown; residuals flagged (4 sats, single system/band ⇒ no
-    # redundancy), so the "insufficient redundancy" note appears.
+    # the solution internals: the full DOP breakdown (GDOP/PDOP/HDOP/VDOP/TDOP) is shown;
+    # residuals flagged (4 sats, single system/band ⇒ no redundancy), so the "insufficient
+    # redundancy" note appears.
     @test occursin("Position Velocity Time (PVT)", out)
-    @test occursin("DOP", out)
+    @test occursin("GDOP", out) && occursin("HDOP", out) && occursin("VDOP", out) &&
+          occursin("PDOP", out) && occursin("TDOP", out)
     @test occursin("insufficient redundancy", out)
+    # The Location panel shows a Google Maps URL (rendered as a clickable OSC 8 link).
+    @test occursin("google.com/maps?q=", out)
 end
 
 @testset "GUI PVT diagnostics — multi-GNSS, multi-band, redundant" begin
