@@ -16,9 +16,12 @@ processes samples. It lays out four panels:
   speed and heading, followed by the solution diagnostics (the full DOP breakdown —
   GDOP/PDOP/HDOP/VDOP/TDOP — inter-system and inter-frequency biases, and pseudorange-residual
   RMS). Diagnostics are shown by default; press `d` to hide them.
-- **Location** — the fix's coordinates and a clickable Google Maps link (an OSC 8 terminal
-  hyperlink, so it opens on click in supporting terminals and is copy-pasteable elsewhere).
-  A rendered in-terminal map view is coming as a follow-up.
+- **Map** — the fix on an OpenStreetMap tile (via
+  [UnicodeMaps.jl](https://github.com/JuliaGNSS/UnicodeMaps.jl)), rendered in the
+  background. This needs network access to fetch tiles; without it (or before the first
+  fix) the panel falls back to the coordinates and a clickable Google Maps link (an OSC 8
+  terminal hyperlink, so it opens on click in supporting terminals and is copy-pasteable
+  elsewhere).
 
 ![The GNSSReceiver terminal GUI](assets/gui.png)
 
@@ -28,6 +31,9 @@ processes samples. It lays out four panels:
 |-----|--------|
 | `q` / `Ctrl-C` | quit |
 | `d` | toggle the PVT diagnostics |
+| `+` / `-` | zoom the map in / out |
+| `h` `j` `k` `l` | pan the map (west / south / north / east) |
+| `0` | recenter the map on the fix and reset the zoom |
 
 ## Launching the GUI
 

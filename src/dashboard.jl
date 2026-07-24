@@ -1,10 +1,10 @@
 # The live GUI is a Tachikoma app (Elm-style Model/update!/view). A background task drains
 # the `GUIData` channel into the model; `view` lays out four panels — CN0 bars and a
-# direction-of-arrival sky plot on top, a Position/Velocity/Time block and a location block
-# (coordinates + a maps link) below — and paints them each frame. The CN0 bars and the sky
-# plot are drawn by `UnicodePlots` (`barplot`/`polarplot`); their colour string is painted
-# into the panel via `_paint_plot!`. Interactivity: `d` toggles the PVT diagnostics,
-# `q`/Ctrl-C quit.
+# direction-of-arrival sky plot on top, a Position/Velocity/Time block and an OpenStreetMap
+# map below — and paints them each frame. The CN0 bars and the sky plot are drawn by
+# `UnicodePlots` (`barplot`/`polarplot`), the map by `UnicodeMaps`; all three arrive as an
+# ANSI colour string that `_paint_plot!` paints into the panel. Interactivity: `d` toggles
+# the PVT diagnostics, `+`/`-`/`hjkl`/`0` drive the map, `q`/Ctrl-C quit.
 #
 # It lives in its own module — the layout Tachikoma's `@tachikoma_app` docstring prescribes
 # — because `using Tachikoma` plus that macro bring ~150 framework names into scope, and
@@ -20,6 +20,7 @@ using Tachikoma
 @tachikoma_app
 
 using UnicodePlots
+using UnicodeMaps: TileSource, worldmap
 using Dates: @dateformat_str
 using AstroTime: to_utc
 using PositionVelocityTime: get_LLA, get_sat_enu
@@ -38,6 +39,18 @@ using ..GNSSReceiver:
     sat_label,
     sat_sort_key
 
+# What the map panel needs rendered: the tile centre, the panel size in cells, the zoom
+# level, and whether to pin the centre (only while the map is centred on the fix).
+const MapRequest = @NamedTuple{
+    lat::Float64, lon::Float64, width::Int, height::Int, zoom::Int, marker::Bool}
+
+const MAP_DEFAULT_ZOOM = 13
+const MAP_MIN_ZOOM = 1        # whole world
+const MAP_MAX_ZOOM = 18       # OpenStreetMap's deepest tile level
+const MAP_MIN_WIDTH = 8       # below this the tile is unreadable; show the text fallback
+const MAP_MIN_HEIGHT = 4
+const MAP_POLL_INTERVAL = 0.5 # seconds between checks for a new map request
+
 mutable struct ReceiverModel <: Model
     quit::Bool
     tick::Int                       # frame counter, drives the "Searching…" dots
@@ -46,9 +59,18 @@ mutable struct ReceiverModel <: Model
     last_fix::Union{GUIData,Nothing}# last frame that carried a real PVT fix
     show_diagnostics::Bool          # PVT diagnostics section, shown by default (toggle with `d`)
     stream_ended::Bool              # set when the data channel closes (stream finished)
+    # Map state. `map_want` is what `view` asks for; `_spawn_map` renders it in the
+    # background and caches the ANSI string in `map_ansi`, tagged with `map_key`.
+    map_zoom::Int
+    map_dlon::Float64               # pan offset from the fix, degrees longitude
+    map_dlat::Float64               # pan offset from the fix, degrees latitude
+    map_ansi::Union{String,Nothing} # last rendered map, as an ANSI colour string
+    map_key::Union{MapRequest,Nothing}  # the request `map_ansi` answers
+    map_want::Union{MapRequest,Nothing} # the request the map panel wants rendered
 end
 
-ReceiverModel() = ReceiverModel(false, 0, ReentrantLock(), nothing, nothing, true, false)
+ReceiverModel() = ReceiverModel(false, 0, ReentrantLock(), nothing, nothing, true, false,
+    MAP_DEFAULT_ZOOM, 0.0, 0.0, nothing, nothing, nothing)
 
 should_quit(m::ReceiverModel) = m.quit
 
@@ -59,10 +81,10 @@ should_quit(m::ReceiverModel) = m.quit
 
 Display the receiver dashboard, consuming each `GUIData` from `gui_data_channel`. Runs a
 Tachikoma terminal app: a background task keeps the model fed with the latest frame while
-the app renders the CN0 bars, the direction-of-arrival sky plot and the
-Position/Velocity/Time block. When the stream ends the last frame stays on screen (flagged
-"stream ended"); the app blocks until the user quits (`q` or `Ctrl-C`). Press `d` to toggle
-the PVT diagnostics.
+the app renders the CN0 bars, the direction-of-arrival sky plot, the Position/Velocity/Time
+block and an OpenStreetMap map of the fix. When the stream ends the last frame stays on
+screen (flagged "stream ended"); the app blocks until the user quits (`q` or `Ctrl-C`).
+Keys: `d` toggles the PVT diagnostics; `+`/`-` zoom and `hjkl` pan the map, `0` recenters it.
 
 Quitting closes `gui_data_channel`, which tears the pipeline down behind it (see
 [`get_gui_data_channel`](@ref GNSSReceiver.get_gui_data_channel)) — `q` stops the run, it
@@ -83,6 +105,7 @@ function gui(gui_data_channel; fps::Int = 12)
             @lock m.lk (m.stream_ended = true)
         end
     )
+    _spawn_map(m)
     try
         # Prefer the interactive threadpool (`julia -t auto,1`) so the render loop is not
         # starved by the streaming/DSP tasks on the default pool.
@@ -97,6 +120,10 @@ function gui(gui_data_channel; fps::Int = 12)
         # sample reader too. Without this the user gets the prompt back while the pipeline
         # keeps churning through the rest of the recording.
         close(gui_data_channel)
+        # Also stop the map task, which is otherwise only wound up by `q` — the app can
+        # leave through an exception too, and nothing should keep fetching tiles for a
+        # dashboard that is gone.
+        @lock m.lk (m.quit = true)
     end
 end
 
@@ -110,6 +137,31 @@ function update!(m::ReceiverModel, e::KeyEvent)
         @lock m.lk (m.show_diagnostics = !m.show_diagnostics)
         return
     end
+    # Map controls: `+`/`-` zoom, `hjkl` pan (vim), `0` recenter. `←/→` are left free for
+    # future navigation; the map uses hjkl so as not to clobber them.
+    if e.key == :char
+        c = e.char
+        if c == '+' || c == '='
+            @lock m.lk (m.map_zoom = min(m.map_zoom + 1, MAP_MAX_ZOOM))
+        elseif c == '-' || c == '_'
+            @lock m.lk (m.map_zoom = max(m.map_zoom - 1, MAP_MIN_ZOOM))
+        elseif c == '0'
+            @lock m.lk begin
+                m.map_zoom = MAP_DEFAULT_ZOOM
+                m.map_dlon = 0.0
+                m.map_dlat = 0.0
+            end
+        elseif c == 'h' || c == 'j' || c == 'k' || c == 'l'
+            @lock m.lk begin
+                # ~⅓ of the view per press: the tile's span halves with every zoom level.
+                step = 0.35 * 360.0 / 2.0^m.map_zoom
+                c == 'h' && (m.map_dlon -= step)       # west
+                c == 'l' && (m.map_dlon += step)       # east
+                c == 'k' && (m.map_dlat += step)       # north
+                c == 'j' && (m.map_dlat -= step)       # south
+            end
+        end
+    end
     return
 end
 
@@ -119,7 +171,7 @@ update!(::ReceiverModel, ::Event) = nothing
 const CN0_PANEL_TITLE = "Carrier-to-Noise-Density-Ratio (CN0) [dBHz]"
 const DOA_PANEL_TITLE = "Satellite Direction-of-Arrival (DOA)"
 const PVT_PANEL_TITLE = "Position Velocity Time (PVT)"
-const LOCATION_PANEL_TITLE = "Location"
+const MAP_PANEL_TITLE = "Map"
 const NOT_ENOUGH_SATS_TEXT = "Not enough satellites to calculate position."
 
 function view(m::ReceiverModel, f::Frame)
@@ -144,18 +196,19 @@ function view(m::ReceiverModel, f::Frame)
     set_string!(buf, header.x, header.y, rpad(hdr, header.width),
         tstyle(:title, bold = true); max_x = right(header))
 
-    # Body: CN0 | DOA (top), PVT | Location (bottom).
+    # Body: CN0 | DOA (top), PVT | Map (bottom).
     toprow, botrow = split_layout(Layout(Vertical, [Percent(50), Fill()]), body)
     topcols = split_layout(Layout(Horizontal, [Percent(50), Fill()]), toprow)
     botcols = split_layout(Layout(Horizontal, [Percent(42), Fill()]), botrow)
     _render_cn0(buf, topcols[1], gui_data, num_dots)
     _render_skyplot(buf, topcols[2], gui_data, num_dots)
     _render_position(buf, botcols[1], gui_data, last_fix, show_diag, fresh, ended)
-    _render_location(buf, botcols[2], last_fix)
+    _render_map(m, buf, botcols[2], last_fix)
 
     diaghint = show_diag ? "[d] hide diagnostics" : "[d] diagnostics"
     render(StatusBar(
-            left = [Span(" ", tstyle(:text_dim)), Span(diaghint, tstyle(:text_dim))],
+            left = [Span(" [+/-] zoom  [hjkl] pan  [0] recenter  ", tstyle(:text_dim)),
+                Span(diaghint, tstyle(:text_dim))],
             right = [Span("  [q] quit ", tstyle(:text_dim))],
         ), footer, buf)
     return
@@ -368,13 +421,17 @@ function _render_position(buf, area::Rect, gui_data, last_fix, show_diag, fresh,
     return
 end
 
-# ── Location ────────────────────────────────────────────────────────────────
-# The fix's coordinates and a ready-to-click Google Maps link. (A rendered map view is
-# coming as a follow-up.) `get_LLA` is called unguarded, exactly as in `_render_position`:
-# both panels convert the same `pvt`, so swallowing a failure here would only blank this
-# panel while the PVT panel above still crashed the frame.
-function _render_location(buf, area::Rect, last_fix)
-    inner = render(Block(; title = LOCATION_PANEL_TITLE, border_style = tstyle(:border),
+# ── Map ─────────────────────────────────────────────────────────────────────
+# The fix on an OpenStreetMap tile. Fetching and rendering a tile takes far too long for a
+# frame, so `view` only ever *asks* for a map (`map_want`) and paints whatever the
+# background task has cached; until that arrives — and whenever it cannot be fetched at all
+# (no network) — the panel falls back to the coordinates and a Google Maps link.
+#
+# `get_LLA` is called unguarded, exactly as in `_render_position`: both panels convert the
+# same `pvt`, so swallowing a failure here would only blank this panel while the PVT panel
+# above still crashed the frame.
+function _render_map(m::ReceiverModel, buf, area::Rect, last_fix)
+    inner = render(Block(; title = MAP_PANEL_TITLE, border_style = tstyle(:border),
             title_style = tstyle(:accent, bold = true)), area, buf)
     if last_fix === nothing
         set_string!(buf, inner.x + 1, inner.y, "awaiting fix…", tstyle(:text_dim);
@@ -382,15 +439,66 @@ function _render_location(buf, area::Rect, last_fix)
         return
     end
     lla = get_LLA(last_fix.pvt)
-    lat, lon = round(lla.lat; digits = 5), round(lla.lon; digits = 5)
-    set_string!(buf, inner.x + 1, inner.y, "$lat, $lon",
-        tstyle(:success, bold = true); max_x = right(inner))
-    # A real OSC 8 hyperlink (via the style's `hyperlink`), so the URL is click-to-open in
-    # terminals that support it (and copy-pasteable everywhere).
-    url = "https://www.google.com/maps?q=$lat,$lon"
-    set_string!(buf, inner.x + 1, inner.y + 1, url,
-        tstyle(:text_dim; hyperlink = url); max_x = right(inner))
+    zoom, dlon, dlat = @lock m.lk (m.map_zoom, m.map_dlon, m.map_dlat)
+    lat, lon = round(lla.lat + dlat; digits = 5), round(lla.lon + dlon; digits = 5)
+    ansi = if inner.width < MAP_MIN_WIDTH || inner.height < MAP_MIN_HEIGHT
+        nothing   # panel too small for a tile; the text fallback still fits
+    else
+        # The pin marks the centre of the tile, which is the fix only while unpanned.
+        want = MapRequest((lat, lon, Int(inner.width), Int(inner.height), zoom,
+            dlon == 0.0 && dlat == 0.0))
+        @lock m.lk begin
+            m.map_want = want
+            m.map_ansi
+        end
+    end
+    if ansi === nothing
+        set_string!(buf, inner.x + 1, inner.y, "$lat, $lon",
+            tstyle(:success, bold = true); max_x = right(inner))
+        # A real OSC 8 hyperlink (via the style's `hyperlink`), so the URL is click-to-open
+        # in terminals that support it (and copy-pasteable everywhere).
+        url = "https://www.google.com/maps?q=$lat,$lon"
+        set_string!(buf, inner.x + 1, inner.y + 1, url,
+            tstyle(:text_dim; hyperlink = url); max_x = right(inner))
+        return
+    end
+    _paint_plot!(buf, inner, ansi)
     return
+end
+
+# Render the map on a background task (tile download + drawing, a good fraction of a
+# second), once per (centre, panel size, zoom) — the map panel only ever paints the cached
+# string. On any failure (offline, tile server error) the request is still marked done, so
+# a failing one is not retried in a tight loop, and the panel keeps showing the coordinate
+# fallback. The task ends with the app.
+function _spawn_map(m::ReceiverModel)
+    Base.errormonitor(
+        Threads.@spawn begin
+            # One tile source for the whole run: building it resolves the current
+            # OpenFreeMap tile URL over the network, and it carries the decoded-tile cache,
+            # so panning back over ground already covered costs no download at all. Built
+            # on first use (and retried later) so being offline at startup is not fatal.
+            source = nothing
+            while !m.quit
+                want, have = @lock m.lk (m.map_want, m.map_key)
+                if want !== nothing && want != have
+                    ansi = try
+                        isnothing(source) && (source = TileSource())
+                        img = worldmap(; center = (want.lon, want.lat), zoom = want.zoom,
+                            size = (want.width, want.height), marker = want.marker, source)
+                        sprint(show, img)
+                    catch
+                        nothing
+                    end
+                    @lock m.lk begin
+                        m.map_key = want
+                        isnothing(ansi) || (m.map_ansi = ansi)
+                    end
+                end
+                sleep(MAP_POLL_INTERVAL)
+            end
+        end
+    )
 end
 
 end # module Dashboard
