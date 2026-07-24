@@ -59,8 +59,10 @@ end
 end
 
 # Render one frame of the Tachikoma dashboard for `model` into an off-screen buffer and
-# return it as plain text. This drives the real `view` (CN0 bars, sky plot, PVT block,
-# location block) without a TTY.
+# return it as plain text. This drives the real `view` (CN0 bars, sky plot, PVT block, map
+# fallback) without a TTY — the map background task is only spawned by `gui`, not `view`,
+# so no network is touched and `map_ansi` stays empty (the map panel shows its coordinate
+# fallback).
 using Tachikoma: Rect, Buffer, Frame, GraphicsRegion, ColorRGBA, buffer_to_text
 
 function render_gui_text(model; width = 140, height = 50)
@@ -136,6 +138,52 @@ end
     @test m.show_diagnostics
     update!(m, KeyEvent('x'))
     @test !m.quit && m.show_diagnostics
+end
+
+@testset "GUI map controls (update!)" begin
+    using Tachikoma: KeyEvent
+    using GNSSReceiver.Dashboard:
+        ReceiverModel, update!, MAP_DEFAULT_ZOOM, MAP_MIN_ZOOM, MAP_MAX_ZOOM
+
+    # Zoom: `+`/`-`, clamped to the tile levels that exist.
+    m = ReceiverModel()
+    update!(m, KeyEvent('+'))
+    @test m.map_zoom == MAP_DEFAULT_ZOOM + 1
+    update!(m, KeyEvent('-'))
+    @test m.map_zoom == MAP_DEFAULT_ZOOM
+    foreach(_ -> update!(m, KeyEvent('-')), 1:30)
+    @test m.map_zoom == MAP_MIN_ZOOM
+    foreach(_ -> update!(m, KeyEvent('+')), 1:30)
+    @test m.map_zoom == MAP_MAX_ZOOM
+
+    # Pan: hjkl move the centre offset, opposite keys cancel out.
+    m = ReceiverModel()
+    update!(m, KeyEvent('l'))
+    @test m.map_dlon > 0
+    update!(m, KeyEvent('h'))
+    @test isapprox(m.map_dlon, 0.0; atol = 1e-9)
+    update!(m, KeyEvent('k'))
+    @test m.map_dlat > 0
+    update!(m, KeyEvent('j'))
+    @test isapprox(m.map_dlat, 0.0; atol = 1e-9)
+
+    # `0` recenters on the fix and resets the zoom, whatever the map was showing.
+    m.map_zoom = 5
+    update!(m, KeyEvent('k'))
+    update!(m, KeyEvent('0'))
+    @test m.map_zoom == MAP_DEFAULT_ZOOM
+    @test m.map_dlon == 0.0 && m.map_dlat == 0.0
+    @test !m.quit   # panning and zooming never quit
+end
+
+@testset "GUI map panel paints a rendered tile" begin
+    # Once the background task has rendered a tile, the panel paints it instead of the
+    # coordinate fallback. Feeding `map_ansi` directly keeps the test off the network.
+    m = gui_model(fixed_gui_data())
+    m.map_ansi = join(("map row $i" for i in 1:6), "\n")
+    out = render_gui_text(m)
+    @test occursin("map row 1", out) && occursin("map row 6", out)
+    @test !occursin("google.com/maps?q=", out)
 end
 
 @testset "GUI header flags stream ended" begin
@@ -303,7 +351,9 @@ end
     @test occursin("GDOP", out) && occursin("HDOP", out) && occursin("VDOP", out) &&
           occursin("PDOP", out) && occursin("TDOP", out)
     @test occursin("insufficient redundancy", out)
-    # The Location panel shows a Google Maps URL (rendered as a clickable OSC 8 link).
+    # With no tile rendered (no background task here), the Map panel falls back to the
+    # coordinates and a Google Maps URL (rendered as a clickable OSC 8 link).
+    @test occursin("Map", out)
     @test occursin("google.com/maps?q=", out)
 end
 

@@ -170,7 +170,7 @@ measurement_channel = read_uint8_iq_file(
 data_channel = receive(
     measurement_channel, GPSL1CA(), sampling_freq; pvt_approximate_year = 2017)
 
-# Opens the interactive dashboard (CN0 bars, sky plot, PVT, location). Press `q` to quit.
+# Opens the interactive dashboard (CN0 bars, sky plot, PVT, map). Press `q` to quit.
 GNSSReceiver.gui(get_gui_data_channel(data_channel))
 ```
 
