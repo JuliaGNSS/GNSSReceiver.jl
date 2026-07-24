@@ -62,7 +62,14 @@ jobs:
           GITHUB_TOKEN: ""
         run: |
           export JULIA_PKG_PRECOMPILE_AUTO=0
-          julia -e 'import Pkg; Pkg.add(name="AirspeedVelocity", version="0.6"); Pkg.add("JSON3")'
+          # TEMPORARY: install AirspeedVelocity from the fork branch that resolves a
+          # package's `[sources]` deps for the `--url` code path
+          # (github.com/MilesCranmer/AirspeedVelocity.jl#133). Released AirspeedVelocity
+          # 0.6 only honours `[sources]` for `--path`, so it fails to resolve our
+          # unregistered UnicodeMaps `[sources]` dep with "has no known versions". Revert
+          # to `Pkg.add(name="AirspeedVelocity", version="0.6")` once that fix is released
+          # (or once UnicodeMaps is registered in General, whichever lands first).
+          julia -e 'import Pkg; Pkg.add(url="https://github.com/zsoerenm/AirspeedVelocity.jl", rev="ss/fix-sources-resolution"); Pkg.add("JSON3")'
           julia -e 'import Pkg; Pkg.build("AirspeedVelocity")'
           echo "$HOME/.julia/bin" >> "$GITHUB_PATH"
 
