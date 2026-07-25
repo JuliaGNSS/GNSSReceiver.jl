@@ -247,7 +247,7 @@ function process(
     # (copies) each group's satellite slot vectors and rebuilds the TrackedSat
     # wrappers every call. The receiver discards the previous `ReceiverState` each
     # chunk and reuses one hoisted correlator, so mutating in place is safe and is
-    # Tracking v3's documented allocation-free real-time pattern.
+    # Tracking's documented allocation-free real-time pattern.
     track_state = track!(band_measurements, track_state; downconvert_and_correlator)
 
     receiver_sat_states = update_all_receiver_sat_states(
