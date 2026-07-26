@@ -1,5 +1,12 @@
 # Changelog
 
+# [2.1.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v2.0.0...v2.1.0) (2026-07-26)
+
+
+### Features
+
+* support Tracking 4 ([76338f7](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/76338f7))
+
 # [2.0.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v1.0.0...v2.0.0) (2026-07-19)
 
 
