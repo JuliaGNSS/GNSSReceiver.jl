@@ -13,7 +13,9 @@ end
 
 makedocs(
     sitename = "GNSSReceiver.jl",
-    modules = [GNSSReceiver],
+    # `gui` is defined in the `Dashboard` submodule (which keeps the Tachikoma namespace out
+    # of `GNSSReceiver`) and re-imported into the parent, so list both.
+    modules = [GNSSReceiver, GNSSReceiver.Dashboard],
     authors = "JuliaGNSS",
     format = Documenter.HTML(
         prettyurls = get(ENV, "CI", nothing) == "true",

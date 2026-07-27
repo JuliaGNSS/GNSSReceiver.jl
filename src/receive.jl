@@ -432,7 +432,16 @@ function receive(
                 # `save_data` — need it.
                 state = state_ref[]
                 if state.runtime - last_output_ref[] >= pvt_update_interval
-                    push!(data_channel, extract(state))
+                    # A closed `data_channel` means the consumers are gone (e.g. the user
+                    # quit the GUI, which closes its channel and so ours): end the run
+                    # quietly rather than letting the `InvalidStateException` escape as an
+                    # unhandled-task error right as the terminal is handed back.
+                    try
+                        push!(data_channel, extract(state))
+                    catch e
+                        e isa InvalidStateException || rethrow(e)
+                        break
+                    end
                     last_output_ref[] = state.runtime
                 end
             end
@@ -442,13 +451,22 @@ function receive(
             # nothing was ever emitted.
             state = state_ref[]
             if isfinite(last_output_ref[]) && state.runtime > last_output_ref[]
-                push!(data_channel, extract(state))
+                try
+                    push!(data_channel, extract(state))
+                catch e
+                    e isa InvalidStateException || rethrow(e)
+                end
             end
         finally
             # Close even when a chunk throws: consumers block in `take!` until the
             # channel closes, so leaving it open would hang them after a crash
             # (`errormonitor` only logs the failure).
             close(data_channel)
+            # Also close the sample source. This task is its only consumer, so once the run
+            # is over — EOF, a crash, or the consumers going away — nothing will drain it
+            # again; leaving it open parks the reader task on a full channel forever, still
+            # holding its files or SDR stream open.
+            foreach(close, measurement_channels)
         end
     )
     data_channel
