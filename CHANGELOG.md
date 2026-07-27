@@ -1,5 +1,12 @@
 # Changelog
 
+# [3.1.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v3.0.0...v3.1.0) (2026-07-27)
+
+
+### Features
+
+* OpenStreetMap map view in the Map panel ([8c2b9c8](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/8c2b9c856e72fb274e2147931a4b9cb4419929fa))
+
 # [3.0.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v2.1.0...v3.0.0) (2026-07-27)
 
 
