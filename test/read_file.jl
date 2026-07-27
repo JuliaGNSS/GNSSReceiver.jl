@@ -39,3 +39,28 @@
 
     rm(tmp; force = true)
 end
+
+@testset "read_files" begin
+    # 24 `Complex{Int16}` samples, one antenna channel, written as raw little-endian I/Q.
+    tmp = tempname()
+    write(tmp, [complex(Int16(i), Int16(-i)) for i = 1:24])
+
+    @testset "Chunked read" begin
+        chunks = collect(read_files(tmp, 4))   # 4 samples/chunk -> 6 chunks
+        @test length(chunks) == 6
+        @test eltype(chunks[1]) == Complex{Int16}
+        @test size(chunks[1]) == (4, 1)
+        @test chunks[1][1, 1] == complex(Int16(1), Int16(-1))
+    end
+
+    @testset "Real-time replay pacing (sample_rate)" begin
+        # 6 chunks of 4 samples at 1 kHz ⇒ 4 ms/chunk ⇒ ≳ 24 ms of pacing; loose lower bound
+        # avoids CI-timing flakiness while still proving pacing happens.
+        t = @elapsed chunks = collect(read_files(tmp, 4; sample_rate = 1000u"Hz"))
+        @test length(chunks) == 6
+        @test chunks[1][1, 1] == complex(Int16(1), Int16(-1))
+        @test t >= 0.012
+    end
+
+    rm(tmp; force = true)
+end

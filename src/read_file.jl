@@ -25,9 +25,14 @@ hold a previously enqueued chunk.
 A custom `read_measurement!(streams, chunk)` can be supplied to decode packed or
 otherwise-encoded sample formats; see the note above for the contract it must honour.
 
-Pass `sample_rate` (the recording's sampling frequency) to **replay in real time** — the
-reader sleeps one chunk's worth of signal time (`num_samples / sample_rate`) between
-chunks. Left `nothing`, chunks are pushed as fast as the pipeline consumes them.
+Pass `sample_rate` (the recording's sampling frequency) to **replay in real time** — chunks
+are then released on a fixed schedule, one chunk's worth of signal time
+(`num_samples / sample_rate`) apart, so the replay neither runs ahead nor drifts behind the
+pace the signal was recorded at. Left `nothing`, chunks are pushed as fast as the pipeline
+consumes them.
+
+Pacing is bounded below by `sleep`'s ~1 ms resolution: a chunk period much shorter than that
+cannot be tracked, and replay runs slower than real time regardless.
 """
 function read_files(
     files,
@@ -50,6 +55,7 @@ function read_files(
     ) do out
         streams = open.(files)
         num_read_samples = 0
+        deadline = time()
         try
             while true
                 if end_condition isa Integer && num_read_samples > end_condition ||
@@ -63,7 +69,7 @@ function read_files(
                 read_measurement!(streams, chunk)
                 num_read_samples += num_samples
                 put!(out, chunk)
-                isnothing(chunk_period) || sleep(chunk_period)
+                deadline = _pace_replay(deadline, chunk_period)
             end
         catch e
             if e isa EOFError
@@ -98,11 +104,12 @@ for exact midscale recentring and drop `max_meas`.
 `end_condition` stops the read exactly like [`read_files`](@ref): an `Integer` sample
 count, a notified `Base.Event`, or `nothing` to read until end-of-file.
 
-Pass `sample_rate` (the recording's sampling frequency) to **replay in real time**: the
-reader then sleeps one chunk's worth of signal time (`num_samples / sample_rate`) between
-chunks, so a file plays back at the pace it was recorded — useful for watching the live
-[`gui`](@ref GNSSReceiver.gui). Left `nothing`, chunks are pushed as fast as the pipeline
-consumes them.
+Pass `sample_rate` (the recording's sampling frequency) to **replay in real time**: chunks
+are then released on a fixed schedule, one chunk's worth of signal time
+(`num_samples / sample_rate`) apart, so the file plays back at the pace it was recorded —
+useful for watching the live [`gui`](@ref GNSSReceiver.gui). Left `nothing`, chunks are
+pushed as fast as the pipeline consumes them. Pacing is bounded below by `sleep`'s ~1 ms
+resolution (see [`read_files`](@ref)).
 """
 function read_uint8_iq_file(
     file,
@@ -123,6 +130,7 @@ function read_uint8_iq_file(
         io = open(file)
         raw = Vector{UInt8}(undef, 2 * num_samples)
         num_read_samples = 0
+        deadline = time()
         try
             while true
                 if end_condition isa Integer && num_read_samples > end_condition ||
@@ -140,7 +148,7 @@ function read_uint8_iq_file(
                 end
                 num_read_samples += num_samples
                 put!(out, chunk)
-                isnothing(chunk_period) || sleep(chunk_period)
+                deadline = _pace_replay(deadline, chunk_period)
             end
         finally
             close(io)
@@ -152,6 +160,25 @@ end
 # replay. `nothing` (no `sample_rate`) means "no pacing — push as fast as possible".
 _replay_chunk_period(_, ::Nothing) = nothing
 _replay_chunk_period(num_samples, sample_rate) = ustrip(s, upreferred(num_samples / sample_rate))
+
+# Sleep until the next chunk is due and return the deadline for the chunk after it.
+#
+# Paced against an absolute schedule rather than `sleep(chunk_period)` per chunk, because a
+# per-chunk sleep accumulates two errors monotonically: the blocking `put!` that hands the
+# chunk to the consumer is not deducted from the wait, and `sleep` has ~1 ms granularity and
+# always overshoots — at a 4 ms chunk that is a 25 % drift *per chunk*. Advancing a deadline
+# instead absorbs both, and a chunk that ran late simply gets no sleep (the schedule catches
+# up rather than falling further behind).
+#
+# The floor is `sleep`'s own resolution: chunk periods below ~1 ms cannot be tracked
+# chunk-by-chunk at all, and replay then runs slower than real time no matter what.
+_pace_replay(deadline, ::Nothing) = deadline
+function _pace_replay(deadline, chunk_period)
+    deadline += chunk_period
+    remaining = deadline - time()
+    remaining > 0 && sleep(remaining)
+    return deadline
+end
 
 function read_measurement!(streams::AbstractVector, measurements)
     foreach(
