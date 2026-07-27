@@ -9,7 +9,9 @@ processes samples. It lays out four panels:
   is healthy and red otherwise.
 - **Satellite Direction-of-Arrival** — a sky plot of the satellites in view, each drawn at
   its azimuth/elevation and labelled with its PRN, coloured by constellation (green GPS,
-  blue Galileo, red GLONASS, yellow BeiDou), with a legend below.
+  blue Galileo, red GLONASS, yellow BeiDou), with a legend below. Azimuth runs clockwise
+  from North at the top; the rings are elevation, with the zenith at the centre and the
+  horizon on the rim, so a satellite moves outward as it sets.
 - **Position Velocity Time (PVT)** — the fix as time (UTC), coordinates, altitude, ground
   speed and heading, followed by the solution diagnostics (the full DOP breakdown —
   GDOP/PDOP/HDOP/VDOP/TDOP — inter-system and inter-frequency biases, and pseudorange-residual
@@ -71,6 +73,10 @@ data_channel = receive(
 
 GNSSReceiver.gui(get_gui_data_channel(data_channel))   # press `q` to quit
 ```
+
+Quitting with `q` closes the GUI channel, and that close propagates back up the pipeline:
+[`receive`](@ref) stops processing and the file reader stops reading. So `q` ends the run —
+it does not leave the receiver grinding through the rest of the recording in the background.
 
 For a complete, copy-pasteable walkthrough — downloading a public recording and replaying
 it into the dashboard — see the [Worked Example (Real Data)](@ref) page.

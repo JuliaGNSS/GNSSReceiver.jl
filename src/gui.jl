@@ -182,6 +182,11 @@ Return a `Channel{GUIData}` that downsamples `data_channel` for display: a spawn
 consumes every [`ReceiverDataOfInterest`](@ref) but only forwards one roughly every
 `push_gui_data_roughly_every` of signal runtime (plus the very first), so the GUI is
 refreshed at a human rate rather than once per processed chunk.
+
+The forwarding task also propagates a *downstream* close upstream: if the consumer closes
+the returned channel — which [`gui`](@ref GNSSReceiver.gui) does when the user quits — it
+closes `data_channel`, ending the run instead of leaving the pipeline churning through the
+rest of the stream with nobody watching.
 """
 function get_gui_data_channel(
     data_channel::Channel{<:ReceiverDataOfInterest},
@@ -196,23 +201,32 @@ function get_gui_data_channel(
     last_pvt_time = Ref{fieldtype(PVTSolution, :time)}(nothing)
     Base.errormonitor(
         Threads.@spawn begin
-            consume_channel(data_channel) do data
-                if (data.runtime - last_gui_output[]) > push_gui_data_roughly_every ||
-                   first[]
-                    # Fresh iff there is a fix whose epoch advanced since the last emission
-                    # (a re-emitted stale solution keeps the same `pvt.time`).
-                    pvt_fresh =
-                        !isnothing(data.pvt.time) && data.pvt.time != last_pvt_time[]
-                    last_pvt_time[] = data.pvt.time
-                    push!(
-                        gui_data_channel,
-                        GUIData(data.sat_data, data.pvt, data.runtime, pvt_fresh),
-                    )
-                    last_gui_output[] = data.runtime
-                    first[] = false
+            try
+                consume_channel(data_channel) do data
+                    if (data.runtime - last_gui_output[]) > push_gui_data_roughly_every ||
+                       first[]
+                        # Fresh iff there is a fix whose epoch advanced since the last emission
+                        # (a re-emitted stale solution keeps the same `pvt.time`).
+                        pvt_fresh =
+                            !isnothing(data.pvt.time) && data.pvt.time != last_pvt_time[]
+                        last_pvt_time[] = data.pvt.time
+                        push!(
+                            gui_data_channel,
+                            GUIData(data.sat_data, data.pvt, data.runtime, pvt_fresh),
+                        )
+                        last_gui_output[] = data.runtime
+                        first[] = false
+                    end
                 end
+                close(gui_data_channel)
+            catch e
+                # The only expected failure is the `push!` above hitting a channel the
+                # consumer has closed (the user quit the GUI). Tear the run down from here:
+                # closing `data_channel` ends `receive`'s processing loop, which in turn
+                # stops the sample reader.
+                e isa InvalidStateException || rethrow()
+                close(data_channel)
             end
-            close(gui_data_channel)
         end
     )
     gui_data_channel
@@ -301,332 +315,4 @@ function pvt_details_lines(pvt)
     end
 
     lines
-end
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tachikoma dashboard
-#
-# The GUI is a Tachikoma app (Elm-style Model/update!/view). A background task drains
-# the `GUIData` channel into the model; `view` lays out four panels — CN0 bars and a
-# direction-of-arrival sky plot on top, a Position/Velocity/Time block and a location
-# block (coordinates + a maps link) below — and paints them each frame. The CN0 bars and
-# the sky plot are drawn by `UnicodePlots` (`barplot`/`polarplot`); their colour string is
-# painted into the panel via `_paint_plot!`. Interactivity: `d` toggles the PVT
-# diagnostics, `q`/Ctrl-C quit.
-
-mutable struct ReceiverModel <: Model
-    quit::Bool
-    tick::Int                       # frame counter, drives the "Searching…" dots
-    lk::ReentrantLock
-    gui::Union{GUIData,Nothing}     # latest frame from the receiver
-    last_fix::Union{GUIData,Nothing}# last frame that carried a real PVT fix
-    show_diagnostics::Bool          # PVT diagnostics section, shown by default (toggle with `d`)
-    stream_ended::Bool              # set when the data channel closes (stream finished)
-end
-
-ReceiverModel() = ReceiverModel(false, 0, ReentrantLock(), nothing, nothing, true, false)
-
-should_quit(m::ReceiverModel) = m.quit
-
-"""
-    gui(gui_data_channel; fps = 12)
-
-Display the receiver dashboard, consuming each `GUIData` from `gui_data_channel`. Runs a
-Tachikoma terminal app: a background task keeps the model fed with the latest frame while
-the app renders the CN0 bars, the direction-of-arrival sky plot and the
-Position/Velocity/Time block. When the stream ends the last frame stays on screen (flagged
-"stream ended"); the app blocks until the user quits (`q`). Press `d` to toggle the PVT
-diagnostics.
-"""
-function gui(gui_data_channel; fps::Int = 12)
-    m = ReceiverModel()
-    # Feed the model from the receiver channel. When the channel closes, keep the last
-    # frame on screen (flag it) rather than quitting — the user quits with `q`.
-    Base.errormonitor(
-        Threads.@spawn begin
-            consume_channel(gui_data_channel) do gui_data
-                @lock m.lk begin
-                    m.gui = gui_data
-                    isnothing(gui_data.pvt.time) || (m.last_fix = gui_data)
-                end
-            end
-            @lock m.lk (m.stream_ended = true)
-        end
-    )
-    # Prefer the interactive threadpool (`julia -t auto,1`) so the render loop is not
-    # starved by the streaming/DSP tasks on the default pool.
-    if Threads.nthreads(:interactive) > 0
-        wait(Threads.@spawn :interactive app(m; fps))
-    else
-        app(m; fps)
-    end
-end
-
-# ── Input ─────────────────────────────────────────────────────────────────────
-function update!(m::ReceiverModel, e::KeyEvent)
-    if e.key == :ctrl_c || e.key == :escape || (e.key == :char && (e.char == 'q' || e.char == 'Q'))
-        m.quit = true
-        return
-    end
-    if e.key == :char && (e.char == 'd' || e.char == 'D')
-        @lock m.lk (m.show_diagnostics = !m.show_diagnostics)
-        return
-    end
-    return
-end
-
-update!(::ReceiverModel, ::Event) = nothing
-
-# ── View ────────────────────────────────────────────────────────────────────
-const CN0_PANEL_TITLE = "Carrier-to-Noise-Density-Ratio (CN0)"
-const DOA_PANEL_TITLE = "Satellite Direction-of-Arrival (DOA)"
-const PVT_PANEL_TITLE = "Position Velocity Time (PVT)"
-const LOCATION_PANEL_TITLE = "Location"
-const NOT_ENOUGH_SATS_TEXT = "Not enough satellites to calculate position."
-
-function view(m::ReceiverModel, f::Frame)
-    m.tick += 1
-    gui_data, last_fix, show_diag, ended =
-        @lock m.lk (m.gui, m.last_fix, m.show_diagnostics, m.stream_ended)
-    buf = f.buffer
-    num_dots = mod(m.tick ÷ 4, 4)
-
-    rows = split_layout(Layout(Vertical, [Fixed(1), Fill(), Fixed(1)]), f.area)
-    header, body, footer = rows[1], rows[2], rows[3]
-
-    fresh = gui_data !== nothing && gui_data.pvt_fresh
-    # "stale" only once a fix is being held frozen (a re-emitted old solution) — not while
-    # still searching/decoding, where there is simply no fix yet. Once the stream has ended
-    # the frozen frame is expected, so show "stream ended" instead of "stale".
-    has_fix = gui_data !== nothing && gui_data.pvt !== nothing && !isnothing(gui_data.pvt.time)
-    rt = gui_data === nothing ? 0.0 : round(ustrip(s, gui_data.runtime); digits = 1)
-    status = ended ? "  │  stream ended (press q to quit)" :
-             (has_fix && !fresh ? "  │  stale (no new fix)" : "")
-    hdr = " ● GNSSReceiver  │  run time $(rt) s" * status
-    set_string!(buf, header.x, header.y, rpad(hdr, header.width),
-        tstyle(:title, bold = true); max_x = right(header))
-
-    # Body: CN0 | DOA (top), PVT | Location (bottom).
-    toprow, botrow = split_layout(Layout(Vertical, [Percent(50), Fill()]), body)
-    topcols = split_layout(Layout(Horizontal, [Percent(50), Fill()]), toprow)
-    botcols = split_layout(Layout(Horizontal, [Percent(42), Fill()]), botrow)
-    _render_cn0(buf, topcols[1], gui_data, num_dots)
-    _render_skyplot(buf, topcols[2], gui_data, num_dots)
-    _render_position(buf, botcols[1], gui_data, last_fix, show_diag, fresh)
-    _render_location(buf, botcols[2], last_fix)
-
-    diaghint = show_diag ? "[d] hide diagnostics" : "[d] diagnostics"
-    render(StatusBar(
-            left = [Span(" ", tstyle(:text_dim)), Span(diaghint, tstyle(:text_dim))],
-            right = [Span("  [q] quit ", tstyle(:text_dim))],
-        ), footer, buf)
-    return
-end
-
-# Paint a UnicodePlots colour string (`string(plot; color=true)`) or any ANSI text into
-# `area`: split into lines, parse each line's ANSI into spans, and lay the spans out
-# left-to-right, clipping at the panel edges. The same technique the map uses.
-function _paint_plot!(buf, area::Rect, str::AbstractString)
-    for (i, line) in enumerate(split(str, '\n'))
-        y = area.y + i - 1
-        y > bottom(area) && break
-        x = area.x
-        for sp in parse_ansi(String(line))
-            x > right(area) && break
-            set_string!(buf, x, y, sp.content, sp.style; max_x = right(area))
-            x += max(1, textwidth(sp.content))
-        end
-    end
-    return
-end
-
-# CN0 in dBHz as a plain rounded number (Inf CN0 → 0 dB reference), matching the old GUI.
-_cn0_db(cn0) = round(10 * log10(Unitful.linear(cn0 == Inf * Hz ? 1Hz : cn0) / Hz); digits = 1)
-
-function _render_cn0(buf, area::Rect, gui_data, num_dots)
-    inner = render(Block(; title = CN0_PANEL_TITLE, border_style = tstyle(:border),
-            title_style = tstyle(:accent, bold = true)), area, buf)
-    if gui_data === nothing || isempty(gui_data.sat_data)
-        set_string!(buf, inner.x + 1, inner.y, "Searching for satellites$(repeat(".", num_dots))",
-            tstyle(:text_dim); max_x = right(inner))
-        return
-    end
-    # Bars sorted by constellation (GPS, then Galileo, …), then PRN, then band; coloured
-    # green (healthy) / red (unhealthy).
-    sorted_keys = sort(collect(keys(gui_data.sat_data)); by = sat_sort_key)
-    labels = [sat_label(key...) for key in sorted_keys]
-    cn0s = [_cn0_db(gui_data.sat_data[key].cn0) for key in sorted_keys]
-    colors = [gui_data.sat_data[key].is_healthy ? :green : :red for key in sorted_keys]
-    labelw = maximum(length, labels)
-    barwidth = clamp(inner.width - labelw - 9, 5, 60)
-    plot = barplot(labels, cn0s; color = colors, border = :none,
-        width = barwidth, maximum = 55)
-    _paint_plot!(buf, inner, string(plot; color = true))
-    return
-end
-
-function _render_skyplot(buf, area::Rect, gui_data, num_dots)
-    inner = render(Block(; title = DOA_PANEL_TITLE, border_style = tstyle(:border),
-            title_style = tstyle(:accent, bold = true)), area, buf)
-    pvt = gui_data === nothing ? nothing : gui_data.pvt
-    if pvt === nothing || isnothing(pvt.time)
-        nsat = gui_data === nothing ? 0 : length(gui_data.sat_data)
-        msg = nsat < 4 ? NOT_ENOUGH_SATS_TEXT : "Decoding satellites$(repeat(".", num_dots))"
-        set_string!(buf, inner.x + 1, inner.y, msg, tstyle(:text_dim); max_x = right(inner))
-        return
-    end
-    # One point per *physical* satellite: the same satellite tracked on several signals
-    # (e.g. Galileo E1B + E5a) shares an az/el, so key by (constellation, PRN) — not
-    # (signal, PRN) — to stop the duplicates piling onto each other. Colour by constellation.
-    seen = Set{Tuple{Symbol,Int}}()
-    azs = Float64[]
-    els_deg = Float64[]
-    prns = Int[]
-    point_colors = Symbol[]
-    for (key, info) in pairs(pvt.sats)
-        signal_id, prn = key
-        system = constellation_of(signal_id)
-        (system, prn) in seen && continue
-        push!(seen, (system, prn))
-        enu = get_sat_enu(pvt.position, info.position)
-        push!(azs, enu.θ)
-        push!(els_deg, enu.ϕ * 180 / π)
-        push!(prns, prn)
-        push!(point_colors, get(CONSTELLATION_COLORS, system, :white))
-    end
-    # Reserve one row for the legend below the plot.
-    plotarea = Rect(inner.x, inner.y, inner.width, max(1, inner.height - 1))
-    # Size the polarplot canvas 2:1 (columns:rows) so it renders as a round circle: braille
-    # cells are ~square on screen, so equal x/y data range needs twice as many columns as
-    # rows. Leave margin for the axis labels UnicodePlots draws around the canvas (~13 cols,
-    # ~4 rows) so the whole circle fits and is not clipped (which read as "not round").
-    wcanvas = clamp(min(plotarea.width - 13, 2 * (plotarea.height - 4)), 8, 60)
-    hcanvas = max(4, wcanvas ÷ 2)
-    doa_plot = polarplot(azs, els_deg; rlim = (0, 90), scatter = true,
-        marker = :circle, color = point_colors, border = :none,
-        width = wcanvas, height = hcanvas)
-    # Label each satellite with its PRN number (coloured by constellation) placed exactly
-    # on its point. `polarplot` plots θ (az) counter-clockwise from +x at radius r (=el),
-    # so the point's Cartesian position is (el·cos az, el·sin az) — annotate there.
-    for (az, el, prn, col) in zip(azs, els_deg, prns, point_colors)
-        annotate!(doa_plot, el * cos(az), el * sin(az), string(prn); color = col)
-    end
-    # Re-label the angular axis to the GNSS azimuth convention: 0° = North on top,
-    # increasing clockwise (90° = East right, 180° = South bottom, 270° = West left).
-    grid_color = UnicodePlots.BORDER_COLOR[]
-    mid_row = ceil(Int, UnicodePlots.nrows(doa_plot.graphics) / 2)
-    label!(doa_plot, :t, "0°"; color = grid_color)
-    label!(doa_plot, :r, mid_row, "90°"; color = grid_color)
-    label!(doa_plot, :b, "180°"; color = grid_color)
-    label!(doa_plot, :l, mid_row, "270°"; color = grid_color)
-    _paint_plot!(buf, plotarea, string(doa_plot; color = true))
-    # Legend: a coloured ● per present constellation, matching the point colours exactly.
-    present = sort(unique(constellation_of(first(key)) for key in keys(pvt.sats)))
-    _paint_plot!(buf, Rect(inner.x + 1, bottom(inner), inner.width - 1, 1),
-        _legend_ansi(present))
-    return
-end
-
-# Constellation legend as an ANSI-coloured string (parsed back into spans by `_paint_plot!`),
-# so the legend markers use exactly the same terminal colours as the plotted points.
-function _legend_ansi(present)
-    io = IOContext(IOBuffer(), :color => true)
-    for (i, c) in enumerate(present)
-        i == 1 || print(io, "   ")
-        printstyled(io, "●"; color = get(CONSTELLATION_COLORS, c, :white))
-        print(io, " ", c)
-    end
-    String(take!(io.io))
-end
-
-function _render_position(buf, area::Rect, gui_data, last_fix, show_diag, fresh)
-    inner = render(Block(; title = PVT_PANEL_TITLE, border_style = tstyle(:border),
-            title_style = tstyle(:accent, bold = true)), area, buf)
-    live = gui_data !== nothing && gui_data.pvt !== nothing && !isnothing(gui_data.pvt.time)
-    fix = live ? gui_data : last_fix
-    x, y = inner.x + 1, inner.y
-    if fix === nothing
-        nsat = gui_data === nothing ? 0 : length(gui_data.sat_data)
-        rt = gui_data === nothing ? 0.0 : round(ustrip(s, gui_data.runtime); digits = 1)
-        msg = nsat < 4 ? NOT_ENOUGH_SATS_TEXT : "Decoding satellites…"
-        set_string!(buf, x, y, msg, tstyle(:text_dim); max_x = right(inner))
-        set_string!(buf, x, y + 1, "$nsat satellites tracked   run time $rt s",
-            tstyle(:text_dim); max_x = right(inner))
-        return
-    end
-    pvt = fix.pvt
-    lla = get_LLA(pvt)
-    lat_hem = lla.lat >= 0 ? "N" : "S"
-    lon_hem = lla.lon >= 0 ? "E" : "W"
-    speed = sqrt(sum(abs2, pvt.velocity))
-    # Time solution: `pvt.time` is a TAI epoch shown as UTC (leap-aware `to_utc`) to ms,
-    # time-then-date (HH:MM:SS.sss dd.mm.yyyy).
-    utc_str = to_utc(String, pvt.time, dateformat"HH:MM:SS.sss dd.mm.yyyy")
-    heading = "$(round(ustrip(°, pvt.course_over_ground); digits = 1))°"
-    low_speed = speed < MIN_SPEED_FOR_HEADING
-    heading_value = low_speed ? "$heading (low speed)" : heading
-    rt = gui_data === nothing ? 0.0 : round(ustrip(s, gui_data.runtime); digits = 1)
-    pvt_rows = [
-        ("Time", "$utc_str UTC"),
-        ("Coordinates",
-            "$(abs(round(lla.lat; digits = 6)))°$lat_hem, " *
-            "$(abs(round(lla.lon; digits = 6)))°$lon_hem"),
-        ("Altitude", "$(round(lla.alt; digits = 1)) m"),
-        ("Speed", "$(round(speed; digits = 2)) m/s"),
-        ("Heading", heading_value),
-        ("Run time", "$rt s"),
-    ]
-    labelw = maximum(length(first(r)) for r in pvt_rows) + 1  # +1 for the colon
-    # A stale (re-emitted) fix or a held last-fix is dimmed so a frozen position is not
-    # read as live.
-    base_style = (fresh && live) ? tstyle(:text) : tstyle(:text_dim)
-    if !live
-        set_string!(buf, x, y, "◦ last fix (re-acquiring)", tstyle(:warning); max_x = right(inner))
-        y += 1
-    end
-    for r in pvt_rows
-        y > bottom(inner) && return
-        st = (r[1] == "Heading" && low_speed) ? tstyle(:text_dim) : base_style
-        set_string!(buf, x, y, "$(rpad(first(r) * ":", labelw)) $(last(r))", st; max_x = right(inner))
-        y += 1
-    end
-    # Diagnostics (DOP, biases, pseudorange residuals): shown below on demand, dimmed as
-    # secondary info. Clipped at the panel bottom.
-    if show_diag
-        y += 1
-        for line in pvt_details_lines(pvt)
-            y > bottom(inner) && return
-            set_string!(buf, x, y, line, tstyle(:text_dim); max_x = right(inner))
-            y += 1
-        end
-    end
-    return
-end
-
-# ── Location ────────────────────────────────────────────────────────────────
-# The fix's coordinates and a ready-to-click Google Maps link. (A rendered map view is
-# coming as a follow-up.)
-function _render_location(buf, area::Rect, last_fix)
-    inner = render(Block(; title = LOCATION_PANEL_TITLE, border_style = tstyle(:border),
-            title_style = tstyle(:accent, bold = true)), area, buf)
-    if last_fix === nothing
-        set_string!(buf, inner.x + 1, inner.y, "awaiting fix…", tstyle(:text_dim);
-            max_x = right(inner))
-        return
-    end
-    lla = try
-        get_LLA(last_fix.pvt)
-    catch
-        nothing
-    end
-    lla === nothing && return
-    lat, lon = round(lla.lat; digits = 5), round(lla.lon; digits = 5)
-    set_string!(buf, inner.x + 1, inner.y, "$lat, $lon",
-        tstyle(:success, bold = true); max_x = right(inner))
-    # A real OSC 8 hyperlink (via the style's `hyperlink`), so the URL is click-to-open in
-    # terminals that support it (and copy-pasteable everywhere).
-    url = "https://www.google.com/maps?q=$lat,$lon"
-    set_string!(buf, inner.x + 1, inner.y + 1, url,
-        tstyle(:text_dim; hyperlink = url); max_x = right(inner))
-    return
 end

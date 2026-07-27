@@ -29,11 +29,6 @@ using StaticArrays,
 
 using Unitful: m, s, ms, Hz, dBHz, dB, °
 
-# The live terminal GUI is a Tachikoma app (see `gui.jl`). `@tachikoma_app` imports the
-# framework's `view` / `update!` / `should_quit` (etc.) so the GUI can add methods to them.
-using Tachikoma
-@tachikoma_app
-
 # Lock-free channel primitives and SoapySDR device streaming now live in their own
 # packages (they replaced the vendored `channel.jl` / `soapy_sdr_helper.jl`). The
 # SDR streaming (`stream_data` / `SDRChannelConfig`) comes from SignalChannels'
@@ -563,6 +558,10 @@ include("read_file.jl")
 include("receive.jl")
 include("process.jl")
 include("gui.jl")
+# The terminal dashboard is a Tachikoma app in its own module, so the UI framework's
+# exports stay out of `GNSSReceiver`'s namespace; only `gui` crosses back over.
+include("dashboard.jl")
+using .Dashboard: gui
 include("save_data.jl")
 
 """
