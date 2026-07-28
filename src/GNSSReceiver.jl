@@ -45,6 +45,19 @@ using SignalChannels:
 
 export ReceiverState,
     receive,
+    AbstractHardwareCorrelatorSDR,
+    CorrelatorDump,
+    NCOUpdate,
+    HardwareCorrelatorLink,
+    raw_sample_channel,
+    correlator_dump_channel,
+    nco_update_channel,
+    num_hardware_channels,
+    assign_channel!,
+    release_channel!,
+    dropped_dump_count!,
+    epoch_strobe,
+    is_epoch_strobe,
     CombinedSignal,
     read_files,
     read_uint8_iq_file,
@@ -555,6 +568,7 @@ function ReceiverState(
 end
 
 include("read_file.jl")
+include("hardware_correlator.jl")
 include("receive.jl")
 include("process.jl")
 include("gui.jl")

@@ -164,6 +164,11 @@ function process(
     sampling_freq,
     interm_freqs::Tuple = map(_ -> 0.0u"Hz", band_systems);
     downconvert_and_correlator = CPUThreadedDownconvertAndCorrelator(),
+    # Where this chunk's correlator outputs come from. `nothing` ⇒ correlate the
+    # raw samples on the CPU with `downconvert_and_correlator`. Pass a
+    # [`HardwareCorrelatorLink`](@ref) to take them from an FPGA correlator
+    # instead; the raw samples then still drive acquisition, decoding and PVT.
+    correlator_source = nothing,
     num_ants::NumAnts{N} = NumAnts(1),
     acquire_every = 10u"s",
     acq_pfa = DEFAULT_ACQ_PFA,
@@ -248,7 +253,18 @@ function process(
     # wrappers every call. The receiver discards the previous `ReceiverState` each
     # chunk and reuses one hoisted correlator, so mutating in place is safe and is
     # Tracking's documented allocation-free real-time pattern.
-    track_state = track!(band_measurements, track_state; downconvert_and_correlator)
+    #
+    # Which correlator produced this chunk's outputs is the one thing a
+    # hardware-correlator receiver changes, and it changes it by dispatch: the
+    # default source is the software backend and calls `track!` as above, while a
+    # `HardwareCorrelatorLink` ingests the FPGA's dumps instead. See
+    # [`advance_tracking!`](@ref).
+    track_state = advance_tracking!(
+        something(correlator_source, downconvert_and_correlator),
+        band_measurements,
+        track_state,
+        band_systems,
+    )
 
     receiver_sat_states = update_all_receiver_sat_states(
         receiver_sat_states,

@@ -283,6 +283,48 @@ function receive(
     )
 end
 
+"""
+    receive(sdr::AbstractHardwareCorrelatorSDR, systems, sampling_freq; kwargs...)
+
+Run the pipeline against an SDR that correlates on its FPGA.
+
+Everything except the correlation is the software receiver, unchanged: the
+device's raw stream ([`raw_sample_channel`](@ref)) still drives acquisition,
+lock detection, decoding, PVT and the runtime clock. What changes is that the
+per-chunk correlator outputs are read off the device's dump stream rather than
+computed from those samples on the CPU, and the resulting Doppler estimates are
+pushed back as [`NCOUpdate`](@ref)s. See [`AbstractHardwareCorrelatorSDR`](@ref)
+for what a vendor package has to provide.
+
+`doppler_update_interval` is the fixed processing epoch dumps are folded on
+(default: one primary code period of the first system's ranging signal), and
+`feedback_delay_epochs` how far ahead each NCO update is scheduled so the loop
+delay stays a known constant. Every other keyword is [`receive`](@ref)'s.
+"""
+function receive(
+    sdr::AbstractHardwareCorrelatorSDR,
+    systems,
+    sampling_freq;
+    doppler_update_interval = nothing,
+    feedback_delay_epochs::Integer = 2,
+    kwargs...,
+)
+    link = HardwareCorrelatorLink(
+        sdr;
+        sampling_freq,
+        reference_signal = ranging_signal(first(as_systems(systems))),
+        doppler_update_interval,
+        feedback_delay_epochs,
+    )
+    receive(
+        raw_sample_channel(sdr),
+        systems,
+        sampling_freq;
+        correlator_source = link,
+        kwargs...,
+    )
+end
+
 function receive(
     measurement_channels::Tuple{Vararg{SignalChannel}},
     systems_per_band::Tuple,
@@ -302,6 +344,10 @@ function receive(
     # `nothing` ⇒ auto-select from the sample element type (integer backend for
     # `Complex{Int16}`, float CPU backend otherwise); see `default_downconvert_and_correlator`.
     downconvert_and_correlator = nothing,
+    # `nothing` ⇒ correlate on the CPU. A [`HardwareCorrelatorLink`](@ref) takes
+    # the correlator outputs from an FPGA instead; the
+    # `receive(::AbstractHardwareCorrelatorSDR, …)` method builds one for you.
+    correlator_source = nothing,
     code_lock_cn0_threshold = nothing,
     time_in_lock_before_calculating_pvt = 2u"s",
     pvt_update_interval = 100u"ms",
@@ -415,6 +461,7 @@ function receive(
                     sampling_freq,
                     interm_freqs;
                     downconvert_and_correlator = resolved_dc,
+                    correlator_source,
                     num_ants,
                     acquire_every,
                     acq_pfa,
