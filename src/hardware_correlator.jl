@@ -447,6 +447,15 @@ function advance_tracking!(
     track_state,
     band_systems,
 )
+    # `track!` resets the per-signal bit buffers at the start of every call and
+    # this method replaces `track!`, so it inherits that duty. The pipeline read
+    # last chunk's bits out right after the previous `advance_tracking!`; without
+    # the reset the hard-bit buffer fills 128 bits after bit sync (2.56 s for GPS
+    # L1 C/A) and throws from inside the estimator — measured on hardware, not
+    # hypothetical. The reset keeps the bit-edge sync and the partial-bit
+    # accumulator; only the already-consumed bits are dropped.
+    Tracking.reset_start_sample_and_bit_buffer!(track_state)
+
     # The raw stream is still the receiver's clock: count what this chunk
     # delivered so the handover time base stays aligned with it.
     link.samples_consumed += _chunk_num_samples(band_measurements)

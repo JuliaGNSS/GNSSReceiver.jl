@@ -615,3 +615,70 @@ end
     @test folds == 2
     @test link.skipped_epochs == 0
 end
+
+@testset "Folding epochs forever does not overflow the hard-bit buffer" begin
+    # `track!` resets the per-signal bit buffers at the start of every call, and
+    # the pipeline reads the bits out right after each chunk. The hardware path
+    # replaces `track!`, so `advance_tracking!` inherits the reset. Without it
+    # the hard-bit buffer (128 bits) throws from inside the estimator 2.56 s
+    # after bit sync on GPS L1 C/A — a lock that looks perfect until it crashes
+    # the receiver task. Measured on hardware before it was guarded here.
+    system = GPSL1CA()
+    prn = 1
+    sdr = RecordingSDR(EPL, 2)
+    link = HardwareCorrelatorLink(
+        sdr;
+        sampling_freq = 4e6Hz,
+        reference_signal = system,
+    )
+    group_key = GNSSReceiver.signal_group_key(system)
+
+    empty_state = GNSSReceiver.ReceiverState(
+        ComplexF64,
+        system;
+        num_samples_for_acquisition = 4000,
+        num_ants = NumAnts(1),
+    ).track_state
+    track_state = Tracking.merge_sats(
+        empty_state,
+        group_key,
+        [Tracking.TrackedSat(system, prn, 0.0, 0.0Hz)],
+    )
+
+    link.assignments[1] = GNSSReceiver.HardwareChannelAssignment(group_key, prn, 1)
+    link.channel_of[link.assignments[1]] = 1
+
+    # Keyed by RF band id (`get_band_id(system_band(...))` = :L1) — that is the
+    # key the estimator looks the sampling frequency up under once a satellite
+    # is actually tracked, unlike the grid-only tests above.
+    band_measurements =
+        (; L1 = Tracking.BandMeasurement(zeros(ComplexF64, 4000), 4e6Hz, 0.0Hz))
+    band_systems = (; L1 = (system,))
+
+    # 7 s of strong dumps with a clean nav-bit flip every 20 epochs: the bit
+    # detector syncs early, and without the reset the 129th accumulated bit
+    # throws mid-run. Early/late carry a little balanced energy so the DLL
+    # discriminator never divides zero by zero.
+    for e = 0:6999
+        bit = isodd(e ÷ 20) ? -1.0 : 1.0
+        put!(
+            sdr.dumps,
+            [
+                CorrelatorDump(
+                    1,
+                    prn,
+                    CorrelatorOutput(epl(2e5, bit * 1e6, 2e5), 4000, e * 4000),
+                ),
+            ],
+        )
+        track_state =
+            advance_tracking!(link, band_measurements, track_state, band_systems)
+    end
+
+    @test link.skipped_epochs == 0
+    @test link.stale_dumps == 0
+    # Bit sync must actually have happened for this test to mean anything…
+    @test Tracking.has_bit_or_secondary_code_been_found(track_state, group_key, prn)
+    # …and the per-call reset keeps the buffer far below its 128-bit capacity.
+    @test Tracking.get_num_bits(track_state, group_key, prn) <= 1
+end
