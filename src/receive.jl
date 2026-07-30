@@ -176,6 +176,8 @@ function plan_band_acquisition(
     sampling_freq,
     acq_doppler_resolutions;
     prns = nothing,
+    acq_min_doppler_coverage = nothing,
+    acq_coherent_integration_time = nothing,
 )
     systems = as_systems(systems)
 
@@ -195,10 +197,18 @@ function plan_band_acquisition(
 
     # Coherent code periods per system from the required Doppler resolution
     # (bin spacing = 1 / (nc · T_code)), snapped to a length `plan_acquire` accepts.
+    # An explicit `acq_coherent_integration_time` overrides the derivation — for
+    # front ends whose noise or LO stability demands a specific coherent length —
+    # and is snapped the same way.
     ncoh = map(acq_systems, acq_doppler_resolutions) do system, acq_doppler_resolution
-        # `ideal` is the minimum coherent length meeting the required resolution
-        # (`ceil`, so the achieved resolution never exceeds the required maximum).
-        ideal = coherent_code_periods_for_resolution(system, acq_doppler_resolution)
+        ideal = if isnothing(acq_coherent_integration_time)
+            # The minimum coherent length meeting the required resolution
+            # (`ceil`, so the achieved resolution never exceeds the required maximum).
+            coherent_code_periods_for_resolution(system, acq_doppler_resolution)
+        else
+            code_period = get_code_length(system) / get_code_frequency(system)
+            max(1, round(Int, upreferred(acq_coherent_integration_time / code_period)))
+        end
         snap_coherent_code_periods(system, sampling_freq, ideal)
     end
 
@@ -215,6 +225,13 @@ function plan_band_acquisition(
     acq_plans = NamedTuple{group_keys}(map(systems, acq_systems, ncoh) do system, acq_sys, nc
         # Per-GNSS candidate PRNs restricted to those that broadcast this signal.
         prns_for_system = search_prns(prns, data_signal(system))
+        # `min_doppler_coverage` is one-sided; leave `plan_acquire`'s default
+        # (±7 kHz, ample for a disciplined front end) unless the caller widened
+        # it — needed when the LO offset alone pushes the apparent Doppler far
+        # beyond the physical ±5 kHz.
+        coverage =
+            isnothing(acq_min_doppler_coverage) ? (;) :
+            (; min_doppler_coverage = acq_min_doppler_coverage)
         plan_acquire(
             acq_sys,
             float(sampling_freq),
@@ -225,6 +242,7 @@ function plan_band_acquisition(
             # selection decision and the plan's actual rotation-search cap can never
             # drift apart (Acquisition exposes no queryable constant for its default).
             max_secondary_code_rotations = MAX_SECONDARY_CODE_ROTATIONS,
+            coverage...,
         )
     end)
 
@@ -337,6 +355,15 @@ function receive(
     # or a plain collection applied to every system. Each system's search is further
     # restricted to the PRNs that broadcast its signal (see `broadcasting_prns`).
     prns = nothing,
+    # One-sided acquisition Doppler coverage. `nothing` ⇒ Acquisition's default
+    # (±7 kHz). Widen it when the front end's LO offset shifts every satellite's
+    # apparent Doppler (e.g. a free-running TCXO putting the constellation at
+    # ±14 kHz before the physical ±5 kHz even starts).
+    acq_min_doppler_coverage = nothing,
+    # Coherent integration length for acquisition. `nothing` ⇒ derived per
+    # system from the tracking loops' pull-in range (see below); a time (e.g.
+    # `10u"ms"`) forces that many code periods, snapped to a valid plan length.
+    acq_coherent_integration_time = nothing,
     # Front-end full-scale for `Complex{Int16}` measurements (integer backend); omit it to
     # fall back to the float backend. Ignored for float samples or when
     # `downconvert_and_correlator` is given.
@@ -410,7 +437,14 @@ function receive(
     # Per-band acquisition plans and buffer sizes (each band is validated as
     # single-band by `plan_band_acquisition`).
     setups = map(band_systems, band_acq_doppler_resolutions) do systems, acq_doppler_resolutions
-        plan_band_acquisition(systems, sampling_freq, acq_doppler_resolutions; prns)
+        plan_band_acquisition(
+            systems,
+            sampling_freq,
+            acq_doppler_resolutions;
+            prns,
+            acq_min_doppler_coverage,
+            acq_coherent_integration_time,
+        )
     end
     # One acquisition-plan NamedTuple across all bands, keyed by group key (unique
     # across bands). `merge` of the per-band NamedTuples flattens them.

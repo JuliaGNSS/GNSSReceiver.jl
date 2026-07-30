@@ -91,12 +91,21 @@ epl(late, prompt, early) =
 
 const EPL = typeof(epl(0, 0, 0))
 
-dump_at(channel, prn, sample_index; prompt = 1.0 + 0im, integrated_samples = 4000) =
-    CorrelatorDump(
-        channel,
-        prn,
-        CorrelatorOutput(epl(0, prompt, 0), integrated_samples, sample_index),
-    )
+dump_at(
+    channel,
+    prn,
+    sample_index;
+    prompt = 1.0 + 0im,
+    integrated_samples = 4000,
+    late = 0.0 + 0im,
+    early = 0.0 + 0im,
+    code_phase = NaN,
+) = CorrelatorDump(
+    channel,
+    prn,
+    CorrelatorOutput(epl(late, prompt, early), integrated_samples, sample_index),
+    code_phase,
+)
 
 @testset "CorrelatorDump / NCOUpdate records" begin
     d = dump_at(1, 5, 4000)
@@ -236,6 +245,78 @@ end
     # Sticky counters are write-1-to-clear: a second read must not double count.
     link.dropped_dumps += dropped_dump_count!(sdr)
     @test link.dropped_dumps == 17
+end
+
+@testset "Absolute code phase follows the device replica (pseudorange anchor)" begin
+    system = GPSL1CA()
+    prn = 7
+    sdr = RecordingSDR(EPL, 2)
+    link = HardwareCorrelatorLink(
+        sdr;
+        sampling_freq = 4e6Hz,
+        reference_signal = system,
+    )
+    track_state = TrackState(system, [TrackedSat(system, prn, 100.0, 0.0Hz)])
+    link.assignments[1] = GNSSReceiver.HardwareChannelAssignment(:GPSL1CA, prn, 1)
+    link.channel_of[link.assignments[1]] = 1
+    sampling_freqs = (L1 = 4e6Hz,)
+    # Balanced accumulators: discriminators read zero, so the Dopplers stay put
+    # and every epoch advances the replica by exactly one code length.
+    balanced = (; late = 400.0 + 0im, prompt = 1000.0 + 0im, early = 400.0 + 0im)
+
+    fold!() = GNSSReceiver.fold_closed_epochs!(link, track_state, sampling_freqs)
+    phase() = get_code_phase(get_sat_state(track_state, prn))
+
+    # A dump without a reported replica phase cannot anchor anything: the seed
+    # lives on the host's raw-sample axis, which the link cannot place on the
+    # device counter, so it stays untouched.
+    put!(sdr.dumps, [dump_at(1, prn, 4000; balanced...), epoch_strobe(epl(0, 0, 0), 8000)])
+    GNSSReceiver.drain_dumps!(link)
+    fold!()
+    @test phase() == 100.0
+
+    # First anchored dump: the reported replica phase (5.0 chips at sample 8000)
+    # replaces the seed's within-code-period part, then the phase is
+    # extrapolated to the fold boundary (12000) — exactly one code period on.
+    put!(
+        sdr.dumps,
+        [
+            dump_at(1, prn, 8000; code_phase = 5.0, balanced...),
+            epoch_strobe(epl(0, 0, 0), 12_000),
+        ],
+    )
+    GNSSReceiver.drain_dumps!(link)
+    fold!()
+    @test phase() ≈ 5.0 atol = 1e-9
+
+    # An epoch with no dump dead-reckons: one more code period, same phase
+    # modulo the code length — the satellite stays comparable with the others.
+    put!(sdr.dumps, [epoch_strobe(epl(0, 0, 0), 16_000)])
+    GNSSReceiver.drain_dumps!(link)
+    fold!()
+    @test phase() ≈ 5.0 atol = 1e-9
+
+    # A later anchor absorbs replica drift the host bookkeeping cannot see
+    # (device NCO quantisation, DLL pull-in): the wrapped difference is applied,
+    # not accumulated error.
+    put!(
+        sdr.dumps,
+        [
+            dump_at(1, prn, 16_000; code_phase = 5.25, balanced...),
+            epoch_strobe(epl(0, 0, 0), 20_000),
+        ],
+    )
+    GNSSReceiver.drain_dumps!(link)
+    fold!()
+    @test phase() ≈ 5.25 atol = 1e-9
+
+    # Releasing the channel forgets the phase reference with it.
+    empty!(sdr.released)
+    GNSSReceiver.release_stale_channels!(
+        link,
+        TrackState(system, Tracking.TrackedSat[]),
+    )
+    @test link.phase_ref_sample[1] == typemin(Int64)
 end
 
 @testset "An unimplemented interface method says which one is missing" begin
@@ -409,6 +490,10 @@ function _correlate_chunk!(sdr::SimulatedFPGA{C}, samples) where {C}
                                 ch.integrated_samples,
                                 sdr.sample_count + 1,
                             ),
+                            # The replica's code phase at the dump sample — the
+                            # absolute anchor a real device latches alongside the
+                            # accumulators (`dump_code_phase` on the M2SDR).
+                            ch.code_phase,
                         ),
                     )
                     ch.accumulators .= 0

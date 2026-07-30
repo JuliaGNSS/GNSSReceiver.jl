@@ -50,6 +50,18 @@ does not have to reproduce `preferred_early_late_to_prompt_code_shift` and
 cannot silently mis-normalise the DLL by getting it wrong. Construct the
 correlator however is convenient; only the values and their order matter.
 
+  - `code_phase` — the device replica's code phase in chips (modulo the primary
+    code length) at `output.sample_index`, or `NaN` when the device does not
+    report it. A device that dumps on the sample completing a code period
+    reports a value just below the code length (e.g. `1022 + frac` for GPS
+    L1 C/A). This is the *absolute pseudorange anchor*: with it the host's
+    per-satellite code-phase bookkeeping is re-anchored to the replica the DLL
+    actually steers on every dump, so neither the handover seed error nor the
+    device NCO's fixed-point quantisation can drift the host's absolute code
+    phase — and PVT stays honest. Without it (`NaN`) the host can only dead
+    reckon from the acquisition seed, which is fine for tracking but degrades
+    the pseudoranges; report it if the hardware can.
+
 `isbits` (so a `PipeChannel{CorrelatorDump{C}}` ring stays allocation-free)
 provided `C` is. Use integer accumulators off the FPGA and let
 `integrated_samples` do the float normalisation on the host.
@@ -63,10 +75,15 @@ struct CorrelatorDump{C<:Tracking.AbstractCorrelator}
     channel::Int32
     prn::Int32
     output::Tracking.CorrelatorOutput{C}
+    code_phase::Float64
 end
 
-CorrelatorDump(channel::Integer, prn::Integer, output::Tracking.CorrelatorOutput) =
-    CorrelatorDump(Int32(channel), Int32(prn), output)
+CorrelatorDump(
+    channel::Integer,
+    prn::Integer,
+    output::Tracking.CorrelatorOutput,
+    code_phase::Real = NaN,
+) = CorrelatorDump(Int32(channel), Int32(prn), output, Float64(code_phase))
 
 """
     EPOCH_STROBE_CHANNEL
@@ -103,6 +120,7 @@ epoch_strobe(correlator_prototype::Tracking.AbstractCorrelator, sample_index::In
         EPOCH_STROBE_CHANNEL,
         Int32(0),
         Tracking.CorrelatorOutput(zero(correlator_prototype), 0, Int(sample_index)),
+        NaN,
     )
 
 """
@@ -330,8 +348,28 @@ mutable struct HardwareCorrelatorLink{
     # Epoch grid on the *sample-index* axis (Δ = interval × fs), not wall clock,
     # so it is deterministic and replayable.
     const epoch_length::Int
+    # Sampling frequency (Hz) of the band the epoch grid lives on. Used to turn
+    # device-sample spans into chips for the code-phase bookkeeping.
+    const sampling_freq_hz::Float64
     const feedback_delay_epochs::Int
     const max_dumps_per_drain::Int
+    # ── Absolute code-phase bookkeeping (pseudoranges) ────────────────────────
+    # The estimator fold updates Dopplers but never advances a satellite's
+    # `code_phase`; in the software receiver the correlate phase does that. Here
+    # the FPGA is the correlate phase, so the link dead-reckons each assigned
+    # satellite's code phase to every fold boundary and — when the device
+    # reports `CorrelatorDump.code_phase` — re-anchors it to the replica the
+    # DLL actually steers. All three vectors are indexed by hardware channel and
+    # only the estimator-driver signal's channel (signal_index 1) participates.
+    #
+    # Device sample the sat's `code_phase` currently refers to (`typemin` until
+    # the first anchor: before that the acquisition seed is left untouched,
+    # because the host cannot place it on the device's counter axis).
+    const phase_ref_sample::Vector{Int64}
+    # Freshest anchor collected while appending this epoch's dumps (`typemin`
+    # sample = none).
+    const anchor_sample::Vector{Int64}
+    const anchor_code_phase::Vector{Float64}
     # How many epochs the fold loop will replay in one chunk before treating the
     # shortfall as a gap and resynchronising the grid (see `fold_closed_epochs!`).
     const max_catchup_epochs::Int
@@ -395,8 +433,12 @@ function HardwareCorrelatorLink(
         dump_type[],
         NCOUpdate[],
         epoch_length,
+        Float64(ustrip(uconvert(Hz, sampling_freq))),
         Int(feedback_delay_epochs),
         Int(max_dumps_per_drain),
+        fill(typemin(Int64), n),
+        fill(typemin(Int64), n),
+        fill(NaN, n),
         Int(max_catchup_epochs),
         typemin(Int),
         typemin(Int),
@@ -499,6 +541,9 @@ function release_stale_channels!(link, track_state)
         release_channel!(link.sdr, hw_channel)
         link.assignments[hw_channel] = nothing
         delete!(link.channel_of, assignment)
+        link.phase_ref_sample[hw_channel] = typemin(Int64)
+        link.anchor_sample[hw_channel] = typemin(Int64)
+        link.anchor_code_phase[hw_channel] = NaN
         # Any dump still in flight for this channel now refers to a satellite
         # that is gone; `fold_closed_epochs!` drops it as stale.
     end
@@ -571,6 +616,12 @@ function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampl
     )
     link.assignments[hw_channel] = assignment
     link.channel_of[assignment] = hw_channel
+    # The sat's `code_phase` is the acquisition seed, which lives on the host's
+    # raw-sample axis; it cannot be placed on the device counter until the first
+    # anchored dump arrives, so the reference starts unknown.
+    link.phase_ref_sample[hw_channel] = typemin(Int64)
+    link.anchor_sample[hw_channel] = typemin(Int64)
+    link.anchor_code_phase[hw_channel] = NaN
     link
 end
 
@@ -665,12 +716,92 @@ function fold_closed_epochs!(link::HardwareCorrelatorLink, track_state, band_mea
     while link.latest_sample_index >= link.next_epoch_boundary
         boundary = link.next_epoch_boundary
         append_epoch_outputs!(link, track_state, boundary)
+        # Phase bookkeeping runs before the estimator so a bit-sync phase snap
+        # in this fold sees the anchored, boundary-referenced code phase.
+        advance_code_phases!(link, track_state, boundary)
         Tracking.estimate_dopplers_and_filter_prompt!(track_state, band_measurements)
         push_nco_updates!(link, track_state, boundary)
         link.next_epoch_boundary = boundary + link.epoch_length
         folds += 1
     end
     folds
+end
+
+"""
+    advance_code_phases!(link, track_state, boundary)
+
+Advance every assigned satellite's absolute `code_phase` to the fold boundary,
+re-anchoring it to the device replica wherever this epoch's dumps carried a
+[`CorrelatorDump`](@ref) `code_phase`.
+
+The estimator fold updates Dopplers but never moves `code_phase` — in the
+software receiver the correlate phase advances it sample by sample. Here the
+FPGA is the correlate phase, so the host mirrors it: dead-reckon by
+`Δsamples × code_frequency / fs` on the device's sample axis, then absorb the
+(wrapped, ±half a code length) difference to the reported replica phase. The
+anchor is what keeps the *absolute* phase — and with it the pseudorange —
+honest: it erases the handover seed error once the DLL has pulled in, and it
+cancels the drift between the host's float bookkeeping and the device NCO's
+fixed-point steps, neither of which any tracking loop would otherwise ever see.
+
+Referencing every satellite to the same boundary is what makes the code phases
+comparable across satellites — the common-reception-time assumption PVT's
+pseudoranges are built on. Satellites without an anchor yet (assigned, but no
+dump seen) keep their acquisition seed: it lives on the host's raw-sample axis,
+which the link cannot place on the device counter, and the DLL pull-in doesn't
+need it to be moved.
+
+The whole-code-period count picked up while unanchored is arbitrary; that is
+fine, because the bit-sync phase snap (which runs *after* this in the same
+fold) re-windows `code_phase` from the bit buffer and preserves only the
+within-code-period part — exactly the part the anchor makes exact.
+"""
+function advance_code_phases!(link::HardwareCorrelatorLink, track_state, boundary)
+    for hw_channel in eachindex(link.assignments)
+        assignment = link.assignments[hw_channel]
+        (isnothing(assignment) || assignment.signal_index != 1) && continue
+        sat_states = get_sat_states(track_state, assignment.group_key)
+        haskey(sat_states, assignment.prn) || continue
+        sat_state = sat_states[assignment.prn]
+
+        signals = Tracking.get_signals(sat_state)
+        signal = get_signal(first(signals))
+        code_length = get_code_length(signal)
+        chips_per_sample =
+            (ustrip(Hz, get_code_frequency(signal)) +
+             ustrip(Hz, uconvert(Hz, get_code_doppler(sat_state)))) / link.sampling_freq_hz
+
+        reference = link.phase_ref_sample[hw_channel]
+        anchor = link.anchor_sample[hw_channel]
+        code_phase = get_code_phase(sat_state)
+        if anchor != typemin(Int64)
+            # Dead-reckon to the anchor (a no-op on the very first one, whose
+            # window is arbitrary until the bit-sync snap), absorb the wrapped
+            # difference to the reported replica phase, then extrapolate the
+            # short hop to the boundary.
+            predicted = reference == typemin(Int64) ? code_phase :
+                        code_phase + (anchor - reference) * chips_per_sample
+            correction = rem(
+                link.anchor_code_phase[hw_channel] - mod(predicted, code_length),
+                code_length,
+                RoundNearest,
+            )
+            code_phase = predicted + correction + (boundary - anchor) * chips_per_sample
+            link.anchor_sample[hw_channel] = typemin(Int64)
+            link.anchor_code_phase[hw_channel] = NaN
+        elseif reference != typemin(Int64)
+            # No dump this epoch (dropped or momentarily silent): keep the phase
+            # moving so it stays comparable with the other satellites'.
+            code_phase += (boundary - reference) * chips_per_sample
+        else
+            continue
+        end
+
+        code_phase = mod(code_phase, Tracking.current_code_wrap(signals))
+        sat_states[assignment.prn] = Tracking.TrackedSat(sat_state; code_phase)
+        link.phase_ref_sample[hw_channel] = boundary
+    end
+    link
 end
 
 # Append every pending output that ended before `boundary`, oldest first, and
@@ -711,6 +842,13 @@ function _append_dump!(link, track_state, dump)
         assignment.prn,
         assignment.signal_index,
     )
+    # Collect the code-phase anchor for the phase bookkeeping. Only the
+    # estimator-driver signal carries the sat-shared code phase; dumps are
+    # appended in `sample_index` order, so the epoch's freshest anchor wins.
+    if assignment.signal_index == 1 && !isnan(dump.code_phase)
+        link.anchor_sample[hw_channel] = dump.output.sample_index
+        link.anchor_code_phase[hw_channel] = dump.code_phase
+    end
     link
 end
 
