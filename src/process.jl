@@ -703,7 +703,14 @@ end
 # `time_out_of_lock` stays 0 and no new attempt fires while it is converging.
 # `reacquire_backoff` sets the base step; `max_reacquire_attempts` caps total
 # attempts before falling back to the periodic full scan (`acquire_every`).
-function should_reacquire(state; reacquire_backoff = 200ms, max_reacquire_attempts = 5)
+# The base back-off must respect the cost of one attempt: each is a full
+# FM-DBZP acquisition over the buffered window, ~seconds of CPU on an embedded
+# host. At a 200 ms base, a handful of satellites bouncing in and out of lock
+# queue acquisitions faster than the processing task can run them — it falls
+# behind real time, every NCO correction applies late, the loops open, more
+# satellites drop, and the receiver death-spirals. Attempts at ~10/40/90 s
+# keep reacquisition cheaper than the periodic full scan it falls back to.
+function should_reacquire(state; reacquire_backoff = 10_000ms, max_reacquire_attempts = 3)
     n = state.num_unsuccessful_reacquisition
     !is_in_lock(state) &&
         n < max_reacquire_attempts &&

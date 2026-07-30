@@ -489,6 +489,12 @@ function advance_tracking!(
     track_state,
     band_systems,
 )
+    # Honour `track!`'s per-chunk contract: the navigation-bit store is consumed
+    # by the decoder after each chunk, so it must be reset at the start of the
+    # next one. `track!` does this itself (track.jl); without it every chunk
+    # re-feeds the whole accumulated history to `decode` as "new" bits.
+    Tracking.reset_start_sample_and_bit_buffer!(track_state)
+
     # The raw stream is still the receiver's clock: count what this chunk
     # delivered so the handover time base stays aligned with it.
     link.samples_consumed += _chunk_num_samples(band_measurements)
