@@ -178,6 +178,7 @@ function plan_band_acquisition(
     prns = nothing,
     acq_min_doppler_coverage = nothing,
     acq_coherent_integration_time = nothing,
+    acq_noncoherent_rounds::Integer = 1,
 )
     systems = as_systems(systems)
 
@@ -212,10 +213,16 @@ function plan_band_acquisition(
         snap_coherent_code_periods(system, sampling_freq, ideal)
     end
 
-    # Size this band's buffer to the largest coherent plan window
-    # (nc · samples_per_code).
+    # Size this band's buffer to the largest plan window: `acq_noncoherent_rounds`
+    # noncoherent segments of nc coherent code periods each. Noncoherent rounds
+    # buy detection sensitivity (~1.5 dB per doubling) without stretching the
+    # coherent window past what the front end's phase stability supports.
     num_samples_for_acquisition = maximum(
-        map((s, nc) -> nc * samples_per_code(s, sampling_freq), acq_systems, ncoh),
+        map(
+            (s, nc) -> acq_noncoherent_rounds * nc * samples_per_code(s, sampling_freq),
+            acq_systems,
+            ncoh,
+        ),
     )
 
     # One acquisition plan per system, keyed like the tracking groups. The plan is
@@ -237,6 +244,7 @@ function plan_band_acquisition(
             float(sampling_freq),
             collect(prns_for_system);
             num_coherently_integrated_code_periods = nc,
+            num_noncoherent_accumulations = acq_noncoherent_rounds,
             # Pass our own cap rather than relying on `plan_acquire`'s default: this
             # is the same value the `acquisition_signal` chooser gates on, so the
             # selection decision and the plan's actual rotation-search cap can never
@@ -364,6 +372,10 @@ function receive(
     # system from the tracking loops' pull-in range (see below); a time (e.g.
     # `10u"ms"`) forces that many code periods, snapped to a valid plan length.
     acq_coherent_integration_time = nothing,
+    # Noncoherent accumulation rounds for acquisition (each a full coherent
+    # window). More rounds buy detection sensitivity on marginal signals at the
+    # cost of a proportionally longer buffer and more acquisition compute.
+    acq_noncoherent_rounds::Integer = 1,
     # The tracking-loop estimator. Override to change the loop-filter
     # bandwidths — e.g. a hardware-correlator loop whose feedback delay spans
     # several epochs needs the PLL bandwidth reduced to keep `BL·τ` stable.
@@ -447,6 +459,7 @@ function receive(
             prns,
             acq_min_doppler_coverage,
             acq_coherent_integration_time,
+            acq_noncoherent_rounds,
         )
     end
     # One acquisition-plan NamedTuple across all bands, keyed by group key (unique
