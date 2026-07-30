@@ -503,8 +503,18 @@ function update_states_from_acquisition_results(
     )
 
     # CFAR alone decides detection: a result is accepted when its peak-to-noise ratio
-    # clears the CFAR threshold for the configured false-alarm probability.
-    acq_res_valids = filter(res -> is_detected(res; pfa = acq_pfa), acquisition_results)
+    # clears the CFAR threshold for the configured false-alarm probability. Guard the
+    # estimates too: a non-finite Doppler or code phase (a degenerate interpolation on
+    # a marginal peak) would seed a tracked satellite whose NaN poisons the replica
+    # parameters — an `InexactError` deep in the correlate phase that kills the whole
+    # processing task.
+    acq_res_valids = filter(
+        res ->
+            is_detected(res; pfa = acq_pfa) &&
+            isfinite(res.carrier_doppler) &&
+            isfinite(res.code_phase),
+        acquisition_results,
+    )
     acquired_prns = map(res -> res.prn, acq_res_valids)
     isempty(acq_res_valids) && return track_state, receiver_sat_states, acquired_prns
 

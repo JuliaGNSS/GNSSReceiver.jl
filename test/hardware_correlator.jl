@@ -257,7 +257,9 @@ end
         reference_signal = system,
     )
     track_state = TrackState(system, [TrackedSat(system, prn, 100.0, 0.0Hz)])
-    link.assignments[1] = GNSSReceiver.HardwareChannelAssignment(:GPSL1CA, prn, 1)
+    # A bare TrackState names its single group `default` (receive() keys groups
+    # by signal id); the assignment must address the group that actually exists.
+    link.assignments[1] = GNSSReceiver.HardwareChannelAssignment(:default, prn, 1)
     link.channel_of[link.assignments[1]] = 1
     sampling_freqs = (L1 = 4e6Hz,)
     # Balanced accumulators: discriminators read zero, so the Dopplers stay put
@@ -310,11 +312,12 @@ end
     fold!()
     @test phase() ≈ 5.25 atol = 1e-9
 
-    # Releasing the channel forgets the phase reference with it.
+    # Releasing the channel forgets the phase reference with it: hand the
+    # release pass a track state that no longer contains our PRN.
     empty!(sdr.released)
     GNSSReceiver.release_stale_channels!(
         link,
-        TrackState(system, Tracking.TrackedSat[]),
+        TrackState(system, [TrackedSat(system, prn + 1, 0.0, 0.0Hz)]),
     )
     @test link.phase_ref_sample[1] == typemin(Int64)
 end

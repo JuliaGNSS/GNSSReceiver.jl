@@ -364,6 +364,10 @@ function receive(
     # system from the tracking loops' pull-in range (see below); a time (e.g.
     # `10u"ms"`) forces that many code periods, snapped to a valid plan length.
     acq_coherent_integration_time = nothing,
+    # The tracking-loop estimator. Override to change the loop-filter
+    # bandwidths — e.g. a hardware-correlator loop whose feedback delay spans
+    # several epochs needs the PLL bandwidth reduced to keep `BL·τ` stable.
+    doppler_estimator = ConventionalAssistedPLLAndDLL(),
     # Front-end full-scale for `Complex{Int16}` measurements (integer backend); omit it to
     # fall back to the float backend. Ignored for float samples or when
     # `downconvert_and_correlator` is given.
@@ -421,7 +425,6 @@ function receive(
     # (driver) signal — the pilot for a combined system, i.e. the signal the loop
     # tracks. `doppler_estimator` must match the loops' estimator; it is baked into
     # the freshly-built receiver state below.
-    doppler_estimator = ConventionalAssistedPLLAndDLL()
     pull_in_margin = 0.5
     band_acq_doppler_resolutions = map(band_systems) do systems
         map(systems) do system
