@@ -710,7 +710,7 @@ end
 # behind real time, every NCO correction applies late, the loops open, more
 # satellites drop, and the receiver death-spirals. Attempts at ~10/40/90 s
 # keep reacquisition cheaper than the periodic full scan it falls back to.
-function should_reacquire(state; reacquire_backoff = 10_000ms, max_reacquire_attempts = 3)
+function should_reacquire(state; reacquire_backoff = 10_000ms, max_reacquire_attempts = 0)
     n = state.num_unsuccessful_reacquisition
     !is_in_lock(state) &&
         n < max_reacquire_attempts &&
