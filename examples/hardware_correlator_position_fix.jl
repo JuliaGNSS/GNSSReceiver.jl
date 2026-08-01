@@ -1293,8 +1293,10 @@ function main()
         @info string(
             "FPGA-vs-CPU probe: ", probe.records, " records, mixing sign ", probe.sign,
             ", CPU-side delta ", join([@sprintf("%.3f", d) for d in probe.delta], "/"),
-            " chips; skipped ", probe.skipped_future, " too-new / ", probe.skipped_old,
-            " rolled-out, ", probe.unaligned, " unaligned, ",
+            " chips; ", probe.skipped_old, " records rolled out of the ring, ",
+            probe.dropped_pending, " dropped from the wait queue, ",
+            probe.unaligned, " unaligned; deepest record→sample lag ",
+            probe.max_wait, " samples; ",
             @sprintf("%.1f", probe.cpu_seconds), " s of CPU")
         close(xcorr_log)
     end
