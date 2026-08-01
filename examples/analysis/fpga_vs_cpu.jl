@@ -44,7 +44,8 @@ Series(prn, ch) = Series(prn, ch, Int64[], Int[], Float64[], Float64[],
 
 function read_log(path)
     series = Dict{Int,Series}()
-    aligns = Tuple{Bool,Int,Int,Int,Float64,Float64}[]
+    aligns = Tuple{Bool,Int,Int,Int,Float64,Float64,Float64,Int}[]
+    sign_vote = (0, 0.0)
     for line in eachline(path)
         (isempty(line) || line[1] == '#') && continue
         f = split(line)
@@ -63,13 +64,16 @@ function read_log(path)
             push!(s.lc, parse(Float64, f[14]))
             push!(s.ec, parse(Float64, f[15]))
             push!(s.carrier, parse(Float64, f[16]))
-        elseif (f[1] == "A" || f[1] == "R") && length(f) >= 7
+        elseif (f[1] == "A" || f[1] == "R") && length(f) >= 9
             push!(aligns, (f[1] == "A", parse(Int, f[2]), parse(Int, f[3]),
                            parse(Int, f[5]), parse(Float64, f[6]),
-                           parse(Float64, f[7])))
+                           parse(Float64, f[7]), parse(Float64, f[8]),
+                           parse(Int, f[9])))
+        elseif f[1] == "S" && length(f) >= 3
+            sign_vote = (parse(Int, f[2]), parse(Float64, f[3]))
         end
     end
-    (series, aligns)
+    (series, aligns, sign_vote)
 end
 
 # The beat between the two prompt streams, in Hz: the frequency at which
@@ -284,9 +288,14 @@ function report(s::Series, aligns)
     @printf("  %d records over %.1f s, %.0f Hz mean carrier Doppler\n",
             n, span, mean(s.carrier))
     mine = filter(a -> a[2] == s.prn, aligns)
+    # One line per handover, and only the re-alignments that actually moved the
+    # reference — a settled reference re-searches every few seconds and finds
+    # itself, which is the expected case and not worth a line each time.
     for a in mine
-        @printf("  %s: %+d samples (%+.3f chips), peak %.1f× floor\n",
-                a[1] ? "alignment at handover" : "re-alignment", a[4], a[5], a[6])
+        (a[1] || abs(a[4]) >= 1) &&
+            @printf("  %s: %+d samples (%+.3f chips), peak %.1f× floor over %d offsets\n",
+                    a[1] ? "alignment at handover" : "re-alignment", a[4], a[5],
+                    a[6], a[8])
     end
     # A re-alignment that keeps finding the peak somewhere else is not a settled
     # reference, and neither is a search that never rises above the floor.
@@ -336,11 +345,14 @@ end
 
 function main(args)
     isempty(args) && (println("usage: fpga_vs_cpu.jl <xcorr.log> [PRN…]"); return)
-    series, aligns = read_log(args[1])
+    series, aligns, sign_vote = read_log(args[1])
     wanted = length(args) > 1 ? parse.(Int, args[2:end]) : sort!(collect(keys(series)))
     isempty(series) && (println("no X records in $(args[1])"); return)
     println("$(args[1]): $(length(series)) satellites, ",
             sum(length(s.pf) for s in values(series)), " compared records")
+    sign_vote[1] == 0 ? println("no mixing-sign vote in this log") :
+        @printf("mixing sign voted %+d (%.1f× floor against the opposite sign)\n",
+                sign_vote[1], sign_vote[2])
     println("""
     ρ is the normalised complex correlation between the two prompt streams: 1.0 is
     "the FPGA prompt IS the CPU prompt up to gain and phase". The C/N0 pair is the

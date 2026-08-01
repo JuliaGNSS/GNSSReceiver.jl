@@ -188,7 +188,7 @@ using GNSSReceiver: CorrelatorDump, NCOUpdate, AbstractHardwareCorrelatorSDR, ep
 # `analysis/selftest_cpu_correlator.jl`.
 include(joinpath(@__DIR__, "analysis", "cpu_correlator.jl"))
 using .CpuCorrelator: SampleRing, Workspace, push_chunk!, covers, correlate_epl,
-    search_offset
+    search_offset, accumulate_offsets!, peak_offset
 
 # The coarse search slides the code replica ±this many whole samples (±16 chips
 # at 4 MHz), which covers any plausible residual of the origin calibration.
@@ -247,6 +247,13 @@ mutable struct CpuReference
     const carrier_ref::Vector{Int64}
     const last_carrier_hz::Vector{Float64}
     const since_search::Vector{Int}      # records since this channel was aligned
+    # The accumulating alignment search, per channel: how many records are still
+    # to be summed, over what margin, whether this cycle began at a handover,
+    # and the power over offsets so far.
+    const search_left::Vector{Int}
+    const search_margin::Vector{Int}
+    const search_fresh::Vector{Bool}
+    const search_acc::Vector{Vector{Float64}}
     const seen::Vector{Int}
     sign::Int                            # carrier mixing sign, 0 until voted
     records::Int
@@ -257,28 +264,57 @@ mutable struct CpuReference
     cpu_seconds::Float64
 end
 
-# How often each channel re-runs the coarse alignment search, in records. The
-# first record of an occupancy is the worst one to anchor on — it can be a
-# partial integration, and it is the one whose loop state is least settled — so
-# the anchor is re-measured on a healthy record a couple of seconds later, and
-# the `R` lines it writes make reference alignment observable over the whole run
-# rather than assumed from one measurement at handover.
-const XCORR_RESEARCH_RECORDS = 2000
+# Alignment searching. `XCORR_SEARCH_RECORDS` records are accumulated per search
+# — one record's argmax over 129 offsets is frequently noise, and a search built
+# on it walks the reference off the satellite while reporting a plausible ratio.
+# After a search succeeds the reference is close, so the next one only has to
+# watch ±`XCORR_TRACK_SAMPLES`; a failure widens it back to the full window.
+# Re-searching every `XCORR_RESEARCH_RECORDS` is what makes reference alignment
+# observable across the run instead of assumed from one measurement at handover.
+const XCORR_SEARCH_RECORDS = 20
+const XCORR_TRACK_SAMPLES = 8
+const XCORR_RESEARCH_RECORDS = 5000
+# Peak-to-floor a search must reach to be believed, and how much better than the
+# offset it is already using a move has to be.
+const XCORR_PEAK_RATIO = 5.0
+const XCORR_MOVE_RATIO = 1.5
 
 function CpuReference(io::IO, origin::Integer, fs::Real, n_channels::Integer;
                       ring_seconds = 0.5, prns = Set{Int}(), every::Integer = 1,
                       max_pending::Integer = 8192)
+    # One field per line, named. Thirty positional arguments is a shape that
+    # silently mis-assigns whenever a field is inserted, and it did.
     p = CpuReference(
-        io, Int64(origin), Float64(fs),
-        SampleRing(round(Int, ring_seconds * fs)),
-        Workspace(2 * CHUNK, XCORR_SEARCH_SAMPLES),
-        Dict{Int,Vector{Float32}}(), Set{Int}(prns), Int(every),
-        PendingRecord[], Int(max_pending),
-        fill(typemin(Int64), n_channels), zeros(n_channels), zeros(n_channels),
-        zeros(Int32, n_channels), zeros(n_channels),
-        fill(typemin(Int64), n_channels), zeros(n_channels), zeros(Int, n_channels),
-        zeros(Int, n_channels),
-        0, 0, 0, 0, 0, Int64(0), 0.0,
+        io,                                                   # io
+        Int64(origin),                                        # origin
+        Float64(fs),                                          # fs
+        SampleRing(round(Int, ring_seconds * fs)),            # ring
+        Workspace(2 * CHUNK, XCORR_SEARCH_SAMPLES),           # ws
+        Dict{Int,Vector{Float32}}(),                          # codes
+        Set{Int}(prns),                                       # prns
+        Int(every),                                           # every
+        PendingRecord[],                                      # pending
+        Int(max_pending),                                     # max_pending
+        fill(typemin(Int64), n_channels),                     # last_index
+        zeros(n_channels),                                    # delta
+        zeros(n_channels),                                    # anchor
+        zeros(Int32, n_channels),                             # occupant
+        zeros(n_channels),                                    # carrier_cycles
+        fill(typemin(Int64), n_channels),                     # carrier_ref
+        zeros(n_channels),                                    # last_carrier_hz
+        zeros(Int, n_channels),                               # since_search
+        zeros(Int, n_channels),                               # search_left
+        fill(XCORR_SEARCH_SAMPLES, n_channels),               # search_margin
+        fill(false, n_channels),                              # search_fresh
+        [zeros(2 * XCORR_SEARCH_SAMPLES + 1) for _ = 1:n_channels],  # search_acc
+        zeros(Int, n_channels),                               # seen
+        0,                                                    # sign
+        0,                                                    # records
+        0,                                                    # skipped_old
+        0,                                                    # dropped_pending
+        0,                                                    # unaligned
+        Int64(0),                                             # max_wait
+        0.0,                                                  # cpu_seconds
     )
     # Compile the kernels here rather than during the first live chunk: the
     # probe runs inside the processing task, and a JIT pause there is a chunk
@@ -296,8 +332,9 @@ function CpuReference(io::IO, origin::Integer, fs::Real, n_channels::Integer;
     println(io, "# X prn ch sample_index n code_phase delta_chips ",
                 "re_Pf im_Pf abs_Lf abs_Ef re_Pc im_Pc abs_Lc abs_Ec ",
                 "carrier_doppler code_doppler")
-    println(io, "# A prn ch sample_index offset_samples offset_chips peak_over_median sign")
-    println(io, "# R prn ch sample_index offset_samples offset_chips peak_over_median")
+    println(io, "# A/R prn ch sample_index offset_samples offset_chips ",
+                "peak_over_median peak_over_centre offsets_searched")
+    println(io, "# S mixing_sign peak_over_median")
     p
 end
 
@@ -410,27 +447,63 @@ function xcorr_compare!(p::CpuReference, rec::PendingRecord, s0::Int64)
     # A fresh occupant is coarse-aligned again. `delta` is not reset with it:
     # most of it is the host↔device axis error, which every channel shares, so
     # the previous occupant's value is the best starting point.
-    fresh = p.occupant[ch] != rec.prn
-    p.since_search[ch] += 1
-    if fresh || p.since_search[ch] >= XCORR_RESEARCH_RECORDS
-        p.occupant[ch] = rec.prn
-        p.since_search[ch] = 0
-        offset, ratio, sign = search_offset(
+    # The mixing sign is voted on once per run, on the first record compared:
+    # inheriting Tracking's convention and getting it wrong costs the CPU side
+    # all of its correlation gain, and nothing else in the output would say so.
+    # One record settles it — the wrong sign leaves 5 kHz of residual carrier
+    # inside a 1 ms integration, which is not a near thing.
+    if p.sign == 0
+        _, ratio, sign = search_offset(
             p.ws, p.ring, s0, n; code, cp_start, cps, freq = rec.carrier_hz,
-            fs = p.fs, signs = p.sign == 0 ? (1, -1) : (p.sign,),
-            margin = XCORR_SEARCH_SAMPLES, phase0)
-        if ratio >= 4
-            p.sign = sign
-            p.delta[ch] += offset * cps
-            cp_start += offset * cps
-            p.anchor[ch] = p.delta[ch]
-        elseif fresh
-            p.unaligned += 1
-            p.anchor[ch] = p.delta[ch]
+            fs = p.fs, signs = (1, -1), margin = XCORR_SEARCH_SAMPLES, phase0)
+        p.sign = sign
+        @printf(p.io, "S %+d %.2f\n", sign, ratio)
+    end
+
+    # Start an alignment search: at every handover, and periodically after that.
+    fresh = p.occupant[ch] != rec.prn
+    if fresh
+        p.occupant[ch] = rec.prn
+        p.search_margin[ch] = XCORR_SEARCH_SAMPLES
+    end
+    p.since_search[ch] += 1
+    if p.search_left[ch] == 0 &&
+       (fresh || p.since_search[ch] >= XCORR_RESEARCH_RECORDS)
+        p.search_left[ch] = XCORR_SEARCH_RECORDS
+        p.search_fresh[ch] = fresh
+        p.since_search[ch] = 0
+        fill!(p.search_acc[ch], 0.0)
+    end
+
+    if p.search_left[ch] > 0
+        m = p.search_margin[ch]
+        acc = view(p.search_acc[ch], 1:(2m+1))
+        accumulate_offsets!(acc, p.ws, p.ring, s0, n; code, cp_start, cps,
+                            freq = rec.carrier_hz, fs = p.fs,
+                            sign = _xcorr_sign(p), margin = m, phase0)
+        p.search_left[ch] -= 1
+        if p.search_left[ch] == 0
+            offset, ratio, over_centre = peak_offset(acc, m)
+            # Move only on a peak that is both real and better than where the
+            # reference already sits. Anything else and a noisy scan would drag
+            # a perfectly aligned reference off the satellite — which is exactly
+            # what a single-record search did before it accumulated.
+            if ratio >= XCORR_PEAK_RATIO &&
+               (offset == 0 || over_centre >= XCORR_MOVE_RATIO)
+                p.delta[ch] += offset * cps
+                p.anchor[ch] = p.delta[ch]
+                cp_start += offset * cps
+                p.search_margin[ch] = XCORR_TRACK_SAMPLES
+            elseif ratio < XCORR_PEAK_RATIO
+                # Nothing found where we were looking: look everywhere again.
+                p.search_margin[ch] = XCORR_SEARCH_SAMPLES
+                p.search_fresh[ch] && (p.unaligned += 1)
+            end
+            @printf(p.io, "%s %d %d %d %d %.4f %.2f %.2f %d\n",
+                    p.search_fresh[ch] ? "A" : "R", rec.prn, ch,
+                    rec.sample_index, offset, offset * cps, ratio, over_centre,
+                    2m + 1)
         end
-        @printf(p.io, "%s %d %d %d %d %.4f %.2f%s\n", fresh ? "A" : "R",
-                rec.prn, ch, rec.sample_index, offset, offset * cps, ratio,
-                fresh ? (sign > 0 ? " +1" : " -1") : "")
     end
 
     late, prompt, early = correlate_epl(

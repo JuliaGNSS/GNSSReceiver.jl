@@ -15,7 +15,8 @@
 # gateware's own datapath was pinned before it was believed.
 module CpuCorrelator
 
-export SampleRing, Workspace, push_chunk!, covers, fetch!, correlate_epl, search_offset
+export SampleRing, Workspace, push_chunk!, covers, fetch!, correlate_epl,
+    search_offset, accumulate_offsets!, peak_offset
 
 """
     SampleRing(len)
@@ -183,6 +184,51 @@ function correlate_epl(ws::Workspace, ring::SampleRing, s0::Integer, n::Integer;
     (tap(ws.mixed, ws.replica, n, 0),
      tap(ws.mixed, ws.replica, n, shift),
      tap(ws.mixed, ws.replica, n, 2shift))
+end
+
+"""
+    accumulate_offsets!(acc, ws, ring, s0, n; code, cp_start, cps, freq, fs, sign,
+                        margin, phase0) -> acc
+
+Add one record's power over replica offsets `-margin … +margin` samples into
+`acc` (length `2·margin+1`), the offsets measured from `cp_start`.
+
+Accumulated across records because a single 1 ms integration cannot localise a
+peak: at 40 dBHz its peak stands only ~11× above the noise floor, and the
+largest of 129 noise bins is regularly a good fraction of that, so the argmax of
+one record is frequently just noise — an alignment search built on it walks the
+reference off the satellite while reporting a plausible-looking ratio. Summing
+`k` records leaves the ratio where it is and shrinks the floor's spread by
+`√k`, which is what makes the argmax trustworthy. Every record brings its own
+`cp_start`, so the offsets stay comparable while the code phase advances.
+"""
+function accumulate_offsets!(acc, ws::Workspace, ring::SampleRing, s0::Integer,
+                             n::Integer; code::Vector{Float32}, cp_start::Real,
+                             cps::Real, freq::Real, fs::Real, sign::Integer,
+                             margin::Integer, phase0::Real = 0.0)
+    code_replica!(ws.replica, code, cp_start - margin * cps, cps, n + 2margin)
+    fetch!(ws.mixed, ring, s0, n)
+    mix!(ws.mixed, n, freq, fs, sign, phase0)
+    @inbounds for j = 0:2margin
+        acc[j+1] += abs2(tap(ws.mixed, ws.replica, n, j))
+    end
+    acc
+end
+
+"""
+    peak_offset(acc, margin) -> (offset_samples, peak_over_median, peak_over_centre)
+
+Where an accumulated scan peaks, how far above its own noise floor, and how far
+above the offset the scan was centred on. The last one is what says whether
+moving the reference is an improvement or a coin toss.
+"""
+function peak_offset(acc, margin::Integer)
+    k = argmax(acc)
+    floor_power = _median(acc)
+    centre = acc[margin+1]
+    (k - 1 - margin,
+     floor_power > 0 ? acc[k] / floor_power : 0.0,
+     centre > 0 ? acc[k] / centre : Inf)
 end
 
 """
