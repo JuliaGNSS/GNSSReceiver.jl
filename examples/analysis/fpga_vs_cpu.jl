@@ -209,35 +209,58 @@ function best_edge(p::Vector{ComplexF64}; m::Int = 20)
     best
 end
 
-# Hard bit decisions from each stream on the same 20 ms grid, compared. The
-# phase reference is each stream's own block sum, so a constant phase offset
-# between the two correlators cannot register as a bit error; only a block whose
-# sign genuinely differs does.
+# Do the two streams see the same navigation bits? Compared as *transitions* —
+# "did the sign flip against the previous 20 ms block" — evaluated separately on
+# each stream and then matched.
+#
+# Not as absolute bit values: each stream's absolute polarity depends on its own
+# carrier phase, and the two correlators differ by a constant phase offset by
+# construction, so comparing absolute decisions measures that offset and nothing
+# else. (It read 50 % on satellites whose prompts agree to ρ = 0.997, which is
+# how the mistake surfaced.) Transitions are phase-offset-free, and they are
+# also what the decoder actually consumes through its own differential sync.
 function bit_disagreement(s::Series, edge::Int; m::Int = 20)
+    sums_f = ComplexF64[]
+    sums_c = ComplexF64[]
+    k = edge + 1
+    while k + m - 1 <= length(s.pf)
+        push!(sums_f, sum(view(s.pf, k:(k+m-1))))
+        push!(sums_c, sum(view(s.pc, k:(k+m-1))))
+        k += m
+    end
     disagree = 0
     total = 0
-    k = edge + 1
-    ref_f = one(ComplexF64)
-    ref_c = one(ComplexF64)
-    while k + m - 1 <= length(s.pf)
-        sf = sum(view(s.pf, k:(k+m-1)))
-        sc = sum(view(s.pc, k:(k+m-1)))
-        if abs(sf) > 0 && abs(sc) > 0
-            bf = real(sf * conj(ref_f)) >= 0
-            bc = real(sc * conj(ref_c)) >= 0
-            bf == bc || (disagree += 1)
-            total += 1
-            # Carry each stream's phase forward, flipped by its own decision, so
-            # the reference rides the carrier instead of drifting out of it.
-            ref_f = bf ? sf : -sf
-            ref_c = bc ? sc : -sc
-        end
-        k += m
+    for i = 2:length(sums_f)
+        (abs(sums_f[i]) == 0 || abs(sums_c[i]) == 0) && continue
+        flip_f = real(sums_f[i] * conj(sums_f[i-1])) < 0
+        flip_c = real(sums_c[i] * conj(sums_c[i-1])) < 0
+        flip_f == flip_c || (disagree += 1)
+        total += 1
     end
     (disagree, total)
 end
 
 imbalance(e, l) = mean((e .- l) ./ max.(e .+ l, eps()))
+
+# The gain between the two prompts, as a regression coefficient over short
+# windows. Not a ratio of magnitudes — |Pf|/|Pc| averages the FPGA's own noise
+# into the gain, inflating it exactly when the device is worst — and not one
+# regression over the whole run either, because the two are only phase-locked
+# over short windows (see `coherence`) and a whole-run fit reads the drift as
+# lost gain.
+function gain(s::Series, beat; m::Int = 20)
+    t = (s.sample .- s.sample[1]) ./ FS
+    r = s.pf .* conj.(s.pc) .* cis.(-2π * beat .* t)
+    num = 0.0
+    den = 0.0
+    nb = length(r) ÷ m
+    for b = 1:nb
+        idx = ((b-1)*m+1):(b*m)
+        num += abs(sum(view(r, idx)))
+        den += sum(abs2, view(s.pc, idx))
+    end
+    den == 0 ? 0.0 : num / den
+end
 
 # Records where the FPGA prompt is far below what the same samples gave the CPU.
 # Added Gaussian noise does not do this; a dropped, truncated or saturated
@@ -271,11 +294,7 @@ function report(s::Series, aligns)
     n < 100 && (@printf("PRN %2d: only %d records — skipped\n", s.prn, n); return)
     span = (s.sample[end] - s.sample[1]) / FS
     beat = beat_frequency(s)
-    # Regression coefficient, not a ratio of magnitudes: |Pf|/|Pc| averages the
-    # FPGA's *own* noise into the gain, which inflates it exactly when the
-    # device is worst. This one is unbiased under independent noise.
-    t = (s.sample .- s.sample[1]) ./ FS
-    scale = abs(sum(s.pf .* conj.(s.pc) .* cis.(-2π * beat .* t))) / sum(abs2, s.pc)
+    scale = gain(s, beat)
     ratio = abs.(s.pf) ./ max.(scale .* abs.(s.pc), eps())
     rho = coherence(s, beat; m = 2)
     edge = best_edge(s.pc)
@@ -317,7 +336,7 @@ function report(s::Series, aligns)
             beat)
     @printf("  C/N0 over %d bit-aligned 20 ms blocks: FPGA %.1f dBHz | CPU %.1f dBHz | Δ %+.1f dB\n",
             blocks, cn0_f, cn0_c, cn0_f - cn0_c)
-    @printf("  20 ms bit decisions disagreeing: %d of %d (%.2f %%)\n",
+    @printf("  20 ms bit transitions disagreeing: %d of %d (%.2f %%)\n",
             disagree, total, 100 * disagree / max(total, 1))
     ndrop, pdrop = dropouts(s, scale)
     @printf("  FPGA prompts below 20 %% of the CPU's: %d (%.2f %%)\n", ndrop, pdrop)
