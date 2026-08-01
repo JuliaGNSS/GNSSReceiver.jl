@@ -76,6 +76,9 @@ mutable struct BandAcquisitionWorker{T,P<:NamedTuple,R<:NamedTuple}
     # Recycled window store (see `AcquisitionResponse.samples`).
     spare::Vector{T}
     in_flight::Bool
+    # The worker itself, so the run can wait for it to go quiescent before the
+    # process tears down (see `close_acquisition!`).
+    task::Union{Nothing,Task}
     # Diagnostics. A stalled or fruitless acquisition is otherwise invisible
     # once the search no longer happens on the receiver's own task, and
     # `last_scan_seconds` is the number that decides whether inline acquisition
@@ -209,6 +212,7 @@ function _spawn_band_worker(
         empty_results,
         T[],
         false,
+        nothing,
         0,
         0,
         0,
@@ -256,6 +260,7 @@ function _spawn_band_worker(
         end
     end
     Base.errormonitor(task)
+    worker.task = task
     worker
 end
 
@@ -300,15 +305,41 @@ function AsyncAcquisition(
 end
 
 """
-    close_acquisition!(scheduler)
+    close_acquisition!(scheduler; timeout = 10.0)
 
 Release the scheduler's resources at the end of a run. Closing the request
-channels ends the worker tasks; the inline scheduler has nothing to release.
+channel ends a worker's loop; the inline scheduler has nothing to release.
+
+This **waits** (up to `timeout` seconds per band) for a scan that is still
+running to finish, rather than just closing the channels and returning. A search
+is seconds of compute inside `Acquisition`/Polyester, and leaving one in flight
+while the caller tears the process down — `exit`, or simply the end of `main` —
+faults the runtime out from under it (observed as a `SIGBUS` in
+`_accumulate_prn_step_tiled!` at the end of an otherwise complete hardware run).
+Waiting makes the end of a run quiescent; the timeout keeps a wedged search from
+hanging the shutdown.
 """
-close_acquisition!(::InlineAcquisition) = nothing
-function close_acquisition!(scheduler::AsyncAcquisition)
+close_acquisition!(::InlineAcquisition; timeout = 10.0) = nothing
+function close_acquisition!(scheduler::AsyncAcquisition; timeout = 10.0)
+    # Close the request channels first, so every worker's loop exits after the
+    # scan it may be running now.
     for worker in values(scheduler.workers)
         close(worker.requests)
+    end
+    for worker in values(scheduler.workers)
+        task = worker.task
+        isnothing(task) && continue
+        istaskdone(task) && continue
+        # `timedwait` polls, which is exactly right here: the wait happens once,
+        # at the end of a run.
+        timedwait(() -> istaskdone(task), timeout) === :ok || @warn(
+            "an acquisition worker was still searching after $timeout s; " *
+            "the run is ending without waiting for it"
+        )
+    end
+    # Only now close the response side: while a worker was still running, its
+    # result had somewhere to go.
+    for worker in values(scheduler.workers)
         close(worker.responses)
     end
     nothing

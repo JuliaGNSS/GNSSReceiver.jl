@@ -46,6 +46,7 @@ function idle_worker(acq_plan, group_key, ::Type{T}, interm_freq, acq_pfa) where
         result_type((result_vector_type(),)),
         T[],
         false,
+        nothing,
         0,
         0,
         0,
@@ -285,6 +286,9 @@ end
     # closed so a late dispatch cannot silently queue work for a finished run.
     @test !isopen(worker.requests)
     @test !isopen(worker.responses)
+    # And the run does not end while the worker is still computing: shutdown
+    # waits for it, so nothing is left running into the process teardown.
+    @test istaskdone(worker.task)
     # Idempotent, and a no-op for the inline scheduler.
     @test isnothing(close_acquisition!(scheduler))
     @test isnothing(close_acquisition!(InlineAcquisition()))
