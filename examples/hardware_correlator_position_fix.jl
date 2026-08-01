@@ -13,9 +13,34 @@
 #      before streaming starts (it only counts samples DMA0 accepts, so that
 #      latch is exact up to dropped buffers); a code-phase sweep against one
 #      acquired satellite then verifies/corrects it modulo the code period.
-#   4. receive(sdr, …) with CSR-polled dumps until the PVT solve returns a fix.
+#   4. receive(sdr, …) with DMA-streamed dumps (dump_source = :dma,
+#      epoch_period = 50 → ~2.2 ms feedback transport) until the PVT solve
+#      returns a fix; it then rides RUN_AFTER_FIX seconds and stops.
 #
-# Usage: julia -t 8 --project=. position_fix.jl [MAX_SECONDS] [RUN_AFTER_FIX]
+# Usage:
+#   julia -t 4,2 --project=. hardware_correlator_position_fix.jl [MAX_SECONDS] [RUN_AFTER_FIX]
+# (defaults 600 and 30; the periodic rescan cadence is acquire_every below.)
+#
+# Companion branches (this exact stack produced the first live fix 2026-08-01,
+# lat 50.768612° lon 6.072698° alt 271.2 m):
+#   GNSSM2SDR.jl feat/code-phase-anchor — immediate-CSR NCO updates, record
+#     dedup, O_NONBLOCK DMA reader; Tracking.jl hwfix/hardware-correlator-run —
+#     1 ms integrations, degenerate-record skips.
+#
+# Board bring-up (Jetson + LiteX M2SDR; redo after EVERY reboot):
+#   sudo insmod ~/litex_m2sdr/litex_m2sdr/software/kernel/m2sdr.ko
+#     (that build has DMA_BUFFER_COUNT=256 — the gateware descriptor table is
+#      256 deep; larger rings wrap it into stale-buffer corruption. Never
+#      modprobe: the installed module is an older single-device build.)
+#   sudo sysctl -w fs.pipe-max-size=67108864   # not persistent
+#   ~/litex_m2sdr/litex_m2sdr/software/user/m2sdr_rf \
+#     --sample-rate 4000000 --bandwidth 2500000 --rx-freq 1575420000 \
+#     --rx-gain 60 --tx-att 89
+#     (long flags only; a bare m2sdr_rf resets to 30.72M/2.4GHz defaults)
+#   Verify: m2sdr_record streams ~32 MB/s with ~0 adjacent-duplicate samples.
+#   Acquisition scans stall the processing pipeline for seconds and the
+#   channels free-run meanwhile (~0.1 chips/s); keep that window short —
+#   MAXN power mode + jetson_clocks helped decisively on the Orin.
 
 using Printf
 using Statistics: mean, median, std
