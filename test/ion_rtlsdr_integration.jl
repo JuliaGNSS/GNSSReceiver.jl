@@ -237,13 +237,19 @@ let
         end
     end
 
-    # Drive the reacquisition path with the real recording: once the full set is
-    # locked, drop a few samples so the code phase slips out of the correlator's
-    # pull-in range. Satellites lose lock and the receiver reacquires them (a single
+    # Drive the recovery path with the real recording: once the full set is locked,
+    # drop a few samples so the code phase slips out of the correlator's pull-in
+    # range. Satellites lose lock and the receiver has to find them again (a single
     # dropped sample is only a ~0.5-chip step the DLL absorbs, and a full 2048-sample
     # code period would realign exactly — a ~1.5-chip, 3-sample slip reliably knocks
     # them out).
-    @testset "Reacquisition after a mid-stream sample slip" begin
+    #
+    # Recovery is the *periodic* scan's job, not fast per-satellite reacquisition:
+    # the latter is off by default (`max_reacquire_attempts = 0`) because a full-grid
+    # `acquire!` per lost satellite is seconds of CPU on an embedded host, and a
+    # handful of satellites bouncing in and out of lock queues those faster than the
+    # receiver can run them. So the run has to span the next `acquire_every`.
+    @testset "Recovery after a mid-stream sample slip" begin
         sampling_freq = 2.048e6u"Hz"
         system = GPSL1CA()
         num_samples = Int(upreferred(sampling_freq * 4u"ms"))
@@ -251,12 +257,11 @@ let
         # The derived cold-start acquisition (4 ms coherent integration here) locks the
         # 7 strongest sats on its first pass; the weaker ones clear the CFAR detection
         # threshold only on later periodic passes — PRNs 7/18/24 at ~10 s and PRN 8
-        # (the weakest, ~41 dB-Hz) at ~20 s. Slip ~21.2 s in — once the full healthy set of 11 is locked — and
-        # stop ~24.4 s in, before the next periodic acquisition at 30 s, so any
-        # recovery is via reacquisition of the lost satellites rather than the
-        # periodic full search.
+        # (the weakest, ~41 dB-Hz) at ~20 s. Slip ~21.2 s in, once the full healthy set
+        # of 11 is locked, and run past the next periodic scan (30 s, one
+        # `acquire_every` after the 20 s one) so the recovery is actually observed.
         slip_after_chunk = 5300
-        stop_after_chunk = 6100
+        stop_after_chunk = 8000
 
         measurement_channel = GNSSReceiver.spawn_signal_channel_thread(;
             T = ComplexF32,
@@ -305,7 +310,7 @@ let
         @test maximum(before_slip) >= 10
         # The slip knocks satellites out of lock (they are removed from the track state).
         @test minimum(after_slip) < maximum(before_slip)
-        # Reacquisition brings satellites back before the run ends.
+        # The next periodic scan brings satellites back before the run ends.
         @test records[end][2] > minimum(after_slip)
     end
 end
