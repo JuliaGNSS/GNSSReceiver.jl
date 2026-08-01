@@ -104,13 +104,24 @@ Workspace(max_samples::Integer, max_margin::Integer) = Workspace(
     Vector{Float64}(undef, 2 * max_margin + 1),
 )
 
-# Wipe the carrier off in place: `mixed[k] *= exp(i·sign·2π·freq·(k-1)/fs)`.
+# Wipe the carrier off in place:
+# `mixed[k] *= exp(i·sign·2π·(phase0 + freq·(k-1)/fs))`.
+#
+# `phase0` (in cycles) is not cosmetic. A hardware correlator's carrier NCO runs
+# *continuously* across records; a reference that restarts at zero every record
+# differs from it by a phase that steps by `freq × record length` each time —
+# tens of thousands of cycles at GPS Dopplers, aliasing to an arbitrary offset
+# per record. Magnitudes survive that, so a code-phase search still finds its
+# peak, but every phase comparison between the two is destroyed. Carry the
+# accumulated phase in and the two replicas are the same oscillator.
+#
 # The incremental rotation is renormalised periodically — a few thousand chained
 # ComplexF32 multiplies otherwise shrink the replica by ~1e-4, which would read
 # as an amplitude loss on the CPU side of the comparison.
-function mix!(mixed, n::Integer, freq::Real, fs::Real, sign::Integer)
+function mix!(mixed, n::Integer, freq::Real, fs::Real, sign::Integer,
+              phase0::Real = 0.0)
     w = ComplexF32(cis(sign * 2π * freq / fs))
-    c = ComplexF32(1, 0)
+    c = ComplexF32(cis(sign * 2π * phase0))
     @inbounds for k = 1:n
         mixed[k] *= c
         c *= w
@@ -158,13 +169,16 @@ end
 Correlate `[s0, s0+n)` against `code` starting at chip phase `cp_start`, having
 mixed out `freq`. `shift` is the prompt→Early offset **in whole samples**, which
 is how both `Tracking` and the gateware quantise the Early/Late spacing, so the
-CPU taps land exactly where the device's do.
+CPU taps land exactly where the device's do. `phase0` is the carrier replica's
+phase in cycles at `s0`: pass the running phase of an NCO mirroring the device's
+(see `mix!`), or leave it at zero when only magnitudes are wanted.
 """
 function correlate_epl(ws::Workspace, ring::SampleRing, s0::Integer, n::Integer;
                        code::Vector{Float32}, cp_start::Real, cps::Real,
-                       freq::Real, fs::Real, sign::Integer, shift::Integer)
+                       freq::Real, fs::Real, sign::Integer, shift::Integer,
+                       phase0::Real = 0.0)
     fetch!(ws.mixed, ring, s0, n)
-    mix!(ws.mixed, n, freq, fs, sign)
+    mix!(ws.mixed, n, freq, fs, sign, phase0)
     code_replica!(ws.replica, code, cp_start - shift * cps, cps, n + 2shift)
     (tap(ws.mixed, ws.replica, n, 0),
      tap(ws.mixed, ws.replica, n, shift),
@@ -188,14 +202,15 @@ else in the output would say so.
 """
 function search_offset(ws::Workspace, ring::SampleRing, s0::Integer, n::Integer;
                        code::Vector{Float32}, cp_start::Real, cps::Real,
-                       freq::Real, fs::Real, signs = (1, -1), margin::Integer = 64)
+                       freq::Real, fs::Real, signs = (1, -1), margin::Integer = 64,
+                       phase0::Real = 0.0)
     code_replica!(ws.replica, code, cp_start - margin * cps, cps, n + 2margin)
     best_offset, best_ratio, best_sign = 0, 0.0, first(signs)
     powers = ws.powers
     length(powers) >= 2margin + 1 || resize!(powers, 2margin + 1)
     for sign in signs
         fetch!(ws.mixed, ring, s0, n)
-        mix!(ws.mixed, n, freq, fs, sign)
+        mix!(ws.mixed, n, freq, fs, sign, phase0)
         @inbounds for j = 0:2margin
             powers[j+1] = abs2(tap(ws.mixed, ws.replica, n, j))
         end

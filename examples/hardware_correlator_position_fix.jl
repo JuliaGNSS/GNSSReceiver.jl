@@ -194,6 +194,34 @@ using .CpuCorrelator: SampleRing, Workspace, push_chunk!, covers, correlate_epl,
 # at 4 MHz), which covers any plausible residual of the origin calibration.
 const XCORR_SEARCH_SAMPLES = 64
 
+# A record waiting for its samples, with everything the comparison needs frozen
+# at the moment it was drained.
+#
+# Records reach the host *ahead* of the raw samples they were computed from: a
+# dump crosses DMA1 in a couple of milliseconds while the same samples are still
+# queued in the recorder pipe and the receiver's own sample channel. Correlating
+# only what the ring already holds would therefore throw away nearly every
+# record — so a record is parked here and picked up once the raw stream has
+# caught up with it, typically one or two chunks later.
+#
+# Freezing the Dopplers at drain time (rather than reading them when the samples
+# arrive) also keeps the CPU replica on the loop state that was actually driving
+# the device around that record.
+struct PendingRecord
+    channel::Int32
+    prn::Int32
+    sample_index::Int64
+    n::Int32
+    code_phase::Float64
+    late::ComplexF64
+    prompt::ComplexF64
+    early::ComplexF64
+    carrier_hz::Float64
+    code_doppler_hz::Float64
+    code_freq_hz::Float64
+    shift::Int32
+end
+
 mutable struct CpuReference
     const io::IO
     # Device sample index of host raw-sample 0, i.e. `sdr.device_origin` at the
@@ -205,29 +233,42 @@ mutable struct CpuReference
     const codes::Dict{Int,Vector{Float32}}
     const prns::Set{Int}
     const every::Int
+    # Records drained but not yet reached by the raw stream.
+    const pending::Vector{PendingRecord}
+    const max_pending::Int
     # Per hardware channel.
     const last_index::Vector{Int64}      # newest record seen, for dedup
     const delta::Vector{Float64}         # CPU code-phase offset, chips
     const anchor::Vector{Float64}        # where the coarse search put `delta`
     const occupant::Vector{Int32}        # PRN the probe last coarse-aligned to
+    # The CPU's own carrier NCO, mirroring the device's: phase in cycles, the
+    # device sample it refers to, and the frequency running since then.
+    const carrier_cycles::Vector{Float64}
+    const carrier_ref::Vector{Int64}
+    const last_carrier_hz::Vector{Float64}
     const seen::Vector{Int}
     sign::Int                            # carrier mixing sign, 0 until voted
     records::Int
-    skipped_old::Int                     # record older than the ring
-    skipped_future::Int                  # record newer than the delivered samples
+    skipped_old::Int                     # the ring rolled over the samples first
+    dropped_pending::Int                 # the queue overflowed
     unaligned::Int                       # coarse search found no peak
+    max_wait::Int64                      # deepest record→sample lag seen, samples
     cpu_seconds::Float64
 end
 
 function CpuReference(io::IO, origin::Integer, fs::Real, n_channels::Integer;
-                      ring_seconds = 0.5, prns = Set{Int}(), every::Integer = 1)
+                      ring_seconds = 0.5, prns = Set{Int}(), every::Integer = 1,
+                      max_pending::Integer = 8192)
     p = CpuReference(
         io, Int64(origin), Float64(fs),
         SampleRing(round(Int, ring_seconds * fs)),
         Workspace(2 * CHUNK, XCORR_SEARCH_SAMPLES),
         Dict{Int,Vector{Float32}}(), Set{Int}(prns), Int(every),
+        PendingRecord[], Int(max_pending),
         fill(typemin(Int64), n_channels), zeros(n_channels), zeros(n_channels),
-        zeros(Int32, n_channels), zeros(Int, n_channels), 0, 0, 0, 0, 0, 0.0,
+        zeros(Int32, n_channels), zeros(n_channels),
+        fill(typemin(Int64), n_channels), zeros(n_channels), zeros(Int, n_channels),
+        0, 0, 0, 0, 0, Int64(0), 0.0,
     )
     # Compile the kernels here rather than during the first live chunk: the
     # probe runs inside the processing task, and a JIT pause there is a chunk
@@ -260,9 +301,9 @@ _xcorr_sign(p::CpuReference) = p.sign == 0 ? 1 : p.sign
 xcorr_append!(p::CpuReference, samples, host_start::Integer) =
     push_chunk!(p.ring, samples, p.origin + Int64(host_start))
 
-# One record: correlate the raw span the FPGA integrated over, at the code phase
-# the FPGA reported, with the Doppler the loop commanded — then log both sides.
-function xcorr_record!(p::CpuReference, assignments, track_state, dump)
+# Capture one drained record: freeze what the comparison will need and park it
+# until the raw stream reaches it.
+function xcorr_capture!(p::CpuReference, assignments, track_state, dump)
     ch = Int(dump.channel)
     (1 <= ch <= length(p.last_index)) || return p          # epoch strobe
     dump.output.sample_index <= p.last_index[ch] && return p
@@ -272,6 +313,8 @@ function xcorr_record!(p::CpuReference, assignments, track_state, dump)
     assignment.prn == Int(dump.prn) || return p
     (isempty(p.prns) || assignment.prn in p.prns) || return p
     isnan(dump.code_phase) && return p
+    n = Int(dump.output.integrated_samples)
+    (n <= 0 || n > length(p.ws.mixed)) && return p
     p.seen[ch] += 1
     (p.every > 1 && p.seen[ch] % p.every != 0) && return p
 
@@ -280,44 +323,88 @@ function xcorr_record!(p::CpuReference, assignments, track_state, dump)
     sat = sat_states[assignment.prn]
     tracked = Tracking.get_signals(sat)[assignment.signal_index]
     signal = Tracking.get_signal(tracked)
-
-    n = Int(dump.output.integrated_samples)
-    s1 = Int64(dump.output.sample_index)
-    s0 = s1 - n
-    (n <= 0 || n > length(p.ws.mixed)) && return p
-    # The record has to lie inside the samples the receiver has delivered:
-    # `:future` means the dump overtook its own raw samples (it cannot, unless
-    # the axis is wrong), `:old` that the ring already rolled over it.
-    status = covers(p.ring, s0, n)
-    if status === :future
-        p.skipped_future += 1
-        return p
-    elseif status === :old
-        p.skipped_old += 1
-        return p
-    end
-
-    code_freq = ustrip(Hz, get_code_frequency(signal)) +
-                ustrip(Hz, uconvert(Hz, Tracking.get_code_doppler(sat)))
-    cps = code_freq / p.fs
-    carrier_hz = ustrip(Hz, uconvert(Hz, Tracking.get_carrier_doppler(sat)))
-    code = xcorr_code_table!(p, assignment.prn)
+    code_doppler = ustrip(Hz, uconvert(Hz, Tracking.get_code_doppler(sat)))
+    code_freq = ustrip(Hz, get_code_frequency(signal)) + code_doppler
     # Whole-sample Early↔Late spacing, quantised exactly the way `_assign!`
     # quantised it for the gateware, so the CPU taps sit where the device's do.
     shift = max(1, round(Int, Tracking.get_early_late_sample_spacing(
         Tracking.get_correlator(tracked), p.fs * Hz, code_freq * Hz) / 2))
+    acc = Tracking.get_accumulators(dump.output.correlator)   # [late, prompt, early]
+
+    if length(p.pending) >= p.max_pending
+        # The raw stream is not catching up (or has stalled). Drop the oldest —
+        # a diagnostic must never become the reason the receiver falls behind.
+        popfirst!(p.pending)
+        p.dropped_pending += 1
+    end
+    push!(p.pending, PendingRecord(
+        Int32(ch), Int32(assignment.prn), Int64(dump.output.sample_index), Int32(n),
+        dump.code_phase,
+        _xcorr_scalar(acc[1]), _xcorr_scalar(acc[2]), _xcorr_scalar(acc[3]),
+        ustrip(Hz, uconvert(Hz, Tracking.get_carrier_doppler(sat))),
+        code_doppler, code_freq, Int32(shift)))
+    p
+end
+
+# Correlate every parked record the raw stream has now reached, in order, and
+# log both sides. Records still ahead of the stream stay parked.
+function xcorr_drain_pending!(p::CpuReference)
+    keep = 0
+    for rec in p.pending
+        s0 = rec.sample_index - rec.n
+        status = covers(p.ring, s0, Int(rec.n))
+        if status === :future
+            keep += 1
+            p.pending[keep] = rec
+            p.max_wait = max(p.max_wait, rec.sample_index - p.ring.ending)
+            continue
+        elseif status === :old
+            p.skipped_old += 1
+            continue
+        end
+        xcorr_compare!(p, rec, s0)
+    end
+    resize!(p.pending, keep)
+    p
+end
+
+# One record: correlate the raw span the FPGA integrated over, at the code phase
+# the FPGA reported, with the Doppler the loop commanded — then log both sides.
+function xcorr_compare!(p::CpuReference, rec::PendingRecord, s0::Int64)
+    ch = Int(rec.channel)
+    n = Int(rec.n)
+    shift = Int(rec.shift)
+    cps = rec.code_freq_hz / p.fs
+    code = xcorr_code_table!(p, rec.prn)
     # The dump's phase is the replica's at the end of the integration.
-    cp_start = dump.code_phase - n * cps + p.delta[ch]
+    cp_start = rec.code_phase - n * cps + p.delta[ch]
+
+    # Mirror the device's carrier NCO instead of restarting at zero. Its phase
+    # runs continuously across records, so a reference that restarts each time
+    # differs from it by `carrier_doppler x record length` — tens of cycles per
+    # record at GPS Dopplers, aliasing to an effectively random offset. That
+    # leaves every magnitude intact and destroys every phase comparison, which
+    # is exactly the comparison this probe exists to make.
+    if p.carrier_ref[ch] == typemin(Int64) || p.occupant[ch] != rec.prn
+        p.carrier_cycles[ch] = 0.0
+    else
+        p.carrier_cycles[ch] = mod(
+            p.carrier_cycles[ch] +
+            p.last_carrier_hz[ch] * (s0 - p.carrier_ref[ch]) / p.fs, 1.0)
+    end
+    p.carrier_ref[ch] = s0
+    p.last_carrier_hz[ch] = rec.carrier_hz
+    phase0 = p.carrier_cycles[ch]
 
     # A fresh occupant is coarse-aligned again. `delta` is not reset with it:
     # most of it is the host↔device axis error, which every channel shares, so
     # the previous occupant's value is the best starting point.
-    if p.occupant[ch] != Int32(assignment.prn)
-        p.occupant[ch] = Int32(assignment.prn)
+    if p.occupant[ch] != rec.prn
+        p.occupant[ch] = rec.prn
         offset, ratio, sign = search_offset(
-            p.ws, p.ring, s0, n; code, cp_start, cps, freq = carrier_hz,
+            p.ws, p.ring, s0, n; code, cp_start, cps, freq = rec.carrier_hz,
             fs = p.fs, signs = p.sign == 0 ? (1, -1) : (p.sign,),
-            margin = XCORR_SEARCH_SAMPLES)
+            margin = XCORR_SEARCH_SAMPLES, phase0)
         if ratio >= 4
             p.sign = sign
             p.delta[ch] += offset * cps
@@ -327,12 +414,12 @@ function xcorr_record!(p::CpuReference, assignments, track_state, dump)
         end
         p.anchor[ch] = p.delta[ch]
         @printf(p.io, "A %d %d %d %d %.4f %.2f %+d\n",
-                assignment.prn, ch, s1, offset, offset * cps, ratio, sign)
+                rec.prn, ch, rec.sample_index, offset, offset * cps, ratio, sign)
     end
 
     late, prompt, early = correlate_epl(
-        p.ws, p.ring, s0, n; code, cp_start, cps, freq = carrier_hz, fs = p.fs,
-        sign = _xcorr_sign(p), shift)
+        p.ws, p.ring, s0, n; code, cp_start, cps, freq = rec.carrier_hz,
+        fs = p.fs, sign = _xcorr_sign(p), shift, phase0)
 
     # Slow normalised early-late envelope DLL on the CPU side. Deliberately
     # sluggish, and bounded to the coarse search's anchor: it exists to hold the
@@ -345,13 +432,11 @@ function xcorr_record!(p::CpuReference, assignments, track_state, dump)
                             p.anchor[ch] - 2.0, p.anchor[ch] + 2.0)
     end
 
-    acc = Tracking.get_accumulators(dump.output.correlator)   # [late, prompt, early]
-    lf, pf, ef = _xcorr_scalar(acc[1]), _xcorr_scalar(acc[2]), _xcorr_scalar(acc[3])
     @printf(p.io, "X %d %d %d %d %.4f %.4f %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.3f %.5f\n",
-            assignment.prn, ch, s1, n, dump.code_phase, p.delta[ch],
-            real(pf), imag(pf), abs(lf), abs(ef),
+            rec.prn, ch, rec.sample_index, n, rec.code_phase, p.delta[ch],
+            real(rec.prompt), imag(rec.prompt), abs(rec.late), abs(rec.early),
             real(prompt), imag(prompt), abs(late), abs(early),
-            carrier_hz, ustrip(Hz, uconvert(Hz, Tracking.get_code_doppler(sat))))
+            rec.carrier_hz, rec.code_doppler_hz)
     p.records += 1
     p
 end
@@ -364,14 +449,16 @@ _xcorr_scalar(x::AbstractVector) = x[1]      # multi-antenna: antenna 0 only
 # second consumer on the SPSC ring; records the drain did not refresh are
 # filtered out by the per-channel `sample_index` dedup.
 #
-# `xcorr_record!` gets the assignment table rather than the link so that its
+# The capture step gets the assignment table rather than the link so that its
 # specialisation depends only on the record and tracking-state types — the
-# warm-up's stub SDR then compiles the same method the live run calls.
+# warm-up's stub SDR then compiles the same method the live run calls — and the
+# correlation step, which is the expensive one, is free of both.
 function xcorr_process!(p::CpuReference, link, track_state)
     t0 = time()
     for dump in link.drain_buffer
-        xcorr_record!(p, link.assignments, track_state, dump)
+        xcorr_capture!(p, link.assignments, track_state, dump)
     end
+    xcorr_drain_pending!(p)
     p.cpu_seconds += time() - t0
     p
 end

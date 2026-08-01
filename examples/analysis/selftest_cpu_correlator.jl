@@ -160,6 +160,36 @@ const AMP = 30.0
         @test (abs(early) - abs(late)) / (abs(early) + abs(late)) < -0.1
     end
 
+    @testset "a mirrored NCO keeps consecutive records in phase" begin
+        # The property the whole comparison rests on: correlate two back-to-back
+        # records of one continuous signal and the two prompts must have the
+        # *same* phase. A reference that restarts its carrier at every record
+        # instead picks up `doppler × record length` of phase between them —
+        # here 2537 cycles' worth, i.e. an arbitrary rotation — which leaves the
+        # magnitudes untouched and makes any FPGA-vs-CPU phase figure noise.
+        samples, cps = inject(PRN, 2N, CP0, DOPPLER, AMP)
+        ring = ringed(samples, ORIGIN)
+        phase = 0.0
+        prompts = ComplexF64[]
+        restarted = ComplexF64[]
+        for r = 0:1
+            s0 = ORIGIN + r * N
+            cp = CP0 + r * N * cps
+            _, p1, _ = correlate_epl(ws, ring, s0, N; code, cp_start = cp, cps,
+                                     freq = DOPPLER, fs = FS, sign = -1,
+                                     shift = 1, phase0 = phase)
+            _, p2, _ = correlate_epl(ws, ring, s0, N; code, cp_start = cp, cps,
+                                     freq = DOPPLER, fs = FS, sign = -1, shift = 1)
+            push!(prompts, p1)
+            push!(restarted, p2)
+            phase = mod(phase + DOPPLER * N / FS, 1.0)
+        end
+        @test abs(angle(prompts[2] * conj(prompts[1]))) < 0.01
+        # …and the naive reference really does scramble it, so the test above is
+        # not passing by accident.
+        @test abs(angle(restarted[2] * conj(restarted[1]))) > 0.1
+    end
+
     @testset "a long integration does not drift the carrier replica" begin
         # 20 code periods: an unrenormalised ComplexF32 rotation would lose
         # amplitude here, and that loss would be charged to the CPU reference.
