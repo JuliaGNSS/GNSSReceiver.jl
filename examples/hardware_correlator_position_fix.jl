@@ -23,6 +23,24 @@
 #  whether the scan runs off the processing task. One default-pool thread is for
 #  the acquisition worker, so give it at least three.)
 #
+# Bit-stream instrument (issue #107). Set HWFIX_BITLOG=<name> to log, next to
+# this script, every soft bit and every 1 ms filtered prompt on the way into
+# `decode`, plus the E/P/L accumulators, both Dopplers and the per-channel
+# record-continuity counters:
+#
+#   HWFIX_BITLOG=bitstream.log julia -t 6,2 --project=. \
+#       hardware_correlator_position_fix.jl 220 20
+#   julia analysis/subframes_softbits.jl bitstream.log 7      # real subframes?
+#   julia analysis/word_errors.jl        bitstream.log 7 993  # where the errors are
+#   julia analysis/walkoff.jl            bitstream.log 10     # E/L imbalance over time
+#
+# Unset (the default) it costs nothing: the wrapper's per-chunk hook returns
+# immediately. Logging goes through the `correlator_source` seam rather than
+# `receive`'s payload channel because that channel emits once per
+# `pvt_update_interval` while the bit buffer is reset every chunk — sampling it
+# sees ~1/50 of the bits. `advance_tracking!` runs after the fold and before
+# `decode` consumes the buffer, so what it sees IS what the decoder gets.
+#
 # Companion branches (this exact stack produced the first live fix 2026-08-01,
 # lat 50.768612° lon 6.072698° alt 271.2 m):
 #   GNSSM2SDR.jl feat/code-phase-anchor — immediate-CSR NCO updates, record
@@ -89,6 +107,8 @@ const ACQ_EVERY = parse(Float64, get(ENV, "HWFIX_ACQ_EVERY", "30")) * u"s"
 const ACQ_ASYNC = get(ENV, "HWFIX_ASYNC", "1") == "1"
 
 const gpsl1 = GPSL1CA()
+# Bit-stream instrument (issue #107): unset means no logging, no cost.
+const BIT_LOG_NAME = get(ENV, "HWFIX_BITLOG", "")
 const RAW_CHUNKS = Threads.Atomic{Int}(0)
 
 # Cap FFTW's own pthread pool: acquisition storms (initial + per-satellite
@@ -109,6 +129,133 @@ using StaticArrays: SVector
 using PipeChannels: PipeChannel
 using Tracking: CorrelatorOutput, EarlyPromptLateCorrelator
 using GNSSReceiver: CorrelatorDump, NCOUpdate, AbstractHardwareCorrelatorSDR, epoch_strobe
+
+# ── Bit-stream instrument ─────────────────────────────────────────────────────
+# `receive`'s payload channel emits once per `pvt_update_interval` (100 ms) but
+# the bit buffer is reset every chunk (2 ms), so the run-script bit log sees
+# ~1/50 of the soft bits — useless for checking preamble spacing or parity.
+# This wraps the correlator source instead: `advance_tracking!` is the one call
+# per chunk that runs after the fold and before `decode` consumes the buffer,
+# so what it sees IS what the decoder gets, bit for bit.
+mutable struct BitLogSource{L}
+    const link::L
+    const io::Union{Nothing,IO}
+    # Per-PRN sink for the raw 1 ms filtered prompts, as interleaved Float32
+    # (re, im). The soft bits alone cannot separate "the 20 ms accumulation is
+    # aligned on the wrong edge" from "the prompts have no phase coherence to
+    # accumulate": with the prompts, both bit phase and coherence can be
+    # measured offline, and the bits re-derived at all 20 edge hypotheses.
+    const prompts::Dict{Int,IO}
+    const prompt_dir::String
+    chunks::Int
+end
+
+function GNSSReceiver.advance_tracking!(
+    source::BitLogSource,
+    band_measurements,
+    track_state,
+    band_systems,
+)
+    track_state = GNSSReceiver.advance_tracking!(
+        source.link,
+        band_measurements,
+        track_state,
+        band_systems,
+    )
+    io = source.io
+    isnothing(io) && return track_state
+    source.chunks += 1
+    link = source.link
+    boundary = link.next_epoch_boundary
+    for (prn, sat) in pairs(Tracking.get_sat_states(track_state))
+        signal = Tracking.get_signals(sat)[1]
+        soft_bits = signal.bit_buffer.soft_bits
+        if !isempty(soft_bits)
+            print(io, "B ", prn, ' ', boundary)
+            for b in soft_bits
+                print(io, ' ', b)
+            end
+            println(io)
+        end
+        prompts = Tracking.get_filtered_prompts(signal)
+        if !isempty(prompts)
+            sink = get!(source.prompts, prn) do
+                open(joinpath(source.prompt_dir, "prompts_prn$(prn).f32"), "w")
+            end
+            for p in prompts
+                write(sink, Float32(real(p)), Float32(imag(p)))
+            end
+            println(io, "P ", prn, ' ', boundary, ' ', length(prompts),
+                    ' ', signal.bit_buffer.found,
+                    ' ', signal.bit_buffer.prompt_accumulator_integrated_code_blocks)
+            # The prompt amplitude decaying over tens of seconds is the thing
+            # that stops the decoder, so log what would explain it: the early /
+            # late imbalance (the DLL's own view of how far off the peak the
+            # replica sits) and the two Dopplers plus the absolute code phase
+            # the host is steering with.
+            acc = Tracking.get_accumulators(
+                Tracking.get_last_fully_integrated_correlator(signal),
+            )
+            println(io, "D ", prn, ' ', boundary,
+                    ' ', abs(acc[1]), ' ', abs(acc[2]), ' ', abs(acc[3]),
+                    ' ', Tracking.get_carrier_doppler(sat),
+                    ' ', Tracking.get_code_doppler(sat),
+                    ' ', Tracking.get_code_phase(sat))
+        end
+    end
+    # ~1 s of chunks: the per-channel record-continuity counters. `lost` is in
+    # device samples of records the host never saw — at 4000 samples per code
+    # block that is directly the number of code blocks this satellite's
+    # navigation bit clock has slipped behind the sample axis.
+    if source.chunks % 500 == 0
+        for ch in eachindex(link.assignments)
+            assignment = link.assignments[ch]
+            isnothing(assignment) && continue
+            println(io, "C ", ch, ' ', assignment.prn, ' ', boundary,
+                    ' ', link.lost_record_samples[ch],
+                    ' ', link.overlapping_record_samples[ch],
+                    ' ', link.last_record_end[ch])
+        end
+        println(io, "L ", boundary, ' ', link.lost_record_gaps,
+                ' ', link.stale_dumps, ' ', link.dropped_dumps,
+                ' ', link.skipped_epochs)
+        flush(io)
+    end
+    track_state
+end
+
+# `receive(::AbstractHardwareCorrelatorSDR, …)` builds the link internally, so
+# to wrap it we build it here and go in through the sample-channel method.
+function hw_receive(
+    sdr,
+    io,
+    prompt_dir = mktempdir();
+    doppler_update_interval = nothing,
+    feedback_delay_epochs::Integer = 2,
+    acquire_async::Bool = true,
+    kwargs...,
+)
+    link = GNSSReceiver.HardwareCorrelatorLink(
+        sdr;
+        sampling_freq = FS,
+        reference_signal = GNSSReceiver.ranging_signal(gpsl1),
+        doppler_update_interval,
+        feedback_delay_epochs,
+    )
+    source = BitLogSource(link, io, Dict{Int,IO}(), prompt_dir, 0)
+    BIT_LOG_SOURCE[] = source
+    GNSSReceiver.receive(
+        GNSSReceiver.raw_sample_channel(sdr),
+        gpsl1,
+        FS;
+        correlator_source = source,
+        acquire_async,
+        kwargs...,
+    )
+end
+
+const BIT_LOG_SOURCE = Ref{Any}(nothing)
+const BIT_LOG_WARM = Ref{Union{Nothing,IO}}(devnull)
 
 my_extract(state) = (
     data = GNSSReceiver.default_data_of_interest(state),
@@ -174,10 +321,9 @@ function warm_up()
         close(sdr.raw)
         close(sdr.dumps)
     end
-    data = GNSSReceiver.receive(
+    data = hw_receive(
         sdr,
-        gpsl1,
-        FS;
+        BIT_LOG_WARM[];
         prns = [1, 2, 3, 4, 5, 7],
         acq_min_doppler_coverage = ACQ_COVERAGE,
         acq_coherent_integration_time = 10ms,
@@ -667,10 +813,14 @@ function main()
 
     strong_prns = [Int(r.prn) for r in strong[1:min(end, 6)]]
     @info "receiver PRN set: $strong_prns"
-    data = GNSSReceiver.receive(
+    bit_log = isempty(BIT_LOG_NAME) ? nothing :
+              open(joinpath(dirname(@__FILE__), BIT_LOG_NAME), "w")
+    isnothing(bit_log) ||
+        @info "logging every soft bit and 1 ms prompt to $(BIT_LOG_NAME)"
+    data = hw_receive(
         sdr,
-        gpsl1,
-        FS;
+        bit_log,
+        dirname(@__FILE__);
         prns = strong_prns,
         acq_min_doppler_coverage = ACQ_COVERAGE,
         acq_coherent_integration_time = 10ms,
@@ -764,6 +914,16 @@ function main()
     end
 
     @info "stopping"
+    let link = BIT_LOG_SOURCE[].link
+        @info "record continuity: " * join(
+            [string(a.prn, "→ch", ch, " lost=", link.lost_record_samples[ch],
+                    "smp overlap=", link.overlapping_record_samples[ch], "smp")
+             for (ch, a) in enumerate(link.assignments) if !isnothing(a)], "  ")
+        @info string("link: gaps=", link.lost_record_gaps, " stale=", link.stale_dumps,
+                     " dropped=", link.dropped_dumps, " skipped_epochs=", link.skipped_epochs)
+    end
+    isnothing(bit_log) || close(bit_log)
+    foreach(close, values(BIT_LOG_SOURCE[].prompts))
     for (prn, v) in bits_log
         open(joinpath(homedir(), "hwfix/run", "bits_c93_prn$(prn).f32"), "w") do io
             write(io, v)
