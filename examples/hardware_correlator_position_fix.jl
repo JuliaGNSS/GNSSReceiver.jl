@@ -246,6 +246,7 @@ mutable struct CpuReference
     const carrier_cycles::Vector{Float64}
     const carrier_ref::Vector{Int64}
     const last_carrier_hz::Vector{Float64}
+    const since_search::Vector{Int}      # records since this channel was aligned
     const seen::Vector{Int}
     sign::Int                            # carrier mixing sign, 0 until voted
     records::Int
@@ -255,6 +256,14 @@ mutable struct CpuReference
     max_wait::Int64                      # deepest record→sample lag seen, samples
     cpu_seconds::Float64
 end
+
+# How often each channel re-runs the coarse alignment search, in records. The
+# first record of an occupancy is the worst one to anchor on — it can be a
+# partial integration, and it is the one whose loop state is least settled — so
+# the anchor is re-measured on a healthy record a couple of seconds later, and
+# the `R` lines it writes make reference alignment observable over the whole run
+# rather than assumed from one measurement at handover.
+const XCORR_RESEARCH_RECORDS = 2000
 
 function CpuReference(io::IO, origin::Integer, fs::Real, n_channels::Integer;
                       ring_seconds = 0.5, prns = Set{Int}(), every::Integer = 1,
@@ -268,6 +277,7 @@ function CpuReference(io::IO, origin::Integer, fs::Real, n_channels::Integer;
         fill(typemin(Int64), n_channels), zeros(n_channels), zeros(n_channels),
         zeros(Int32, n_channels), zeros(n_channels),
         fill(typemin(Int64), n_channels), zeros(n_channels), zeros(Int, n_channels),
+        zeros(Int, n_channels),
         0, 0, 0, 0, 0, Int64(0), 0.0,
     )
     # Compile the kernels here rather than during the first live chunk: the
@@ -287,6 +297,7 @@ function CpuReference(io::IO, origin::Integer, fs::Real, n_channels::Integer;
                 "re_Pf im_Pf abs_Lf abs_Ef re_Pc im_Pc abs_Lc abs_Ec ",
                 "carrier_doppler code_doppler")
     println(io, "# A prn ch sample_index offset_samples offset_chips peak_over_median sign")
+    println(io, "# R prn ch sample_index offset_samples offset_chips peak_over_median")
     p
 end
 
@@ -399,8 +410,11 @@ function xcorr_compare!(p::CpuReference, rec::PendingRecord, s0::Int64)
     # A fresh occupant is coarse-aligned again. `delta` is not reset with it:
     # most of it is the host↔device axis error, which every channel shares, so
     # the previous occupant's value is the best starting point.
-    if p.occupant[ch] != rec.prn
+    fresh = p.occupant[ch] != rec.prn
+    p.since_search[ch] += 1
+    if fresh || p.since_search[ch] >= XCORR_RESEARCH_RECORDS
         p.occupant[ch] = rec.prn
+        p.since_search[ch] = 0
         offset, ratio, sign = search_offset(
             p.ws, p.ring, s0, n; code, cp_start, cps, freq = rec.carrier_hz,
             fs = p.fs, signs = p.sign == 0 ? (1, -1) : (p.sign,),
@@ -409,12 +423,14 @@ function xcorr_compare!(p::CpuReference, rec::PendingRecord, s0::Int64)
             p.sign = sign
             p.delta[ch] += offset * cps
             cp_start += offset * cps
-        else
+            p.anchor[ch] = p.delta[ch]
+        elseif fresh
             p.unaligned += 1
+            p.anchor[ch] = p.delta[ch]
         end
-        p.anchor[ch] = p.delta[ch]
-        @printf(p.io, "A %d %d %d %d %.4f %.2f %+d\n",
-                rec.prn, ch, rec.sample_index, offset, offset * cps, ratio, sign)
+        @printf(p.io, "%s %d %d %d %d %.4f %.2f%s\n", fresh ? "A" : "R",
+                rec.prn, ch, rec.sample_index, offset, offset * cps, ratio,
+                fresh ? (sign > 0 ? " +1" : " -1") : "")
     end
 
     late, prompt, early = correlate_epl(

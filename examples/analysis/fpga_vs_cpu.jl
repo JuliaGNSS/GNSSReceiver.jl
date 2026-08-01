@@ -44,7 +44,7 @@ Series(prn, ch) = Series(prn, ch, Int64[], Int[], Float64[], Float64[],
 
 function read_log(path)
     series = Dict{Int,Series}()
-    aligns = Tuple{Int,Int,Int,Float64,Float64,Int}[]
+    aligns = Tuple{Bool,Int,Int,Int,Float64,Float64}[]
     for line in eachline(path)
         (isempty(line) || line[1] == '#') && continue
         f = split(line)
@@ -63,10 +63,10 @@ function read_log(path)
             push!(s.lc, parse(Float64, f[14]))
             push!(s.ec, parse(Float64, f[15]))
             push!(s.carrier, parse(Float64, f[16]))
-        elseif f[1] == "A" && length(f) >= 7
-            push!(aligns, (parse(Int, f[2]), parse(Int, f[3]),
+        elseif (f[1] == "A" || f[1] == "R") && length(f) >= 7
+            push!(aligns, (f[1] == "A", parse(Int, f[2]), parse(Int, f[3]),
                            parse(Int, f[5]), parse(Float64, f[6]),
-                           parse(Float64, f[7]), parse(Int, f[8])))
+                           parse(Float64, f[7])))
         end
     end
     (series, aligns)
@@ -145,14 +145,29 @@ function _peak_exact(r, t, lo, hi, step)
     best_f
 end
 
-# How much of the two prompts is the *same* signal. `ρ = 1` means the FPGA
-# prompt is the CPU prompt up to a gain and a phase; the shortfall is noise one
-# of them has and the other does not.
-function coherence(s::Series, beat)
+# How much of the two prompts is the *same* signal, measured over windows of `m`
+# records. `ρ = 1` means the FPGA prompt IS the CPU prompt up to a gain and a
+# phase; the shortfall is noise one of them has and the other does not.
+#
+# Windowed, and reported at several window lengths, because the two are not
+# expected to hold a common phase forever: the CPU side mirrors the device's
+# carrier NCO from the frequencies the loop *commanded*, and the device applies
+# those words at its own moments and in its own quantisation, so the relative
+# phase random-walks over seconds. That walk is a property of the mirror, not a
+# defect of the correlator. The short window is the honest measure of whether
+# the two correlators agree; the long one measures how well the mirror tracks.
+function coherence(s::Series, beat; m::Int = 2)
     t = (s.sample .- s.sample[1]) ./ FS
-    num = sum(s.pf .* conj.(s.pc) .* cis.(-2π * beat .* t))
-    den = sqrt(sum(abs2, s.pf) * sum(abs2, s.pc))
-    den == 0 ? 0.0 : abs(num) / den
+    r = s.pf .* conj.(s.pc) .* cis.(-2π * beat .* t)
+    nb = length(r) ÷ m
+    nb == 0 && return 0.0
+    acc = 0.0
+    for b = 1:nb
+        idx = ((b-1)*m+1):(b*m)
+        den = sqrt(sum(abs2, view(s.pf, idx)) * sum(abs2, view(s.pc, idx)))
+        den > 0 && (acc += abs(sum(view(r, idx))) / den)
+    end
+    acc / nb
 end
 
 # Narrowband/wideband power ratio C/N0 (Beaulieu's NWPR), on blocks of `m`
@@ -220,6 +235,33 @@ end
 
 imbalance(e, l) = mean((e .- l) ./ max.(e .+ l, eps()))
 
+# Records where the FPGA prompt is far below what the same samples gave the CPU.
+# Added Gaussian noise does not do this; a dropped, truncated or saturated
+# integration does, and the two have very different fixes.
+function dropouts(s::Series, scale)
+    isapprox(scale, 0; atol = 0) && return (0, 0.0)
+    n = count(k -> abs(s.pf[k]) < 0.2 * scale * abs(s.pc[k]) && abs(s.pc[k]) > 0,
+              eachindex(s.pf))
+    (n, 100 * n / length(s.pf))
+end
+
+# The same C/N0 pair over time, so a transient — a stall, a reassignment, a
+# fade — cannot be read as a steady loss.
+function cn0_over_time(s::Series, edge::Int; bins::Int = 6)
+    n = length(s.pf)
+    per = max(20, (n ÷ bins) ÷ 20 * 20)
+    out = Tuple{Float64,Float64,Float64}[]
+    k = 1
+    while k + per - 1 <= n
+        seg = k:(k+per-1)
+        f, _ = nwpr_cn0(s.pf[seg], edge)
+        c, _ = nwpr_cn0(s.pc[seg], edge)
+        push!(out, ((s.sample[k] - s.sample[1]) / FS, f, c))
+        k += per
+    end
+    out
+end
+
 function report(s::Series, aligns)
     n = length(s.pf)
     n < 100 && (@printf("PRN %2d: only %d records — skipped\n", s.prn, n); return)
@@ -231,7 +273,7 @@ function report(s::Series, aligns)
     t = (s.sample .- s.sample[1]) ./ FS
     scale = abs(sum(s.pf .* conj.(s.pc) .* cis.(-2π * beat .* t))) / sum(abs2, s.pc)
     ratio = abs.(s.pf) ./ max.(scale .* abs.(s.pc), eps())
-    rho = coherence(s, beat)
+    rho = coherence(s, beat; m = 2)
     edge = best_edge(s.pc)
     cn0_f, blocks = nwpr_cn0(s.pf, edge)
     cn0_c, _ = nwpr_cn0(s.pc, edge)
@@ -241,25 +283,55 @@ function report(s::Series, aligns)
     @printf("\nPRN %2d  (hardware channel %d)\n", s.prn, s.channel)
     @printf("  %d records over %.1f s, %.0f Hz mean carrier Doppler\n",
             n, span, mean(s.carrier))
-    for a in aligns
-        a[1] == s.prn || continue
-        @printf("  coarse alignment: %+d samples (%+.3f chips), peak %.1f× floor, mixing sign %+d\n",
-                a[3], a[4], a[5], a[6])
+    mine = filter(a -> a[2] == s.prn, aligns)
+    for a in mine
+        @printf("  %s: %+d samples (%+.3f chips), peak %.1f× floor\n",
+                a[1] ? "alignment at handover" : "re-alignment", a[4], a[5], a[6])
     end
+    # A re-alignment that keeps finding the peak somewhere else is not a settled
+    # reference, and neither is a search that never rises above the floor.
+    weak = count(a -> a[6] < 4, mine)
+    moved = count(a -> !a[1] && abs(a[4]) >= 1, mine)
+    (weak > 0 || moved > 0) && @printf(
+        "  ⚠ %d alignment searches found no peak, %d re-alignments moved the reference\n",
+        weak, moved)
     @printf("  CPU-side code offset: %+.3f … %+.3f chips (the host↔device axis residual)\n",
             minimum(s.delta), maximum(s.delta))
     @printf("  amplitude scale Pf/Pc: %.4g (median of |Pf|/|Pc|: %.4g), per-record spread %.1f %%\n",
             scale, median(abs.(s.pf) ./ max.(abs.(s.pc), eps())), 100 * std(ratio))
-    @printf("  prompt coherence ρ = %.4f  ⇒  FPGA-only noise %+.1f dB relative to the common prompt\n",
+    @printf("  prompt coherence ρ = %.4f over 2 ms  ⇒  FPGA-only noise %+.1f dB relative to the common prompt\n",
             rho, excess)
+    @printf("      …over 20 ms %.4f, 100 ms %.4f, 1 s %.4f (the fall-off is the CPU's mirror of the device NCO drifting, not the correlator)\n",
+            coherence(s, beat; m = 20), coherence(s, beat; m = 100),
+            coherence(s, beat; m = 1000))
     @printf("  FPGA↔CPU beat frequency: %+.3f Hz  (0 ⇒ the carrier NCO runs at the commanded word)\n",
             beat)
     @printf("  C/N0 over %d bit-aligned 20 ms blocks: FPGA %.1f dBHz | CPU %.1f dBHz | Δ %+.1f dB\n",
             blocks, cn0_f, cn0_c, cn0_f - cn0_c)
     @printf("  20 ms bit decisions disagreeing: %d of %d (%.2f %%)\n",
             disagree, total, 100 * disagree / max(total, 1))
+    ndrop, pdrop = dropouts(s, scale)
+    @printf("  FPGA prompts below 20 %% of the CPU's: %d (%.2f %%)\n", ndrop, pdrop)
     @printf("  early−late imbalance: FPGA %+.4f | CPU %+.4f\n",
             imbalance(s.ef, s.lf), imbalance(s.ec, s.lc))
+    # A CPU correlation of the same samples cannot be genuinely worse than the
+    # device's: same signal, same noise, unlimited precision. When it is, the
+    # reference is mis-aligned — a wrong code phase, a slipped axis — and every
+    # figure above is measuring the reference, not the device. Say so rather
+    # than let it read as a device defect.
+    if !isnan(cn0_c) && !isnan(cn0_f) && cn0_c < cn0_f - 3
+        @printf("  ⚠ the CPU reference is %.1f dB WORSE than the device — the reference is mis-aligned,\n",
+                cn0_f - cn0_c)
+        println("    so nothing above is a finding about the correlator (see this channel's A/R lines)")
+    end
+    bins = cn0_over_time(s, edge)
+    if length(bins) > 1
+        print("  C/N0 over time (s: FPGA/CPU):")
+        for (t, f, c) in bins
+            @printf("  %.0f: %.0f/%.0f", t, f, c)
+        end
+        println()
+    end
 end
 
 function main(args)
