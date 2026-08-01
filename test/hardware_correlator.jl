@@ -366,13 +366,21 @@ mutable struct SimulatedChannel
     active::Bool
 end
 
-mutable struct SimulatedFPGA{C} <: AbstractHardwareCorrelatorSDR
-    const raw::SignalChannel
+# Every field is concretely typed, including `raw` and `system`. That is not
+# cosmetic: `GPSL1CA` is a *parametric* type (`GPSL1CA{Matrix{Int16}}` — it
+# carries its code table), so a bare `system::GPSL1CA` field is abstract, and
+# the per-sample `get_code(sdr.system, …)` in `_correlate_chunk!` then goes
+# through dynamic dispatch and boxes its result: ~430 B per sample, i.e.
+# ~1.7 GB of garbage per second of replayed signal, which is most of the
+# closed-loop test's runtime.
+mutable struct SimulatedFPGA{C,R<:SignalChannel,S<:AbstractGNSSSignal} <:
+               AbstractHardwareCorrelatorSDR
+    const raw::R
     const dumps::PipeChannel{CorrelatorDump{C}}
     const ncos::PipeChannel{NCOUpdate}
     const channels::Vector{SimulatedChannel}
     const lock::ReentrantLock
-    const system::GPSL1CA
+    const system::S
     const sampling_freq::Float64
     const epoch_length::Int
     # The device's free-running sample counter, shared by both streams.
@@ -531,7 +539,9 @@ end
     true_code_freq =
         nominal_code_freq + true_doppler * get_code_center_frequency_ratio(system)
 
-    sdr = SimulatedFPGA{EPL}(
+    # The type parameters follow from the field types, so the default
+    # constructor infers them.
+    sdr = SimulatedFPGA(
         SignalChannel{ComplexF64,1}(chunk, 4),
         PipeChannel{CorrelatorDump{EPL}}(1 << 16),
         PipeChannel{NCOUpdate}(1 << 12),
