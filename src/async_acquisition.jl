@@ -85,7 +85,7 @@ mutable struct BandAcquisitionWorker{T,P<:NamedTuple,R<:NamedTuple}
     # was ever viable on this host.
     dispatched_scans::Int
     completed_scans::Int
-    merged_detections::Int
+    detected_prns::Int
     last_scan_seconds::Float64
 end
 
@@ -532,7 +532,14 @@ function acquire_band_async(
         worker.in_flight = false
         worker.completed_scans += 1
         worker.last_scan_seconds = response.scan_seconds
-        worker.merged_detections += sum(length, values(response.results); init = 0)
+        # `acquire!` returns one result per PRN *searched*, so count the ones
+        # that actually passed the detector — "the scans found nothing" and "the
+        # scans never ran" look identical otherwise.
+        worker.detected_prns += sum(
+            results -> count(res -> is_detected(res; pfa = acq_pfa), results),
+            values(response.results);
+            init = 0,
+        )
         # Reuse the window store for the next scan rather than allocating one.
         worker.spare = response.samples
         track_state, receiver_sat_states = merge_scan(

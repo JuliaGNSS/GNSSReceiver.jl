@@ -170,7 +170,7 @@ end
     # measured duration carried with it.
     @test worker.dispatched_scans == 1
     @test worker.completed_scans == 1
-    @test worker.merged_detections == 1
+    @test worker.detected_prns == 1
     @test worker.last_scan_seconds == 0.42
 
     # And the periodic timer was restarted at the dispatching chunk (whose
