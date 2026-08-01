@@ -16,7 +16,19 @@ using GNSSReceiver:
     close_acquisition!
 
 # A GPS L1 C/A signal at a known code phase and Doppler, plus unit-variance noise.
-function l1ca_signal(num_samples, prn, sampling_freq; code_phase, doppler, amplitude, rng)
+# `first_sample` is the absolute sample index the block starts at, so consecutive
+# blocks are one continuous signal and a producer can generate as many as a test
+# needs.
+function l1ca_signal(
+    num_samples,
+    prn,
+    sampling_freq;
+    code_phase,
+    doppler,
+    amplitude,
+    rng,
+    first_sample = 0,
+)
     system = GPSL1CA()
     fs = ustrip(Hz, sampling_freq)
     code_freq =
@@ -24,7 +36,7 @@ function l1ca_signal(num_samples, prn, sampling_freq; code_phase, doppler, ampli
         doppler * get_code_center_frequency_ratio(system)
     samples = Matrix{ComplexF64}(undef, num_samples, 1)
     for n = 0:(num_samples-1)
-        t = n / fs
+        t = (first_sample + n) / fs
         samples[n+1, 1] =
             amplitude * get_code(system, code_phase + code_freq * t, prn) *
             cis(2π * doppler * t) + randn(rng, ComplexF64) / sqrt(2)
@@ -179,30 +191,46 @@ end
 @testset "Asynchronous acquisition locks a satellite through `receive`" begin
     # End to end: only a merge that puts the handover on the right code phase
     # (and a pipeline that kept tracking while the scan ran) ends in lock.
+    #
+    # The stream has to stay alive until the scan comes back, which is the whole
+    # reason asynchronous acquisition is real-time only: a *fixed* number of
+    # chunks pushed as fast as the pipeline eats them is a race the scan loses on
+    # a fast host — the run simply ends first (this test was flaky exactly that
+    # way). So the producer generates signal on demand and stops when the
+    # consumer has seen what it is waiting for, with a cap so a broken merge
+    # fails the test instead of hanging it.
     system = GPSL1CA()
     prn = 19
     key = get_signal_id(system)
     sampling_freq = 4e6Hz
     chunk = 4000
-    num_chunks = 400
+    max_chunks = 20_000            # 20 s of signal; the cap, not the expectation
     rng = Random.Xoshiro(0xBEE7)
-    signal = l1ca_signal(
-        num_chunks * chunk,
-        prn,
-        sampling_freq;
-        code_phase = 512.3,
-        doppler = -800.0,
-        amplitude = 0.35,       # ≈ 48 dBHz against unit-variance noise
-        rng,
-    )
+    locked = Ref(false)
+    enough = Threads.Atomic{Bool}(false)
+    chunks_produced = Ref(0)
 
     measurement_channel = GNSSReceiver.spawn_signal_channel_thread(;
         T = ComplexF64,
         num_samples = chunk,
         num_antenna_channels = 1,
     ) do ch
-        for c = 1:num_chunks
-            put!(ch, signal[((c-1)*chunk+1):(c*chunk), :])
+        for c = 0:(max_chunks-1)
+            enough[] && break
+            put!(
+                ch,
+                l1ca_signal(
+                    chunk,
+                    prn,
+                    sampling_freq;
+                    code_phase = 512.3,
+                    doppler = -800.0,
+                    amplitude = 0.35,   # ≈ 48 dBHz against unit-variance noise
+                    rng,
+                    first_sample = c * chunk,
+                ),
+            )
+            chunks_produced[] = c + 1
         end
     end
 
@@ -215,12 +243,21 @@ end
         # A synthetic signal carries no navigation data, so PVT can never solve.
         time_in_lock_before_calculating_pvt = 1000u"s",
     )
-    results = collect_data(data_channel)
+    # Stop the stream once the satellite has been merged AND held for a while, so
+    # the assertion is about a converged loop rather than a fresh handover.
+    n_locked = Ref(0)
+    GNSSReceiver.consume_channel(data_channel) do data
+        if haskey(data.sat_data, (key, prn)) && data.sat_data[(key, prn)].cn0 > 40dBHz
+            n_locked[] += 1
+            if n_locked[] >= 10        # ≥ 1 s of signal in lock
+                locked[] = true
+                enough[] = true
+            end
+        end
+    end
 
-    @test !isempty(results)
-    final = last(results)
-    @test haskey(final.sat_data, (key, prn))
-    @test final.sat_data[(key, prn)].cn0 > 40dBHz
+    @test locked[]
+    @test chunks_produced[] < max_chunks   # i.e. it locked before the cap
 end
 
 @testset "The inline scheduler is unchanged by the new seam" begin
