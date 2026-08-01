@@ -391,6 +391,21 @@ mutable struct HardwareCorrelatorLink{
     # sample = none).
     const anchor_sample::Vector{Int64}
     const anchor_code_phase::Vector{Float64}
+    # ── Record continuity, per hardware channel ───────────────────────────────
+    # A channel's records tile the sample axis: each one covers
+    # `[sample_index - integrated_samples, sample_index)`, so the next one must
+    # start exactly where this one ended. This vector holds that expected start
+    # (`typemin` = no record folded on the channel yet, e.g. right after an
+    # assignment). Anything else is a discontinuity, and the two counters below
+    # record it — see `_account_record_continuity!` for why the bit clock, not
+    # the loop filters, is what a lost record damages.
+    const last_record_end::Vector{Int64}
+    # Device samples this channel's record stream is missing, i.e. summed
+    # forward gaps. Reset when the channel is (re)assigned.
+    const lost_record_samples::Vector{Int64}
+    # How far this channel's records have overlapped (a record starting before
+    # the previous one ended: a duplicate or a device counter step back).
+    const overlapping_record_samples::Vector{Int64}
     # How many epochs the fold loop will replay in one chunk before treating the
     # shortfall as a gap and resynchronising the grid (see `fold_closed_epochs!`).
     const max_catchup_epochs::Int
@@ -408,6 +423,9 @@ mutable struct HardwareCorrelatorLink{
     stale_dumps::Int
     unassignable_signals::Int
     skipped_epochs::Int
+    # Number of forward gaps seen across all channels (the *samples* they cost
+    # are per channel, above).
+    lost_record_gaps::Int
 end
 
 function HardwareCorrelatorLink(
@@ -460,9 +478,13 @@ function HardwareCorrelatorLink(
         fill(typemin(Int64), n),
         fill(typemin(Int64), n),
         fill(NaN, n),
+        fill(typemin(Int64), n),
+        zeros(Int64, n),
+        zeros(Int64, n),
         Int(max_catchup_epochs),
         typemin(Int),
         typemin(Int),
+        0,
         0,
         0,
         0,
@@ -571,6 +593,9 @@ function release_stale_channels!(link, track_state)
         link.phase_ref_sample[hw_channel] = typemin(Int64)
         link.anchor_sample[hw_channel] = typemin(Int64)
         link.anchor_code_phase[hw_channel] = NaN
+        link.last_record_end[hw_channel] = typemin(Int64)
+        link.lost_record_samples[hw_channel] = 0
+        link.overlapping_record_samples[hw_channel] = 0
         # Any dump still in flight for this channel now refers to a satellite
         # that is gone; `fold_closed_epochs!` drops it as stale.
     end
@@ -649,6 +674,11 @@ function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampl
     link.phase_ref_sample[hw_channel] = typemin(Int64)
     link.anchor_sample[hw_channel] = typemin(Int64)
     link.anchor_code_phase[hw_channel] = NaN
+    # A fresh occupant starts a fresh record stream: the previous satellite's
+    # end sample says nothing about where this one's first record begins.
+    link.last_record_end[hw_channel] = typemin(Int64)
+    link.lost_record_samples[hw_channel] = 0
+    link.overlapping_record_samples[hw_channel] = 0
     link
 end
 
@@ -850,6 +880,61 @@ function append_epoch_outputs!(link, track_state, boundary)
     link
 end
 
+# A channel's records tile the sample axis: record `k` covers
+# `[sample_index - integrated_samples, sample_index)`, so record `k+1` must
+# start exactly where record `k` ended. Measure the discontinuity.
+#
+# This matters far more than it looks. The loop filters key off each record's
+# own `integrated_samples`, so a lost record costs them nothing but one missed
+# update — but the *navigation bit clock* counts code blocks as they are folded
+# (`Tracking.buffer` completes a bit once the accumulated block count reaches
+# `num_code_blocks_that_form_a_bit`), so a record the host never sees moves that
+# satellite's bit boundary permanently by the record's length. Tracking, C/N0
+# and bit sync all stay healthy while the bit stream sits off its 20 ms grid;
+# only the decoder notices, and only as "a valid preamble never appears again".
+# `Tracking.advance_bit_clock` is what puts the clock back, and the gap record
+# appended below is how this path asks for it.
+function _account_record_continuity!(
+    link,
+    track_state,
+    assignment,
+    sat_state,
+    hw_channel,
+    output,
+)
+    expected_start = link.last_record_end[hw_channel]
+    record_start = output.sample_index - output.integrated_samples
+    if expected_start != typemin(Int64)
+        gap = record_start - expected_start
+        if gap > 0
+            link.lost_record_samples[hw_channel] += gap
+            link.lost_record_gaps += 1
+            # Hand the fold a record covering exactly the missing span with a
+            # zeroed correlator. `Tracking` reads that as "this much time passed
+            # and nothing is known about it": the loop filters, the prompt
+            # filter and the C/N0 estimator skip it (they would only be poisoned
+            # by a zero prompt), while the bit clock is credited the blocks it
+            # covers. The bit straddling the gap comes out weak, and every bit
+            # after it stays on the 20 ms grid.
+            append_correlator_output!(
+                track_state,
+                Tracking.CorrelatorOutput(
+                    zero(get_correlator(sat_state, assignment.signal_index)),
+                    gap,
+                    record_start,
+                ),
+                assignment.group_key,
+                assignment.prn,
+                assignment.signal_index,
+            )
+        elseif gap < 0
+            link.overlapping_record_samples[hw_channel] -= gap
+        end
+    end
+    link.last_record_end[hw_channel] = output.sample_index
+    link
+end
+
 function _append_dump!(link, track_state, dump)
     hw_channel = Int(dump.channel)
     checkbounds(Bool, link.assignments, hw_channel) || (link.stale_dumps += 1; return link)
@@ -862,6 +947,14 @@ function _append_dump!(link, track_state, dump)
         return link
     end
     sat_state = get_sat_state(track_state, assignment.group_key, assignment.prn)
+    _account_record_continuity!(
+        link,
+        track_state,
+        assignment,
+        sat_state,
+        hw_channel,
+        dump.output,
+    )
     append_correlator_output!(
         track_state,
         _retag_spacing(get_correlator(sat_state, assignment.signal_index), dump.output),
