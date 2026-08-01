@@ -18,8 +18,10 @@
 #      returns a fix; it then rides RUN_AFTER_FIX seconds and stops.
 #
 # Usage:
-#   julia -t 4,2 --project=. hardware_correlator_position_fix.jl [MAX_SECONDS] [RUN_AFTER_FIX]
-# (defaults 600 and 30; the periodic rescan cadence is acquire_every below.)
+#   julia -t 6,2 --project=. hardware_correlator_position_fix.jl [MAX_SECONDS] [RUN_AFTER_FIX]
+# (defaults 600 and 30; HWFIX_ACQ_EVERY / HWFIX_ASYNC set the rescan cadence and
+#  whether the scan runs off the processing task. One default-pool thread is for
+#  the acquisition worker, so give it at least three.)
 #
 # Companion branches (this exact stack produced the first live fix 2026-08-01,
 # lat 50.768612° lon 6.072698° alt 271.2 m):
@@ -38,9 +40,9 @@
 #     --rx-gain 60 --tx-att 89
 #     (long flags only; a bare m2sdr_rf resets to 30.72M/2.4GHz defaults)
 #   Verify: m2sdr_record streams ~32 MB/s with ~0 adjacent-duplicate samples.
-#   Acquisition scans stall the processing pipeline for seconds and the
-#   channels free-run meanwhile (~0.1 chips/s); keep that window short —
-#   MAXN power mode + jetson_clocks helped decisively on the Orin.
+#   MAXN power mode + jetson_clocks: the scan itself now overlaps tracking
+#   (asynchronous acquisition), but it still competes for cores with the fold
+#   and the CSR/DMA reader, so the clocks matter.
 
 using Printf
 using Statistics: mean, median, std
@@ -77,6 +79,14 @@ const ACQ_COVERAGE = 25_000.0Hz          # one-sided; LO offset ~14 kHz + Dopple
 const CN0_FLOOR_DBHZ = 38.0              # calibration satellite quality gate
 const MAX_SECONDS = length(ARGS) >= 1 ? parse(Float64, ARGS[1]) : 600.0
 const RUN_AFTER_FIX = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 30.0
+# Periodic rescan cadence. Acquisition now runs off the processing task
+# (`acquire_async`), so a scan no longer stalls the chunk pipeline and a real
+# rescan cadence is affordable — the `t=` vs `rt=` gap in the progress line is
+# the direct measurement of that. `HWFIX_ASYNC=0` puts the search back inline
+# for comparison, which is what forced the earlier runs to disable the rescan
+# altogether (`acquire_every = 300 s`).
+const ACQ_EVERY = parse(Float64, get(ENV, "HWFIX_ACQ_EVERY", "30")) * u"s"
+const ACQ_ASYNC = get(ENV, "HWFIX_ASYNC", "1") == "1"
 
 const gpsl1 = GPSL1CA()
 const RAW_CHUNKS = Threads.Atomic{Int}(0)
@@ -174,6 +184,9 @@ function warm_up()
         acq_noncoherent_rounds = 3,
         max_meas = 2^11,
         acquire_every = 50ms,
+        # Same scheduler as the live call, so its merge path is compiled here
+        # and not during the decode window.
+        acquire_async = ACQ_ASYNC,
         feedback_delay_epochs = 1,
         doppler_estimator = ConventionalAssistedPLLAndDLL(),
         extract = my_extract,
@@ -664,9 +677,11 @@ function main()
         acq_noncoherent_rounds = 3,
         max_meas = 2^11,
         # The first acquisition fires as soon as the buffer fills (the timer
-        # starts at -Inf); a long period after that keeps multi-second
-        # acquisition stalls out of the decode window.
-        acquire_every = 300u"s",
+        # starts at -Inf). With asynchronous acquisition the periodic rescan
+        # costs the pipeline nothing, so it runs at a cadence that can actually
+        # recover a lost satellite instead of being switched off.
+        acquire_every = ACQ_EVERY,
+        acquire_async = ACQ_ASYNC,
         # Loop-delay management: the correction from epoch k reaches the NCO
         # ~τ = (fold latency + feedback delay) later. The default 18 Hz PLL at
         # τ ≈ 4-5 ms sits in the delay-instability zone (BL·τ ≈ 0.08): power

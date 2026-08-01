@@ -326,6 +326,13 @@ for what a vendor package has to provide.
 (default: one primary code period of the first system's ranging signal), and
 `feedback_delay_epochs` how far ahead each NCO update is scheduled so the loop
 delay stays a known constant. Every other keyword is [`receive`](@ref)'s.
+
+Acquisition runs asynchronously by default here (`acquire_async = true`), unlike
+the plain sample-channel methods: a hardware-correlator receiver is live by
+construction, and a scan that blocked the chunk pipeline would delay the NCO
+feedback past the epochs it was scheduled for — every channel then free-runs and
+a long enough scan costs every lock. Pass `acquire_async = false` to override
+(e.g. for a deterministic test against a simulated device).
 """
 function receive(
     sdr::AbstractHardwareCorrelatorSDR,
@@ -333,6 +340,7 @@ function receive(
     sampling_freq;
     doppler_update_interval = nothing,
     feedback_delay_epochs::Integer = 2,
+    acquire_async::Bool = true,
     kwargs...,
 )
     link = HardwareCorrelatorLink(
@@ -347,6 +355,7 @@ function receive(
         systems,
         sampling_freq;
         correlator_source = link,
+        acquire_async,
         kwargs...,
     )
 end
@@ -376,6 +385,14 @@ function receive(
     # window). More rounds buy detection sensitivity on marginal signals at the
     # cost of a proportionally longer buffer and more acquisition compute.
     acq_noncoherent_rounds::Integer = 1,
+    # Run acquisition on a worker task per band instead of inline, so a scan
+    # (seconds of CPU on an embedded host) never stalls the chunk pipeline. For
+    # *live* receivers only: results are merged a few chunks later, which is
+    # exactly what a real-time stream needs and pointless for a file replay,
+    # where the samples arrive faster than a scan completes and inline
+    # acquisition is both quicker and deterministic. Needs at least two threads.
+    # See `async_acquisition.jl`.
+    acquire_async::Bool = false,
     # The tracking-loop estimator. Override to change the loop-filter
     # bandwidths — e.g. a hardware-correlator loop whose feedback delay spans
     # several epochs needs the PLL bandwidth reduced to keep `BL·τ` stable.
@@ -474,6 +491,21 @@ function receive(
     )
     initial_state = ReceiverState(band_systems, buffers; num_ants, doppler_estimator)
 
+    # Acquisition runs inline unless the caller asked for workers. The workers
+    # take ownership of the acquisition plans (`acquire!` mutates their FFT
+    # scratch), so exactly one of the two paths uses them.
+    acquisition =
+        acquire_async ?
+        AsyncAcquisition(
+            band_keys,
+            band_systems,
+            acq_plans,
+            map(b -> eltype(b.buffer), values(buffers)),
+            interm_freqs,
+            acq_pfa,
+            true,   # `subsample_interpolation`, as `process` defaults it
+        ) : InlineAcquisition()
+
     # The channel carries whatever `extract` returns. Infer that type without running
     # user code where possible (`promote_op`); for the default this is a concrete
     # `ReceiverDataOfInterest`. Fall back to calling `extract` on the (empty) initial
@@ -512,6 +544,7 @@ function receive(
                     interm_freqs;
                     downconvert_and_correlator = resolved_dc,
                     correlator_source,
+                    acquisition,
                     num_ants,
                     acquire_every,
                     acq_pfa,
@@ -555,6 +588,8 @@ function receive(
                 end
             end
         finally
+            # Ends the acquisition worker tasks (a no-op when acquisition is inline).
+            close_acquisition!(acquisition)
             # Close even when a chunk throws: consumers block in `take!` until the
             # channel closes, so leaving it open would hang them after a crash
             # (`errormonitor` only logs the failure).

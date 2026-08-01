@@ -571,6 +571,7 @@ include("read_file.jl")
 include("hardware_correlator.jl")
 include("receive.jl")
 include("process.jl")
+include("async_acquisition.jl")
 include("gui.jl")
 # The terminal dashboard is a Tachikoma app in its own module, so the UI framework's
 # exports stay out of `GNSSReceiver`'s namespace; only `gui` crosses back over.

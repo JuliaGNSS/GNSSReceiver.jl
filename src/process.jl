@@ -169,6 +169,11 @@ function process(
     # [`HardwareCorrelatorLink`](@ref) to take them from an FPGA correlator
     # instead; the raw samples then still drive acquisition, decoding and PVT.
     correlator_source = nothing,
+    # Where acquisition runs. [`InlineAcquisition`](@ref) searches on this task,
+    # inside this call; an [`AsyncAcquisition`](@ref) hands the window to a
+    # worker task instead and merges its results on a later chunk, so a scan
+    # never stalls tracking. `receive` builds the latter for `acquire_async`.
+    acquisition = InlineAcquisition(),
     num_ants::NumAnts{N} = NumAnts(1),
     acquire_every = 10u"s",
     acq_pfa = DEFAULT_ACQ_PFA,
@@ -194,50 +199,27 @@ function process(
     # share one runtime and signal duration.
     signal_duration = size(first(meas), 1) / sampling_freq
 
-    # Acquisition only touches state when a periodic scan is due on some band or a satellite
-    # qualifies for reacquisition. On the common steady-state frame neither holds, so skip
-    # `_acquire_all_bands` entirely — its per-band buffer resets and NamedTuple merges would
-    # otherwise allocate every chunk. Buffers are rebuilt only if one still holds samples
-    # (they must be emptied so the next scan's coherent window stays gap-free). This is a
-    # pure allocation optimisation: the full path is a no-op on these frames anyway (see
-    # `acquire_band`), so results are identical.
-    acq_due =
-        any(t -> runtime - t >= acquire_every, values(receiver_state.last_time_acquisition_ran))
-    reacq_due =
-        any(d -> any(should_reacquire, d), values(receiver_state.receiver_sat_states))
+    # (Re)acquire — on this task or on an acquisition worker, depending on the
+    # scheduler; see `advance_acquisition`.
     track_state, receiver_sat_states, acquisition_buffers, last_time_acquisition_ran =
-        if acq_due || reacq_due
-            _acquire_all_bands(
-                receiver_state.track_state,
-                receiver_state.receiver_sat_states,
-                receiver_state.acquisition_buffers,
-                receiver_state.last_time_acquisition_ran,
-                band_keys,
-                band_systems,
-                meas,
-                interm_freqs,
-                acq_plans,
-                (
-                    runtime,
-                    num_ants,
-                    acquire_every,
-                    acq_pfa,
-                    code_lock_cn0_threshold,
-                    subsample_interpolation,
-                ),
-            )
-        else
-            buffers =
-                all(b -> b.current_length == 0, values(receiver_state.acquisition_buffers)) ?
-                receiver_state.acquisition_buffers :
-                map(SampleBuffers.reset, receiver_state.acquisition_buffers)
+        advance_acquisition(
+            acquisition,
+            receiver_state,
+            band_keys,
+            band_systems,
+            meas,
+            interm_freqs,
+            acq_plans,
+            sampling_freq,
             (
-                receiver_state.track_state,
-                receiver_state.receiver_sat_states,
-                buffers,
-                receiver_state.last_time_acquisition_ran,
-            )
-        end
+                runtime,
+                num_ants,
+                acquire_every,
+                acq_pfa,
+                code_lock_cn0_threshold,
+                subsample_interpolation,
+            ),
+        )
 
     # Single multi-band tracking pass: one `BandMeasurement` per band, keyed by
     # band, fed to one `track!` call over the shared multi-band `TrackState`.

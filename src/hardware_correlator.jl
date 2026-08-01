@@ -138,6 +138,27 @@ Scheduling the update at a *named* sample rather than "as soon as it arrives"
 is what makes the feedback delay deterministic: the correction computed from
 epoch `k` lands at `k + n` for a fixed `n` chosen by the host, instead of
 whenever PCIe happens to deliver it. The loop filter can then account for `n`.
+
+!!! warning "Updates overlap: a device must never let one cancel another"
+    One update per assigned channel is pushed per folded epoch, so at a 1 kHz
+    fold rate the next update reaches the device ~1 ms after the last while
+    `apply_at_sample` is one or more epochs ahead — the successor **always**
+    arrives before its predecessor is due. A device that stages a commit in a
+    single register set (a common gateware shape, e.g. the LiteX-M2SDR's
+    `apply_at`/`arm` pair) must therefore not treat arming as a queue: if a new
+    arm replaces a pending commit, no NCO word ever reaches the replicas and
+    every channel silently free-runs on its handover values while the loops look
+    healthy on the host. That failure cost a season of "tracks, then walks off
+    and never decodes" in issue #107.
+
+    A vendor package has three sound options, in order of preference: apply the
+    words at `apply_at_sample` from a real queue; apply them *immediately* on
+    arrival and accept the transport jitter (correct for a rate-only correction —
+    a small unknown delay beats a correction that never lands, and this is what
+    GNSSM2SDR does, reserving the scheduled path for sample-exact handovers); or
+    reject the update and report it, so the receiver sees the loop is open.
+    Silently dropping either the new or the pending update is the one
+    unacceptable choice.
 """
 struct NCOUpdate
     channel::Int32
