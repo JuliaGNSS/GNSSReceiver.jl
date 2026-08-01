@@ -41,6 +41,21 @@
 # sees ~1/50 of the bits. `advance_tracking!` runs after the fold and before
 # `decode` consumes the buffer, so what it sees IS what the decoder gets.
 #
+# FPGA-vs-CPU correlator probe (issue #107). Set HWFIX_XCORR=<name> to correlate
+# the *same raw samples* on the CPU, with the *same NCO parameters*, once per
+# hardware record, and log both prompts side by side:
+#
+#   HWFIX_XCORR=xcorr.log HWFIX_XCORR_PRNS=7,20 julia -t 6,2 --project=. \
+#       hardware_correlator_position_fix.jl 120 10
+#   julia analysis/fpga_vs_cpu.jl xcorr.log
+#
+# This is the direct measurement of what the hardware correlator loses: the
+# 200 s bit-error study (issue #107) put a ~3 % BER on the FPGA bit stream while
+# the pure software receiver validated full ephemerides off the same DMA0 stream
+# in the same minute, which leaves only the correlator itself. Both streams see
+# one input, so every shared error source — antenna, RF, DMA0, acquisition —
+# cancels, and the residual is the device's.
+#
 # Companion branches (this exact stack produced the first live fix 2026-08-01,
 # lat 50.768612° lon 6.072698° alt 271.2 m):
 #   GNSSM2SDR.jl feat/code-phase-anchor — immediate-CSR NCO updates, record
@@ -71,7 +86,7 @@ using Geodesy: LLAfromECEF, wgs84
 
 using Acquisition: acquire
 using FFTW
-using GNSSSignals: GPSL1CA, get_code
+using GNSSSignals: GPSL1CA, get_code, get_code_frequency
 import Tracking
 using Tracking: ConventionalAssistedPLLAndDLL
 using SignalChannels: SignalChannel
@@ -109,6 +124,15 @@ const ACQ_ASYNC = get(ENV, "HWFIX_ASYNC", "1") == "1"
 const gpsl1 = GPSL1CA()
 # Bit-stream instrument (issue #107): unset means no logging, no cost.
 const BIT_LOG_NAME = get(ENV, "HWFIX_BITLOG", "")
+# FPGA-vs-CPU correlator probe (issue #107): likewise off unless named.
+const XCORR_LOG_NAME = get(ENV, "HWFIX_XCORR", "")
+# Restrict the probe to these PRNs (empty ⇒ every assigned satellite). One CPU
+# correlation per hardware record costs ~50 µs, so five satellites at 1 kHz add
+# ~0.25 s of CPU per second of signal to the *processing task* — watch the
+# `t=` vs `rt=` gap and narrow this (or raise HWFIX_XCORR_EVERY) if it grows.
+const XCORR_PRNS =
+    Set(parse.(Int, filter(!isempty, split(get(ENV, "HWFIX_XCORR_PRNS", ""), ','))))
+const XCORR_EVERY = parse(Int, get(ENV, "HWFIX_XCORR_EVERY", "1"))
 const RAW_CHUNKS = Threads.Atomic{Int}(0)
 
 # Cap FFTW's own pthread pool: acquisition storms (initial + per-satellite
@@ -130,6 +154,228 @@ using PipeChannels: PipeChannel
 using Tracking: CorrelatorOutput, EarlyPromptLateCorrelator
 using GNSSReceiver: CorrelatorDump, NCOUpdate, AbstractHardwareCorrelatorSDR, epoch_strobe
 
+# ── FPGA ↔ CPU correlator probe ───────────────────────────────────────────────
+# Correlate the same raw samples the FPGA correlated, over the same span, with
+# the same NCO parameters, and log both prompts per record.
+#
+# The alignment is the whole trick. A hardware record covers device samples
+# `[sample_index - integrated_samples, sample_index)` and reports the code NCO's
+# own phase at its end; the raw stream is the same samples, offset by the
+# constant `sdr.device_origin` (the run's origin calibration is what pins it).
+# So the probe rings the raw chunks by device index and, for each record, slices
+# exactly that span back out. Nothing is resampled or re-timed: if the two
+# prompts disagree, the disagreement is in the correlator.
+#
+# Three things are deliberately NOT taken from the host's model of the device:
+#
+#   * The code phase comes off the wire (`CorrelatorDump.code_phase`), so the
+#     CPU replica sits where the device's replica actually sat, not where the
+#     host thinks it steered it.
+#   * A slow CPU-side DLL (`delta`, chips) rides on top of it. An exact device
+#     axis leaves it at zero; a residual is the host↔device sample-mapping error
+#     in chips, measured rather than assumed — and it keeps the CPU reference on
+#     the peak while that is measured, so the comparison stays fair.
+#   * The mixing sign is voted on at the first record rather than inherited from
+#     Tracking's convention: getting it wrong costs the CPU side all of its
+#     correlation gain, and nothing else in the output would say so.
+#
+# The carrier *frequency* is shared on purpose — both sides mix with the Doppler
+# the loop commanded. A carrier NCO that does not honour that word then shows up
+# offline as a phase ramp on the FPGA prompt against a stationary CPU one.
+#
+# The kernels live in `analysis/cpu_correlator.jl` so they can be pinned against
+# an analytically known injected signal without a board; see
+# `analysis/selftest_cpu_correlator.jl`.
+include(joinpath(@__DIR__, "analysis", "cpu_correlator.jl"))
+using .CpuCorrelator: SampleRing, Workspace, push_chunk!, covers, correlate_epl,
+    search_offset
+
+# The coarse search slides the code replica ±this many whole samples (±16 chips
+# at 4 MHz), which covers any plausible residual of the origin calibration.
+const XCORR_SEARCH_SAMPLES = 64
+
+mutable struct CpuReference
+    const io::IO
+    # Device sample index of host raw-sample 0, i.e. `sdr.device_origin` at the
+    # moment `receive` took the stream over. Constant for the run.
+    const origin::Int64
+    const fs::Float64
+    const ring::SampleRing
+    const ws::Workspace
+    const codes::Dict{Int,Vector{Float32}}
+    const prns::Set{Int}
+    const every::Int
+    # Per hardware channel.
+    const last_index::Vector{Int64}      # newest record seen, for dedup
+    const delta::Vector{Float64}         # CPU code-phase offset, chips
+    const anchor::Vector{Float64}        # where the coarse search put `delta`
+    const occupant::Vector{Int32}        # PRN the probe last coarse-aligned to
+    const seen::Vector{Int}
+    sign::Int                            # carrier mixing sign, 0 until voted
+    records::Int
+    skipped_old::Int                     # record older than the ring
+    skipped_future::Int                  # record newer than the delivered samples
+    unaligned::Int                       # coarse search found no peak
+    cpu_seconds::Float64
+end
+
+function CpuReference(io::IO, origin::Integer, fs::Real, n_channels::Integer;
+                      ring_seconds = 0.5, prns = Set{Int}(), every::Integer = 1)
+    p = CpuReference(
+        io, Int64(origin), Float64(fs),
+        SampleRing(round(Int, ring_seconds * fs)),
+        Workspace(2 * CHUNK, XCORR_SEARCH_SAMPLES),
+        Dict{Int,Vector{Float32}}(), Set{Int}(prns), Int(every),
+        fill(typemin(Int64), n_channels), zeros(n_channels), zeros(n_channels),
+        zeros(Int32, n_channels), zeros(Int, n_channels), 0, 0, 0, 0, 0, 0.0,
+    )
+    # Compile the kernels here rather than during the first live chunk: the
+    # probe runs inside the processing task, and a JIT pause there is a chunk
+    # backlog and a burst of stale NCO commits. They are separate methods, so
+    # they have to be *run*, not merely referenced — over the still-zeroed ring,
+    # which correlates to nothing and costs a millisecond. Nothing durable is
+    # touched: the sign vote is `search_offset`'s return value, not its state.
+    let n = 400, code = xcorr_code_table!(p, 1)
+        correlate_epl(p.ws, p.ring, Int64(0), n; code, cp_start = 0.0,
+                      cps = 0.2558, freq = 1000.0, fs = p.fs, sign = 1, shift = 1)
+        search_offset(p.ws, p.ring, Int64(0), n; code, cp_start = 0.0,
+                      cps = 0.2558, freq = 1000.0, fs = p.fs,
+                      margin = XCORR_SEARCH_SAMPLES)
+    end
+    println(io, "# X prn ch sample_index n code_phase delta_chips ",
+                "re_Pf im_Pf abs_Lf abs_Ef re_Pc im_Pc abs_Lc abs_Ec ",
+                "carrier_doppler code_doppler")
+    println(io, "# A prn ch sample_index offset_samples offset_chips peak_over_median sign")
+    p
+end
+
+xcorr_code_table!(p::CpuReference, prn::Integer) = get!(p.codes, Int(prn)) do
+    Float32[get_code(gpsl1, i, prn) for i = 0:(CA_CODE_LENGTH-1)]
+end
+
+# Until the first usable vote, mix as Tracking does; every `A` line carries the
+# vote's evidence, so a run that never voted says so.
+_xcorr_sign(p::CpuReference) = p.sign == 0 ? 1 : p.sign
+
+xcorr_append!(p::CpuReference, samples, host_start::Integer) =
+    push_chunk!(p.ring, samples, p.origin + Int64(host_start))
+
+# One record: correlate the raw span the FPGA integrated over, at the code phase
+# the FPGA reported, with the Doppler the loop commanded — then log both sides.
+function xcorr_record!(p::CpuReference, assignments, track_state, dump)
+    ch = Int(dump.channel)
+    (1 <= ch <= length(p.last_index)) || return p          # epoch strobe
+    dump.output.sample_index <= p.last_index[ch] && return p
+    p.last_index[ch] = dump.output.sample_index
+    assignment = assignments[ch]
+    isnothing(assignment) && return p
+    assignment.prn == Int(dump.prn) || return p
+    (isempty(p.prns) || assignment.prn in p.prns) || return p
+    isnan(dump.code_phase) && return p
+    p.seen[ch] += 1
+    (p.every > 1 && p.seen[ch] % p.every != 0) && return p
+
+    sat_states = Tracking.get_sat_states(track_state, assignment.group_key)
+    haskey(sat_states, assignment.prn) || return p
+    sat = sat_states[assignment.prn]
+    tracked = Tracking.get_signals(sat)[assignment.signal_index]
+    signal = Tracking.get_signal(tracked)
+
+    n = Int(dump.output.integrated_samples)
+    s1 = Int64(dump.output.sample_index)
+    s0 = s1 - n
+    (n <= 0 || n > length(p.ws.mixed)) && return p
+    # The record has to lie inside the samples the receiver has delivered:
+    # `:future` means the dump overtook its own raw samples (it cannot, unless
+    # the axis is wrong), `:old` that the ring already rolled over it.
+    status = covers(p.ring, s0, n)
+    if status === :future
+        p.skipped_future += 1
+        return p
+    elseif status === :old
+        p.skipped_old += 1
+        return p
+    end
+
+    code_freq = ustrip(Hz, get_code_frequency(signal)) +
+                ustrip(Hz, uconvert(Hz, Tracking.get_code_doppler(sat)))
+    cps = code_freq / p.fs
+    carrier_hz = ustrip(Hz, uconvert(Hz, Tracking.get_carrier_doppler(sat)))
+    code = xcorr_code_table!(p, assignment.prn)
+    # Whole-sample Early↔Late spacing, quantised exactly the way `_assign!`
+    # quantised it for the gateware, so the CPU taps sit where the device's do.
+    shift = max(1, round(Int, Tracking.get_early_late_sample_spacing(
+        Tracking.get_correlator(tracked), p.fs * Hz, code_freq * Hz) / 2))
+    # The dump's phase is the replica's at the end of the integration.
+    cp_start = dump.code_phase - n * cps + p.delta[ch]
+
+    # A fresh occupant is coarse-aligned again. `delta` is not reset with it:
+    # most of it is the host↔device axis error, which every channel shares, so
+    # the previous occupant's value is the best starting point.
+    if p.occupant[ch] != Int32(assignment.prn)
+        p.occupant[ch] = Int32(assignment.prn)
+        offset, ratio, sign = search_offset(
+            p.ws, p.ring, s0, n; code, cp_start, cps, freq = carrier_hz,
+            fs = p.fs, signs = p.sign == 0 ? (1, -1) : (p.sign,),
+            margin = XCORR_SEARCH_SAMPLES)
+        if ratio >= 4
+            p.sign = sign
+            p.delta[ch] += offset * cps
+            cp_start += offset * cps
+        else
+            p.unaligned += 1
+        end
+        p.anchor[ch] = p.delta[ch]
+        @printf(p.io, "A %d %d %d %d %.4f %.2f %+d\n",
+                assignment.prn, ch, s1, offset, offset * cps, ratio, sign)
+    end
+
+    late, prompt, early = correlate_epl(
+        p.ws, p.ring, s0, n; code, cp_start, cps, freq = carrier_hz, fs = p.fs,
+        sign = _xcorr_sign(p), shift)
+
+    # Slow normalised early-late envelope DLL on the CPU side. Deliberately
+    # sluggish, and bounded to the coarse search's anchor: it exists to hold the
+    # reference on the peak and to *measure* the residual axis error, not to
+    # track the satellite — the FPGA is doing that.
+    denom = abs(early) + abs(late)
+    if denom > 0
+        disc = (abs(early) - abs(late)) / denom
+        p.delta[ch] = clamp(p.delta[ch] + 0.05 * disc * shift * cps,
+                            p.anchor[ch] - 2.0, p.anchor[ch] + 2.0)
+    end
+
+    acc = Tracking.get_accumulators(dump.output.correlator)   # [late, prompt, early]
+    lf, pf, ef = _xcorr_scalar(acc[1]), _xcorr_scalar(acc[2]), _xcorr_scalar(acc[3])
+    @printf(p.io, "X %d %d %d %d %.4f %.4f %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.3f %.5f\n",
+            assignment.prn, ch, s1, n, dump.code_phase, p.delta[ch],
+            real(pf), imag(pf), abs(lf), abs(ef),
+            real(prompt), imag(prompt), abs(late), abs(early),
+            carrier_hz, ustrip(Hz, uconvert(Hz, Tracking.get_code_doppler(sat))))
+    p.records += 1
+    p
+end
+
+_xcorr_scalar(x::Complex) = x
+_xcorr_scalar(x::AbstractVector) = x[1]      # multi-antenna: antenna 0 only
+
+# Every record the link drained this chunk. `drain_buffer` is the link's own
+# batch `take!` scratch, so reading it here tees the dump stream without a
+# second consumer on the SPSC ring; records the drain did not refresh are
+# filtered out by the per-channel `sample_index` dedup.
+#
+# `xcorr_record!` gets the assignment table rather than the link so that its
+# specialisation depends only on the record and tracking-state types — the
+# warm-up's stub SDR then compiles the same method the live run calls.
+function xcorr_process!(p::CpuReference, link, track_state)
+    t0 = time()
+    for dump in link.drain_buffer
+        xcorr_record!(p, link.assignments, track_state, dump)
+    end
+    p.cpu_seconds += time() - t0
+    p
+end
+
 # ── Bit-stream instrument ─────────────────────────────────────────────────────
 # `receive`'s payload channel emits once per `pvt_update_interval` (100 ms) but
 # the bit buffer is reset every chunk (2 ms), so the run-script bit log sees
@@ -147,6 +393,10 @@ mutable struct BitLogSource{L}
     # measured offline, and the bits re-derived at all 20 edge hypotheses.
     const prompts::Dict{Int,IO}
     const prompt_dir::String
+    # The FPGA-vs-CPU probe, or `nothing`. It hangs off the same wrapper because
+    # it needs both halves of one chunk: the raw samples on the way in, and the
+    # records the fold drained on the way out.
+    const xcorr::Union{Nothing,CpuReference}
     chunks::Int
 end
 
@@ -156,12 +406,22 @@ function GNSSReceiver.advance_tracking!(
     track_state,
     band_systems,
 )
+    probe = source.xcorr
+    # Ring the chunk BEFORE the fold: `advance_tracking!` is what advances
+    # `samples_consumed`, so this is the one moment its value still names the
+    # first sample of this chunk.
+    isnothing(probe) || xcorr_append!(
+        probe,
+        Tracking.get_samples(first(values(band_measurements))),
+        source.link.samples_consumed,
+    )
     track_state = GNSSReceiver.advance_tracking!(
         source.link,
         band_measurements,
         track_state,
         band_systems,
     )
+    isnothing(probe) || xcorr_process!(probe, source.link, track_state)
     io = source.io
     isnothing(io) && return track_state
     source.chunks += 1
@@ -233,6 +493,7 @@ function hw_receive(
     doppler_update_interval = nothing,
     feedback_delay_epochs::Integer = 2,
     acquire_async::Bool = true,
+    xcorr = nothing,
     kwargs...,
 )
     link = GNSSReceiver.HardwareCorrelatorLink(
@@ -242,7 +503,7 @@ function hw_receive(
         doppler_update_interval,
         feedback_delay_epochs,
     )
-    source = BitLogSource(link, io, Dict{Int,IO}(), prompt_dir, 0)
+    source = BitLogSource(link, io, Dict{Int,IO}(), prompt_dir, xcorr, 0)
     BIT_LOG_SOURCE[] = source
     GNSSReceiver.receive(
         GNSSReceiver.raw_sample_channel(sdr),
@@ -324,6 +585,10 @@ function warm_up()
     data = hw_receive(
         sdr,
         BIT_LOG_WARM[];
+        # The probe's own kernels are compiled by its constructor; this is for
+        # the wrapper around them, which only exists when the probe does.
+        xcorr = isempty(XCORR_LOG_NAME) ? nothing :
+                CpuReference(devnull, 0, FS_HZ, 5; ring_seconds = 0.05),
         prns = [1, 2, 3, 4, 5, 7],
         acq_min_doppler_coverage = ACQ_COVERAGE,
         acq_coherent_integration_time = 10ms,
@@ -817,10 +1082,25 @@ function main()
               open(joinpath(dirname(@__FILE__), BIT_LOG_NAME), "w")
     isnothing(bit_log) ||
         @info "logging every soft bit and 1 ms prompt to $(BIT_LOG_NAME)"
+    # The probe's device axis is `sdr.device_origin` as it stands now — the
+    # calibrated origin plus everything the pre-receiver drainer ate. It is
+    # fixed for the rest of the run, which is exactly what makes a raw sample
+    # addressable by the device index a record reports.
+    xcorr_log = isempty(XCORR_LOG_NAME) ? nothing :
+                open(joinpath(dirname(@__FILE__), XCORR_LOG_NAME), "w")
+    probe = isnothing(xcorr_log) ? nothing :
+            CpuReference(xcorr_log, sdr.device_origin, FS_HZ,
+                         GNSSReceiver.num_hardware_channels(sdr);
+                         prns = XCORR_PRNS, every = XCORR_EVERY)
+    isnothing(probe) || @info string(
+        "FPGA-vs-CPU probe → ", XCORR_LOG_NAME, " (origin ", sdr.device_origin,
+        ", PRNs ", isempty(XCORR_PRNS) ? "all" : join(sort!(collect(XCORR_PRNS)), ","),
+        ", every ", XCORR_EVERY, " records)")
     data = hw_receive(
         sdr,
         bit_log,
         dirname(@__FILE__);
+        xcorr = probe,
         prns = strong_prns,
         acq_min_doppler_coverage = ACQ_COVERAGE,
         acq_coherent_integration_time = 10ms,
@@ -921,6 +1201,15 @@ function main()
              for (ch, a) in enumerate(link.assignments) if !isnothing(a)], "  ")
         @info string("link: gaps=", link.lost_record_gaps, " stale=", link.stale_dumps,
                      " dropped=", link.dropped_dumps, " skipped_epochs=", link.skipped_epochs)
+    end
+    if !isnothing(probe)
+        @info string(
+            "FPGA-vs-CPU probe: ", probe.records, " records, mixing sign ", probe.sign,
+            ", CPU-side delta ", join([@sprintf("%.3f", d) for d in probe.delta], "/"),
+            " chips; skipped ", probe.skipped_future, " too-new / ", probe.skipped_old,
+            " rolled-out, ", probe.unaligned, " unaligned, ",
+            @sprintf("%.1f", probe.cpu_seconds), " s of CPU")
+        close(xcorr_log)
     end
     isnothing(bit_log) || close(bit_log)
     foreach(close, values(BIT_LOG_SOURCE[].prompts))
