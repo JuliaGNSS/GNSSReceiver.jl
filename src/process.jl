@@ -603,79 +603,6 @@ function acquire_satellites(
     track_state, receiver_sat_states
 end
 
-# The acquisition grid leaves a carrier-Doppler error of up to half a bin even
-# with subsample interpolation (10 ms coherent → 100 Hz bins → ±25 Hz or so).
-# A software tracking loop swallows that during pull-in, but the
-# hardware-correlator path adds a feedback delay of a few epochs, which shrinks
-# the reliably pulled-in error to a few Hz — most handovers are lost at birth.
-# Polish each detection on the very acquisition window it came from: wipe code
-# and coarse carrier, form one prompt per code period, square the prompts to
-# strip the BPSK data modulation, and locate the residual carrier by DFT. Over
-# a ≥20 ms window this lands within ~1-2 Hz, well inside pull-in range.
-function refine_carrier_dopplers(acq_res, signal, sampling_freq, interm_freq, acq_pfa)
-    sig = signal isa AbstractMatrix ? view(signal, :, 1) : signal
-    map(acq_res) do res
-        (
-            is_detected(res; pfa = acq_pfa) &&
-            isfinite(res.carrier_doppler) &&
-            isfinite(res.code_phase)
-        ) || return res
-        refined = squared_prompt_doppler(res, sig, sampling_freq, interm_freq)
-        @set res.carrier_doppler = oftype(res.carrier_doppler, refined)
-    end
-end
-
-function squared_prompt_doppler(res, sig, sampling_freq, interm_freq)
-    fs = Float64(ustrip(Hz, sampling_freq))
-    d0 = Float64(ustrip(Hz, res.carrier_doppler))
-    f0 = Float64(ustrip(Hz, interm_freq)) + d0
-    system = res.system
-    code_len = Int(get_code_length(system))
-    nominal_chip_rate = Float64(ustrip(Hz, get_code_frequency(system)))
-    # Doppler-corrected chip rate: over a 100 ms window a raw-rate replica would
-    # slide ~0.7 chips at 14 kHz LO offset and smear the late prompts.
-    chip_rate =
-        nominal_chip_rate *
-        (1.0 + d0 / Float64(ustrip(Hz, get_center_frequency(system))))
-    samples_per_code_period = round(Int, fs * code_len / nominal_chip_rate)
-    num_code_periods = min(100, length(sig) ÷ samples_per_code_period)
-    # Below ~20 periods the squared-DFT grid is too coarse to improve on the
-    # acquisition estimate; keep it.
-    num_code_periods < 20 && return d0 * Hz
-    code = Float32[get_code(system, i, res.prn) for i = 0:(code_len-1)]
-    code_phase_start = Float64(res.code_phase)
-    prompts = Vector{ComplexF64}(undef, num_code_periods)
-    carrier_step = -2π * f0 / fs
-    chips_per_sample = chip_rate / fs
-    @inbounds for m = 1:num_code_periods
-        acc = zero(ComplexF64)
-        base = (m - 1) * samples_per_code_period
-        for k = 1:samples_per_code_period
-            n = base + k - 1
-            chip = floor(Int, muladd(chips_per_sample, n, code_phase_start)) % code_len
-            acc += ComplexF64(sig[base+k]) * code[chip+1] * cis(carrier_step * n)
-        end
-        prompts[m] = acc
-    end
-    # Squaring doubles the residual carrier and removes the ±1 data modulation;
-    # the prompt sequence is sampled once per code period, so the doubled
-    # residual is unambiguous over ±(fs_prompt/4) — far beyond the ±60 Hz the
-    # acquisition grid can be wrong by.
-    squared = prompts .^ 2
-    code_period_s = samples_per_code_period / fs
-    centers = ((1:num_code_periods) .- 0.5) .* code_period_s
-    best_offset = 0.0
-    best_power = -1.0
-    for offset = -60.0:1.0:60.0
-        power = abs(sum(squared[m] * cis(-4π * offset * centers[m]) for m = 1:num_code_periods))
-        if power > best_power
-            best_power = power
-            best_offset = offset
-        end
-    end
-    (d0 + best_offset) * Hz
-end
-
 # One acquisition pass over `prns` on the buffered window, merged back into the
 # receiver: acquire, advance the detected code phases to the current frame, then
 # update the tracking and satellite states. Shared by the periodic scan and fast
@@ -701,14 +628,6 @@ function acquire_and_update_states(
         prns;
         interm_freq,
         subsample_interpolation,
-    )
-
-    acq_res = refine_carrier_dopplers(
-        acq_res,
-        SampleBuffers.get_samples(acquisition_buffer),
-        acq_plan.sampling_freq,
-        interm_freq,
-        acq_pfa,
     )
 
     corrected_acq_res = correct_code_phases(acq_res, acquisition_buffer, num_samples)

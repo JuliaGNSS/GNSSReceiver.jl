@@ -34,10 +34,9 @@ end
 
 # A worker with no task behind it: the test plays the worker, so every step of
 # the scheduler's per-chunk contract is observed exactly when it happens.
-function idle_worker(acq_plan, group_key, ::Type{T}, interm_freq, acq_pfa) where {T}
+function idle_worker(acq_plan, group_key, ::Type{T}, interm_freq) where {T}
     prn_type = NamedTuple{(group_key,),Tuple{Vector{Int}}}
-    result_vector_type =
-        GNSSReceiver._scan_result_type(acq_plan, T, interm_freq, acq_pfa)
+    result_vector_type = GNSSReceiver._scan_result_type(acq_plan, T, interm_freq)
     result_type = NamedTuple{(group_key,),Tuple{result_vector_type}}
     BandAcquisitionWorker(
         Channel{AcquisitionRequest{T,prn_type}}(1),
@@ -72,7 +71,7 @@ end
         [prn];
         num_coherently_integrated_code_periods = 4,
     )
-    worker = idle_worker(acq_plan, key, ComplexF64, 0.0Hz, GNSSReceiver.DEFAULT_ACQ_PFA)
+    worker = idle_worker(acq_plan, key, ComplexF64, 0.0Hz)
     scheduler = AsyncAcquisition(NamedTuple{(band_key,)}((worker,)))
 
     state = GNSSReceiver.ReceiverState(
@@ -132,7 +131,6 @@ end
         (acq_plan,),
         request,
         0.0Hz,
-        GNSSReceiver.DEFAULT_ACQ_PFA,
         true,
         typeof(worker.empty_results),
     )
@@ -276,7 +274,6 @@ end
         (; key => acq_plan),
         (ComplexF64,),
         (0.0Hz,),
-        GNSSReceiver.DEFAULT_ACQ_PFA,
         true,
     )
     worker = scheduler.workers[band_key]

@@ -502,7 +502,6 @@ function receive(
             acq_plans,
             map(b -> eltype(b.buffer), values(buffers)),
             interm_freqs,
-            acq_pfa,
             true,   # `subsample_interpolation`, as `process` defaults it
         ) : InlineAcquisition()
 

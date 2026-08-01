@@ -101,33 +101,23 @@ struct AsyncAcquisition{W<:NamedTuple}
     workers::W
 end
 
-# The two calls the worker task makes, as plain functions so their return type
-# can be inferred (`Base.promote_op`) without running an acquisition.
-function _acquire_and_refine(
-    acq_plan,
-    samples,
-    prns,
-    interm_freq,
-    acq_pfa,
-    subsample_interpolation,
-)
-    acq_res = acquire!(acq_plan, samples, prns; interm_freq, subsample_interpolation)
-    refine_carrier_dopplers(acq_res, samples, acq_plan.sampling_freq, interm_freq, acq_pfa)
-end
+# The search the worker task runs, as a plain function so its return type can be
+# inferred (`Base.promote_op`) without running an acquisition.
+_search(acq_plan, samples, prns, interm_freq, subsample_interpolation) =
+    acquire!(acq_plan, samples, prns; interm_freq, subsample_interpolation)
 
 # Concrete result-vector type of one group's scan, derived from the plan and the
 # sample type rather than by running one. Falls back to the abstract element
 # type if inference cannot pin it: the merge then dispatches dynamically, which
 # costs one scan's worth of dynamic calls every `acquire_every` and never
 # touches the per-chunk path.
-function _scan_result_type(acq_plan, ::Type{T}, interm_freq, acq_pfa) where {T}
+function _scan_result_type(acq_plan, ::Type{T}, interm_freq) where {T}
     result_type = Base.promote_op(
-        _acquire_and_refine,
+        _search,
         typeof(acq_plan),
         Vector{T},
         Vector{Int},
         typeof(interm_freq),
-        typeof(acq_pfa),
         Bool,
     )
     isconcretetype(result_type) ? result_type : Vector{Acquisition.AcquisitionResults}
@@ -140,19 +130,11 @@ function _scan_group(
     samples,
     prns,
     interm_freq,
-    acq_pfa,
     subsample_interpolation,
     ::Type{V},
 ) where {V}
     isempty(prns) && return V()
-    _acquire_and_refine(
-        acq_plan,
-        samples,
-        prns,
-        interm_freq,
-        acq_pfa,
-        subsample_interpolation,
-    )
+    _search(acq_plan, samples, prns, interm_freq, subsample_interpolation)
 end
 
 # Run a whole request: every group of the band, in the group order the results
@@ -161,7 +143,6 @@ function _run_scan(
     acq_plans::Tuple,
     request::AcquisitionRequest,
     interm_freq,
-    acq_pfa,
     subsample_interpolation,
     ::Type{R},
 ) where {R}
@@ -172,7 +153,6 @@ function _run_scan(
                 request.samples,
                 prns,
                 interm_freq,
-                acq_pfa,
                 subsample_interpolation,
                 V,
             ),
@@ -193,11 +173,10 @@ function _spawn_band_worker(
     group_keys::NTuple{N,Symbol},
     acq_plans::Tuple,
     interm_freq,
-    acq_pfa,
     subsample_interpolation,
 ) where {T,N}
     prn_type = NamedTuple{group_keys,NTuple{N,Vector{Int}}}
-    result_types = map(plan -> _scan_result_type(plan, T, interm_freq, acq_pfa), acq_plans)
+    result_types = map(plan -> _scan_result_type(plan, T, interm_freq), acq_plans)
     result_type = NamedTuple{group_keys,Tuple{result_types...}}
     # Capacity one: `in_flight` already bounds the receiver to a single
     # outstanding scan per band, so neither `put!` can ever block.
@@ -228,14 +207,7 @@ function _spawn_band_worker(
         end
         scan_start = time()
         results = try
-            _run_scan(
-                acq_plans,
-                request,
-                interm_freq,
-                acq_pfa,
-                subsample_interpolation,
-                result_type,
-            )
+            _run_scan(acq_plans, request, interm_freq, subsample_interpolation, result_type)
         catch e
             # A failed scan must not take the worker (or the receiver) down: the
             # next one runs on the next window. Reported once rather than every
@@ -266,11 +238,13 @@ end
 
 """
     AsyncAcquisition(band_keys, band_systems, acq_plans, sample_types, interm_freqs,
-                     acq_pfa, subsample_interpolation)
+                     subsample_interpolation)
 
 Spawn one acquisition worker per band. `sample_types` are the per-band scalar
 sample element types (the acquisition buffers'), everything else is
-[`receive`](@ref)'s per-band acquisition configuration.
+[`receive`](@ref)'s per-band acquisition configuration. Detection itself is not
+the worker's business — it hands every result back and the merge applies the
+CFAR test, so the false-alarm probability stays a `process` keyword.
 """
 function AsyncAcquisition(
     band_keys::NTuple{NB,Symbol},
@@ -278,7 +252,6 @@ function AsyncAcquisition(
     acq_plans,
     sample_types::Tuple,
     interm_freqs::Tuple,
-    acq_pfa,
     subsample_interpolation,
 ) where {NB}
     if Threads.nthreads() < 2
@@ -297,7 +270,6 @@ function AsyncAcquisition(
             group_keys,
             values(acq_plans[group_keys]),
             interm_freq,
-            acq_pfa,
             subsample_interpolation,
         )
     end
@@ -655,9 +627,11 @@ end
 # Merge a finished scan into the receiver state. The only thing the delay
 # changes is how far the code phases have to be advanced: acquisition reports
 # them at the start of its window, and `advance_code_phase` propagates them at
-# the acquired code rate to the frame being processed now. Over the ~1-3 s a
-# scan takes, the refined Doppler (~1-2 Hz) leaves a few thousandths of a chip
-# of propagation error — far below the acquisition estimate's own accuracy.
+# the acquired code rate to the frame being processed now. Over the ~1-3 s a scan
+# takes, the acquisition Doppler's own error (half a bin, ~25 Hz on a 10 ms grid)
+# propagates into ~0.05 chips of code-phase error — an order of magnitude below
+# the DLL's half-chip pull-in, and the same order as the acquisition code-phase
+# estimate itself.
 function merge_scan(
     response::AcquisitionResponse,
     track_state,
