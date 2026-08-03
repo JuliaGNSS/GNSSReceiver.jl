@@ -7,10 +7,13 @@ using Test,
     Geodesy,
     AstroTime,
     PositionVelocityTime,
+    RINEXParser,
     StaticArrays,
     Random,
     Accessors,
     Acquisition,
+    Accessors,
+    Dates,
     Dictionaries,
     LinearAlgebra,
     Scratch
@@ -33,6 +36,7 @@ include("vector_tracking.jl")
 include("prn_selection.jl")
 include("gui.jl")
 include("save_data.jl")
+include("rinex.jl")
 include("receive.jl")
 include("sample_buffer.jl")
 include("ion_rtlsdr_integration.jl")

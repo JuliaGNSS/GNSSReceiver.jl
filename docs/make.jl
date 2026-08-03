@@ -27,6 +27,7 @@ makedocs(
         "Acquisition & Tracking Parameters" => "parameters.md",
         "Worked Example (Real Data)" => "example.md",
         "Custom Receiver Output" => "custom_output.md",
+        "RINEX Output" => "rinex.md",
         "Graphical User Interface" => "gui.md",
         "API Reference" => "api.md",
     ],

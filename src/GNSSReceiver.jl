@@ -36,6 +36,25 @@ using Unitful: m, s, ms, Hz, dBHz, dB, °, uconvert
 # packages (they replaced the vendored `channel.jl` / `soapy_sdr_helper.jl`). The
 # SDR streaming (`stream_data` / `SDRChannelConfig`) comes from SignalChannels'
 # SoapySDR extension, which `using SoapySDR` above loads.
+# RINEX 3.05 file formatting lives in its own receiver-agnostic package; `rinex.jl` is
+# only the glue that turns receiver state into its record types.
+using RINEXParser:
+    RinexObsHeader,
+    RinexObsWriter,
+    ObsEpoch,
+    ObsValue,
+    SatObs,
+    write_epoch!,
+    RinexNavHeader,
+    RinexNavWriter,
+    GPSEphemeris,
+    GalileoEphemeris,
+    galileo_data_sources,
+    galileo_sv_health,
+    IonosphericCorrection,
+    TimeSystemCorrection,
+    write_ephemeris!
+
 using PipeChannels: PipeChannel
 using SignalChannels:
     SignalChannel,
@@ -57,7 +76,8 @@ export ReceiverState,
     get_gui_data_channel,
     write_to_file,
     gnss_receiver_gui,
-    gnss_write_to_file
+    gnss_write_to_file,
+    RinexConfig
 
 include("lock_detector.jl")
 include("beamformer.jl")
@@ -636,6 +656,7 @@ function ReceiverState(
 end
 
 include("read_file.jl")
+include("rinex.jl")
 include("receive.jl")
 include("process.jl")
 include("gui.jl")
@@ -663,6 +684,9 @@ identical channel config is used per antenna). Samples are streamed as `stream_t
 (default `ComplexF32`); pass `stream_type = Complex{Int16}` to use Tracking's fast integer
 backend on an Int16-native device, in which case `max_meas` (the front-end full-scale) is
 required. It is ignored for float stream types.
+
+Set `write_rinex = true` (or a [`RinexConfig`](@ref)) to record RINEX 3.05 observation and
+navigation files alongside the live display; see [`receive`](@ref).
 """
 function gnss_receiver_gui(;
     system = GPSL1CA(),
@@ -681,6 +705,8 @@ function gnss_receiver_gui(;
     # Front-end full-scale, required only when `stream_type` is `Complex{Int16}` (the
     # integer downconvert-and-correlator); ignored for float stream types (see `receive`).
     max_meas = nothing,
+    # RINEX 3.05 recording: `false`, `true`, or a `RinexConfig` (see `receive`).
+    write_rinex::Union{Bool,RinexConfig} = false,
 )
     systems = as_systems(system)
     num_samples_per_chunk = Int(upreferred(sampling_freq * chunk_time))
@@ -715,7 +741,15 @@ function gnss_receiver_gui(;
 
     # Performing GNSS acquisition and tracking. `receive`'s single-channel convenience
     # method wraps the stream and systems into the one-band tuple form.
-    data_channel = receive(data_stream, systems, sampling_freq; num_ants, interm_freq, max_meas)
+    data_channel = receive(
+        data_stream,
+        systems,
+        sampling_freq;
+        num_ants,
+        interm_freq,
+        max_meas,
+        write_rinex,
+    )
 
     gui_channel = get_gui_data_channel(data_channel)
 

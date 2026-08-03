@@ -36,5 +36,8 @@ single multi-GNSS PVT solution:
   a complete position fix computed from a public recording.
 - [Custom Receiver Output](https://JuliaGNSS.github.io/GNSSReceiver.jl/dev/custom_output/)
   — emit your own per-chunk data.
+- [RINEX Output](https://JuliaGNSS.github.io/GNSSReceiver.jl/dev/rinex/) — stream RINEX 3.05
+  observation and navigation files while receiving (`write_rinex = true`), for
+  post-processing in RTKLIB, gLAB or any other GNSS toolchain.
 - [Graphical User Interface](https://JuliaGNSS.github.io/GNSSReceiver.jl/dev/gui/) — the
   live terminal GUI.
