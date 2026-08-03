@@ -40,6 +40,11 @@ collect_data
 gui
 ```
 
+## RINEX output
+
+[`RinexConfig`](@ref) and the internals behind it are documented on the [RINEX Output](@ref)
+page, together with how the epochs are timed and what ends up in the files.
+
 ## Data types
 
 ```@docs
