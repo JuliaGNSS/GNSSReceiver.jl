@@ -9,6 +9,12 @@ on:
 jobs:
   release:
     name: Release
+    # semantic-release pushes its own version bump to main, which triggers
+    # this workflow again. That re-run races the tag push: when it loses, it
+    # does not see the tag it just released, recomputes the same version and
+    # fails because the version in Project.toml is already the one it wants
+    # to write. The message prefix comes from the release configuration.
+    if: "!startsWith(github.event.head_commit.message, 'build(release):')"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
