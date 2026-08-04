@@ -404,10 +404,11 @@ filter is doing through its [`VTStatus`](@ref).
 
 Set `write_rinex = true` to additionally stream RINEX 3.05 observation and navigation files
 to disk while receiving — pseudorange, carrier phase, Doppler and C/N0 per epoch, plus the
-decoded broadcast ephemerides. It is off by default; `write_rinex = RinexConfig(...)`
-configures the output paths, the epoch interval and the header metadata (see
-[`RinexConfig`](@ref)), and [`RinexLogger`](@ref) documents how epochs are timed. RINEX
-output is independent of `extract`, so a custom payload does not disturb it.
+decoded broadcast ephemerides — named by the RINEX long filename convention. It is off by
+default; `write_rinex = RinexConfig(...)` configures the directory and names, the epoch
+interval and the header metadata (see [`RinexConfig`](@ref)), and [`RinexLogger`](@ref)
+documents how epochs are timed. RINEX output is independent of `extract`, so a custom
+payload does not disturb it.
 
 The downconvert-and-correlator backend is auto-selected from the sample element type:
 `Complex{Int16}` inputs use Tracking's fast integer backend when `max_meas` (the front-end

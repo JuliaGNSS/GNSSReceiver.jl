@@ -12,9 +12,10 @@ RINEX output is **off by default**. Switch it on with the `write_rinex` keyword:
 receive(measurement_channel, GPSL1CA(), sampling_freq; write_rinex = true)
 ```
 
-which writes `gnss.obs` and `gnss.nav` in the working directory. Pass a
-[`RinexConfig`](@ref) instead of `true` to choose the paths, the epoch interval and the
-header metadata:
+which writes a pair of files named by the RINEX long filename convention into the working
+directory — `UNKN00XXX_R_20200010000_00U_01S_GO.rnx` and its `…_GN.rnx` navigation
+counterpart. Pass a [`RinexConfig`](@ref) instead of `true` to choose where they go, what
+the name says about the site, the epoch interval and the header metadata:
 
 ```julia
 receive(
@@ -22,16 +23,47 @@ receive(
     GPSL1CA(),
     sampling_freq;
     write_rinex = RinexConfig(;
-        obs_file = "roof.obs",
-        nav_file = "roof.nav",
+        directory = "recordings",
         interval = 1.0u"s",
-        marker_name = "ROOF-1",
+        period = 1u"hr",
+        marker_name = "ROOF12DEU",
         antenna_type = "TRM59800.00     SCIS",
         observer = "A. Observer",
         agency = "Example University",
     ),
 )
 ```
+
+That run writes `recordings/ROOF12DEU_R_20200010000_01H_01S_GO.rnx` and
+`recordings/ROOF12DEU_R_20200010000_01H_GN.rnx`. Set `obs_file` or `nav_file` to a path of
+your own to name a file yourself, or to `nothing` to skip it.
+
+## File names
+
+The names come from [RINEXParser's](https://github.com/JuliaGNSS/RINEXParser.jl)
+`rinex_filename`, which builds them from the header of the file being written, so they are
+the convention's own fields rather than anything this package invents:
+
+| Field                | Where it comes from                                                                                                                                                                                                              |
+|:-------------------- |:-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `XXXXMRCCC` site     | `marker_name`, which RINEX 3 expects to *be* the nine-character site identification — one is taken apart into station, monument, receiver and country, any other marker name yields the station alone (`"ROOF-1"` → `ROOF00XXX`) |
+| `R` data source      | always "from receiver data"                                                                                                                                                                                                      |
+| `YYYYDDDHHMM` start  | the first epoch the run stamped, in GNSS system time                                                                                                                                                                             |
+| `PPU` file period    | `period`, or `00U` where the length of the run was not planned                                                                                                                                                                   |
+| `FFU` data frequency | `interval`, so a 1 Hz run says `01S`; navigation names carry no such field                                                                                                                                                       |
+| `DT` data type       | the constellations being tracked and the kind of file: `GO`, `EO`, `MO`, `MN`, …                                                                                                                                                 |
+
+A long filename carries the start time of the file, and this receiver does not know that
+until its first fix — long after the files have to be open, since an unwritable path should
+fail at the `receive` call and a run that never gets a fix should still leave valid
+header-only files. So the files are written under the name the run's own wall clock gives
+them and renamed onto the name their data gives them when they are closed. Rerunning the
+same recording therefore lands on the same name and replaces it, and a run that never got a
+fix keeps the name it was opened under.
+
+Names are placed in `directory`, which also prefixes a relative `obs_file` or `nav_file`; an
+absolute one ignores it. The directory has to exist — a run does not create one, so a typo
+puts nothing in an unexpected place.
 
 The same keyword works on [`gnss_receiver_gui`](@ref), so a live SDR session can record
 RINEX while you watch the terminal display.
@@ -155,10 +187,10 @@ data_channel = receive(
     sampling_freq;
     pvt_approximate_year = 2017,   # resolves the GPS week-number rollover for old data
     write_rinex = RinexConfig(;
-        obs_file = joinpath(directory, "ion.obs"),
-        nav_file = joinpath(directory, "ion.nav"),
+        directory,
         interval = 1.0u"s",
-        marker_name = "ION-RTLSDR",
+        marker_name = "ION-RTLSDR",   # not a site identification, so it names the station
+        country = "NLD",              # the recording is from the Netherlands
         observer = "GNSSReceiver.jl",
     ),
 )
@@ -168,17 +200,26 @@ results = collect_data(data_channel)
 length(results)
 ```
 
+The names the files ended up with. The recording is from 2017, and the names say so: they
+report the start time of the data, not of the run that read it.
+
+```@example rinex
+readdir(directory)
+```
+
 The observation file — header, then one epoch record per second followed by one line per
 satellite:
 
 ```@example rinex
-print(join(first(readlines(joinpath(directory, "ion.obs")), 24), "\n"))
+obs_file = only(filter(endswith("GO.rnx"), readdir(directory; join = true)))
+print(join(first(readlines(obs_file), 24), "\n"))
 ```
 
 And the first broadcast ephemeris in the navigation file:
 
 ```@example rinex
-nav = readlines(joinpath(directory, "ion.nav"))
+nav_file = only(filter(endswith("GN.rnx"), readdir(directory; join = true)))
+nav = readlines(nav_file)
 print(join(nav[1:(findfirst(contains("END OF HEADER"), nav)+8)], "\n"))
 ```
 

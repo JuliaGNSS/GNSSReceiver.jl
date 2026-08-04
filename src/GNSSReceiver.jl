@@ -39,6 +39,7 @@ using Unitful: m, s, ms, Hz, dBHz, dB, °, uconvert
 # RINEX 3.05 file formatting lives in its own receiver-agnostic package; `rinex.jl` is
 # only the glue that turns receiver state into its record types.
 using RINEXParser:
+    rinex_filename,
     RinexObsHeader,
     RinexObsWriter,
     ObsEpoch,

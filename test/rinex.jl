@@ -830,6 +830,132 @@ end
     @test length(lines) - header_end == 8
 end
 
+@testset "RINEX files are named by the long filename convention" begin
+    # The state of the epoch tests: GPS week 2124 second 82596, 2020-09-20 22:56:36, which
+    # is day 264 of 2020 — so a derived name starts `20202642256`.
+    state = _rinex_receiver_state()
+    _run(config) = begin
+        logger = GNSSReceiver.RinexLogger(
+            config,
+            ((GPSL1CA(),),),
+            (0.0Hz,);
+            approximate_year = 2020,
+        )
+        GNSSReceiver.log_rinex!(logger, state)
+        close(logger)
+        logger
+    end
+
+    # Named by the convention by default: the site from the marker name, the data type from
+    # the constellation being tracked, the data frequency from the epoch interval.
+    directory = mktempdir()
+    logger = _run(RinexConfig(; directory, marker_name = "TEST-1"))
+    @test basename(logger.obs_path) == "TEST00XXX_R_20202642256_00U_01S_GO.rnx"
+    @test basename(logger.nav_path) == "TEST00XXX_R_20202642256_00U_GN.rnx"
+    # The name the file was opened under is gone, not left behind beside the final one.
+    @test sort(readdir(directory)) ==
+          sort([basename(logger.obs_path), basename(logger.nav_path)])
+    # And the name is one RINEXParser reads back into the fields it was built from.
+    name = parse(RinexFileName, logger.obs_path)
+    @test name.station == "TEST"
+    @test name.country == "XXX"
+    @test name.start_time == DateTime(2020, 9, 20, 22, 56)
+    @test name.interval == 1.0
+    @test isnothing(name.period)
+    @test (name.system, name.kind) == ('G', 'O')
+
+    # A marker name that is a site identification fills every site field of the name, and
+    # the collection period and country the receiver cannot know are configuration.
+    logger = _run(
+        RinexConfig(;
+            directory = mktempdir(),
+            marker_name = "ROOF12DEU",
+            period = Day(1),
+            interval = 2.0u"s",
+        ),
+    )
+    @test basename(logger.obs_path) == "ROOF12DEU_R_20202642256_01D_02S_GO.rnx"
+    logger = _run(
+        RinexConfig(; directory = mktempdir(), marker_name = "TEST-1", country = "DEU"),
+    )
+    @test basename(logger.obs_path) == "TEST00DEU_R_20202642256_00U_01S_GO.rnx"
+
+    # A period may be a unitful time, like the epoch interval beside it.
+    @test GNSSReceiver.rinex_period(1u"hr") == Second(3600)
+    @test GNSSReceiver.rinex_period(Day(1)) == Day(1)
+    @test isnothing(GNSSReceiver.rinex_period(nothing))
+    logger = _run(RinexConfig(; directory = mktempdir(), period = 1u"hr"))
+    @test basename(logger.obs_path) == "UNKN00XXX_R_20202642256_01H_01S_GO.rnx"
+
+    # A run with observations switched off stamps no epoch, so its navigation file is named
+    # after the first fix — the only absolute time it has.
+    logger = _run(
+        RinexConfig(; directory = mktempdir(), obs_file = nothing, marker_name = "TEST-1"),
+    )
+    @test isnothing(logger.obs_path)
+    @test basename(logger.nav_path) == "TEST00XXX_R_20202642256_00U_GN.rnx"
+
+    # A run that never got a fix stamped no epoch, so it has no start time of its own to be
+    # named after and keeps the name it was opened under — which is a name of the
+    # convention too, carrying the wall clock of the run instead.
+    directory = mktempdir()
+    logger = GNSSReceiver.RinexLogger(
+        RinexConfig(; directory, marker_name = "TEST-1"),
+        ((GPSL1CA(),),),
+        (0.0Hz,);
+        approximate_year = 2020,
+    )
+    close(logger)
+    @test isnothing(logger.session_start)
+    @test isfile(logger.obs_path)
+    opened = parse(RinexFileName, logger.obs_path)
+    @test opened.station == "TEST"
+    # The wall clock of the run, give or take the minute it may have rolled into.
+    @test Millisecond(0) <= now(UTC) - opened.start_time < Minute(2)
+    @test length(readdir(directory)) == 2
+
+    # A configured name is still a name, taken relative to the directory.
+    directory = mktempdir()
+    logger = _run(RinexConfig(; directory, obs_file = "roof.obs", nav_file = "roof.nav"))
+    @test logger.obs_path == joinpath(directory, "roof.obs")
+    @test logger.nav_path == joinpath(directory, "roof.nav")
+    @test sort(readdir(directory)) == ["roof.nav", "roof.obs"]
+    # An absolute one ignores the directory.
+    absolute = joinpath(mktempdir(), "abs.obs")
+    logger = _run(RinexConfig(; directory, obs_file = absolute, nav_file = nothing))
+    @test logger.obs_path == absolute
+    @test isfile(absolute)
+end
+
+@testset "a RINEX target and directory that cannot be written" begin
+    # A mistyped `:convention` is not a path, so it is rejected at the `receive` call.
+    @test_throws ArgumentError GNSSReceiver.rinex_config(
+        RinexConfig(; obs_file = :convension),
+    )
+    @test_throws ArgumentError GNSSReceiver.rinex_config(RinexConfig(; nav_file = :latest))
+    @test GNSSReceiver.rinex_config(RinexConfig()) == RinexConfig()
+
+    # A directory that is not there is not created behind the caller's back.
+    missing_directory = joinpath(mktempdir(), "not-there")
+    @test_throws ArgumentError GNSSReceiver.RinexLogger(
+        RinexConfig(; directory = missing_directory),
+        ((GPSL1CA(),),),
+        (0.0Hz,),
+    )
+    # Unless nothing is to be written there at all.
+    logger = GNSSReceiver.RinexLogger(
+        RinexConfig(;
+            directory = missing_directory,
+            obs_file = nothing,
+            nav_file = nothing,
+        ),
+        ((GPSL1CA(),),),
+        (0.0Hz,),
+    )
+    close(logger)
+    @test !isdir(missing_directory)
+end
+
 @testset "receive writes valid RINEX when disabled and when enabled" begin
     sampling_freq = 5e6Hz
     system = GPSL1CA()

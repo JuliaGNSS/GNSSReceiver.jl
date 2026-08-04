@@ -7,26 +7,51 @@ defaults below.
 
 # Keywords
 
-  - `obs_file`, `nav_file`: output paths. `nothing` skips that file, so
-    `RinexConfig(obs_file = nothing)` writes only the navigation (ephemeris) file.
+  - `directory`: where the files are written. A relative `obs_file` or `nav_file` is taken
+    relative to it, an absolute one ignores it, and a derived name is placed in it.
+  - `obs_file`, `nav_file`: `:convention` to let RINEXParser name the file by the RINEX
+    long filename convention (the default, see below), a path to name it yourself, or
+    `nothing` to skip that file — `RinexConfig(obs_file = nothing)` writes only the
+    navigation (ephemeris) file.
   - `interval`: spacing of the observation epochs, which are written at integer multiples of
     it in GNSS system time (see [`RinexLogger`](@ref) for the epoch steering). Because that
     grid is in system time and not receiver time, the rate is exactly this interval whatever
     the receiver's clock drift — but it must be comfortably longer than `receive`'s
     `pvt_update_interval`, which is how often an epoch time becomes available (see
     `check_epoch_cadence`).
+  - `period`: the intended collection period a derived name reports, as a `Dates.Period` or
+    a unitful time — `Day(1)`, `1u"hr"`. Left `nothing` the name says `00U`, not specified,
+    which is what the length of a run nobody planned is.
+  - `country`: ISO 3166-1 alpha-3 code of the site, for a derived name. Left `nothing` it
+    comes from `marker_name` where that is a site identification, and is `XXX` otherwise.
   - `marker_name`, `marker_type`, `observer`, `agency`, `receiver_number`,
     `receiver_type`, `antenna_number`, `antenna_type`: verbatim observation-header
     metadata. The receiver cannot know these, so they default to RINEX placeholders.
+    `marker_name` also names the site of a derived file name: RINEX 3 expects the
+    nine-character site identification `XXXXMRCCC` in this record, and one is taken apart
+    into the station, monument, receiver and country of the name, while any other marker
+    name yields the station alone.
   - `leap_seconds`: current GPS-UTC leap-second count for the `LEAP SECONDS` header
     record. Left `nothing` it is filled from the navigation message *if* a satellite has
     broadcast it by the time the header is written (GPS sends it on subframe 4 page 18,
     only every 12.5 min, so usually it has not).
+
+# Derived file names
+
+A long filename carries the start time of the file, which this receiver does not know until
+its first fix — long after the files have to be open. So a file named by the convention is
+written under the name the run's own wall clock gives it and renamed onto the name its data
+gives it when it is closed, which is where a rerun of the same recording lands on the same
+name again. A run that never got a fix has no start time of its own and keeps the name it
+was opened under.
 """
 Base.@kwdef struct RinexConfig
-    obs_file::Union{Nothing,String} = "gnss.obs"
-    nav_file::Union{Nothing,String} = "gnss.nav"
+    directory::String = "."
+    obs_file::Union{Nothing,Symbol,String} = :convention
+    nav_file::Union{Nothing,Symbol,String} = :convention
     interval::typeof(1.0s) = 1.0s
+    period::Union{Nothing,Dates.Period,Unitful.Time} = nothing
+    country::Union{Nothing,String} = nothing
     marker_name::String = "UNKNOWN"
     marker_type::String = "GEODETIC"
     observer::String = ""
@@ -41,7 +66,57 @@ end
 # `write_rinex = false` / `true` / `RinexConfig(...)`: normalise the flag form to either
 # "off" (`nothing`) or a configuration.
 rinex_config(flag::Bool) = flag ? RinexConfig() : nothing
-rinex_config(config::RinexConfig) = config
+rinex_config(config::RinexConfig) = check_rinex_targets(config)
+
+# `:convention` is the only symbol a file target can be, so a mistyped one says so at the
+# `receive` call rather than reaching the writers as a name.
+function check_rinex_targets(config::RinexConfig)
+    for (field, target) in (:obs_file => config.obs_file, :nav_file => config.nav_file)
+        target isa Symbol &&
+            target !== :convention &&
+            throw(
+                ArgumentError(
+                    "RinexConfig.$field is :$target; a file target is :convention to name " *
+                    "the file by the RINEX long filename convention, a path to name it " *
+                    "yourself, or nothing to skip it",
+                ),
+            )
+    end
+    config
+end
+
+# The intended collection period as RINEXParser takes it. `interval` in this configuration
+# is a unitful time, so a period may be one too, rather than only the `Dates.Period` the
+# name field is written from.
+rinex_period(::Nothing) = nothing
+rinex_period(period::Dates.Period) = period
+rinex_period(period::Unitful.Time) = Second(round(Int, ustrip(s, period)))
+
+# Fields of a derived name this configuration supplies. The marker name is passed for the
+# navigation header too, which carries none of its own but belongs to the same session as
+# the observation file. `country` is left out where it is not configured, because RINEXParser
+# would overrule a marker name that is a site identification with it.
+naming_keywords(config::RinexConfig) =
+    isnothing(config.country) ?
+    (; marker_name = config.marker_name, period = rinex_period(config.period)) :
+    (;
+        marker_name = config.marker_name,
+        period = rinex_period(config.period),
+        country = config.country,
+    )
+
+# A navigation file that can only ever carry one constellation names it; anything else is
+# left unpinned, which marks the file — and its name — as mixed.
+nav_satellite_system(systems) = length(systems) == 1 ? only(systems) : nothing
+
+# The path a file is written to: the configured name, taken relative to the configured
+# directory, or the RINEX long filename its own header gives it.
+rinex_path(config::RinexConfig, file::String, header, start_time) =
+    joinpath(config.directory, file)
+rinex_path(config::RinexConfig, ::Symbol, header, start_time) = joinpath(
+    config.directory,
+    rinex_filename(header, start_time; naming_keywords(config)...),
+)
 
 # Speed of light and the GPS time-scale origin, taken from the packages that own them
 # rather than restated as literals. Every RINEX epoch and ephemeris record is stamped in
@@ -583,6 +658,13 @@ mutable struct RinexLogger
     approximate_year::Int
     channel::Channel{RinexRecord}
     task::Task
+    # Where the files are, which for a derived name is the name the run's wall clock gave
+    # them until [`close`](@ref) renames them onto the name their data gives them.
+    obs_path::Union{Nothing,String}
+    nav_path::Union{Nothing,String}
+    # Start time the derived names report: the first epoch that was stamped, which is the
+    # earliest absolute time the run knows.
+    session_start::Union{Nothing,DateTime}
     # Continuous carrier phase per `(group key, PRN)`, i.e. per tracked signal of a
     # satellite. An entry lives as long as its tracking arc; a satellite that drops out of
     # lock loses its entry and comes back on a fresh, loss-of-lock-flagged arc.
@@ -631,12 +713,22 @@ function RinexLogger(
 )
     obs_types, layouts = rinex_layout(band_systems, interm_freqs)
     check_epoch_cadence(config.interval, pvt_update_interval)
+    systems = unique(layout.system for layout in values(layouts))
+    check_rinex_directory(config)
     # The writers are opened here rather than inside the task so that an unwritable path
     # fails at the `receive` call, and so that a run producing no records at all still
-    # leaves valid, header-only files.
+    # leaves valid, header-only files. A name derived from the convention therefore cannot
+    # carry the start time of the data yet — the run's own clock stands in for it until
+    # `close` renames the file.
+    opened_at = floor(now(UTC), Minute)
     header = isnothing(config.obs_file) ? nothing : initial_obs_header(config, obs_types)
-    obs_writer = isnothing(header) ? nothing : RinexObsWriter(config.obs_file, header)
-    nav_writer = isnothing(config.nav_file) ? nothing : RinexNavWriter(config.nav_file)
+    obs_path =
+        isnothing(header) ? nothing : rinex_path(config, config.obs_file, header, opened_at)
+    nav_path =
+        isnothing(config.nav_file) ? nothing :
+        rinex_path(config, config.nav_file, naming_nav_header(systems), opened_at)
+    obs_writer = isnothing(obs_path) ? nothing : RinexObsWriter(obs_path, header)
+    nav_writer = isnothing(nav_path) ? nothing : RinexNavWriter(nav_path)
     # Buffered, so a slow disk cannot rendezvous with — and stall — the tracking loop.
     channel = Channel{RinexRecord}(16)
     task = spawn_rinex_writer(channel, obs_writer, nav_writer)
@@ -644,10 +736,13 @@ function RinexLogger(
         config,
         header,
         layouts,
-        unique(layout.system for layout in values(layouts)),
+        systems,
         approximate_year,
         channel,
         task,
+        obs_path,
+        nav_path,
+        nothing,
         Dict{Tuple{Symbol,Int},CarrierPhaseAccumulator}(),
         nothing,
         nothing,
@@ -657,12 +752,32 @@ function RinexLogger(
     )
 end
 
+# A name is only ever derived into a directory that is already there: creating one behind
+# the caller's back would put a run's output somewhere they did not mean.
+function check_rinex_directory(config::RinexConfig)
+    (isnothing(config.obs_file) && isnothing(config.nav_file)) && return nothing
+    isdir(config.directory) || throw(
+        ArgumentError(
+            "RinexConfig.directory \"$(config.directory)\" is not a directory that " *
+            "exists, so the RINEX files cannot be written there",
+        ),
+    )
+    nothing
+end
+
+# The navigation header a name is derived from. Only its satellite system reaches the name,
+# and that is settled by the configuration before a single ephemeris is decoded — the same
+# choice [`build_nav_records`](@ref) makes for the header that is written.
+naming_nav_header(systems) =
+    RinexNavHeader(; satellite_system = nav_satellite_system(systems))
+
 """
     close(logger::RinexLogger)
 
 Stop the RINEX output and block until the files are complete on disk. Closing also flushes
-the header of a file that never saw a record, so even an aborted run leaves valid RINEX. A
-writer that failed has already reported it, so this does not raise it again.
+the header of a file that never saw a record, so even an aborted run leaves valid RINEX, and
+renames a file named by the convention onto the start time of its own data. A writer that
+failed has already reported it, so this does not raise it again.
 """
 function Base.close(logger::RinexLogger)
     close(logger.channel)
@@ -671,7 +786,51 @@ function Base.close(logger::RinexLogger)
     catch e
         e isa TaskFailedException || rethrow()
     end
+    rename_to_convention!(logger)
     nothing
+end
+
+# The files carry the start time of the run's wall clock until here, because a long filename
+# needs a start time before the first fix can give one. Now that they are closed, the name
+# their own data gives them is known, so they are moved onto it. `force`, because opening a
+# file already truncated whatever stood at its name: a rerun of the same recording produces
+# the same name again and is meant to replace it. Renaming is the last thing a run does, and
+# a run's output is worth more than its name, so a failure to move it is reported rather
+# than raised.
+function rename_to_convention!(logger::RinexLogger)
+    start_time = logger.session_start
+    isnothing(start_time) && return nothing
+    config = logger.config
+    if config.obs_file isa Symbol && !isnothing(logger.obs_path)
+        logger.obs_path = move_rinex(
+            logger.obs_path,
+            rinex_path(config, config.obs_file, logger.header, start_time),
+        )
+    end
+    if config.nav_file isa Symbol && !isnothing(logger.nav_path)
+        logger.nav_path = move_rinex(
+            logger.nav_path,
+            rinex_path(
+                config,
+                config.nav_file,
+                naming_nav_header(logger.systems),
+                start_time,
+            ),
+        )
+    end
+    nothing
+end
+
+function move_rinex(from::String, to::String)
+    from == to && return from
+    try
+        mv(from, to; force = true)
+        to
+    catch e
+        @warn "The RINEX file $from could not be renamed to the $to its start time gives " *
+              "it, so it keeps the name it was written under." exception = e
+        from
+    end
 end
 
 # Total GNSS system time of a PVT epoch, in seconds since the GPS time-scale origin. The
@@ -756,6 +915,7 @@ function log_rinex!(logger::RinexLogger, receiver_state)
     logger.last_nav_runtime = runtime
 
     epoch = isnothing(timing) ? nothing : build_obs_epoch(logger, receiver_state, timing)
+    note_session_start!(logger, epoch, receiver_state)
     ephemerides, nav_header = build_nav_records(logger, receiver_state)
     position = receiver_state.pvt.position
     record = RinexRecord(
@@ -771,6 +931,20 @@ function log_rinex!(logger::RinexLogger, receiver_state)
         put!(logger.channel, record)
     catch e
         e isa InvalidStateException || rethrow()
+    end
+    nothing
+end
+
+# The start time a derived file name reports, taken once. The first epoch that was stamped is
+# it: that is `TIME OF FIRST OBS` of the file being named. A run with observations switched
+# off stamps none, and there the first fix is the only absolute time it has.
+function note_session_start!(logger::RinexLogger, epoch, receiver_state)
+    isnothing(logger.session_start) || return nothing
+    if !isnothing(epoch)
+        logger.session_start = epoch.time
+    elseif isnothing(logger.config.obs_file) && !isnothing(receiver_state.pvt.time)
+        logger.session_start =
+            first(epoch_datetime(0, gps_seconds(receiver_state.pvt.time)))
     end
     nothing
 end
@@ -995,9 +1169,7 @@ function build_nav_records(logger::RinexLogger, receiver_state)
         end
     end
     header = RinexNavHeader(;
-        # A file that can only ever carry one constellation names it; anything else is left
-        # unpinned so RINEXParser marks the file as mixed.
-        satellite_system = length(logger.systems) == 1 ? only(logger.systems) : nothing,
+        satellite_system = nav_satellite_system(logger.systems),
         ionospheric_corrections = unique(ionospheric_corrections),
         time_system_corrections = unique(time_system_corrections),
         leap_seconds,
