@@ -1,5 +1,12 @@
 # Changelog
 
+# [3.2.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v3.1.0...v3.2.0) (2026-08-04)
+
+
+### Features
+
+* support Tracking 5; credit integration time in the code lock detector ([e077c33](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/e077c33e40e4df19ee1d8a934828a4c7a3e4fe65))
+
 # [3.1.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v3.0.0...v3.1.0) (2026-07-27)
 
 
