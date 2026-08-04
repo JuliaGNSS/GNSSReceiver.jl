@@ -19,9 +19,36 @@ Declares code lock from the estimated carrier-to-noise density ratio. After a
 `wait_time_threshold` warm-up it accumulates out-of-lock time whenever the CN0 is below
 `cn0_threshold` (and pays it back down otherwise); lock is lost once the accumulated
 out-of-lock time reaches `out_of_lock_time_threshold`.
+
+The comparison is made on the *post-integration* SNR, `CN0 · T`, rather than on CN0
+alone. `T` is the integration time of the record the CN0 estimate came from
+(Tracking's `get_last_fully_integrated_integration_time`), and `cn0_threshold` is the CN0
+demanded over `reference_integration_time` — one primary code period. A record spanning
+`N` code blocks therefore clears the detector at `10·log10(N)` dB less CN0, which is what
+the longer coherent integration genuinely buys: detectability is set by the
+post-integration SNR, not by CN0 on its own.
+
+Anchoring to the primary code period rather than to the symbol period keeps
+`cn0_threshold` meaning exactly what it meant for one-block records (the default
+tracking cadence), and needs no data rate — so it is also defined for pilot signals,
+where `get_data_frequency` is 0 Hz.
+
+`coherence_limit` caps the credited `T`, and defaults to `Inf·s` — uncapped — because
+Tracking already bounds a record at the coherent limit itself: post-sync it integrates
+`clamp(preferred_num_code_blocks_to_integrate, 1, blocks_per_symbol)` blocks, where a
+symbol is the data-bit period, or the secondary-code period for a pilot. That bound is
+generous for a long overlay (GPS L1C-P's is 1800 blocks), so set `coherence_limit` when
+crediting a full symbol is more than the loop should be trusted with.
+
+Note that Tracking's `preferred_num_code_blocks_to_integrate` defaults to 1 and this
+receiver never raises it, so every record is currently one code block and the credit is
+exactly `cn0_threshold` — the `N > 1` behaviour above only engages once that is plumbed
+through.
 """
 struct CodeLockDetector <: AbstractLockDetector
     cn0_threshold::typeof(1.0u"dBHz")
+    reference_integration_time::typeof(1.0u"s")
+    coherence_limit::typeof(1.0u"s")
     out_of_lock_time::typeof(1.0u"s")
     out_of_lock_time_threshold::typeof(1.0u"s")
     wait_time::typeof(1.0u"s")
@@ -30,11 +57,17 @@ end
 
 function CodeLockDetector(;
     cn0_threshold = 30u"dBHz",
+    # GPS L1 C/A's code period. The receiver passes the ranging signal's own period —
+    # see `primary_code_period` and the `ReceiverSatState` constructors.
+    reference_integration_time = 1u"ms",
+    coherence_limit = Inf * u"s",
     out_of_lock_time_threshold = 200u"ms",
     wait_time_threshold = 80u"ms",
 )
     CodeLockDetector(
         cn0_threshold,
+        reference_integration_time,
+        coherence_limit,
         0.0u"s",
         out_of_lock_time_threshold,
         0.0u"s",
@@ -42,10 +75,29 @@ function CodeLockDetector(;
     )
 end
 
-function update(lock_detector::CodeLockDetector, cn0, signal_duration)
+# Post-integration SNR of the last fully integrated record against the SNR
+# `cn0_threshold` demands over one `reference_integration_time`. Both sides are
+# dimensionless (Hz · s), so `uconvert` makes the comparison unit-agnostic regardless of
+# whether the caller's integration time arrives as `s` or as Tracking's `Hz^-1`.
+#
+# Written as a negated `>=` so that a non-finite CN0 counts as *out* of lock: the moments
+# estimator degenerates to `NaN` for an all-zero prompt buffer, and `NaN < threshold` is
+# `false` — which would otherwise hold a dead channel in lock indefinitely.
+function is_below_cn0_threshold(lock_detector::CodeLockDetector, cn0, integration_time)
+    credited = min(integration_time, lock_detector.coherence_limit)
+    snr = uconvert(NoUnits, Unitful.linear(cn0) * credited)
+    required = uconvert(
+        NoUnits,
+        Unitful.linear(lock_detector.cn0_threshold) *
+        lock_detector.reference_integration_time,
+    )
+    !(snr >= required)
+end
+
+function update(lock_detector::CodeLockDetector, cn0, integration_time, signal_duration)
     out_of_lock_time = lock_detector.out_of_lock_time
     if lock_detector.wait_time >= lock_detector.wait_time_threshold
-        if cn0 < lock_detector.cn0_threshold
+        if is_below_cn0_threshold(lock_detector, cn0, integration_time)
             out_of_lock_time += signal_duration
         elseif out_of_lock_time > 0.0u"s"
             out_of_lock_time -= signal_duration
@@ -53,6 +105,8 @@ function update(lock_detector::CodeLockDetector, cn0, signal_duration)
     end
     CodeLockDetector(
         lock_detector.cn0_threshold,
+        lock_detector.reference_integration_time,
+        lock_detector.coherence_limit,
         out_of_lock_time,
         lock_detector.out_of_lock_time_threshold,
         min(lock_detector.wait_time + signal_duration, lock_detector.wait_time_threshold),

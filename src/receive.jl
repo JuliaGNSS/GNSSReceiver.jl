@@ -120,8 +120,7 @@ end
 # the carrier discriminator sees at the acquisition→tracking handover. Before
 # bit/secondary-code sync the loops integrate a single primary code block, so this
 # is one primary-code period (get_code_length / get_code_frequency).
-handover_coherent_integration_time(signal::AbstractGNSSSignal) =
-    get_code_length(signal) / get_code_frequency(signal)
+handover_coherent_integration_time(signal::AbstractGNSSSignal) = primary_code_period(signal)
 
 # Carrier-Doppler pull-in range: the largest carrier-Doppler error the tracking
 # loop can pull into lock from a fresh acquisition handover. `receive` sizes each
@@ -255,7 +254,8 @@ task; one `ReceiverDataOfInterest` is emitted per `pvt_update_interval`. Acquisi
 and Doppler resolution are derived per system from the tracking loop pull-in range, and
 `prns` restricts the search (`nothing` ⇒ each constellation's default range, a per-GNSS
 `NamedTuple`/`Dict` keyed by `get_constellation_id`, or a plain collection applied to
-every system). A satellite is declared locked once its CN0 exceeds `code_lock_cn0_threshold` and
+every system). A satellite is declared locked once its CN0 exceeds `code_lock_cn0_threshold` — referred
+to a one-code-block record, so an `N`-block record locks at `10·log10(N)` dB less — and
 contributes to the PVT solution — recomputed every `pvt_update_interval` — after
 `time_in_lock_before_calculating_pvt`. `enable_ionospheric_correction`,
 `enable_tropospheric_correction` and `pvt_approximate_year` (which resolves the GPS

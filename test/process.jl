@@ -132,7 +132,15 @@ end
 # the reacquisition back-off (`should_reacquire`) — pass a value past the first
 # back-off step (200 ms) to make the sat eligible for reacquisition.
 out_of_lock_code_detector() =
-    GNSSReceiver.CodeLockDetector(30.0u"dBHz", 250u"ms", 200u"ms", 80u"ms", 80u"ms")
+    GNSSReceiver.CodeLockDetector(
+        30.0u"dBHz",
+        1u"ms",       # reference_integration_time: GPS L1 C/A's code period
+        Inf * u"s",   # coherence_limit: uncapped
+        250u"ms",
+        200u"ms",
+        80u"ms",
+        80u"ms",
+    )
 
 function out_of_lock_sat_state(system, prn; time_out_of_lock = 0.0u"s")
     GNSSReceiver.ReceiverSatState(

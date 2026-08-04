@@ -66,6 +66,12 @@ using GNSSReceiver.SampleBuffers
 # `PositionVelocityTime` keys its `pvt.sats` by, so one key addresses a satellite
 # across tracking, decoding and PVT.
 
+# Duration of one primary code period of `signal`. Defined for every signal — unlike a
+# symbol period, it needs no data rate — which is why the code-lock detector anchors its
+# CN0 threshold to it (see `CodeLockDetector`).
+primary_code_period(signal::AbstractGNSSSignal) =
+    uconvert(s, get_code_length(signal) / get_code_frequency(signal))
+
 # Number of samples spanning one primary code period of `system` at `sampling_freq`.
 # Uses the same `ceil` convention as Acquisition's `plan_acquire`, so buffer sizing
 # matches the plan's sample requirement exactly.
@@ -213,7 +219,10 @@ function ReceiverSatState(
     ReceiverSatState(
         acq.prn,
         decoder,
-        CodeLockDetector(; cn0_threshold = code_lock_cn0_threshold),
+        CodeLockDetector(;
+            cn0_threshold = code_lock_cn0_threshold,
+            reference_integration_time = primary_code_period(acq.system),
+        ),
         CarrierLockDetector(),
         0.0s,
         0.0s,
@@ -229,7 +238,11 @@ function ReceiverSatState(
     ReceiverSatState(
         prn,
         GNSSDecoderState(system, prn),
-        CodeLockDetector(; cn0_threshold = code_lock_cn0_threshold),
+        CodeLockDetector(;
+            cn0_threshold = code_lock_cn0_threshold,
+            # The detector runs on the ranging signal, so its code period is the reference.
+            reference_integration_time = primary_code_period(ranging_signal(system)),
+        ),
         CarrierLockDetector(),
         0.0s,
         0.0s,
