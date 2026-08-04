@@ -420,6 +420,15 @@ function update_all_receiver_sat_states(receiver_sat_states, track_state, system
                     update(
                         receiver_sat_state.code_lock_detector,
                         estimate_cn0(track_state, group_key, prn, RANGING_SIGNAL_INDEX),
+                        # `estimate_cn0` normalizes by this same integration time, so the
+                        # detector's `CN0 · T` test recovers the record's raw
+                        # post-integration SNR — independent of Tracking's normalization.
+                        get_last_fully_integrated_integration_time(
+                            track_state,
+                            group_key,
+                            prn,
+                            RANGING_SIGNAL_INDEX,
+                        ),
                         signal_duration,
                     ),
                     update(

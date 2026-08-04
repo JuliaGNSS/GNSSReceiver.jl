@@ -109,7 +109,7 @@ The lock knob surfaced directly on [`receive`](@ref) is the code-lock CN0 thresh
 
 | Keyword | Default | Meaning |
 |---|---|---|
-| `code_lock_cn0_threshold` | `nothing` (⇒ `30u"dBHz"` per signal) | A satellite is declared code-locked while its estimated CN0 stays above this. |
+| `code_lock_cn0_threshold` | `nothing` (⇒ `30u"dBHz"` per signal) | A satellite is declared code-locked while its estimated CN0 stays above this, referred to a one-code-block record. |
 
 ```julia
 data_channel = receive(
@@ -117,6 +117,14 @@ data_channel = receive(
     code_lock_cn0_threshold = 32u"dBHz",   # stricter lock
 )
 ```
+
+The threshold is referred to a record spanning **one primary code period**, because what
+decides detectability is the post-integration SNR `CN0 · T` rather than CN0 on its own.
+When tracking integrates over `N` code blocks per record, a satellite therefore holds lock
+at `10·log10(N)` dB less CN0 — 3 dB at two blocks — since the longer coherent integration
+recovers exactly that much. Anchoring to the code period rather than to the symbol period
+keeps the number meaning the same thing for the default one-block cadence and stays
+defined for pilot signals, which have no data rate.
 
 The remaining detector timings (out-of-lock, warm-up and carrier integration windows) are
 set at detector construction; see their docstrings in the [API Reference](@ref) for the
