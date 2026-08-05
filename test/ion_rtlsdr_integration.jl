@@ -183,9 +183,16 @@ let
         expected_hdop = 0.91
         expected_vdop = 1.13
         expected_tdop = 0.72
+        # Baselined on Tracking 6's default NWPR estimator, midway between the two
+        # backends. Within ~1 dB of the moment ratio's numbers these replaced: every
+        # satellite here is 40 dB-Hz or better, where a coherent estimator loses little to
+        # loop phase noise. The exception is PRN 13, 2 dB lower — also the least steadily
+        # tracked satellite of the eleven, its per-record estimate dipping to ~27 dB-Hz
+        # during the run, which is exactly what a coherent estimate charges for and the
+        # moment ratio's noise floor hid.
         expected_cn0_dbhz = Dict(
-            5 => 51.2, 7 => 41.9, 8 => 40.8, 13 => 46.9, 15 => 48.5,
-            18 => 40.8, 20 => 44.1, 21 => 41.9, 24 => 40.2, 28 => 49.4, 30 => 49.1,
+            5 => 50.6, 7 => 41.4, 8 => 41.3, 13 => 45.0, 15 => 47.6,
+            18 => 40.1, 20 => 43.6, 21 => 41.4, 24 => 40.3, 28 => 49.6, 30 => 47.9,
         )
 
         # Position: 1 m tolerance. Each backend is deterministic (bit-identical run to run),

@@ -44,6 +44,25 @@ Note that Tracking's `preferred_num_code_blocks_to_integrate` defaults to 1 and 
 receiver never raises it, so every record is currently one code block and the credit is
 exactly `cn0_threshold` — the `N > 1` behaviour above only engages once that is plumbed
 through.
+
+The estimate itself comes from Tracking's default CN0 estimator, which as of Tracking 6 is
+the narrowband/wideband power ratio (`NWPRCN0Estimator`) rather than the moment ratio.
+`cn0_threshold` is unchanged in units and meaning, but the number it is compared against
+is a different — and far better behaved — statistic:
+
+  - the moment ratio manufactured signal power out of noise, reporting a median of
+    ~27.6 dB-Hz on pure noise, so a threshold below ~30 dB-Hz could never trip and one at
+    30 dB-Hz was cleared by noise on ~19 % of records. NWPR reports `-Inf dB-Hz` on noise
+    and clears no finite threshold, so the out-of-lock dwell is now spent monotonically: a
+    satellite that dies drops after exactly `out_of_lock_time_threshold`, rather than the
+    ~1.3× that the detector used to take paying time back on the noise realizations that
+    cleared the threshold;
+  - NWPR measures *coherent* CN0, so residual loop phase noise counts against it. With the
+    conventional PLL at 1 ms records and the default ~5 ms coherent window, Tracking
+    measures a median 44.4 dB-Hz at a true 45 dB-Hz and 23.6 dB-Hz at a true 25 dB-Hz: a
+    fraction of a dB on a strong satellite, one to two dB near threshold. The detector is
+    therefore that much stricter than the nominal number suggests; lower `cn0_threshold`
+    by the same if the pre-Tracking-6 sensitivity is wanted back.
 """
 struct CodeLockDetector <: AbstractLockDetector
     cn0_threshold::typeof(1.0u"dBHz")
@@ -82,7 +101,9 @@ end
 #
 # Written as a negated `>=` so that a non-finite CN0 counts as *out* of lock: the moments
 # estimator degenerates to `NaN` for an all-zero prompt buffer, and `NaN < threshold` is
-# `false` — which would otherwise hold a dead channel in lock indefinitely.
+# `false` — which would otherwise hold a dead channel in lock indefinitely. NWPR's "no
+# detectable signal" is `-Inf dB-Hz`, which needs no special handling: it linearizes to
+# `0 Hz` and so fails the comparison against every finite threshold.
 function is_below_cn0_threshold(lock_detector::CodeLockDetector, cn0, integration_time)
     credited = min(integration_time, lock_detector.coherence_limit)
     snr = uconvert(NoUnits, Unitful.linear(cn0) * credited)

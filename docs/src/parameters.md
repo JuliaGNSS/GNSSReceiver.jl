@@ -126,6 +126,19 @@ recovers exactly that much. Anchoring to the code period rather than to the symb
 keeps the number meaning the same thing for the default one-block cadence and stays
 defined for pilot signals, which have no data rate.
 
+The CN0 itself is estimated by Tracking, whose default estimator is the
+narrowband/wideband power ratio (NWPR) as of Tracking 6. The threshold keeps its units and
+its meaning, but the statistic it is compared against changed: NWPR reports `-Inf dBHz` on
+noise instead of the moment ratio's ~27.6 dB-Hz floor, so a dead or falsely acquired
+channel now drops out of lock promptly rather than clearing a 30 dB-Hz threshold on ~19 %
+of records. Because NWPR measures *coherent* CN0, residual loop phase noise counts against
+it: with the conventional PLL at 1 ms records and the default ~5 ms coherent window,
+Tracking measures a median 44.4 dB-Hz at a true 45 dB-Hz and 23.6 dB-Hz at a true
+25 dB-Hz — a fraction of a dB on a strong satellite, one to two dB near threshold. Lower
+`code_lock_cn0_threshold` by the same if you want the pre-Tracking-6 sensitivity back. The
+estimate is also what `sat_data[…].cn0` reports and what the GUI plots, so displayed CN0s
+near and below threshold are lower (and truer) than they used to be.
+
 The remaining detector timings (out-of-lock, warm-up and carrier integration windows) are
 set at detector construction; see their docstrings in the [API Reference](@ref) for the
 defaults.
