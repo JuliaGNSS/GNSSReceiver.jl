@@ -86,14 +86,21 @@ end
     # The moments CN0 estimator degenerates to `NaN` for an all-zero prompt buffer (a
     # dead correlator channel) and to `Inf` when it sees no noise at all. `NaN` must
     # count as out of lock rather than hold lock forever through a failed comparison.
+    # `-Inf dBHz` is the default NWPR estimator's "no detectable signal", so it is the
+    # value a noise-only channel now actually reports.
     detector = GNSSReceiver.CodeLockDetector(;
         cn0_threshold = 30u"dBHz",
         reference_integration_time = REFERENCE_T,
     )
     nan_cn0 = uconvert(u"dBHz", NaN * u"Hz")
     inf_cn0 = uconvert(u"dBHz", Inf * u"Hz")
+    minus_inf_cn0 = uconvert(u"dBHz", 0.0u"Hz")
+    @test ustrip(minus_inf_cn0) == -Inf
     @test GNSSReceiver.is_below_cn0_threshold(detector, nan_cn0, REFERENCE_T)
     @test !GNSSReceiver.is_below_cn0_threshold(detector, inf_cn0, REFERENCE_T)
+    @test GNSSReceiver.is_below_cn0_threshold(detector, minus_inf_cn0, REFERENCE_T)
+    # Not even a record long enough to credit `10·log10(N)` dB rescues it.
+    @test GNSSReceiver.is_below_cn0_threshold(detector, minus_inf_cn0, 20 * REFERENCE_T)
 end
 
 @testset "ReceiverSatState anchors the threshold to the ranging signal's code period" begin
@@ -111,24 +118,43 @@ end
 
 # ---------------------------------------------------------------------------------------
 # Synthetic-signal tests. The testsets above feed the detector fabricated CN0 numbers; the
-# ones below drive it through Tracking's real `MomentsCN0Estimator` and the two accessors
+# ones below drive it through Tracking's real CN0 estimators and the two accessors
 # `process` actually calls (`estimate_cn0` and `get_last_fully_integrated_integration_time`),
 # so the seam between Tracking's normalization and the detector's `CN0 · T` test is covered
 # rather than assumed.
 #
 # Prompt model: a coherent prompt correlator output for a signal at carrier-to-noise density
 # ratio `cn0` integrated over `T` is a constant signal amplitude in complex Gaussian noise.
-# The moments estimator recovers `SNR = A²/σ²`, and `randn(ComplexF64)` has unit total
-# power, so `σ² = 1` and `A = √(CN0·T)`.
+# The estimators recover `SNR = A²/σ²`, and `randn(ComplexF64)` has unit total power, so
+# `σ² = 1` and `A = √(CN0·T)`. The amplitude is constant — a perfectly phase-locked loop —
+# which is what lets NWPR's coherent narrowband sum reach the truth here; in a real loop its
+# residual phase noise costs a dB or two near threshold (see `CodeLockDetector`).
+#
+# Two estimators are exercised: Tracking's per-signal default (`NWPRCN0Estimator` as of
+# Tracking 6 — what the receiver actually runs on), and the `MomentsCN0Estimator` that used
+# to be the default. Fed the identical prompt stream, so anything that holds for both is a
+# property of the detector rather than of one estimator's normalization. Passed as a
+# zero-argument factory because both buffer into a mutable array that must not be shared
+# between realizations.
 # ---------------------------------------------------------------------------------------
 
-function synthetic_tracked_signal(cn0, num_code_blocks, seed; num_prompts = 100)
+const NUM_PROMPTS = 100
+default_estimator() = Tracking.default_cn0_estimator(GPSL1CA(), NUM_PROMPTS)
+moments_estimator() = MomentsCN0Estimator(NUM_PROMPTS)
+
+function synthetic_tracked_signal(
+    cn0,
+    num_code_blocks,
+    seed;
+    num_prompts = NUM_PROMPTS,
+    make_estimator = moments_estimator,
+)
     signal = GPSL1CA()
     base = TrackedSignal(signal; num_prompts_for_cn0_estimation = num_prompts)
     integration_time = num_code_blocks * GNSSReceiver.primary_code_period(signal)
     amplitude = sqrt(ustrip(uconvert(NoUnits, Unitful.linear(cn0) * integration_time)))
     rng = Random.Xoshiro(seed)
-    estimator = MomentsCN0Estimator(num_prompts)
+    estimator = make_estimator()
     for _ = 1:num_prompts
         estimator = Tracking.update(estimator, amplitude + randn(rng, ComplexF64))
     end
@@ -153,19 +179,28 @@ synthetic_detector() = GNSSReceiver.CodeLockDetector(;
     reference_integration_time = GNSSReceiver.primary_code_period(GPSL1CA()),
 )
 
-# Fraction of independent noise realizations the detector would call in-lock. The moments
-# estimator has several dB of spread at 100 prompts, so near-threshold behaviour is only
+# Fraction of independent noise realizations the detector would call in-lock. Both
+# estimators have several dB of spread at 100 prompts, so near-threshold behaviour is only
 # meaningful as a rate — no single realization proves anything.
-synthetic_hold_rate(detector, cn0, num_code_blocks; trials = 200) =
+synthetic_hold_rate(detector, cn0, num_code_blocks; trials = 200, kwargs...) =
     count(
-        !synthetic_is_below(detector, synthetic_tracked_signal(cn0, num_code_blocks, s))
-        for s = 1:trials
+        !synthetic_is_below(
+            detector,
+            synthetic_tracked_signal(cn0, num_code_blocks, s; kwargs...),
+        ) for s = 1:trials
     ) / trials
 
 # Drive `update` over `seeds` at a fixed CN0 and record length, as `process` would.
-function synthetic_drive(detector, cn0, num_code_blocks, seeds; signal_duration = 4u"ms")
+function synthetic_drive(
+    detector,
+    cn0,
+    num_code_blocks,
+    seeds;
+    signal_duration = 4u"ms",
+    kwargs...,
+)
     for seed in seeds
-        tracked = synthetic_tracked_signal(cn0, num_code_blocks, seed)
+        tracked = synthetic_tracked_signal(cn0, num_code_blocks, seed; kwargs...)
         detector = GNSSReceiver.update(
             detector,
             estimate_cn0(tracked),
@@ -176,14 +211,17 @@ function synthetic_drive(detector, cn0, num_code_blocks, seeds; signal_duration 
     detector
 end
 
-@testset "Detector statistic is immune to Tracking's CN0 normalization" begin
+@testset "Detector statistic is immune to Tracking's CN0 normalization ($name)" for (
+    name,
+    make_estimator,
+) in (("default estimator", default_estimator), ("moments", moments_estimator))
     # One prompt buffer, presented as an N-block record for several N. `estimate_cn0`
     # divides by the record's integration time, so it reports 10·log10(N) dB lower — but
     # the detector multiplies the same time back in, so its statistic, and therefore its
     # decision, must be bit-identical. This is what makes the threshold independent of how
-    # Tracking chooses to normalize.
+    # Tracking chooses to normalize — and of which estimator it swaps in as its default.
     detector = synthetic_detector()
-    one_block = synthetic_tracked_signal(30.0dBHz, 1, 7)
+    one_block = synthetic_tracked_signal(30.0dBHz, 1, 7; make_estimator)
     reference_cn0 = estimate_cn0(one_block)
     reference_snr = uconvert(
         NoUnits,
@@ -208,7 +246,10 @@ end
     end
 end
 
-@testset "An N-block record buys exactly 10·log10(N) dB of CN0" begin
+@testset "An N-block record buys exactly 10·log10(N) dB of CN0 ($name)" for (
+    name,
+    make_estimator,
+) in (("default estimator", default_estimator), ("moments", moments_estimator))
     # At a fixed CN0 the prompt amplitude grows as √(N·T), so an N-block record at CN0 `x`
     # produces the identical prompt buffer to a one-block record at `x + 10·log10(N)` dB.
     # The detector must therefore make the identical decision — per realization, not just
@@ -219,40 +260,47 @@ end
         for seed = 1:25
             @test synthetic_is_below(
                 detector,
-                synthetic_tracked_signal(cn0, num_blocks, seed),
+                synthetic_tracked_signal(cn0, num_blocks, seed; make_estimator),
             ) == synthetic_is_below(
                 detector,
-                synthetic_tracked_signal(equivalent, 1, seed),
+                synthetic_tracked_signal(equivalent, 1, seed; make_estimator),
             )
         end
     end
 end
 
-@testset "Longer records hold lock on signals a one-block record drops" begin
+@testset "Longer records hold lock on signals a one-block record drops ($name)" for (
+    name,
+    make_estimator,
+) in (("default estimator", default_estimator), ("moments", moments_estimator))
     # The statistical consequence of the above, over many noise realizations, with wide
-    # margins rather than any single realization's outcome.
+    # margins rather than any single realization's outcome. The margins are wide enough to
+    # hold for both estimators even though they disagree by ~3 dB near threshold (the moment
+    # ratio's noise floor reads 27.9 dBHz where NWPR reads a true 25.0).
     detector = synthetic_detector()
 
     # 22 dBHz is ~8 dB under the threshold: a one-block record almost always drops it,
     # while 20 blocks (13 dB of credit) puts it comfortably above.
-    @test synthetic_hold_rate(detector, 22.0dBHz, 1) < 0.4
-    @test synthetic_hold_rate(detector, 22.0dBHz, 20) > 0.95
+    @test synthetic_hold_rate(detector, 22.0dBHz, 1; make_estimator) < 0.4
+    @test synthetic_hold_rate(detector, 22.0dBHz, 20; make_estimator) > 0.95
     # Monotone in the number of blocks credited.
-    rates = [synthetic_hold_rate(detector, 25.0dBHz, n) for n in (1, 2, 4, 20)]
+    rates =
+        [synthetic_hold_rate(detector, 25.0dBHz, n; make_estimator) for n in (1, 2, 4, 20)]
     @test issorted(rates)
     @test rates[1] < 0.4
     @test rates[end] > 0.95
 
     # A strong signal is held whatever the record length.
-    @test synthetic_hold_rate(detector, 45.0dBHz, 1) == 1.0
-    @test synthetic_hold_rate(detector, 45.0dBHz, 20) == 1.0
+    @test synthetic_hold_rate(detector, 45.0dBHz, 1; make_estimator) == 1.0
+    @test synthetic_hold_rate(detector, 45.0dBHz, 20; make_estimator) == 1.0
 end
 
 @testset "Crediting integration time does not raise the noise-only false-alarm rate" begin
-    # On pure noise the detector's statistic reduces to the raw moments SNR whatever `N` is
-    # — the estimator divides the record's integration time out and the detector multiplies
-    # it straight back in — so crediting a longer record must not make a noise-only channel
-    # any more likely to be called locked.
+    # On pure noise the detector's statistic reduces to the estimator's raw SNR whatever `N`
+    # is — the estimator divides the record's integration time out and the detector
+    # multiplies it straight back in — so crediting a longer record must not make a
+    # noise-only channel any more likely to be called locked. Checked on the moment ratio,
+    # which is the estimator that actually has a noise-only false-alarm rate to raise.
     detector = synthetic_detector()
     false_alarm_one_block = synthetic_hold_rate(detector, 0.0dBHz, 1)
     false_alarm_twenty_blocks = synthetic_hold_rate(detector, 0.0dBHz, 20)
@@ -273,22 +321,60 @@ end
     end
 end
 
-@testset "Synthetic CN0 drives the detector's lock transitions" begin
+@testset "Tracking's default estimator has no noise-only false alarms" begin
+    # What Tracking 6's default estimator changes for the detector. NWPR reports
+    # `-Inf dBHz` on pure noise rather than the moment ratio's ~27.6 dBHz floor, so a dead
+    # or falsely acquired channel clears no threshold at all — at any record length, since
+    # the credit multiplies a linear CN0 of zero.
+    detector = synthetic_detector()
+    for num_code_blocks in (1, 20)
+        @test synthetic_hold_rate(
+            detector,
+            0.0dBHz,
+            num_code_blocks;
+            make_estimator = default_estimator,
+        ) == 0.0
+    end
+
+    # The consequence end to end: the out-of-lock dwell is spent monotonically instead of
+    # being paid back on the realizations the moment ratio let through, so lock is lost in
+    # exactly `wait_time_threshold + out_of_lock_time_threshold` of signal — 20 + 50 updates
+    # of 4 ms — rather than the ~85 the moment ratio needs.
+    duration = 4u"ms"
+    for num_updates in (69, 70)
+        driven = synthetic_drive(
+            synthetic_detector(),
+            0.0dBHz,
+            1,
+            1:num_updates;
+            signal_duration = duration,
+            make_estimator = default_estimator,
+        )
+        @test GNSSReceiver.is_in_lock(driven) == (num_updates < 70)
+        @test driven.out_of_lock_time ≈ (num_updates - 20) * duration
+    end
+end
+
+@testset "Synthetic CN0 drives the detector's lock transitions ($name)" for (
+    name,
+    make_estimator,
+) in (("default estimator", default_estimator), ("moments", moments_estimator))
     # End to end through `update`: the timers and the lock decision, fed by CN0 estimates
     # that came out of Tracking's estimator rather than being fabricated.
 
-    # Note on drive lengths: because the estimator clears the threshold on ~20% of noise
-    # realizations, a failing signal accumulates out-of-lock time at only ~0.6·signal_duration
-    # per update (the detector pays time back on the realizations that pass), so ~85 updates
-    # are needed to cross a 200 ms threshold. 200 updates leaves comfortable margin.
+    # Note on drive lengths: they are sized for the moment ratio, which clears the threshold
+    # on ~20% of noise realizations, so a failing signal accumulates out-of-lock time at
+    # only ~0.6·signal_duration per update (the detector pays time back on the realizations
+    # that pass) and needs ~85 updates to cross a 200 ms threshold. 200 updates leaves
+    # comfortable margin; NWPR gets there in 70.
 
     # A healthy signal warms up and stays locked.
-    healthy = synthetic_drive(synthetic_detector(), 45.0dBHz, 1, 1:200)
+    healthy = synthetic_drive(synthetic_detector(), 45.0dBHz, 1, 1:200; make_estimator)
     @test GNSSReceiver.is_in_lock(healthy)
     @test healthy.out_of_lock_time == 0u"s"
 
     # Then it collapses: lock is lost once `out_of_lock_time_threshold` accumulates.
-    collapsed = synthetic_drive(healthy, 5.0dBHz, 1, 201:400)
+    collapsed = synthetic_drive(healthy, 5.0dBHz, 1, 201:400; make_estimator)
     @test !GNSSReceiver.is_in_lock(collapsed)
     @test collapsed.out_of_lock_time >= collapsed.out_of_lock_time_threshold
 
@@ -296,8 +382,9 @@ end
     # 20-block records hold it without ever accumulating any out-of-lock time at all,
     # because the 13 dB of credited integration time covers the shortfall. Same CN0, same
     # code path; only the record length differs. This is the fix in one comparison.
-    on_one_block = synthetic_drive(synthetic_detector(), 20.0dBHz, 1, 1:200)
-    on_twenty_blocks = synthetic_drive(synthetic_detector(), 20.0dBHz, 20, 1:200)
+    on_one_block = synthetic_drive(synthetic_detector(), 20.0dBHz, 1, 1:200; make_estimator)
+    on_twenty_blocks =
+        synthetic_drive(synthetic_detector(), 20.0dBHz, 20, 1:200; make_estimator)
     @test !GNSSReceiver.is_in_lock(on_one_block)
     @test GNSSReceiver.is_in_lock(on_twenty_blocks)
     @test on_twenty_blocks.out_of_lock_time == 0u"s"

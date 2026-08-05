@@ -357,6 +357,43 @@ end
     @test occursin("google.com/maps?q=", out)
 end
 
+@testset "GUI CN0 bars survive an unmeasurable satellite" begin
+    # Tracking's default NWPR estimator reports `-Inf dBHz` for a satellite whose CN0 it
+    # cannot measure — and a negative dB-Hz figure just above that — while the detectors may
+    # still be holding it, so such a satellite does reach the bar chart.
+    # `UnicodePlots.barplot` throws on any value below zero ("all values have to be ≥ 0"),
+    # which would take the whole dashboard down, so the panel floors them at the 0 dB
+    # baseline instead.
+    _cn0_db = GNSSReceiver.Dashboard._cn0_db
+    no_signal = uconvert(u"dBHz", 0.0u"Hz")
+    @test ustrip(no_signal) == -Inf
+    @test _cn0_db(45.1234dBHz) == 45.1
+    @test _cn0_db(no_signal) == 0.0
+    @test _cn0_db(uconvert(u"dBHz", 0.5u"Hz")) == 0.0     # ≈ -3 dBHz, still negative
+    @test _cn0_db(uconvert(u"dBHz", Inf * u"Hz")) == 0.0
+    @test _cn0_db(uconvert(u"dBHz", NaN * u"Hz")) == 0.0
+
+    # End to end through the real `view`: the frame renders, with the measurable satellite's
+    # bar intact next to the unmeasurable one's empty bar.
+    sat_data_type = GNSSReceiver.SatelliteDataOfInterest{SVector{2,ComplexF64}}
+    sat_keys = [(:GPSL1CA, 3), (:GPSL1CA, 12)]
+    gui_data = GNSSReceiver.GUIData(
+        Dictionary(
+            sat_keys,
+            [
+                sat_data_type(cn0, zeros(SVector{2,ComplexF64}), true) for
+                cn0 in (no_signal, 45.0dBHz)
+            ],
+        ),
+        PositionVelocityTime.PVTSolution(),
+        10.0u"s",
+        true,
+    )
+    out = render_gui_text(gui_model(gui_data))
+    @test occursin(r"G03 L1\s+0\s", out)          # empty bar, drawn at the baseline
+    @test occursin(r"G12 L1\s+■+ 45\s", out)      # ... next to an intact one
+end
+
 @testset "GUI PVT diagnostics — multi-GNSS, multi-band, redundant" begin
     sat_data_type = GNSSReceiver.SatelliteDataOfInterest{ComplexF64}
     keys_ = [
