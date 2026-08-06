@@ -103,6 +103,7 @@ function fixed_gui_data(; runtime = 10.0u"s", pvt_fresh = true)
                         ECEF(5e6 + 1e5 * i, 3e6 - 1e5 * i, 1e6 + 2e5 * i),
                         0.0,
                         0.0u"m",
+                        0.0u"m/s",
                     ) for i in eachindex(sat_keys)
                 ],
             ),
@@ -210,6 +211,76 @@ end
     @test !occursin("stream ended", out)
 end
 
+@testset "GUI header shows the vector-tracking badge" begin
+    sat_data_type = GNSSReceiver.SatelliteDataOfInterest{SVector{2,ComplexF64}}
+    z = zeros(SVector{2,ComplexF64})
+    # Six tracked satellites, all of them in the vector loop — the badge's loop count is
+    # exactly these `in_vt_loop` flags, so it is the fixture that sets it.
+    members = Dictionary(Dict{Tuple{Symbol,Int},sat_data_type}(
+        (:GPSL1CA, prn) => GNSSReceiver.SatelliteDataOfInterest(46.0dBHz, z, true, true)
+        for prn = 1:6
+    ))
+    header(vt; sats = members) = render_gui_text(
+        gui_model(GNSSReceiver.GUIData(sats, GNSSReceiver.PVTSolution(), 5.0u"s", true, vt)),
+    )
+
+    # Disabled (vt === nothing): no badge at all.
+    @test !occursin("VT ", header(nothing))
+
+    # Armed (enabled but the filter has not taken over yet): "VT armed", no member count.
+    out = header(GNSSReceiver.VTStatus(false))
+    @test occursin("VT armed", out)
+    @test !occursin("VT running", out)
+
+    # Running: "VT running (measured/loop sats)". The measured count comes from `pvt.sats` —
+    # empty in this fixture — so the badge must not report the loop size alone, which would
+    # claim satellites the solution did not use.
+    out = header(GNSSReceiver.VTStatus(true))
+    @test occursin("VT running", out) && occursin("0/6 sats", out)
+end
+
+@testset "CN0 bars mark vector-loop and fix membership" begin
+    sat_data_type = GNSSReceiver.SatelliteDataOfInterest{SVector{2,ComplexF64}}
+    z = zeros(SVector{2,ComplexF64})
+    # The four combinations the marker column distinguishes (4th arg is `in_vt_loop`):
+    # PRN 3 loop + fix, PRN 5 loop only (coasted), PRN 9 fix only, PRN 12 neither.
+    sats = Dictionary(Dict{Tuple{Symbol,Int},sat_data_type}(
+        (:GPSL1CA, 3) => GNSSReceiver.SatelliteDataOfInterest(46.0dBHz, z, true, true),
+        (:GPSL1CA, 5) => GNSSReceiver.SatelliteDataOfInterest(45.0dBHz, z, true, true),
+        (:GPSL1CA, 9) => GNSSReceiver.SatelliteDataOfInterest(44.0dBHz, z, true, false),
+        (:GPSL1CA, 12) => GNSSReceiver.SatelliteDataOfInterest(42.0dBHz, z, true, false),
+    ))
+    # `pvt.sats` — the satellites that determined the fix — is a different set from the loop.
+    info() = PositionVelocityTime.SatInfo(ECEF(5e6, 3e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s")
+    pvt = PositionVelocityTime.PVTSolution(;
+        sats = Dictionary([(:GPSL1CA, 3), (:GPSL1CA, 9)], [info(), info()]),
+    )
+    render_vt(vt; solution = pvt) = render_gui_text(
+        gui_model(GNSSReceiver.GUIData(sats, solution, 5.0u"s", true, vt)),
+    )
+
+    # VT running: a marker per membership, each right after the PRN with no space before it,
+    # and the legend rides in the title.
+    out = render_vt(GNSSReceiver.VTStatus(true))
+    @test occursin("G03* L1", out)       # loop and fix
+    @test occursin("G05∘ L1", out)       # loop only — coasted through this update
+    @test occursin("G09· L1", out)       # fix only — not vector-steered
+    @test occursin("G12  L1", out)       # neither: the column stays blank
+    @test occursin("* VT+fix, ∘ VT coasted, · fix", out)
+
+    # VT disabled: the loop flags are ignored — even though PRNs 3 and 5 still carry
+    # `in_vt_loop = true` — and only fix membership is left to mark.
+    out = render_vt(nothing)
+    @test occursin("G03· L1", out) && occursin("G09· L1", out)
+    @test occursin("G05  L1", out) && occursin("G12  L1", out)
+    @test occursin("· = in fix", out)
+    @test !occursin("VT coasted", out)
+
+    # No fix at all: nothing to mark, so no marker legend either.
+    out = render_vt(nothing; solution = GNSSReceiver.PVTSolution())
+    @test !occursin("· = in fix", out)
+end
+
 @testset "GUI holds the last fix when the current frame has none" begin
     fix = fixed_gui_data(; runtime = 10.0u"s")
     # Current frame carries no fix (`pvt.time === nothing`) but an earlier one did, so the
@@ -220,9 +291,9 @@ end
 
     out = render_gui_text(m)
     @test occursin("last fix (re-acquiring)", out)
-    # The held fix's coordinates stay on screen, stamped with the *current* run time.
+    # The held fix's coordinates stay on screen; the *current* run time is in the header.
     @test occursin("Coordinates: 50.830895°N, 5.568737°E", out)
-    @test occursin("Run time:", out) && occursin("20.0 s", out)
+    @test occursin("run time", out) && occursin("20.0 s", out)
 
     # Once the stream has ended nothing is being re-acquired any more — the panel must not
     # claim otherwise while the header says "stream ended".
@@ -242,7 +313,9 @@ end
     )
     out = render_gui_text(gui_model(gui_data))
     @test occursin("Searching for satellites", out)
-    @test occursin("Not enough satellites to calculate position.", out)
+    # No satellites tracked yet: the panels report searching, never a fixed
+    # "not enough satellites" threshold (the fix minimum is layout-dependent).
+    @test !occursin("Not enough satellites", out)
 end
 
 @testset "GUI while decoding (enough sats but no PVT yet)" begin
@@ -268,6 +341,38 @@ end
     @test occursin("Decoding satellites", out)
     @test !occursin("Not enough satellites", out)
     @test occursin("G03 L1", out)     # a CN0 bar label
+end
+
+@testset "GUI with a non-finite CN0" begin
+    # Tracking's NWPR CN0 estimator reports `-Inf dB-Hz` for a channel with no
+    # detectable signal (a tracked satellite in a deep outage) and `NaN dB-Hz` for a
+    # correlator that has accumulated nothing yet. `barplot` throws on a negative bar
+    # value, so both must be floored to 0 rather than reaching it — otherwise one such
+    # satellite takes the whole dashboard down on render.
+    @test GNSSReceiver.Dashboard._cn0_db(-Inf * dBHz) == 0.0
+    @test GNSSReceiver.Dashboard._cn0_db(NaN * dBHz) == 0.0
+    @test GNSSReceiver.Dashboard._cn0_db(-3.0dBHz) == 0.0
+    @test GNSSReceiver.Dashboard._cn0_db(Inf * dBHz) == 0.0   # unchanged: 0 dB reference
+    @test GNSSReceiver.Dashboard._cn0_db(45.123dBHz) ≈ 45.1
+
+    sat_data_type = GNSSReceiver.SatelliteDataOfInterest{SVector{2,ComplexF64}}
+    gui_data = GNSSReceiver.GUIData(
+        Dictionary(
+            [(:GPSL1CA, 3), (:GPSL1CA, 12)],
+            [
+                GNSSReceiver.SatelliteDataOfInterest(
+                    cn0,
+                    zeros(SVector{2,ComplexF64}),
+                    true,
+                ) for cn0 in (-Inf * dBHz, 44.0dBHz)
+            ],
+        ),
+        GNSSReceiver.PVTSolution(),
+        10.0u"s",
+        true,
+    )
+    out = render_gui_text(gui_model(gui_data))
+    @test occursin("G03 L1", out) && occursin("G12 L1", out)
 end
 
 @testset "GUI with data" begin
@@ -310,10 +415,10 @@ end
                     (:GPSL1CA, 10),
                 ],
                 [
-                    PositionVelocityTime.SatInfo(ECEF(5e6, 3e6, 1e6), 0.0, 0.0u"m"),
-                    PositionVelocityTime.SatInfo(ECEF(3e6, 3e6, 2e6), 0.0, 0.0u"m"),
-                    PositionVelocityTime.SatInfo(ECEF(2e6, 5e6, 1e6), 0.0, 0.0u"m"),
-                    PositionVelocityTime.SatInfo(ECEF(3e6, 1e6, 1e6), 0.0, 0.0u"m"),
+                    PositionVelocityTime.SatInfo(ECEF(5e6, 3e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s"),
+                    PositionVelocityTime.SatInfo(ECEF(3e6, 3e6, 2e6), 0.0, 0.0u"m", 0.0u"m/s"),
+                    PositionVelocityTime.SatInfo(ECEF(2e6, 5e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s"),
+                    PositionVelocityTime.SatInfo(ECEF(3e6, 1e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s"),
                 ],
             ),
         ),
@@ -342,7 +447,7 @@ end
     # velocity is well above the low-speed threshold, so it is not flagged low-speed.
     @test occursin("Heading:", out) && occursin("°", out)
     @test !occursin("low speed", out)
-    @test occursin("Run time:", out) && occursin("10.0 s", out)
+    @test occursin("run time", out) && occursin("10.0 s", out)
     # The block is titled "Position Velocity Time (PVT)" and, with diagnostics on, folds in
     # the solution internals: the full DOP breakdown (GDOP/PDOP/HDOP/VDOP/TDOP) is shown;
     # residuals flagged (4 sats, single system/band ⇒ no redundancy), so the "insufficient
@@ -394,6 +499,58 @@ end
     @test occursin(r"G12 L1\s+■+ 45\s", out)      # ... next to an intact one
 end
 
+@testset "GUI CN0 bars announce the satellites that do not fit" begin
+    # `barplot` draws one row per bar and `_paint_plot!` clips at the panel's bottom edge, so
+    # a panel shorter than the satellite list would show a shorter list with no trace of the
+    # rest. The bottom row is spent on a continuation marker instead, so the count of missing
+    # satellites is always on screen.
+    sat_data_type = GNSSReceiver.SatelliteDataOfInterest{ComplexF64}
+    gui_of(prns) = GNSSReceiver.GUIData(
+        Dictionary(
+            [(:GPSL1CA, prn) for prn in prns],
+            [sat_data_type(45.0dBHz, complex(1.0, 0.0), true) for _ in prns],
+        ),
+        PositionVelocityTime.PVTSolution(),
+        10.0u"s",
+        true,
+    )
+
+    # A frame tall enough for all fourteen: every bar is drawn and nothing is announced.
+    out = render_gui_text(gui_model(gui_of(1:14)); height = 50)
+    @test occursin(r"G14 L1\s+■+ 45\s", out)
+    @test !occursin("⋮", out)
+
+    # A 24-row frame leaves the panel eight bar rows: seven bars, then the marker — which
+    # names the hidden satellites, as all seven fit the panel width.
+    out = render_gui_text(gui_model(gui_of(1:14)); height = 24)
+    @test occursin(r"G07 L1\s+■+ 45\s", out)      # the leading slice, in the usual order
+    @test !occursin(r"G08 L1\s+■", out)           # ... and no bar past it
+    @test occursin("⋮  7 more: G08 L1, G09 L1, G10 L1, G11 L1, G12 L1, G13 L1, G14 L1", out)
+
+    # Too many hidden to name in the width available: the row takes as many as fit and ends
+    # in `…`, so the list is never read as the whole of what is hidden — the count is.
+    out = render_gui_text(gui_model(gui_of(1:30)); height = 24)
+    @test occursin("⋮  23 more: G08 L1, ", out)
+    @test occursin(", …", out)
+
+    # Room for a single bar: the bar keeps the row. The marker is dropped rather than
+    # displacing the only satellite on screen.
+    out = render_gui_text(gui_model(gui_of(1:14)); height = 10)
+    @test occursin(r"G01 L1\s+■+ 45\s", out)
+    @test !occursin("⋮", out)
+
+    # The list is cut to the width, one name at a time: whole list and no ellipsis when it
+    # fits, an ellipsis as soon as anything is left out, and the bare count once not even the
+    # first name plus its ellipsis fits. Nothing it returns is ever wider than `width`.
+    continuation = GNSSReceiver.Dashboard._cn0_continuation
+    hidden = [(:GPSL1CA, 30), (:GalileoE1B, 11)]
+    listed = "⋮  2 more: G30 L1, E11 E1"
+    @test continuation(hidden, textwidth(listed)) == listed
+    @test continuation(hidden, textwidth(listed) - 1) == "⋮  2 more: G30 L1, …"
+    @test continuation(hidden, textwidth("⋮  2 more: G30 L1, …") - 1) == "⋮  2 more"
+    @test all(textwidth(continuation(hidden, w)) <= w for w in 9:40)
+end
+
 @testset "GUI PVT diagnostics — multi-GNSS, multi-band, redundant" begin
     sat_data_type = GNSSReceiver.SatelliteDataOfInterest{ComplexF64}
     keys_ = [
@@ -403,7 +560,7 @@ end
     ]
     sat_positions = [ECEF(5e6 + 1e5 * i, 3e6 - 1e5 * i, 1e6 + 2e5 * i) for i in eachindex(keys_)]
     # All residuals 2.0 m ⇒ overall and per-signal RMS are exactly 2.0 m.
-    sats = Dictionary(keys_, [PositionVelocityTime.SatInfo(p, 0.0, 2.0u"m") for p in sat_positions])
+    sats = Dictionary(keys_, [PositionVelocityTime.SatInfo(p, 0.0, 2.0u"m", 0.0u"m/s") for p in sat_positions])
 
     pvt = PositionVelocityTime.PVTSolution(;
         position = ECEF(4.0e6, 3.9e5, 4.9e6),
@@ -426,7 +583,7 @@ end
     )
     out = render_gui_text(gui_model(gd; show_diagnostics = true))
 
-    @test occursin("Run time:", out) && occursin("42.0 s", out)
+    @test occursin("run time", out) && occursin("42.0 s", out)
     @test occursin("DOP", out) && occursin("2.5", out)          # GDOP
     @test occursin("Inter-system biases", out) && occursin("GST", out) && occursin("12.34", out)
     # Inter-frequency bias names its reference band explicitly ("L5 (vs L1)").
@@ -435,9 +592,15 @@ end
     # No velocity given ⇒ zero speed ⇒ heading is flagged low-speed.
     @test occursin("Heading:", out) && occursin("low speed", out)
     # 8 sats, unknowns = 3 + 2 time systems + 1 extra band = 6 ⇒ redundant ⇒ not flagged.
-    @test occursin("Pseudorange residual RMS", out)
-    @test occursin("RMS/m", out)          # tabular header
+    @test occursin("Measurement residuals (RMS):", out)
+    @test occursin("range/m", out)        # tabular header, one per residual domain
+    @test occursin("rate/(m/s)", out)
     @test occursin("2.0", out)            # RMS value (all residuals 2.0 m)
+    # The per-signal rows are drawn as children of the `overall` row — a branch for each but
+    # the last band, in the order the signals appear — so the table reads as one figure and
+    # its breakdown rather than as a column of unrelated numbers.
+    @test occursin("overall", out)
+    @test occursin("├ L1", out) && occursin("├ E1", out) && occursin("└ L5", out)
     @test !occursin("insufficient redundancy", out)
     # DOA legend distinguishes constellations.
     @test occursin("GPS", out) && occursin("Galileo", out)

@@ -20,6 +20,12 @@ Declares code lock from the estimated carrier-to-noise density ratio. After a
 `cn0_threshold` (and pays it back down otherwise); lock is lost once the accumulated
 out-of-lock time reaches `out_of_lock_time_threshold`.
 
+The accumulated time is capped at twice that threshold. Since it is paid back at the rate
+it is spent, an uncapped dwell would make re-declaring lock take as long as the outage that
+preceded it — minutes, for a satellite kept in tracking through a tunnel by the
+vector-tracking loop. With the cap, one `out_of_lock_time_threshold` of good signal always
+brings a satellite back.
+
 The comparison is made on the *post-integration* SNR, `CN0 · T`, rather than on CN0
 alone. `T` is the integration time of the record the CN0 estimate came from
 (Tracking's `get_last_fully_integrated_integration_time`), and `cn0_threshold` is the CN0
@@ -65,31 +71,31 @@ is a different — and far better behaved — statistic:
     by the same if the pre-Tracking-6 sensitivity is wanted back.
 """
 struct CodeLockDetector <: AbstractLockDetector
-    cn0_threshold::typeof(1.0u"dBHz")
-    reference_integration_time::typeof(1.0u"s")
-    coherence_limit::typeof(1.0u"s")
-    out_of_lock_time::typeof(1.0u"s")
-    out_of_lock_time_threshold::typeof(1.0u"s")
-    wait_time::typeof(1.0u"s")
-    wait_time_threshold::typeof(1.0u"s")
+    cn0_threshold::typeof(1.0dBHz)
+    reference_integration_time::typeof(1.0s)
+    coherence_limit::typeof(1.0s)
+    out_of_lock_time::typeof(1.0s)
+    out_of_lock_time_threshold::typeof(1.0s)
+    wait_time::typeof(1.0s)
+    wait_time_threshold::typeof(1.0s)
 end
 
 function CodeLockDetector(;
-    cn0_threshold = 30u"dBHz",
+    cn0_threshold = 30dBHz,
     # GPS L1 C/A's code period. The receiver passes the ranging signal's own period —
     # see `primary_code_period` and the `ReceiverSatState` constructors.
-    reference_integration_time = 1u"ms",
-    coherence_limit = Inf * u"s",
-    out_of_lock_time_threshold = 200u"ms",
-    wait_time_threshold = 80u"ms",
+    reference_integration_time = 1ms,
+    coherence_limit = Inf * s,
+    out_of_lock_time_threshold = 200ms,
+    wait_time_threshold = 80ms,
 )
     CodeLockDetector(
         cn0_threshold,
         reference_integration_time,
         coherence_limit,
-        0.0u"s",
+        0.0s,
         out_of_lock_time_threshold,
-        0.0u"s",
+        0.0s,
         wait_time_threshold,
     )
 end
@@ -115,12 +121,26 @@ function is_below_cn0_threshold(lock_detector::CodeLockDetector, cn0, integratio
     !(snr >= required)
 end
 
+# How far above `out_of_lock_time_threshold` the accumulated out-of-lock time may run. The
+# dwell is paid back one-for-one, so without a cap the time to *re*-declare lock is the full
+# length of the outage that came before it: a satellite obscured for a minute would need a
+# minute of clean signal to come back. That contradicts what the dwell is for — riding out
+# brief fades — and it is what a vector-tracking member, which is kept in tracking through
+# an outage instead of being dropped and reacquired (`remove_lost_satellites`), actually
+# lives through. Capping at a small multiple of the threshold keeps the "consistently weak"
+# verdict (the detector still sits well past the threshold) while bounding the recovery at
+# `(cap - 1) · out_of_lock_time_threshold` of good signal.
+const OUT_OF_LOCK_TIME_CAP_FACTOR = 2
+
 function update(lock_detector::CodeLockDetector, cn0, integration_time, signal_duration)
     out_of_lock_time = lock_detector.out_of_lock_time
     if lock_detector.wait_time >= lock_detector.wait_time_threshold
         if is_below_cn0_threshold(lock_detector, cn0, integration_time)
-            out_of_lock_time += signal_duration
-        elseif out_of_lock_time > 0.0u"s"
+            out_of_lock_time = min(
+                out_of_lock_time + signal_duration,
+                OUT_OF_LOCK_TIME_CAP_FACTOR * lock_detector.out_of_lock_time_threshold,
+            )
+        elseif out_of_lock_time > 0.0s
             out_of_lock_time -= signal_duration
         end
     end
@@ -145,6 +165,17 @@ function is_in_lock(lock_detector::AbstractLockDetector)
 end
 
 """
+    set_out_of_lock(lock_detector::AbstractLockDetector)
+
+Return a copy of the detector with its accumulated out-of-lock time raised to the
+threshold, so [`is_in_lock`](@ref) immediately reports `false`. Used to force a
+satellite out of lock, e.g. when vector tracking releases it for cause.
+"""
+function set_out_of_lock(lock_detector::AbstractLockDetector)
+    @set lock_detector.out_of_lock_time = lock_detector.out_of_lock_time_threshold
+end
+
+"""
     CarrierLockDetector <: AbstractLockDetector
 
 Declares carrier lock from the prompt correlator using the standard low-pass filtered
@@ -156,27 +187,27 @@ little in-phase dominance accumulates out-of-lock time, and lock is lost once it
 struct CarrierLockDetector <: AbstractLockDetector
     prev_filtered_inphase::Float64
     prev_filtered_quadrature::Float64
-    integration_time::typeof(1.0u"s")
-    integration_time_threshold::typeof(1.0u"s")
-    out_of_lock_time::typeof(1.0u"s")
-    out_of_lock_time_threshold::typeof(1.0u"s")
-    wait_time::typeof(1.0u"s")
-    wait_time_threshold::typeof(1.0u"s")
+    integration_time::typeof(1.0s)
+    integration_time_threshold::typeof(1.0s)
+    out_of_lock_time::typeof(1.0s)
+    out_of_lock_time_threshold::typeof(1.0s)
+    wait_time::typeof(1.0s)
+    wait_time_threshold::typeof(1.0s)
 end
 
 function CarrierLockDetector(;
-    out_of_lock_time_threshold = 4u"s",
-    wait_time_threshold = 80u"ms",
-    integration_time_threshold = 80u"ms",
+    out_of_lock_time_threshold = 4s,
+    wait_time_threshold = 80ms,
+    integration_time_threshold = 80ms,
 )
     CarrierLockDetector(
         0.0,
         0.0,
-        0.0u"s",
+        0.0s,
         integration_time_threshold,
-        0.0u"s",
+        0.0s,
         out_of_lock_time_threshold,
-        0.0u"s",
+        0.0s,
         wait_time_threshold,
     )
 end
@@ -198,12 +229,12 @@ function update(lock_detector::CarrierLockDetector, prompt, signal_duration)
             if next_filtered_inphase / K2 < next_filtered_quadrature
                 out_of_lock_time += next_integration_time
             else
-                out_of_lock_time = 0.0u"s"
+                out_of_lock_time = 0.0s
             end
         end
         next_filtered_inphase = 0.0
         next_filtered_quadrature = 0.0
-        next_integration_time = 0.0u"s"
+        next_integration_time = 0.0s
     end
     CarrierLockDetector(
         next_filtered_inphase,

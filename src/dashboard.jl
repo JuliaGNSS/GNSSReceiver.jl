@@ -52,6 +52,10 @@ const MAP_MIN_WIDTH = 8       # below this the tile is unreadable; show the text
 const MAP_MIN_HEIGHT = 4
 const MAP_POLL_INTERVAL = 0.5 # seconds between checks for a new map request
 
+# Columns `barplot` pads before its (right-justified) label column, so the CN0 panel can put
+# its continuation marker in that column rather than guessing at the panel's own padding.
+const CN0_LABEL_INDENT = 3
+
 mutable struct ReceiverModel <: Model
     quit::Bool
     tick::Int                       # frame counter, drives the "Searching…" dots
@@ -169,11 +173,13 @@ end
 update!(::ReceiverModel, ::Event) = nothing
 
 # ── View ────────────────────────────────────────────────────────────────────
-const CN0_PANEL_TITLE = "Carrier-to-Noise-Density-Ratio (CN0) [dBHz]"
+const CN0_PANEL_TITLE = "Carrier-to-Noise-Density Ratio (C/N₀) [dBHz]"
+# Spelling out the marker legend costs more columns than the long title leaves, and a title
+# clipped mid-legend is worse than a terse one — so the panel shortens its name to make room.
+const CN0_PANEL_TITLE_SHORT = "C/N₀ [dBHz]"
 const DOA_PANEL_TITLE = "Satellite Direction-of-Arrival (DOA)"
 const PVT_PANEL_TITLE = "Position Velocity Time (PVT)"
 const MAP_PANEL_TITLE = "Map"
-const NOT_ENOUGH_SATS_TEXT = "Not enough satellites to calculate position."
 
 function view(m::ReceiverModel, f::Frame)
     m.tick += 1
@@ -194,8 +200,37 @@ function view(m::ReceiverModel, f::Frame)
     status = ended ? "  │  stream ended (press q to quit)" :
              (has_fix && !fresh ? "  │  stale (no new fix)" : "")
     hdr = " ● GNSSReceiver  │  run time $(rt) s" * status
-    set_string!(buf, header.x, header.y, rpad(hdr, header.width),
+    hx = set_string!(buf, header.x, header.y, hdr,
         tstyle(:title, bold = true); max_x = right(header))
+    # Vector-tracking badge, coloured by state: green while the navigation filter is closing
+    # the loops, yellow while enabled but not yet running ("armed"), and nothing at all when
+    # VT is disabled. The count reads measured/loop — the satellites whose measurements
+    # determined this solution (`pvt.sats`, the same set the fix-quality table counts) out of
+    # the loop's total membership (the `in_vt_loop` flags of this same frame), the difference
+    # being members coasted through an obscuration. One number for both would hide exactly
+    # that.
+    vt = gui_data === nothing ? nothing : gui_data.vt
+    if vt !== nothing
+        num_members = count(sat -> sat.in_vt_loop, gui_data.sat_data)
+        # Non-zero only while the filter is (or has recently been) propagating on its dynamics
+        # alone: the starvation watchdog grows this whenever an epoch could not determine the
+        # navigation state and pays it back at half rate afterwards, so it is an "unsolvable
+        # for about this long" figure rather than a stopwatch — shown only while it is running
+        # up, and dropped from the badge as soon as it is back to zero.
+        coasting = vt.time_with_insufficient_meas > 0.0s ?
+            ", propagating $(round(ustrip(s, vt.time_with_insufficient_meas); digits = 1)) s" :
+            ""
+        badge, badge_style = vt.running ?
+            (
+                "  │  VT running ($(length(gui_data.pvt.sats))/$(num_members) sats$(coasting))",
+                isempty(coasting) ? tstyle(:success, bold = true) : tstyle(:warning, bold = true),
+            ) :
+            ("  │  VT armed", tstyle(:warning))
+        hx = set_string!(buf, hx, header.y, badge, badge_style; max_x = right(header))
+    end
+    # Pad the rest of the row so the title bar stays continuous.
+    hx <= right(header) && set_string!(buf, hx, header.y,
+        repeat(" ", right(header) - hx + 1), tstyle(:title, bold = true); max_x = right(header))
 
     # Body: CN0 | DOA (top), PVT | Map (bottom).
     toprow, botrow = split_layout(Layout(Vertical, [Percent(50), Fill()]), body)
@@ -203,8 +238,8 @@ function view(m::ReceiverModel, f::Frame)
     botcols = split_layout(Layout(Horizontal, [Percent(42), Fill()]), botrow)
     _render_cn0(buf, topcols[1], gui_data, num_dots)
     _render_skyplot(buf, topcols[2], gui_data, num_dots)
-    _render_position(buf, botcols[1], gui_data, last_fix, show_diag, fresh, ended)
-    _render_map(m, buf, botcols[2], last_fix)
+    _render_position(buf, botcols[1], gui_data, last_fix, show_diag, fresh, ended, num_dots)
+    _render_map(m, buf, botcols[2], last_fix, num_dots)
 
     diaghint = show_diag ? "[d] hide diagnostics" : "[d] diagnostics"
     render(StatusBar(
@@ -240,7 +275,7 @@ end
 # reference an `Inf` CN0 got in the old GUI. `barplot` throws on anything negative or
 # non-finite ("all values have to be ≥ 0"), and both are reachable for a satellite the
 # detectors are still holding: Tracking's NWPR estimator reports `-Inf dBHz` for "no
-# detectable signal" and a negative dB-Hz figure just above that (any CN0 under 1 Hz),
+# detectable signal" and a negative dBHz figure just above that (any CN0 under 1 Hz),
 # while `Inf`/`NaN` come from a degenerate prompt buffer. Such a satellite draws an empty
 # bar instead of taking the whole panel — and with it the dashboard — down.
 function _cn0_db(cn0)
@@ -249,7 +284,22 @@ function _cn0_db(cn0)
 end
 
 function _render_cn0(buf, area::Rect, gui_data, num_dots)
-    inner = render(Block(; title = CN0_PANEL_TITLE, border_style = tstyle(:border),
+    # One marker column carries both memberships, which are different sets: the vector loop
+    # (`in_vt_loop`) and the satellites whose measurements determined this fix (`pvt.sats`).
+    # A loop member missing from `pvt.sats` was coasted through this update — the case worth
+    # seeing — so it gets its own glyph rather than sharing `*`. Without VT only the fix
+    # membership is left to show. Legends ride in the panel title and appear only once some
+    # satellite carries the mark, so a quiet receiver adds no chrome.
+    vt_on = gui_data !== nothing && gui_data.vt !== nothing
+    in_fix = gui_data === nothing ? Set{Tuple{Symbol,Int}}() : Set(keys(gui_data.pvt.sats))
+    title = if vt_on && any(sd -> sd.in_vt_loop, values(gui_data.sat_data))
+        CN0_PANEL_TITLE_SHORT * "  (* VT+fix, ∘ VT coasted, · fix)"
+    elseif !isempty(in_fix)
+        CN0_PANEL_TITLE_SHORT * "  (· = in fix)"
+    else
+        CN0_PANEL_TITLE
+    end
+    inner = render(Block(; title = title, border_style = tstyle(:border),
             title_style = tstyle(:accent, bold = true)), area, buf)
     if gui_data === nothing || isempty(gui_data.sat_data)
         set_string!(buf, inner.x + 1, inner.y, "Searching for satellites$(repeat(".", num_dots))",
@@ -257,11 +307,43 @@ function _render_cn0(buf, area::Rect, gui_data, num_dots)
         return
     end
     # Bars sorted by constellation (GPS, then Galileo, …), then PRN, then band; coloured
-    # green (healthy) / red (unhealthy).
+    # green (healthy) / red (unhealthy). The mark goes right after the PRN (`G03* L1`), with a
+    # blank in that column for an unmarked bar, so no space precedes it, all labels stay one
+    # width, and `barplot`'s right-justification keeps the PRN/band columns aligned.
+    # `sat_label` is `<sys><2-digit prn> <3-char band>`, so the mark goes at index 4. The column
+    # is spent only when something could occupy it — a receiver still searching keeps the space
+    # for the bars.
+    marking = vt_on || !isempty(in_fix)
     sorted_keys = sort(collect(keys(gui_data.sat_data)); by = sat_sort_key)
-    labels = [sat_label(key...) for key in sorted_keys]
-    cn0s = [_cn0_db(gui_data.sat_data[key].cn0) for key in sorted_keys]
-    colors = [gui_data.sat_data[key].is_healthy ? :green : :red for key in sorted_keys]
+    # `barplot` draws one row per bar between a leading and a trailing blank row, and
+    # `_paint_plot!` clips at the panel's bottom edge, so a panel shorter than the satellite
+    # list would quietly show a shorter list — a satellite panel must not lie about how many
+    # satellites there are. `inner.height - 1` bars fit (the trailing blank row is the one
+    # that may be clipped without loss); past that the last row goes to a continuation marker
+    # rather than to one more bar, so the number of missing satellites is always on screen.
+    # The shown bars stay the leading slice of the same sort order, so a satellite being
+    # acquired or lost never reshuffles the ones already on screen.
+    max_bar_rows = max(1, inner.height - 1)
+    num_shown = length(sorted_keys) > max_bar_rows ? max(1, max_bar_rows - 1) :
+                length(sorted_keys)
+    # Slices, not `view`s: at module scope `view` is `Tachikoma.view` (see the module
+    # header), and a frame's worth of labels and bars is allocated below regardless.
+    hidden_keys = sorted_keys[(num_shown+1):end]
+    shown_keys = sorted_keys[1:num_shown]
+    labels = map(shown_keys) do key
+        lbl = sat_label(key...)
+        marking || return lbl
+        mark = if vt_on && gui_data.sat_data[key].in_vt_loop
+            key in in_fix ? "*" : "∘"
+        elseif key in in_fix
+            "·"
+        else
+            " "
+        end
+        lbl[1:3] * mark * lbl[4:end]
+    end
+    cn0s = [_cn0_db(gui_data.sat_data[key].cn0) for key in shown_keys]
+    colors = [gui_data.sat_data[key].is_healthy ? :green : :red for key in shown_keys]
     labelw = maximum(length, labels)
     # Chrome `barplot` draws around the bars themselves: the label column, then `" ┤"`
     # between label and bar, then the value printed after the bar (" 45.1" — a space plus up
@@ -271,7 +353,38 @@ function _render_cn0(buf, area::Rect, gui_data, num_dots)
     plot = barplot(labels, cn0s; color = colors, border = :none,
         width = barwidth, maximum = 55)
     _paint_plot!(buf, inner, string(plot; color = true))
+    # The marker sits on the row after the last bar (blank row, then one row per bar), in the
+    # label column, so it reads as the bar list continuing. It is skipped when even that row
+    # is past the panel — a panel with room for a single bar keeps the bar.
+    isempty(hidden_keys) && return
+    y = inner.y + num_shown + 1
+    y > bottom(inner) && return
+    x = inner.x + CN0_LABEL_INDENT
+    set_string!(buf, x, y, _cn0_continuation(hidden_keys, right(inner) - x + 1),
+        tstyle(:text_dim); max_x = right(inner))
     return
+end
+
+# The continuation row standing in for the satellites the panel had no room for: a vertical
+# ellipsis under the bar labels, how many are hidden, and as many of their names as `width`
+# takes. A list cut short ends in `…`, so it is never mistaken for the whole of what is
+# hidden — the count ahead of it is what carries that. When not even one name fits, the count
+# stands alone.
+function _cn0_continuation(hidden_keys, width)
+    counted = "⋮  $(length(hidden_keys)) more"
+    labels = [strip(sat_label(key...)) for key in hidden_keys]
+    # Longest prefix of the list that fits, measured by accumulating widths rather than by
+    # rendering each candidate: `": "` before the first name, `", "` between names, and — for
+    # every prefix but the whole list — `", …"` for the remainder.
+    used = textwidth(counted) + 2
+    shown = 0
+    for (i, label) in enumerate(labels)
+        used += textwidth(label) + (i == 1 ? 0 : 2)
+        used + (i == lastindex(labels) ? 0 : 3) <= width || break
+        shown = i
+    end
+    shown == 0 && return counted
+    counted * ": " * join(labels[1:shown], ", ") * (shown < length(labels) ? ", …" : "")
 end
 
 function _render_skyplot(buf, area::Rect, gui_data, num_dots)
@@ -279,7 +392,12 @@ function _render_skyplot(buf, area::Rect, gui_data, num_dots)
             title_style = tstyle(:accent, bold = true)), area, buf)
     if gui_data === nothing || isnothing(gui_data.pvt.time)
         nsat = gui_data === nothing ? 0 : length(gui_data.sat_data)
-        msg = nsat < 4 ? NOT_ENOUGH_SATS_TEXT : "Decoding satellites$(repeat(".", num_dots))"
+        # `nsat` counts tracked (not necessarily decoded) satellites, and the count
+        # a fix needs is layout-dependent (3 + one clock per time system + one IFB
+        # per extra band), so the panel reports progress and lets the fix itself
+        # signal success.
+        msg = nsat == 0 ? "Searching for satellites$(repeat(".", num_dots))" :
+              "Decoding satellites$(repeat(".", num_dots))"
         set_string!(buf, inner.x + 1, inner.y, msg, tstyle(:text_dim); max_x = right(inner))
         return
     end
@@ -365,7 +483,7 @@ function _legend_ansi(present)
     String(take!(io.io))
 end
 
-function _render_position(buf, area::Rect, gui_data, last_fix, show_diag, fresh, ended)
+function _render_position(buf, area::Rect, gui_data, last_fix, show_diag, fresh, ended, num_dots)
     inner = render(Block(; title = PVT_PANEL_TITLE, border_style = tstyle(:border),
             title_style = tstyle(:accent, bold = true)), area, buf)
     live = gui_data !== nothing && !isnothing(gui_data.pvt.time)
@@ -373,11 +491,12 @@ function _render_position(buf, area::Rect, gui_data, last_fix, show_diag, fresh,
     x, y = inner.x + 1, inner.y
     if fix === nothing
         nsat = gui_data === nothing ? 0 : length(gui_data.sat_data)
-        rt = gui_data === nothing ? 0.0 : round(ustrip(s, gui_data.runtime); digits = 1)
-        msg = nsat < 4 ? NOT_ENOUGH_SATS_TEXT : "Decoding satellites…"
+        # See `_render_skyplot`: no fixed satellite threshold — just report progress.
+        # Run time is already shown in the header, so it is not repeated here. The animated
+        # dots match the CN0 and DOA panels (`repeat(".", num_dots)`) so all three "wait" alike.
+        msg = nsat == 0 ? "Searching for satellites$(repeat(".", num_dots))" :
+              "Decoding satellites$(repeat(".", num_dots))"
         set_string!(buf, x, y, msg, tstyle(:text_dim); max_x = right(inner))
-        set_string!(buf, x, y + 1, "$nsat satellites tracked   run time $rt s",
-            tstyle(:text_dim); max_x = right(inner))
         return
     end
     pvt = fix.pvt
@@ -391,7 +510,7 @@ function _render_position(buf, area::Rect, gui_data, last_fix, show_diag, fresh,
     heading = "$(round(ustrip(°, pvt.course_over_ground); digits = 1))°"
     low_speed = speed < MIN_SPEED_FOR_HEADING
     heading_value = low_speed ? "$heading (low speed)" : heading
-    rt = gui_data === nothing ? 0.0 : round(ustrip(s, gui_data.runtime); digits = 1)
+    # Run time is shown in the header, so it is not repeated in this panel.
     pvt_rows = [
         ("Time", "$utc_str UTC"),
         ("Coordinates",
@@ -400,7 +519,6 @@ function _render_position(buf, area::Rect, gui_data, last_fix, show_diag, fresh,
         ("Altitude", "$(round(lla.alt; digits = 1)) m"),
         ("Speed", "$(round(speed; digits = 2)) m/s"),
         ("Heading", heading_value),
-        ("Run time", "$rt s"),
     ]
     labelw = maximum(length(first(r)) for r in pvt_rows) + 1  # +1 for the colon
     # A stale (re-emitted) fix or a held last-fix is dimmed so a frozen position is not
@@ -442,12 +560,12 @@ end
 # `get_LLA` is called unguarded, exactly as in `_render_position`: both panels convert the
 # same `pvt`, so swallowing a failure here would only blank this panel while the PVT panel
 # above still crashed the frame.
-function _render_map(m::ReceiverModel, buf, area::Rect, last_fix)
+function _render_map(m::ReceiverModel, buf, area::Rect, last_fix, num_dots)
     inner = render(Block(; title = MAP_PANEL_TITLE, border_style = tstyle(:border),
             title_style = tstyle(:accent, bold = true)), area, buf)
     if last_fix === nothing
-        set_string!(buf, inner.x + 1, inner.y, "awaiting fix…", tstyle(:text_dim);
-            max_x = right(inner))
+        set_string!(buf, inner.x + 1, inner.y, "awaiting fix$(repeat(".", num_dots))",
+            tstyle(:text_dim); max_x = right(inner))
         return
     end
     lla = get_LLA(last_fix.pvt)

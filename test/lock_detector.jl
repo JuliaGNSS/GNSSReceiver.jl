@@ -31,6 +31,36 @@ const REFERENCE_T = 1u"ms"
     @test detector.out_of_lock_time == accumulated - 4u"ms"
 end
 
+@testset "CodeLockDetector caps the out-of-lock dwell so recovery is bounded" begin
+    # The dwell is paid back at the rate it is spent, so an uncapped accumulation would make
+    # re-declaring lock take as long as the outage before it — minutes for a vector-tracking
+    # member carried through a tunnel, which is exactly the case the bridging is for.
+    detector = GNSSReceiver.CodeLockDetector(;
+        cn0_threshold = 30u"dBHz",
+        reference_integration_time = REFERENCE_T,
+        out_of_lock_time_threshold = 200u"ms",
+        wait_time_threshold = 80u"ms",
+    )
+    for _ = 1:20
+        detector = GNSSReceiver.update(detector, 45u"dBHz", REFERENCE_T, 4u"ms")
+    end
+    # A 60 s outage at 4 ms per update.
+    for _ = 1:15_000
+        detector = GNSSReceiver.update(detector, 10u"dBHz", REFERENCE_T, 4u"ms")
+    end
+    @test !GNSSReceiver.is_in_lock(detector)
+    @test detector.out_of_lock_time ==
+          GNSSReceiver.OUT_OF_LOCK_TIME_CAP_FACTOR * detector.out_of_lock_time_threshold
+
+    # One threshold's worth of good signal therefore brings it back, not sixty seconds':
+    # 51 updates of 4 ms pay 204 ms off the 400 ms cap, crossing back under the threshold.
+    for _ = 1:51
+        detector = GNSSReceiver.update(detector, 45u"dBHz", REFERENCE_T, 4u"ms")
+    end
+    @test GNSSReceiver.is_in_lock(detector)
+    @test detector.out_of_lock_time < detector.out_of_lock_time_threshold
+end
+
 @testset "CodeLockDetector stays neutral before the wait time elapses" begin
     # Before `wait_time_threshold` is reached a bad CN0 must not accumulate any
     # out-of-lock time (the detector is still warming up).

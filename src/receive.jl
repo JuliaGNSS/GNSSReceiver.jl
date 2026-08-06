@@ -3,21 +3,92 @@
 
 Per-satellite summary emitted for each processed chunk: the estimated carrier-to-noise
 density ratio `cn0`, the latest fully integrated `prompt` correlator value (a scalar
-for single-antenna, an `SVector` for multi-antenna) and whether the satellite reports
-itself `is_healthy`.
+for single-antenna, an `SVector` for multi-antenna), whether the satellite reports
+itself `is_healthy`, and whether its tracking loops are currently closed by the
+vector-tracking navigation filter (`in_vt_loop`; always `false` when VT is disabled).
+
+Loop membership is not the same as having determined the solution: a member coasting
+through an obscuration stays `in_vt_loop` and keeps being steered by the filter, but
+withholds its discriminators. Which satellites were *measured* is `pvt.sats`, under vector
+and scalar tracking alike — see [`VTStatus`](@ref) for the coasted ones.
 """
 struct SatelliteDataOfInterest{P<:Union{<:Complex,<:AbstractVector{<:Complex}}}
     cn0::typeof(1.0dBHz)
     prompt::P
     is_healthy::Bool
+    in_vt_loop::Bool
 end
+
+# Back-compat / convenience: a satellite summary built without VT membership defaults to
+# not being in the vector loop.
+SatelliteDataOfInterest(
+    cn0,
+    prompt::P,
+    is_healthy,
+) where {P<:Union{<:Complex,<:AbstractVector{<:Complex}}} =
+    SatelliteDataOfInterest{P}(cn0, prompt, is_healthy, false)
+SatelliteDataOfInterest{P}(
+    cn0,
+    prompt,
+    is_healthy,
+) where {P<:Union{<:Complex,<:AbstractVector{<:Complex}}} =
+    SatelliteDataOfInterest{P}(cn0, prompt, is_healthy, false)
+
+"""
+    VTStatus
+
+Condensed vector-tracking status carried alongside a receiver snapshot. A `nothing` in
+place of a `VTStatus` means vector tracking is disabled (pure scalar tracking).
+
+# Fields
+- `running::Bool`: whether the navigation filter is currently closing the tracking loops.
+  It starts with the first scalar fix and falls back on prolonged measurement starvation.
+- `member_sats::Dictionary{Tuple{Symbol,Int},SatInfo}`: every member of the loop as of the
+  filter's latest update, keyed exactly as `pvt.sats` is, each with the position, transmit
+  time and post-fit residuals that update produced for it. Empty while the scalar solve is
+  in control (nothing was filtered), so it never carries a stale report.
+- `position_std`, `clock_std`: the filter's own uncertainty in its position (the root sum of
+  the three position variances) and in the reported clock bias. `NaN * m` while the filter
+  is not running. This is what `pvt.dop` cannot say: DOP is the *geometry* of the satellites
+  that were measured, and it is `nothing` altogether on an epoch carried by the dynamics —
+  where these two are the only quality figures left.
+- `time_with_insufficient_meas`: how long the filter has been coasting on epochs it could
+  not solve, counted against `VectorTracking`'s `insufficient_meas_timeout`, at which point
+  vector tracking is abandoned. Nonzero means the loop is on its way out; it is paid back
+  down (at half rate) by solvable epochs.
+
+`pvt.sats` holds the members the update actually *measured*; `member_sats` holds those and
+the coasted ones together, so `setdiff(keys(member_sats), keys(pvt.sats))` is what the
+filter predicted through an obscuration. A coasted member's residual is the divergence
+indicator: it reduces to the code discriminator for a well-steered member and grows without
+bound for one drifting away, which is why it is reported rather than dropped.
+
+Current loop *membership* is not carried here: it is the `in_vt_loop` flags of the snapshot's
+`sat_data`, and it describes a different instant than `member_sats` does — a satellite that
+has just joined the loop is flagged but has no entry yet, while one released during the
+latest update still has its entry (with the residual that explains the release) but is no
+longer flagged. Count the flags where you need the size of the loop.
+"""
+struct VTStatus
+    running::Bool
+    member_sats::Dictionary{Tuple{Symbol,Int},SatInfo}
+    position_std::typeof(1.0m)
+    clock_std::typeof(1.0m)
+    time_with_insufficient_meas::typeof(1.0s)
+end
+
+# Convenience: a status carrying only the loop state — no per-member report and no
+# uncertainties, as a filter that has not updated yet has neither.
+VTStatus(running) =
+    VTStatus(running, Dictionary{Tuple{Symbol,Int},SatInfo}(), NaN * m, NaN * m, 0.0s)
 
 """
     ReceiverDataOfInterest
 
 Snapshot of the receiver after a processed chunk: `sat_data` maps each tracked satellite
-to its [`SatelliteDataOfInterest`](@ref), `pvt` is the current PVT solution and `runtime`
-is the elapsed signal time. This is the element type produced by [`receive`](@ref).
+to its [`SatelliteDataOfInterest`](@ref), `pvt` is the current PVT solution, `runtime`
+is the elapsed signal time and `vt` is the [`VTStatus`](@ref) (or `nothing` when vector
+tracking is disabled). This is the element type produced by [`receive`](@ref).
 
 `sat_data` is a `Dictionaries.Dictionary` (GNSSReceiver.jl PR #96) keyed by
 `(signal_id, prn)` — the ranging signal's id and PRN — so the same PRN can appear on
@@ -28,10 +99,30 @@ struct ReceiverDataOfInterest{S<:SatelliteDataOfInterest}
     sat_data::Dictionary{Tuple{Symbol,Int},S}
     pvt::PVTSolution
     runtime::typeof(1.0s)
+    vt::Union{Nothing,VTStatus}
 end
+
+# Back-compat / convenience: a snapshot built without VT status defaults to disabled.
+ReceiverDataOfInterest(
+    sat_data::Dictionary{Tuple{Symbol,Int},S},
+    pvt,
+    runtime,
+) where {S<:SatelliteDataOfInterest} =
+    ReceiverDataOfInterest{S}(sat_data, pvt, runtime, nothing)
+ReceiverDataOfInterest{S}(
+    sat_data,
+    pvt,
+    runtime,
+) where {S<:SatelliteDataOfInterest} =
+    ReceiverDataOfInterest{S}(sat_data, pvt, runtime, nothing)
 
 is_sat_healthy_at(sat_state_dict, prn) =
     haskey(sat_state_dict, prn) && is_sat_healthy(sat_state_dict[prn].decoder)
+
+# Whether the satellite is currently in the vector-tracking loop, read from the cached
+# `in_vt_loop` flag on its `ReceiverSatState` (`false` when VT is off or the sat is absent).
+is_sat_in_vt_loop_at(sat_state_dict, prn) =
+    haskey(sat_state_dict, prn) && sat_state_dict[prn].in_vt_loop
 
 # Prompt correlator value of a satellite's ranging signal (the pilot, for a combined
 # system) — the quantity `SatelliteDataOfInterest` reports.
@@ -71,6 +162,7 @@ function build_sat_data(receiver_state)
                     estimate_cn0(sat_state, RANGING_SIGNAL_INDEX),
                     _ranging_prompt(sat_state),
                     is_sat_healthy_at(sat_state_dict, prn),
+                    is_sat_in_vt_loop_at(sat_state_dict, prn),
                 ),
             )
         end
@@ -78,12 +170,33 @@ function build_sat_data(receiver_state)
     sat_data
 end
 
+# Condensed vector-tracking status for the payload: `nothing` when vector tracking is
+# disabled (`receiver_state.vt === nothing`), otherwise the [`VTStatus`](@ref). The
+# per-member report is whatever the navigation filter's latest update left on the state.
+#
+# The uncertainties are reported only while the filter is running, like `member_sats`: with
+# the scalar solve in control the covariance describes an update that did not determine the
+# reported solution (and before the first one it is still all zeros, which would read as
+# perfect certainty rather than as no information).
+function vt_status_of_interest(receiver_state)
+    vt = receiver_state.vt
+    vt === nothing && return nothing
+    VTStatus(
+        vt.running,
+        vt.member_sats,
+        (vt.running ? position_uncertainty(vt) : NaN) * m,
+        (vt.running ? clock_uncertainty(vt) : NaN) * m,
+        vt.time_with_insufficient_meas,
+    )
+end
+
 """
     default_data_of_interest(receiver_state) -> ReceiverDataOfInterest
 
 Condense a `ReceiverState` into the default per-chunk payload emitted by [`receive`](@ref):
 each tracked satellite's CN0, prompt correlator value and health — keyed by
-`(signal_id, prn)` — together with the current PVT solution and the runtime.
+`(signal_id, prn)` — together with the current PVT solution, the runtime and the
+vector-tracking status.
 
 This is the default `extract` function of [`receive`](@ref). Pass your own
 `extract(receiver_state)` to emit a different payload (e.g. raw carrier Doppler, code
@@ -96,6 +209,7 @@ function default_data_of_interest(receiver_state)
         build_sat_data(receiver_state),
         receiver_state.pvt,
         receiver_state.runtime,
+        vt_status_of_interest(receiver_state),
     )
 end
 
@@ -125,12 +239,9 @@ handover_coherent_integration_time(signal::AbstractGNSSSignal) = primary_code_pe
 # Carrier-Doppler pull-in range: the largest carrier-Doppler error the tracking
 # loop can pull into lock from a fresh acquisition handover. `receive` sizes each
 # constellation's acquisition Doppler bin from this (bin = 2·margin·pull_in) so the
-# worst-case post-acquisition residual lands inside the loop's capture range.
-#
-# This mirrors the capture behaviour of `Tracking`'s `ConventionalPLLAndDLL`
-# estimator using only the released `Tracking` / `GNSSSignals` API — the loop lives
-# in `Tracking`, but the sizing decision is the receiver's, so the range is derived
-# here rather than queried from the loop.
+# worst-case post-acquisition residual lands inside the loop's capture range. These
+# are the pull-in ranges of `Tracking`'s `ConventionalPLLAndDLL` estimator, derived
+# from the public `Tracking` / `GNSSSignals` API.
 
 # FLL-assisted carrier loop — the `ConventionalAssistedPLLAndDLL` default, a
 # `ThirdOrderAssistedBilinearLF`. Pull-in comes from the FLL frequency
@@ -165,6 +276,21 @@ function carrier_doppler_pull_in_range(
     )
     T = handover_coherent_integration_time(signal)
     uconvert(Hz, min(B_L, 1 / (2 * T)))
+end
+
+# The vector estimator's acquisition handover runs on its scalar fallback loop
+# (the navigation filter only takes over once the satellite is locked and
+# decoded), which uses the same FLL-assisted filter and per-signal defaults as
+# the conventional estimator — so the pull-in range is the same FLL
+# discriminator bound. `VectorPLLAndDLL` is always FLL-assisted here (its
+# default, and a non-assisted carrier filter cannot close the vector carrier
+# loop), so no pure-PLL fallback method is needed.
+function carrier_doppler_pull_in_range(
+    ::VectorPLLAndDLL{<:Tracking.ThirdOrderAssistedBilinearLF},
+    signal::AbstractGNSSSignal,
+)
+    T = handover_coherent_integration_time(signal)
+    uconvert(Hz, 1 / (4 * T))
 end
 
 # Build the per-constellation acquisition plans and the acquisition-buffer sample
@@ -254,12 +380,27 @@ task; one `ReceiverDataOfInterest` is emitted per `pvt_update_interval`. Acquisi
 and Doppler resolution are derived per system from the tracking loop pull-in range, and
 `prns` restricts the search (`nothing` ⇒ each constellation's default range, a per-GNSS
 `NamedTuple`/`Dict` keyed by `get_constellation_id`, or a plain collection applied to
-every system). A satellite is declared locked once its CN0 exceeds `code_lock_cn0_threshold` — referred
-to a one-code-block record, so an `N`-block record locks at `10·log10(N)` dB less — and
-contributes to the PVT solution — recomputed every `pvt_update_interval` — after
+every system). A satellite is declared locked from its CN0 — referred to a one-code-block
+record, so an `N`-block record locks at `10·log10(N)` dB less — and contributes to the PVT
+solution — recomputed every `pvt_update_interval` — after
 `time_in_lock_before_calculating_pvt`. `enable_ionospheric_correction`,
 `enable_tropospheric_correction` and `pvt_approximate_year` (which resolves the GPS
 week-number rollover for old recordings) are passed through to `calc_pvt`.
+
+Pass `vector_tracking = true` to switch to vector tracking: once a first scalar fix is
+available, a navigation Kalman filter closes every satellite's code/carrier loop
+centrally from the fused multi-GNSS solution instead of per-satellite loop filters, and
+the emitted PVT solutions come from the filter. Like the scalar solve, the filter
+estimates one clock bias per GNSS time system and one inter-frequency bias per band
+beyond a reference band, and corrects the pseudoranges for the broadcast ionospheric
+model and the tropospheric delay.
+
+Passing a [`VectorTracking`](@ref) in place of `true` enables vector tracking *and*
+configures the filter, which is worth doing whenever the platform or the front end is known:
+the defaults assume vehicular dynamics and a TCXO-grade oscillator, and both the dynamics
+(`acceleration_noise_std`) and the oscillator stability (`h0`, `hm2`) materially change how
+the filter weighs its prediction against the measurements. Each payload then reports what the
+filter is doing through its [`VTStatus`](@ref).
 
 The downconvert-and-correlator backend is auto-selected from the sample element type:
 `Complex{Int16}` inputs use Tracking's fast integer backend when `max_meas` (the front-end
@@ -271,7 +412,7 @@ function receive(
     measurement_channel::SignalChannel,
     systems,
     sampling_freq;
-    interm_freq = 0.0u"Hz",
+    interm_freq = 0.0Hz,
     kwargs...,
 )
     receive(
@@ -288,23 +429,33 @@ function receive(
     systems_per_band::Tuple,
     sampling_freq;
     num_ants::NumAnts{N} = NumAnts(1),
-    interm_freqs::Tuple = map(_ -> 0.0u"Hz", measurement_channels),
-    acquire_every = 10u"s",
+    interm_freqs::Tuple = map(_ -> 0.0Hz, measurement_channels),
+    acquire_every = 10s,
     # PRNs to acquire. `nothing` ⇒ each constellation's default range; a per-GNSS
     # `NamedTuple`/`Dict` keyed by `get_constellation_id` (`(GPS = …, Galileo = …)`);
     # or a plain collection applied to every system. Each system's search is further
     # restricted to the PRNs that broadcast its signal (see `broadcasting_prns`).
     prns = nothing,
-    # Front-end full-scale for `Complex{Int16}` measurements (integer backend); omit it to
-    # fall back to the float backend. Ignored for float samples or when
-    # `downconvert_and_correlator` is given.
+    # Front-end full-scale, used only to auto-select and size the integer backend for
+    # `Complex{Int16}` measurements; omit it to fall back to the float backend. Ignored
+    # for float samples, and when `downconvert_and_correlator` is given — an explicit
+    # integer correlator already carries its own full-scale (built as
+    # `Int16ThreadedDownconvertAndCorrelator(max_meas)`), so there is nothing left for
+    # this keyword to configure.
     max_meas = nothing,
     # `nothing` ⇒ auto-select from the sample element type (integer backend for
     # `Complex{Int16}`, float CPU backend otherwise); see `default_downconvert_and_correlator`.
     downconvert_and_correlator = nothing,
-    code_lock_cn0_threshold = nothing,
-    time_in_lock_before_calculating_pvt = 2u"s",
-    pvt_update_interval = 100u"ms",
+    pvt_update_interval = 100ms,
+    # How long a satellite must have been continuously in lock before its measurements
+    # enter the PVT solve — the settling time its loops need before the code phase the
+    # pseudorange is built from is the tracked one rather than a pull-in transient.
+    time_in_lock_before_calculating_pvt = 2s,
+    # Vector tracking: `true` closes the tracking loops through a navigation filter
+    # once a first scalar fix is available; `false` (the default) keeps scalar tracking.
+    # A `VectorTracking` enables it and configures the filter (platform dynamics,
+    # oscillator stability, when to give up).
+    vector_tracking::Union{Bool,VectorTracking} = false,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
     pvt_approximate_year::Integer = year(now(UTC)),
@@ -339,16 +490,15 @@ function receive(
     band_systems = map(as_systems, systems_per_band)
     band_keys = map(s -> get_band_id(system_band(first(s))), band_systems)
 
-    # Acquisition Doppler resolution derived per system from the carrier tracking
-    # loops' *pull-in range*: the worst-case post-acquisition residual (≈ half a
-    # Doppler bin) is held to at most `pull_in_margin` of that range
-    # (bin = 2·margin·pull_in) — a smaller margin gives finer bins (more sensitive,
-    # more compute) and more clearance from the FLL discriminator's aliasing edge.
-    # The pull-in is a property of `doppler_estimator` and each group's *ranging*
-    # (driver) signal — the pilot for a combined system, i.e. the signal the loop
-    # tracks. `doppler_estimator` must match the loops' estimator; it is baked into
-    # the freshly-built receiver state below.
-    doppler_estimator = ConventionalAssistedPLLAndDLL()
+    # Acquisition Doppler resolution derived per system from the carrier loops'
+    # *pull-in range* (bin = 2·margin·pull_in), so the worst-case post-acquisition
+    # residual lands inside the loop's capture range; a smaller `pull_in_margin`
+    # gives finer bins. The pull-in depends on `doppler_estimator` and each group's
+    # ranging (driver) signal, so the estimator that sizes acquisition must be the
+    # one the receiver state below bakes in for the same `vector_tracking` mode —
+    # `VectorPLLAndDLL` under vector tracking (sized from its scalar fallback),
+    # else the conventional PLL/DLL.
+    doppler_estimator = doppler_estimator_for(vector_tracking)
     pull_in_margin = 0.5
     band_acq_doppler_resolutions = map(band_systems) do systems
         map(systems) do system
@@ -376,7 +526,7 @@ function receive(
         # buffer is sized in scalar samples, so unwrap to the scalar element type `T`.
         map((ch, s) -> SampleBuffer(eltype(eltype(ch)), s[3]), measurement_channels, setups),
     )
-    initial_state = ReceiverState(band_systems, buffers; num_ants, doppler_estimator)
+    initial_state = ReceiverState(band_systems, buffers; num_ants, vector_tracking)
 
     # The channel carries whatever `extract` returns. Infer that type without running
     # user code where possible (`promote_op`); for the default this is a concrete
@@ -418,9 +568,8 @@ function receive(
                     num_ants,
                     acquire_every,
                     acq_pfa,
-                    code_lock_cn0_threshold,
-                    time_in_lock_before_calculating_pvt,
                     pvt_update_interval,
+                    time_in_lock_before_calculating_pvt,
                     enable_ionospheric_correction,
                     enable_tropospheric_correction,
                     pvt_approximate_year,
