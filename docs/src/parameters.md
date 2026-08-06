@@ -105,20 +105,11 @@ per satellite by a [`CodeLockDetector`](@ref GNSSReceiver.CodeLockDetector) **an
 [`CarrierLockDetector`](@ref GNSSReceiver.CarrierLockDetector). Both track elapsed signal
 time, so their behaviour is independent of how the signal is chunked.
 
-The lock knob surfaced directly on [`receive`](@ref) is the code-lock CN0 threshold:
+The detector thresholds and timings (the code-lock CN0 threshold, out-of-lock, warm-up and
+carrier integration windows) are set at detector construction from per-signal defaults; see
+their docstrings in the [API Reference](@ref).
 
-| Keyword | Default | Meaning |
-|---|---|---|
-| `code_lock_cn0_threshold` | `nothing` (⇒ `30u"dBHz"` per signal) | A satellite is declared code-locked while its estimated CN0 stays above this, referred to a one-code-block record. |
-
-```julia
-data_channel = receive(
-    measurement_channel, GPSL1CA(), 2.048e6u"Hz";
-    code_lock_cn0_threshold = 32u"dBHz",   # stricter lock
-)
-```
-
-The threshold is referred to a record spanning **one primary code period**, because what
+The CN0 threshold is referred to a record spanning **one primary code period**, because what
 decides detectability is the post-integration SNR `CN0 · T` rather than CN0 on its own.
 When tracking integrates over `N` code blocks per record, a satellite therefore holds lock
 at `10·log10(N)` dB less CN0 — 3 dB at two blocks — since the longer coherent integration
@@ -134,10 +125,12 @@ channel now drops out of lock promptly rather than clearing a 30 dB-Hz threshold
 of records. Because NWPR measures *coherent* CN0, residual loop phase noise counts against
 it: with the conventional PLL at 1 ms records and the default ~5 ms coherent window,
 Tracking measures a median 44.4 dB-Hz at a true 45 dB-Hz and 23.6 dB-Hz at a true
-25 dB-Hz — a fraction of a dB on a strong satellite, one to two dB near threshold. Lower
-`code_lock_cn0_threshold` by the same if you want the pre-Tracking-6 sensitivity back. The
-estimate is also what `sat_data[…].cn0` reports and what the GUI plots, so displayed CN0s
-near and below threshold are lower (and truer) than they used to be.
+25 dB-Hz — a fraction of a dB on a strong satellite, one to two dB near threshold. The
+threshold is not a `receive` keyword: it comes from the per-signal default
+(`GNSSReceiver.get_default_code_lock_cn0_threshold`, 30 dB-Hz) that each satellite's
+`CodeLockDetector` is constructed with, which is where the pre-Tracking-6 sensitivity would
+have to be bought back. The estimate is also what `sat_data[…].cn0` reports and what the GUI
+plots, so displayed CN0s near and below threshold are lower (and truer) than they used to be.
 
 The remaining detector timings (out-of-lock, warm-up and carrier integration windows) are
 set at detector construction; see their docstrings in the [API Reference](@ref) for the
@@ -165,6 +158,60 @@ data_channel = receive(
     pvt_approximate_year = 2017,
 )
 ```
+
+## Vector tracking
+
+By default every satellite closes its own code/carrier loops (scalar tracking).
+`vector_tracking = true` switches the receiver to vector tracking: once a first scalar
+fix is available, a navigation Kalman filter fuses all satellites' accumulated
+discriminator outputs into one position/velocity/clock solution and closes every
+tracking loop centrally from it (a vector delay/frequency lock loop, VDFLL). Weak or
+briefly obscured satellites are carried through outages by the collective solution, and
+the emitted PVT solutions come from the navigation filter (at `pvt_update_interval`).
+They carry the same per-satellite diagnostics as a scalar fix, including the post-fit
+pseudorange and range-rate residuals (`SatInfo.residual` and `SatInfo.rate_residual`) of
+every satellite in the vector loop — reported even for a satellite whose signal the loop
+is currently carrying through an outage.
+
+```julia
+data_channel = receive(
+    measurement_channel, (GPSL1CA(), GalileoE1B()), 2.048e6u"Hz";
+    vector_tracking = true,
+)
+```
+
+Multi-constellation and multi-band configurations are supported with the same bias model
+as the scalar solve: the filter estimates one receiver clock bias per GNSS time system
+(all driven by the one oscillator's clock drift) and one receiver inter-frequency bias
+per band beyond a reference band. The pseudorange measurements are corrected for the
+broadcast ionospheric model and the Saastamoinen tropospheric delay, exactly like
+`calc_pvt` (toggled by the same `enable_ionospheric_correction` /
+`enable_tropospheric_correction` keywords).
+
+`vector_tracking = true` runs the filter with its default configuration. To configure it,
+pass a [`VectorTracking`](@ref GNSSReceiver.VectorTracking) instead — it both enables vector
+tracking and describes the platform and the front end, which is worth doing whenever either
+is known: the defaults assume vehicular dynamics and a TCXO-grade oscillator, and both the
+dynamics (`acceleration_noise_std`) and the oscillator stability (`h0`, `hm2`) materially
+change how the filter weighs its prediction against the measurements. The same struct also
+selects the measurement set (`use_pseudorange_rates = false` for a pseudorange-only VDLL
+instead of the default VDFLL), the motion and clock model orders, the inter-frequency-bias
+process noise and how long the filter may coast before falling back to scalar tracking:
+
+```julia
+data_channel = receive(
+    measurement_channel, (GPSL1CA(), GalileoE1B()), 2.048e6u"Hz";
+    vector_tracking = VectorTracking(;
+        acceleration_noise_std = 1.0u"m/s^2",   # pedestrian dynamics
+        insufficient_meas_timeout = 30.0u"s",
+    ),
+)
+```
+
+Each emitted payload then reports what the filter is doing through its
+[`VTStatus`](@ref GNSSReceiver.VTStatus): whether it is running, its own position and clock
+uncertainty, every loop member's post-fit residuals (coasted members included) and how long
+it has been coasting on epochs it could not solve.
 
 ## Custom per-chunk output
 

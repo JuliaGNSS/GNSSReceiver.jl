@@ -138,9 +138,70 @@ end
     )
 end
 
+# Run `_acquire_all_bands` only when it can change something — a periodic scan
+# is due on some band, or a satellite qualifies for reacquisition — since on a
+# steady-state frame its per-band buffer resets and NamedTuple merges would
+# allocate for a no-op. When skipping, any buffer still holding samples is
+# emptied so the next scan's coherent window stays gap-free. Returns the same
+# four values (`track_state`, per-group satellite states, per-band acquisition
+# buffers and timers), same types, on both paths.
+function acquire_if_due(
+    receiver_state,
+    band_keys,
+    band_systems,
+    meas,
+    interm_freqs,
+    acq_plans,
+    runtime;
+    num_ants,
+    acquire_every,
+    acq_pfa,
+    code_lock_cn0_threshold,
+    subsample_interpolation,
+)
+    acq_due = any(
+        t -> runtime - t >= acquire_every,
+        values(receiver_state.last_time_acquisition_ran),
+    )
+    reacq_due =
+        any(d -> any(should_reacquire, d), values(receiver_state.receiver_sat_states))
+    if acq_due || reacq_due
+        _acquire_all_bands(
+            receiver_state.track_state,
+            receiver_state.receiver_sat_states,
+            receiver_state.acquisition_buffers,
+            receiver_state.last_time_acquisition_ran,
+            band_keys,
+            band_systems,
+            meas,
+            interm_freqs,
+            acq_plans,
+            (
+                runtime,
+                num_ants,
+                acquire_every,
+                acq_pfa,
+                code_lock_cn0_threshold,
+                subsample_interpolation,
+            ),
+        )
+    else
+        buffers =
+            all(b -> b.current_length == 0, values(receiver_state.acquisition_buffers)) ?
+            receiver_state.acquisition_buffers :
+            map(SampleBuffers.reset, receiver_state.acquisition_buffers)
+        (
+            receiver_state.track_state,
+            receiver_state.receiver_sat_states,
+            buffers,
+            receiver_state.last_time_acquisition_ran,
+        )
+    end
+end
+
 """
     process(receiver_state, acq_plans, measurements, band_systems, sampling_freq,
-            interm_freqs = map(_ -> 0.0u"Hz", band_systems); kwargs...)
+            interm_freqs = map(_ -> 0.0Hz, band_systems); kwargs...)
 
 Advance the receiver by one measurement chunk per band and return the next
 `ReceiverState`.
@@ -149,12 +210,12 @@ A single chunk runs the whole per-cycle pipeline: it (re)acquires satellites per
 `acq_plans` at most every `acquire_every` (buffering samples only when acquisition could
 fire), tracks every band's satellites from one `TrackState`, updates their lock detectors
 and, once enough have been locked for `time_in_lock_before_calculating_pvt`, recomputes
-the fused multi-GNSS PVT solution every `pvt_update_interval`. Satellites that drop out of
-lock are removed and reacquired with a bounded quadratic back-off. `measurements`,
-`band_systems` and `interm_freqs` are tuples aligned band-by-band (`interm_freqs` defaults
-to `0 Hz` for every band); `acq_plans` is one
-`NamedTuple` keyed by group key across all bands. This is the function [`receive`](@ref)
-calls for each chunk; see it for the meaning of the remaining keyword arguments.
+the fused multi-GNSS PVT solution every `pvt_update_interval`.
+Satellites that drop out of lock are removed and reacquired
+with a bounded quadratic back-off. `measurements`, `band_systems` and `interm_freqs` are
+tuples aligned band-by-band (`interm_freqs` defaults to `0 Hz` for every band), and
+`acq_plans` is one `NamedTuple` keyed by group key across all bands. This is the function
+[`receive`](@ref) calls for each chunk; see it for the remaining keyword arguments.
 """
 function process(
     receiver_state::ReceiverState,
@@ -162,14 +223,14 @@ function process(
     measurements::Tuple,
     band_systems::Tuple,
     sampling_freq,
-    interm_freqs::Tuple = map(_ -> 0.0u"Hz", band_systems);
+    interm_freqs::Tuple = map(_ -> 0.0Hz, band_systems);
     downconvert_and_correlator = CPUThreadedDownconvertAndCorrelator(),
     num_ants::NumAnts{N} = NumAnts(1),
-    acquire_every = 10u"s",
+    acquire_every = 10s,
     acq_pfa = DEFAULT_ACQ_PFA,
     code_lock_cn0_threshold = nothing, # `nothing` ⇒ per-system `get_default_code_lock_cn0_threshold`
-    time_in_lock_before_calculating_pvt = 2u"s",
-    pvt_update_interval = 100u"ms",
+    pvt_update_interval = 100ms,
+    time_in_lock_before_calculating_pvt = 2s,
     subsample_interpolation = true,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
@@ -189,65 +250,43 @@ function process(
     # share one runtime and signal duration.
     signal_duration = size(first(meas), 1) / sampling_freq
 
-    # Acquisition only touches state when a periodic scan is due on some band or a satellite
-    # qualifies for reacquisition. On the common steady-state frame neither holds, so skip
-    # `_acquire_all_bands` entirely — its per-band buffer resets and NamedTuple merges would
-    # otherwise allocate every chunk. Buffers are rebuilt only if one still holds samples
-    # (they must be emptied so the next scan's coherent window stays gap-free). This is a
-    # pure allocation optimisation: the full path is a no-op on these frames anyway (see
-    # `acquire_band`), so results are identical.
-    acq_due =
-        any(t -> runtime - t >= acquire_every, values(receiver_state.last_time_acquisition_ran))
-    reacq_due =
-        any(d -> any(should_reacquire, d), values(receiver_state.receiver_sat_states))
+    # (Re)acquire per band, but only when a scan is actually due — see `acquire_if_due`.
     track_state, receiver_sat_states, acquisition_buffers, last_time_acquisition_ran =
-        if acq_due || reacq_due
-            _acquire_all_bands(
-                receiver_state.track_state,
-                receiver_state.receiver_sat_states,
-                receiver_state.acquisition_buffers,
-                receiver_state.last_time_acquisition_ran,
-                band_keys,
-                band_systems,
-                meas,
-                interm_freqs,
-                acq_plans,
-                (
-                    runtime,
-                    num_ants,
-                    acquire_every,
-                    acq_pfa,
-                    code_lock_cn0_threshold,
-                    subsample_interpolation,
-                ),
-            )
-        else
-            buffers =
-                all(b -> b.current_length == 0, values(receiver_state.acquisition_buffers)) ?
-                receiver_state.acquisition_buffers :
-                map(SampleBuffers.reset, receiver_state.acquisition_buffers)
-            (
-                receiver_state.track_state,
-                receiver_state.receiver_sat_states,
-                buffers,
-                receiver_state.last_time_acquisition_ran,
-            )
-        end
+        acquire_if_due(
+            receiver_state,
+            band_keys,
+            band_systems,
+            meas,
+            interm_freqs,
+            acq_plans,
+            runtime;
+            num_ants,
+            acquire_every,
+            acq_pfa,
+            code_lock_cn0_threshold,
+            subsample_interpolation,
+        )
 
     # Single multi-band tracking pass: one `BandMeasurement` per band, keyed by
     # band, fed to one `track!` call over the shared multi-band `TrackState`.
+    #
+    # `BandMeasurement` promotes its two frequency arguments to a common unit, so mixing
+    # units here (e.g. a `MHz` sampling frequency with an `Hz` intermediate frequency)
+    # collapses both to the SI base `s^-1`. The vector-tracking estimator's `Hz`-typed
+    # discriminator accumulator then rejects that `s^-1` value at the first loop closure
+    # (scalar tracking has no such field, so it silently tolerates the mismatch). Normalise
+    # both to `Hz` so the stored sampling frequency matches the loop filters and estimator.
     band_measurements = NamedTuple{band_keys}(
         map(
-            (m, interm_freq) -> Tracking.BandMeasurement(m, sampling_freq, interm_freq),
+            (m, interm_freq) ->
+                Tracking.BandMeasurement(m, uconvert(Hz, sampling_freq), uconvert(Hz, interm_freq)),
             meas,
             interm_freqs,
         ),
     )
-    # In-place `track!` rather than the immutable `track`: the latter detaches
-    # (copies) each group's satellite slot vectors and rebuilds the TrackedSat
-    # wrappers every call. The receiver discards the previous `ReceiverState` each
-    # chunk and reuses one hoisted correlator, so mutating in place is safe and is
-    # Tracking's documented allocation-free real-time pattern.
+    # Advance every band's satellites by one tracking pass over the shared
+    # `TrackState`, mutating it in place (`track!`): the receiver discards the
+    # previous `ReceiverState` each chunk, so this is safe and allocation-free.
     track_state = track!(band_measurements, track_state; downconvert_and_correlator)
 
     receiver_sat_states = update_all_receiver_sat_states(
@@ -259,20 +298,37 @@ function process(
 
     track_state = remove_lost_satellites(receiver_sat_states, track_state)
 
-    pvt, last_time_pvt_ran = update_pvt(
-        all_systems,
-        receiver_sat_states,
-        track_state,
-        receiver_state.pvt,
-        receiver_state.pvt_sat_state_buffer,
-        runtime,
-        time_in_lock_before_calculating_pvt,
-        receiver_state.last_time_pvt_ran,
-        pvt_update_interval;
-        enable_ionospheric_correction,
-        enable_tropospheric_correction,
-        pvt_approximate_year,
-    )
+    # Run a navigation cycle once a full `pvt_update_interval` of signal time has
+    # accumulated, otherwise carry the previous solution forward. The elapsed
+    # time is the filter's integration interval; gating the cadence here lets the
+    # `update_navigation` methods assume they are only called when a cycle is due.
+    integration_time = runtime - receiver_state.last_time_pvt_ran
+    track_state, receiver_sat_states, pvt, vt, last_time_pvt_ran =
+        if integration_time >= pvt_update_interval
+            update_navigation(
+                receiver_state.vt,
+                all_systems,
+                track_state,
+                receiver_sat_states,
+                receiver_state.pvt,
+                receiver_state.pvt_sat_state_buffer,
+                sampling_freq,
+                runtime,
+                integration_time;
+                time_in_lock_before_calculating_pvt,
+                enable_ionospheric_correction,
+                enable_tropospheric_correction,
+                pvt_approximate_year,
+            )
+        else
+            (
+                track_state,
+                receiver_sat_states,
+                receiver_state.pvt,
+                receiver_state.vt,
+                receiver_state.last_time_pvt_ran,
+            )
+        end
 
     ReceiverState(
         track_state,
@@ -281,9 +337,112 @@ function process(
         last_time_acquisition_ran,
         pvt,
         receiver_state.pvt_sat_state_buffer,
+        vt,
         runtime + signal_duration,
         last_time_pvt_ran,
     )
+end
+
+# Advance the navigation solution by one cycle, dispatched on the tracking mode.
+# Called by `process` only when a PVT cycle is due (the cadence gate lives
+# there), so both methods run unconditionally and return the new
+# `(track_state, receiver_sat_states, pvt, vt, last_time_pvt_ran)` — the pieces
+# in `ReceiverState` field order — with `last_time_pvt_ran` set to the current
+# `runtime`. `integration_time` is the elapsed signal time since the previous cycle.
+
+# Scalar receiver (`vt === nothing`): plain PVT via `update_pvt`; tracking and
+# satellite states pass through unchanged, and there is no vector-tracking state.
+function update_navigation(
+    ::Nothing,
+    all_systems,
+    track_state,
+    receiver_sat_states,
+    pvt,
+    pvt_sat_state_buffer,
+    sampling_freq,
+    runtime,
+    integration_time;
+    time_in_lock_before_calculating_pvt = 2s,
+    enable_ionospheric_correction = true,
+    enable_tropospheric_correction = true,
+    pvt_approximate_year::Integer = year(now(UTC)),
+)
+    pvt = update_pvt(
+        all_systems,
+        track_state,
+        receiver_sat_states,
+        pvt,
+        pvt_sat_state_buffer;
+        time_in_lock_before_calculating_pvt,
+        enable_ionospheric_correction,
+        enable_tropospheric_correction,
+        pvt_approximate_year,
+    )
+    track_state, receiver_sat_states, pvt, nothing, runtime
+end
+
+# Vector-tracking receiver: while the vector loop is not yet running, compute
+# the scalar PVT as usual and use the first fix to initialize the navigation
+# filter; once running, each cycle is one navigation-filter iteration that also
+# closes the tracking loops (see `vector_tracking.jl`).
+function update_navigation(
+    vt::VectorTrackingState,
+    all_systems,
+    track_state,
+    receiver_sat_states,
+    pvt,
+    pvt_sat_state_buffer,
+    sampling_freq,
+    runtime,
+    integration_time;
+    time_in_lock_before_calculating_pvt = 2s,
+    enable_ionospheric_correction = true,
+    enable_tropospheric_correction = true,
+    pvt_approximate_year::Integer = year(now(UTC)),
+)
+    if vt.running
+        track_state, receiver_sat_states, pvt, vt = run_vt_iteration(
+            vt,
+            all_systems,
+            track_state,
+            receiver_sat_states,
+            sampling_freq,
+            integration_time;
+            enable_ionospheric_correction,
+            enable_tropospheric_correction,
+            pvt_approximate_year,
+        )
+    else
+        previous_pvt = pvt
+        pvt = update_pvt(
+            all_systems,
+            track_state,
+            receiver_sat_states,
+            pvt,
+            pvt_sat_state_buffer;
+            time_in_lock_before_calculating_pvt,
+            enable_ionospheric_correction,
+            enable_tropospheric_correction,
+            pvt_approximate_year,
+        )
+        # A fresh fix seeds the navigation filter and starts the vector loop;
+        # `initialize_vector_tracking` no-ops when `pvt` is unchanged (a failed
+        # solve returns the previous solution).
+        track_state, receiver_sat_states, vt = initialize_vector_tracking(
+            vt,
+            all_systems,
+            track_state,
+            receiver_sat_states,
+            previous_pvt,
+            pvt,
+            sampling_freq,
+            integration_time;
+            enable_ionospheric_correction,
+            enable_tropospheric_correction,
+            pvt_approximate_year,
+        )
+    end
+    track_state, receiver_sat_states, pvt, vt, runtime
 end
 
 function remove_lost_satellites(receiver_sat_states, track_state)
@@ -291,7 +450,12 @@ function remove_lost_satellites(receiver_sat_states, track_state)
         isempty(group_sat_states) && continue
         tracked_prns = keys(get_sat_states(track_state, group_key))
         for receiver_sat_state in group_sat_states
-            if !is_in_lock(receiver_sat_state) && receiver_sat_state.prn in tracked_prns
+            # A satellite in the vector loop is never removed here — the
+            # navigation filter keeps steering it through outages and decides
+            # itself when to release it.
+            if !is_in_lock(receiver_sat_state) &&
+               !receiver_sat_state.in_vt_loop &&
+               receiver_sat_state.prn in tracked_prns
                 track_state = remove_satellite(track_state; prn = receiver_sat_state.prn, group = group_key)
             end
         end
@@ -301,8 +465,11 @@ end
 
 # Append the PVT-ready satellites of the given `systems` (every constellation
 # across all bands) to `states`. A satellite is ready once it is in lock and has
-# been in lock long enough to have decoded usable data. Called by the combined
-# multi-band PVT solve (`update_pvt`).
+# been in lock for `time_in_lock_before_calculating_pvt` — long enough for its
+# loops to have settled onto the signal, so the code phase the pseudorange is
+# built from is the tracked one and not a pull-in transient. Called by the
+# combined multi-band PVT solve (`update_pvt`); `calc_pvt` itself further filters
+# to satellites whose navigation data is fully decoded and healthy.
 function collect_pvt_sat_states!(
     states,
     systems,
@@ -313,7 +480,8 @@ function collect_pvt_sat_states!(
     for system in systems
         group_key = signal_group_key(system)
         for receiver_sat_state in receiver_sat_states[group_key]
-            if is_in_lock(receiver_sat_state) && receiver_sat_state.time_in_lock > time_in_lock_before_calculating_pvt
+            if is_in_lock(receiver_sat_state) &&
+               receiver_sat_state.time_in_lock > time_in_lock_before_calculating_pvt
                 # Hand PVT the *ranging* signal (the pilot, for a combined spec) as
                 # `system` and the *data* decoder separately: PVT derives the code /
                 # carrier terms and the group-delay ISC from the ranging signal (its
@@ -332,24 +500,6 @@ function collect_pvt_sat_states!(
     states
 end
 
-# `calc_pvt` with the optional-year keyword spliced in only when supplied.
-function _calc_pvt(
-    pvt_satellite_states,
-    pvt;
-    enable_ionospheric_correction,
-    enable_tropospheric_correction,
-    pvt_approximate_year,
-)
-    length(pvt_satellite_states) >= 4 || return pvt
-    calc_pvt(
-        pvt_satellite_states,
-        pvt;
-        enable_ionospheric_correction,
-        enable_tropospheric_correction,
-        approximate_year = pvt_approximate_year,
-    )
-end
-
 # Combined multi-band PVT over the single receiver state: pool every band's
 # PVT-ready satellites into one `calc_pvt`. `all_systems` is the flat tuple of
 # specs across all bands; `receiver_sat_states` and `track_state` are the
@@ -358,20 +508,15 @@ end
 # GNSS time system and an inter-frequency-bias column per extra band).
 function update_pvt(
     all_systems,
-    receiver_sat_states,
     track_state,
+    receiver_sat_states,
     pvt,
-    pvt_sat_state_buffer,
-    runtime,
-    time_in_lock_before_calculating_pvt,
-    last_time_pvt_ran,
-    pvt_update_interval;
+    pvt_sat_state_buffer;
+    time_in_lock_before_calculating_pvt = 2s,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
     pvt_approximate_year::Integer = year(now(UTC)),
 )
-    runtime - last_time_pvt_ran >= pvt_update_interval || return pvt, last_time_pvt_ran
-
     # Reuse the buffer across PVT cycles: `collect_pvt_sat_states!` empties and refills it,
     # avoiding a fresh `Vector{SatelliteState}` allocation every cycle.
     empty!(pvt_sat_state_buffer)
@@ -383,14 +528,13 @@ function update_pvt(
         time_in_lock_before_calculating_pvt,
     )
 
-    pvt = _calc_pvt(
+    calc_pvt(
         pvt_sat_state_buffer,
         pvt;
         enable_ionospheric_correction,
         enable_tropospheric_correction,
-        pvt_approximate_year,
+        approximate_year = pvt_approximate_year,
     )
-    return pvt, runtime
 end
 
 function update_all_receiver_sat_states(receiver_sat_states, track_state, systems, signal_duration)
@@ -408,7 +552,11 @@ function update_all_receiver_sat_states(receiver_sat_states, track_state, system
         data_idx = data_signal_index(system)
         group_states = receiver_sat_states[group_key]
         map!(group_states, group_states) do receiver_sat_state
-            if is_in_lock(receiver_sat_state)
+            # A satellite in the vector loop keeps decoding and updating its
+            # detectors even while out of (code) lock — the navigation filter
+            # carries it through the outage and reads the detectors to manage
+            # its availability.
+            if is_in_lock(receiver_sat_state) || receiver_sat_state.in_vt_loop
                 prn = receiver_sat_state.prn
                 ReceiverSatState(
                     prn,
@@ -445,6 +593,7 @@ function update_all_receiver_sat_states(receiver_sat_states, track_state, system
                     receiver_sat_state.time_in_lock + signal_duration,
                     0.0s,
                     0,
+                    receiver_sat_state.in_vt_loop,
                 )
             else
                 increase_time_out_of_lock(receiver_sat_state, signal_duration)
@@ -544,9 +693,9 @@ end
 )
     track_state, sat_state_dict =
         acquire_satellites(track_state, first(sat_state_dicts), first(systems), first(acq_plans), invariant_acq_args...)
-    track_state, rest =
+    track_state, rest_dicts =
         _acquire_all_systems(track_state, Base.tail(systems), Base.tail(sat_state_dicts), Base.tail(acq_plans), invariant_acq_args)
-    (track_state, (sat_state_dict, rest...))
+    (track_state, (sat_state_dict, rest_dicts...))
 end
 
 function acquire_satellites(
@@ -583,7 +732,14 @@ function acquire_satellites(
                 prn -> !(prn in keys(receiver_sat_states)),
                 collect(acq_plan.avail_prns),
             ),
-            collect(keys(filter(state -> !is_in_lock(state), receiver_sat_states))),
+            collect(
+                keys(
+                    filter(
+                        state -> !is_in_lock(state) && !state.in_vt_loop,
+                        receiver_sat_states,
+                    ),
+                ),
+            ),
         )
         if !isempty(missing_satellites)
             track_state, receiver_sat_states, _ = acquire_and_update_states(
@@ -689,7 +845,10 @@ end
 # attempts before falling back to the periodic full scan (`acquire_every`).
 function should_reacquire(state; reacquire_backoff = 200ms, max_reacquire_attempts = 5)
     n = state.num_unsuccessful_reacquisition
-    !is_in_lock(state) &&
+    # Never reacquire a satellite in the vector loop — it is still tracked,
+    # with its NCOs driven by the navigation filter.
+    !state.in_vt_loop &&
+        !is_in_lock(state) &&
         n < max_reacquire_attempts &&
         state.time_out_of_lock >= (n + 1)^2 * reacquire_backoff
 end

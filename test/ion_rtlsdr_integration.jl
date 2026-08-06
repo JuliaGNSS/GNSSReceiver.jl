@@ -173,7 +173,10 @@ let
         # to sub-mm / sub-ppm per element type; the tolerances absorb float-arithmetic
         # drift and the float-vs-integer correlator's carrier-replica quantisation.
         # Recording: Sep 10, 2017, Oegstgeest, NL (52.177°N 4.490°E, ~74 m).
-        expected_position = [3.9074084447e6, 3.0683808164e5, 5.0149597259e6]   # ECEF metres
+        # Baseline captured under PositionVelocityTime 5.0.3, whose Niell tropospheric
+        # mapping moved the fix (+0.35, +0.29, +1.14) m against the 5.0.0 capture — the
+        # mostly-vertical shift a mapping-function change produces.
+        expected_position = [3.9074087926e6, 3.0683836901e5, 5.0149608655e6]   # ECEF metres
         expected_velocity = [0.610, 0.209, 3.577]                              # m/s
         expected_time = TAIEpoch(2017, 9, 10, 22, 57, 20.697)                  # final-fix epoch (TAI)
         expected_time_correction = -2.0226547144e7                             # receiver clock bias (metres)
@@ -314,5 +317,143 @@ let
         @test minimum(after_slip) < maximum(before_slip)
         # Reacquisition brings satellites back before the run ends.
         @test records[end][2] > minimum(after_slip)
+    end
+
+    # Run the same recording with vector tracking: the receiver starts on the vector
+    # estimator's scalar fallback loops, switches to the navigation filter with the
+    # first scalar fix, and from then on every emitted PVT solution comes from the
+    # filter with the loops closed centrally. Assert against the same ground truth as
+    # the scalar baseline, for both measurement sets — pseudoranges + pseudorange
+    # rates (VDFLL) and pseudoranges only (VDLL).
+    @testset "ION RTL-SDR vector tracking integration test" begin
+        # Deliberately in MHz (not Hz) while the IF below is in Hz: a real front end mixes
+        # units this way, and `Tracking.BandMeasurement`'s `promote` then collapses both to
+        # the SI base `s^-1`. Vector tracking's `Hz`-typed discriminator accumulator rejects
+        # that, so this unit choice guards the `uconvert(Hz, …)` normalisation in `process`
+        # (regression for the VT first-fix crash). Do not "tidy" this back to Hz.
+        sampling_freq = 2.048u"MHz"
+        system = GPSL1CA()
+        num_samples = Int(upreferred(sampling_freq * 4u"ms"))
+
+        measurement_channel = GNSSReceiver.spawn_signal_channel_thread(;
+            T = ComplexF32,
+            num_samples,
+            num_antenna_channels = 1,
+        ) do ch
+            _ion_produce!(ch, ComplexF32, dat_file, num_samples, 1)
+        end
+
+        # Capture the vector-tracking engagement alongside the default payload: how
+        # many satellites the navigation filter controls and whether it is running.
+        extract = function (receiver_state)
+            (
+                data = GNSSReceiver.default_data_of_interest(receiver_state),
+                vt_running = receiver_state.vt.running,
+                num_vt_sats = count(
+                    GNSSReceiver.in_vt_loop,
+                    get_sat_states(receiver_state.track_state, :GPSL1CA),
+                ),
+            )
+        end
+
+        data_channel = receive(
+            measurement_channel,
+            system,
+            sampling_freq;
+            num_ants = NumAnts(1),
+            interm_freq = 0.0u"Hz",
+            pvt_approximate_year = 2017,
+            vector_tracking = true,
+            extract,
+        )
+
+        num_vt_outputs = 0
+        max_vt_sats = 0
+        last = nothing
+        GNSSReceiver.consume_channel(data_channel) do out
+            if out.vt_running
+                num_vt_outputs += 1
+                max_vt_sats = max(max_vt_sats, out.num_vt_sats)
+                last = out
+            end
+        end
+
+        @info "Vector tracking results" num_vt_outputs max_vt_sats
+        # The vector loop engages and stays engaged for most of the run (the first
+        # scalar fix needs the ~30 s navigation-message decode plus lock time; ~25 s
+        # of vector tracking remain on this 60 s recording).
+        @test num_vt_outputs > 100
+        @test max_vt_sats >= 7
+        @test !isnothing(last)
+
+        pvt = last.data.pvt
+        @info "Vector tracking final fix" pvt.time pvt.position num_sats = length(pvt.sats)
+
+        # The same receiver location as the scalar baseline (Sep 10, 2017,
+        # Oegstgeest, NL). The navigation filter's pseudoranges are atmosphere-
+        # corrected like the scalar solve's; the final fix lands within a few
+        # metres of the baseline (the filter smooths through its own promotion
+        # transients rather than solving each epoch independently).
+        expected_position = [3.9074087926e6, 3.0683836901e5, 5.0149608655e6]
+        @test isapprox(pvt.position[1], expected_position[1], atol = 10.0)
+        @test isapprox(pvt.position[2], expected_position[2], atol = 10.0)
+        @test isapprox(pvt.position[3], expected_position[3], atol = 10.0)
+
+        # Stationary receiver: the filter's velocity is noise-level.
+        @test norm([pvt.velocity...]) < 2.0
+
+        # The final epoch matches the recording date to within the run length.
+        @test pvt.time isa TAIEpoch
+        expected_final_time = TAIEpoch(2017, 9, 10, 22, 57, 20.697)
+        @test abs(AstroTime.value(pvt.time - expected_final_time)) < 1.0
+
+        # The filter reports a full measurement geometry at the end of the run.
+        @test length(pvt.sats) >= 7
+        @test !isnothing(pvt.dop)
+
+        # `SatInfo.residual` is the POST-fit pseudorange residual — the same
+        # quantity the scalar `calc_pvt` reports, in the same observed − computed
+        # orientation — so a vector-tracking solution is directly comparable with a
+        # scalar one. Reporting the filter's pre-fit innovation here instead would
+        # carry the prediction error that the measurement update removes.
+        #
+        # The *scatter* across satellites is the part that reflects measurement
+        # quality, and it is comparable to the scalar solve's on this recording
+        # (~7 m vs ~4 m). The common mode is not: the vector loop settles with a
+        # steady-state code-phase lag against the receiver clock drift, which on
+        # this RTL-SDR capture (cheap TCXO, large drift) reaches ~48 m ≈ 0.16
+        # L1 C/A chips within 10 s of engaging and then holds. Being common mode
+        # it is absorbed by the clock-bias state, so the position above is
+        # unaffected — but it does inflate the reported residual RMS relative to
+        # a scalar solve. Tracked as an open issue; asserted loosely here so a
+        # regression in the per-satellite part is still caught.
+        residuals = [ustrip(u"m", info.residual) for info in pvt.sats]
+        @test all(isfinite, residuals)
+        common_mode = sum(residuals) / length(residuals)
+        scatter = sqrt(sum(abs2, residuals .- common_mode) / length(residuals))
+        @test scatter < 15.0
+        @test abs(common_mode) < 80.0
+
+        # `SatInfo.rate_residual` is the range-rate counterpart, formed from the
+        # carrier-Doppler (FLL) measurements the VDFLL fuses alongside the
+        # pseudoranges. It is the independent half of the diagnostic: a satellite
+        # can carry a clean pseudorange residual and still disagree with the
+        # velocity/clock-drift solution.
+        #
+        # Unlike the pseudorange residual above, this one does *not* inherit a large
+        # common mode from the code-phase lag — the lag is a phase offset, not a rate
+        # one. Both the scatter (~1.7 m/s) and the common mode (~0.6 m/s) land in the
+        # same range as the scalar solve's rate residuals on this recording (~1.3 m/s
+        # RMS about a mean of zero): on an RTL-SDR front end this is the Doppler
+        # measurement quality itself, not a vector-loop artefact. Bounded with
+        # headroom so a real regression — a sign flip, a wavelength/Hz mix-up, or a
+        # missing FLL contribution — still shows up.
+        rate_residuals = [ustrip(u"m/s", info.rate_residual) for info in pvt.sats]
+        @test all(isfinite, rate_residuals)
+        rate_common_mode = sum(rate_residuals) / length(rate_residuals)
+        rate_scatter =
+            sqrt(sum(abs2, rate_residuals .- rate_common_mode) / length(rate_residuals))
+        @test rate_scatter < 4.0
+        @test abs(rate_common_mode) < 2.0
     end
 end

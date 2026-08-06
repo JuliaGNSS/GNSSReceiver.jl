@@ -18,6 +18,7 @@ using StaticArrays,
     PositionVelocityTime,
     GNSSSignals,
     Acquisition,
+    KalmanFilters,
     Unitful,
     JLD2,
     LinearAlgebra,
@@ -27,7 +28,9 @@ using StaticArrays,
     Dictionaries,
     Dates
 
-using Unitful: m, s, ms, Hz, dBHz, dB, °
+import Geodesy
+using Geodesy: ECEF
+using Unitful: m, s, ms, Hz, dBHz, dB, °, uconvert
 
 # Lock-free channel primitives and SoapySDR device streaming now live in their own
 # packages (they replaced the vendored `channel.jl` / `soapy_sdr_helper.jl`). The
@@ -45,6 +48,7 @@ using SignalChannels:
 
 export ReceiverState,
     receive,
+    VectorTracking,
     CombinedSignal,
     read_files,
     read_uint8_iq_file,
@@ -58,6 +62,7 @@ export ReceiverState,
 include("lock_detector.jl")
 include("beamformer.jl")
 include("sample_buffer.jl")
+include("vector_tracking.jl")
 
 using GNSSReceiver.SampleBuffers
 
@@ -209,6 +214,11 @@ struct ReceiverSatState{DS<:GNSSDecoderState}
     time_in_lock::typeof(1.0s)
     time_out_of_lock::typeof(1.0s)
     num_unsuccessful_reacquisition::Int
+    # Whether the satellite's tracking loops are closed by the vector-tracking
+    # navigation filter (see `vector_tracking.jl`). Cached from the tracking
+    # state so lock handling and reacquisition — which run without the
+    # per-satellite estimator states at hand — can consult it.
+    in_vt_loop::Bool
 end
 
 function ReceiverSatState(
@@ -227,6 +237,7 @@ function ReceiverSatState(
         0.0s,
         0.0s,
         0,
+        false,
     )
 end
 
@@ -247,11 +258,24 @@ function ReceiverSatState(
         0.0s,
         0.0s,
         0,
+        false,
     )
 end
 
 function is_in_lock(state::ReceiverSatState)
-    is_in_lock(state.code_lock_detector) && is_in_lock(state.carrier_lock_detector)
+    if state.in_vt_loop
+        # Code lock only: vector tracking feeds on the code (pseudorange)
+        # measurements and does not strictly need carrier phase lock, so a
+        # satellite returning from an outage re-enters the measurement set on
+        # code lock alone rather than waiting on the carrier lock detector.
+        # Recovery is quick regardless: the navigation filter keeps the code
+        # and carrier NCOs steered from the PVT solution through the outage, so
+        # the code stays aligned and the frequency-aided carrier phase drifts
+        # at most about a cycle — both relock fast once the signal returns.
+        is_in_lock(state.code_lock_detector)
+    else
+        is_in_lock(state.code_lock_detector) && is_in_lock(state.carrier_lock_detector)
+    end
 end
 
 function increase_time_out_of_lock(state::ReceiverSatState, time::Unitful.Time)
@@ -282,6 +306,7 @@ struct ReceiverState{
     LT<:NamedTuple,
     P<:PVTSolution,
     PB<:AbstractVector{<:SatelliteState},
+    VT<:Union{Nothing,VectorTrackingState},
 }
     track_state::TS
     receiver_sat_states::RS
@@ -293,6 +318,9 @@ struct ReceiverState{
     # makes its element type the abstract `SatelliteState` when more than one signal is
     # tracked, but reuse still saves the per-cycle allocation.
     pvt_sat_state_buffer::PB
+    # Vector-tracking runtime state, or `nothing` for a scalar-tracking receiver
+    # (see `vector_tracking.jl`).
+    vt::VT
     runtime::typeof(1.0s)
     last_time_pvt_ran::typeof(1.0s)
 end
@@ -468,6 +496,16 @@ end
 # separate pilot trait is needed.
 is_decodable(system) = hasmethod(GNSSDecoderState, Tuple{typeof(data_signal(system)),Int})
 
+# The decoder-state type of a system's data component, used to type the (still empty)
+# per-satellite dictionaries. Asked of inference rather than read off a throwaway instance:
+# building one allocates the whole decoder — for Galileo an AFF3CT Viterbi decoder, which
+# cannot be constructed at all where `libaff3ct_jl` is missing (Windows) — long before any
+# satellite is acquired. The constructors are trivial and type-stable, so this resolves to
+# the same concrete type; were inference ever to give up, `ReceiverSatState`'s
+# `DS<:GNSSDecoderState` bound would reject the result loudly rather than silently.
+decoder_state_type(system) =
+    Base.promote_op(GNSSDecoderState, typeof(data_signal(system)), Int)
+
 # Reject a system whose data component cannot be decoded — e.g. a bare pilot such as
 # `GPSL5Q()` passed as a system, or a `CombinedSignal` with a non-data `.data` slot.
 # Tracking a pilot alone yields no navigation message, ephemeris or PVT, and would
@@ -493,6 +531,23 @@ function rx_center_frequency(systems)
     get_center_frequency(ranging_signal(first(systems)))
 end
 
+# The `vector_tracking` keyword is either a switch or the navigation filter's
+# configuration: `false` disables it, `true` takes the `VectorTracking` defaults,
+# and a `VectorTracking` both enables it and describes the platform and oscillator.
+# These two reduce it to the question each caller actually asks.
+vt_enabled(vector_tracking::Bool) = vector_tracking
+vt_enabled(::VectorTracking) = true
+vt_config(vector_tracking::Bool) = VectorTracking()
+vt_config(vector_tracking::VectorTracking) = vector_tracking
+
+# The tracking loops' Doppler estimator for the given mode: `Tracking`'s
+# `VectorPLLAndDLL` under vector tracking (it accumulates the discriminators and
+# applies the navigation filter's NCO corrections), the conventional
+# FLL-assisted PLL/DLL for scalar tracking. Not user-selectable — the mode alone
+# determines it.
+doppler_estimator_for(vector_tracking) =
+    vt_enabled(vector_tracking) ? VectorPLLAndDLL() : ConventionalAssistedPLLAndDLL()
+
 # Primary constructor: build one multi-band receiver state from the per-band
 # system tuples and pre-built per-band acquisition buffers (keyed by `band_key`).
 # All systems across all bands become tracking groups in a single `TrackState`,
@@ -501,8 +556,9 @@ function ReceiverState(
     band_systems::Tuple,
     acquisition_buffers::NamedTuple;
     num_ants::NumAnts = NumAnts(1),
-    doppler_estimator::Tracking.AbstractDopplerEstimator = ConventionalAssistedPLLAndDLL(),
+    vector_tracking::Union{Bool,VectorTracking} = false,
 )
+    doppler_estimator = doppler_estimator_for(vector_tracking)
     systems = _flatten_systems(band_systems)
     assert_decodable(systems)
     group_keys = map(signal_group_key, systems)
@@ -520,7 +576,7 @@ function ReceiverState(
     end)
     track_state = TrackState(groups, doppler_estimator)
     receiver_sat_states = NamedTuple{group_keys}(map(systems) do system
-        DS = typeof(GNSSDecoderState(data_signal(system), 1))
+        DS = decoder_state_type(system)
         Dictionary{Int,ReceiverSatState{DS}}()
     end)
     # One acquisition timer per band, keyed like the buffers.
@@ -528,6 +584,13 @@ function ReceiverState(
     last_time_acquisition_ran = NamedTuple{band_keys}(map(_ -> -Inf * 1.0s, band_keys))
     pvt = PositionVelocityTime.PVTSolution()
     pvt_sat_state_buffer = PositionVelocityTime.SatelliteState[]
+    # The vector-tracking clock/inter-frequency-bias layout is fixed here, from
+    # the *configured* systems, so the navigation filter's state dimension
+    # never changes mid-run. `vector_tracking` carries the filter's configuration
+    # when the caller passed one, and its defaults when they just passed `true`.
+    vt =
+        vt_enabled(vector_tracking) ?
+        VectorTrackingState(vt_config(vector_tracking), NavFilterLayout(systems)) : nothing
     ReceiverState(
         track_state,
         receiver_sat_states,
@@ -535,6 +598,7 @@ function ReceiverState(
         last_time_acquisition_ran,
         pvt,
         pvt_sat_state_buffer,
+        vt,
         0.0s,
         -Inf * 1.0s,
     )
@@ -550,9 +614,12 @@ the incoming signal samples (e.g. `ComplexF64` or `Complex{Int16}`).
 of these sharing one RF band; each becomes a tracking group in a single `TrackState`,
 keyed by its ranging signal's id. `num_samples_for_acquisition` sizes the acquisition
 sample buffer, and `num_ants` selects single- versus multi-antenna processing.
-`doppler_estimator` pins the tracking loops' estimator (it must match the one whose
-pull-in range sizes acquisition). One `ReceiverState` spans every band; pass the per-band
-system tuples and pre-built acquisition buffers to the primary constructor for the
+`vector_tracking = true` closes the tracking loops through a navigation filter instead
+of per-satellite loop filters (the tracking-loop estimator follows from this: the
+conventional FLL-assisted PLL/DLL for scalar, `VectorPLLAndDLL` for vector tracking); pass
+a [`VectorTracking`](@ref) instead of `true` to describe the platform's dynamics and the
+receiver's oscillator to that filter. One `ReceiverState` spans every band; pass the
+per-band system tuples and pre-built acquisition buffers to the primary constructor for the
 multi-band case.
 """
 function ReceiverState(
@@ -560,12 +627,12 @@ function ReceiverState(
     systems;
     num_samples_for_acquisition,
     num_ants::NumAnts = NumAnts(1),
-    doppler_estimator::Tracking.AbstractDopplerEstimator = ConventionalAssistedPLLAndDLL(),
+    vector_tracking::Union{Bool,VectorTracking} = false,
 ) where {T}
     systems = as_systems(systems)
     band_key = get_band_id(system_band(first(systems)))
     buffers = NamedTuple{(band_key,)}((SampleBuffer(T, num_samples_for_acquisition),))
-    ReceiverState((systems,), buffers; num_ants, doppler_estimator)
+    ReceiverState((systems,), buffers; num_ants, vector_tracking)
 end
 
 include("read_file.jl")

@@ -6,7 +6,18 @@ struct GUIData{S<:SatelliteDataOfInterest}
     runtime::typeof(1.0s)
     # Whether this data carries a *new* PVT solution.
     pvt_fresh::Bool
+    # Vector-tracking status (see `VTStatus`), or `nothing` when VT is disabled.
+    vt::Union{Nothing,VTStatus}
 end
+
+# Back-compat / convenience: GUI data built without VT status defaults to disabled.
+GUIData(
+    sat_data::Dictionary{Tuple{Symbol,Int},S},
+    pvt,
+    runtime,
+    pvt_fresh,
+) where {S<:SatelliteDataOfInterest} =
+    GUIData{S}(sat_data, pvt, runtime, pvt_fresh, nothing)
 
 # Satellite labels follow the RINEX-3 convention: the satellite is identified by
 # its system letter + zero-padded PRN (`G30`, `E24`, `R05`, `C21` — the same code
@@ -229,7 +240,7 @@ const CONSTELLATION_COLORS = Dict(
 const MIN_SPEED_FOR_HEADING = 0.5
 
 """
-    get_gui_data_channel(data_channel, push_gui_data_roughly_every = 500u"ms")
+    get_gui_data_channel(data_channel, push_gui_data_roughly_every = 500ms)
 
 Return a `Channel{GUIData}` that downsamples `data_channel` for display: a spawned task
 consumes every [`ReceiverDataOfInterest`](@ref) but only forwards one roughly every
@@ -265,7 +276,7 @@ function get_gui_data_channel(
                         last_pvt_time[] = data.pvt.time
                         push!(
                             gui_data_channel,
-                            GUIData(data.sat_data, data.pvt, data.runtime, pvt_fresh),
+                            GUIData(data.sat_data, data.pvt, data.runtime, pvt_fresh, data.vt),
                         )
                         last_gui_output[] = data.runtime
                         first[] = false
@@ -297,7 +308,9 @@ function _fmt2(x)
 end
 
 # The PVT solution's internals as text lines: DOP, inter-system and inter-frequency
-# biases (metres), and pseudorange-residual RMS (overall and per signal). Appended
+# biases (metres), and residual RMS in both domains — range and range rate, overall
+# and broken down per signal, which is why the block is named for the residuals
+# rather than for the pseudoranges one of its two columns is about. Appended
 # below the position/velocity/time block in the combined panel. The residuals are
 # greyed out until the solution is over-determined — with only
 # `3 + #time-systems + #extra-bands` satellites the least-squares residual is ~0 by
@@ -351,29 +364,65 @@ function pvt_details_lines(pvt)
         # Estimated unknowns: 3 position + one clock per time system (reference +
         # each inter-system bias) + one per extra band.
         num_unknowns = 3 + (1 + length(pvt.inter_system_biases)) + length(pvt.inter_frequency_biases)
+        # Range and range-rate residuals side by side: the rate column is the Doppler-domain
+        # counterpart, so a satellite consistent in range but not in rate (a cycle slip, or a
+        # replica the loop is dragging) shows up as a rate RMS out of scale with the range one.
         residuals = [ustrip(m, info.residual) for info in values(pvt.sats)]
-        # Table rows (label, RMS, count): overall first, then one per signal.
-        rows = Tuple{String,Float64,Int}[("overall", _rms(residuals), n)]
-        for sig in unique(first(key) for key in keys(pvt.sats))
-            per_sig =
-                [ustrip(m, pvt.sats[key].residual) for key in keys(pvt.sats) if first(key) == sig]
+        rate_residuals = [ustrip(m/s, info.rate_residual) for info in values(pvt.sats)]
+        # Table rows (label, RMS, rate RMS, count): overall first, then one per signal.
+        rows = Tuple{String,Float64,Float64,Int}[
+            ("overall", _rms(residuals), _rms(rate_residuals), n),
+        ]
+        # Drawn as children of the `overall` row above, so the table reads as one figure and
+        # its breakdown — the per-signal counts sum to the overall `n` — rather than as a
+        # column of unrelated numbers where `overall` is just the widest label.
+        sigs = unique(first(key) for key in keys(pvt.sats))
+        for (i, sig) in enumerate(sigs)
+            sig_keys = [key for key in keys(pvt.sats) if first(key) == sig]
             # Label each per-signal row by its band abbreviation (e.g. `GalileoE1C_BOC11`
             # → "E1"), falling back to the raw id for an unlisted signal.
-            push!(rows, (get(BAND_ABBREVIATIONS, sig, string(sig)), _rms(per_sig), length(per_sig)))
+            push!(
+                rows,
+                (
+                    (i == lastindex(sigs) ? "└ " : "├ ") *
+                    get(BAND_ABBREVIATIONS, sig, string(sig)),
+                    _rms([ustrip(m, pvt.sats[key].residual) for key in sig_keys]),
+                    _rms([ustrip(m/s, pvt.sats[key].rate_residual) for key in sig_keys]),
+                    length(sig_keys),
+                ),
+            )
         end
-        namew = maximum(length(first(row)) for row in rows)
-        res_lines = ["Pseudorange residual RMS:", "  $(rpad("signal", namew))  $(lpad("RMS/m", 6))   n"]
-        for (label, rms, cnt) in rows
-            push!(res_lines, "  $(rpad(label, namew))  $(lpad(_fmt2(rms), 6))  $(lpad(cnt, 2))")
+        # The title takes a line of its own rather than heading the label column: folding it
+        # in would widen that column to the title's length (47 columns against 34 here) and
+        # leave a gutter between every label and its figures, and the panel is 42% of the
+        # terminal. The label column then needs no heading — the rows name themselves.
+        # `textwidth`, not `length`, as `rpad`/`lpad` pad in display columns: the branch
+        # glyphs are one column each, but a label counted in characters would misalign a
+        # wider one. Both value columns are as wide as their own heading (`range/m` is one
+        # column wider than the figures it heads), so heading and figures right-align on the
+        # same edge.
+        namew = maximum(textwidth(first(row)) for row in rows)
+        res_lines = [
+            # The statistic goes in the title, which is now free of the table's geometry: it
+            # holds for both columns, and spelling it into the headings ("range RMS/m") would
+            # widen them by the length of the word.
+            "Measurement residuals (RMS):",
+            "  $(" "^namew)  $(lpad("range/m", 7))  $(lpad("rate/(m/s)", 10))   n",
+        ]
+        for (label, rms, rate_rms, cnt) in rows
+            push!(
+                res_lines,
+                "  $(rpad(label, namew))  $(lpad(_fmt2(rms), 7))  " *
+                "$(lpad(_fmt2(rate_rms), 10))  $(lpad(cnt, 2))",
+            )
         end
-        if n > num_unknowns
-            append!(lines, res_lines)
-        else
-            # No redundancy, residuals ~0 by construction: flag it in the header. The
-            # whole diagnostics block is rendered dimmed anyway (it is secondary info).
-            res_lines[1] *= " (insufficient redundancy)"
-            append!(lines, res_lines)
-        end
+        # No redundancy, residuals ~0 by construction: flag it under the table rather than on
+        # the title line, where the two together run to 53 columns and a narrow panel clips
+        # the caveat off the end — the one part of this block that must not go missing. On
+        # its own line it is 27. The whole diagnostics block is rendered dimmed anyway (it is
+        # secondary info).
+        n > num_unknowns || push!(res_lines, "  (insufficient redundancy)")
+        append!(lines, res_lines)
     end
 
     lines

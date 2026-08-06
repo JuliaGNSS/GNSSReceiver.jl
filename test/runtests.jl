@@ -9,11 +9,17 @@ using Test,
     PositionVelocityTime,
     StaticArrays,
     Random,
+    Accessors,
     Acquisition,
     Dictionaries,
+    LinearAlgebra,
     Scratch
 
 using JLD2: load
+
+# The navigation-filter configuration (also accepted by `receive`'s `vector_tracking`
+# keyword in place of `true`); the tests exercise its parameters directly.
+using GNSSReceiver: VectorTracking
 
 using Unitful: Hz, dBHz, ms
 
@@ -23,6 +29,7 @@ include("beamformer.jl")
 include("lock_detector.jl")
 include("acquisition_signal.jl")
 include("process.jl")
+include("vector_tracking.jl")
 include("prn_selection.jl")
 include("gui.jl")
 include("save_data.jl")
