@@ -271,8 +271,8 @@ end
 # `receiver_sat_states`, `pvt`, `runtime` and `last_time_pvt_ran` are shared
 # across bands and stored once. Only acquisition is intrinsically per-band — each
 # band buffers its own RF stream — so `acquisition_buffers` and
-# `last_time_acquisition_ran` are NamedTuples keyed by `band_key` (`:l1`, `:l5`,
-# …), one entry per band. `receiver_sat_states` is a NamedTuple keyed by each
+# `last_time_acquisition_ran` are NamedTuples keyed by `band_key` (`get_band_id`:
+# `:L1`, `:L5`, …), one entry per band. `receiver_sat_states` is a NamedTuple keyed by each
 # system's group key (`get_signal_id`, the ranging signal's id, unique across
 # bands), each value a per-constellation dictionary of `ReceiverSatState` by PRN.
 struct ReceiverState{
@@ -455,7 +455,8 @@ function assert_single_band(systems)
     bands = map(system_band, systems)
     allequal(bands) || throw(
         ArgumentError(
-            "All systems must share one RF band; got bands $bands",
+            "All systems must share one RF band; got bands " *
+            join(map(get_band_name, bands), ", "),
         ),
     )
     nothing
@@ -475,9 +476,9 @@ function assert_decodable(systems)
     for system in systems
         is_decodable(system) || throw(
             ArgumentError(
-                "System with data component $(get_signal_id(data_signal(system))) is not " *
-                "decodable; tracking a pilot-only signal is not supported — pair it with " *
-                "its data component via `CombinedSignal(pilot, data)`.",
+                "System with data component $(get_signal_name(data_signal(system))) is " *
+                "not decodable; tracking a pilot-only signal is not supported — pair it " *
+                "with its data component via `CombinedSignal(pilot, data)`.",
             ),
         )
     end

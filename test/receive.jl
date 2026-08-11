@@ -57,6 +57,16 @@ end
         num_samples_for_acquisition = 20000,
         num_ants = NumAnts(1),
     )
+    # The message names the offending component the way an ICD does
+    # (`get_signal_name`), not by its type name.
+    @test occursin(
+        "GPS L5-Q",
+        try
+            GNSSReceiver.assert_decodable((GPSL5Q(),))
+        catch e
+            e.msg
+        end,
+    )
     # A CombinedSignal that pairs the pilot with its data component is accepted.
     @test GNSSReceiver.ReceiverState(
         ComplexF64,
@@ -68,6 +78,21 @@ end
     @test !GNSSReceiver.is_decodable(GPSL5Q())
     @test GNSSReceiver.is_decodable(GPSL5I())
     @test GNSSReceiver.is_decodable(GNSSReceiver.CombinedSignal(GPSL5Q(), GPSL5I()))
+end
+
+@testset "Rejects systems spanning more than one RF band" begin
+    # One sample stream carries one carrier, so a genuinely un-tunable mix must be
+    # rejected — while signals of different constellations sharing a carrier are fine.
+    @test isnothing(GNSSReceiver.assert_single_band((GPSL1CA(), GalileoE1B())))
+    @test_throws ArgumentError GNSSReceiver.assert_single_band((GPSL1CA(), GPSL5I()))
+    # The message names the bands (`get_band_name`) rather than showing the `Band`
+    # instances, which would read "(L1(), L5())".
+    msg = try
+        GNSSReceiver.assert_single_band((GPSL1CA(), GPSL5I()))
+    catch e
+        e.msg
+    end
+    @test occursin("L1, L5", msg)
 end
 
 # Deterministic multi-antenna noise channel for the extract-hook tests below: the

@@ -442,3 +442,105 @@ end
     # DOA legend distinguishes constellations.
     @test occursin("GPS", out) && occursin("Galileo", out)
 end
+
+@testset "Display metadata is derived from GNSSSignals" begin
+    # The GUI's per-signal display tables are built from `DISPLAYED_SIGNALS` through
+    # GNSSSignals' accessors, so every entry must agree with the accessor it came from.
+    # This is what replaced reading the constellation back out of the id's spelling.
+    for S in GNSSReceiver.DISPLAYED_SIGNALS
+        id = get_signal_id(S)
+        constellation = get_constellation_id(S)
+        @test GNSSReceiver.constellation_of(id) === constellation
+        @test GNSSReceiver.constellation_name(constellation) == get_constellation_name(S)
+        # Every displayed signal is orderable and labellable, and its constellation has a
+        # RINEX letter, a marker colour and a rank — so no displayed signal can fall
+        # through to a fallback.
+        @test haskey(GNSSReceiver.SIGNAL_ORDER, id)
+        @test haskey(GNSSReceiver.BAND_ABBREVIATIONS, id)
+        @test haskey(GNSSReceiver.CONSTELLATION_LETTERS, constellation)
+        @test haskey(GNSSReceiver.CONSTELLATION_COLORS, constellation)
+        @test haskey(GNSSReceiver.CONSTELLATION_ORDER, constellation)
+    end
+    @test GNSSReceiver.constellation_of(:GPSL1CA) === :GPS
+    @test GNSSReceiver.constellation_of(:GalileoE5aQ) === :Galileo
+    @test GNSSReceiver.constellation_name(:Galileo) == "Galileo"
+    # A signal the GUI does not know lands in `:Other` instead of erroring — the id no
+    # longer has to begin with its constellation's name for this to work.
+    @test GNSSReceiver.constellation_of(:SomeFutureSignal) === :Other
+    @test GNSSReceiver.constellation_name(:Other) == "Other"
+end
+
+@testset "Satellite labels and display order" begin
+    # RINEX-style system letter + zero-padded PRN + band token, every label the same
+    # width (the token is padded to the widest, 3 chars).
+    @test GNSSReceiver.sat_label(:GPSL1CA, 3) == "G03 L1 "
+    @test GNSSReceiver.sat_label(:GPSL1C_P, 30) == "G30 L1C"
+    @test GNSSReceiver.sat_label(:GalileoE1B, 24) == "E24 E1 "
+    @test GNSSReceiver.sat_label(:GalileoE5aQ, 7) == "E07 E5a"
+    @test allequal(
+        length(GNSSReceiver.sat_label(id, 1)) for
+        id in keys(GNSSReceiver.BAND_ABBREVIATIONS)
+    )
+
+    # Bars are ordered by constellation, then PRN, then signal — the signal rank being
+    # each signal's position in `DISPLAYED_SIGNALS` (ascending band, data before pilot).
+    # A BOC(1,1) approximation ranks with the E1 signal it stands in for, so it sorts
+    # before E5a rather than after everything known.
+    keys_ = [
+        (:GalileoE5aI, 5),
+        (:GPSL5I, 5),
+        (:GPSL1CA, 5),
+        (:GalileoE1B, 5),
+        (:GPSL1CA, 3),
+        (:GalileoE1B_BOC11, 5),
+    ]
+    @test sort(keys_; by = GNSSReceiver.sat_sort_key) == [
+        (:GPSL1CA, 3),
+        (:GPSL1CA, 5),
+        (:GPSL5I, 5),
+        (:GalileoE1B, 5),
+        (:GalileoE1B_BOC11, 5),
+        (:GalileoE5aI, 5),
+    ]
+    # An unknown signal sorts last (`:Other`) instead of erroring.
+    unknown_last =
+        sort([(:SomeFutureSignal, 1), (:GPSL1CA, 30)]; by = GNSSReceiver.sat_sort_key)
+    @test last(unknown_last) == (:SomeFutureSignal, 1)
+end
+
+@testset "Band and time-system display tables" begin
+    # Keyed by `get_band_id` — exactly what `pvt.inter_frequency_biases` is keyed by —
+    # and named by `get_band_name`, which is the band's own label (no constellation).
+    for B in GNSSReceiver.DISPLAYED_BANDS
+        @test GNSSReceiver.band_name(get_band_id(B)) == get_band_name(B)
+    end
+    @test GNSSReceiver.band_name(get_band_id(L1)) == "L1"
+    @test GNSSReceiver.BAND_ORDER[get_band_id(L1)] <
+          GNSSReceiver.BAND_ORDER[get_band_id(L2)] <
+          GNSSReceiver.BAND_ORDER[get_band_id(L5)]
+    @test GNSSReceiver.band_name(:E6) == "E6"   # a band we don't rank still prints
+
+    # Time systems are ranked by `get_time_system_id`, GPS before Galileo.
+    @test GNSSReceiver.TIME_SYSTEM_ORDER[get_time_system_id(GPST())] <
+          GNSSReceiver.TIME_SYSTEM_ORDER[get_time_system_id(GST())]
+end
+
+@testset "PVT diagnostics name time systems and bands" begin
+    # Anchored on the lowest-ranked time system present (GPS < Galileo) rather than on
+    # `calc_pvt`'s `reference_system`, which can flip between solves.
+    pvt = PositionVelocityTime.PVTSolution(;
+        reference_system = GST(),
+        inter_system_biases =
+            Dict{GNSSSignals.TimeSystem,typeof(1.0u"m")}(GPST() => -12.34u"m"),
+        inter_frequency_biases =
+            Dict{Symbol,InterFrequencyBias}(:L5 => InterFrequencyBias(5.67u"m", :L1)),
+    )
+    lines = GNSSReceiver.pvt_details_lines(pvt)
+    # The anchor is spelled out in full (`get_time_system_name`) since it is stated once
+    # and says what the rows are measured against; the rows use the compact ids
+    # (`get_time_system_id`) to fit the narrow panel.
+    @test "Inter-system biases (vs GPS Time):" in lines
+    @test "  GST: 12.34 m" in lines
+    # Bands are named through `get_band_name`.
+    @test "  L5 (vs L1): 5.67 m" in lines
+end
