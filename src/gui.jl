@@ -21,6 +21,13 @@ end
 const CONSTELLATION_LETTERS =
     Dict(:GPS => "G", :Galileo => "E", :GLONASS => "R", :BeiDou => "C", :Other => "?")
 
+# Band token per signal. Deliberately *not* `GNSSSignals.get_band_name`: band identity
+# there is by RF frequency, so that names the band — `get_band_name(GalileoE1B)` is "L1",
+# not "E1" — whereas a satellite label wants the constellation's own ICD label for the
+# carrier. The ICD label is a per-(constellation, band) fact rather than a band fact
+# (Galileo calls 1575.42 MHz E1 and 1176.45 MHz E5a), so it is stated here. The "L1C"
+# entries are a further display choice of ours: IS-GPS-800 calls that band L1, but the bar
+# chart spells the modernized signal "L1C" so it cannot be misread as L1 C/A.
 const BAND_ABBREVIATIONS = Dict(
     :GPSL1CA => "L1",
     :GPSL1C_D => "L1C",
@@ -40,6 +47,61 @@ const BAND_ABBREVIATIONS = Dict(
     :GalileoE5aQ => "E5a",
 )
 
+# Every signal the GUI knows how to display, listed in the order the CN0 bar chart shows
+# them: grouped by constellation (see `CONSTELLATION_ORDER`), then by band (ascending band
+# number), then data component before pilot. Listed as *types*, never instances —
+# constructing a signal reads its code file from disk and bakes every PRN's table, while
+# every GNSSSignals accessor takes the type just as happily.
+#
+# The tables below are derived from this one list through those accessors, so each signal's
+# constellation (`get_constellation_id`) and display rank (its position here) is stated
+# once: teaching the GUI about a new signal is one line here, not an entry in three tables.
+const DISPLAYED_SIGNALS = (
+    GPSL1CA,
+    GPSL1C_D,
+    GPSL1C_P,
+    GPSL2CM,
+    GPSL2CL,
+    GPSL5I,
+    GPSL5Q,
+    GalileoE1B,
+    GalileoE1C,
+    # The BOC(1,1) approximations rank next to the full-CBOC E1B/E1C they stand in for,
+    # for the same reason they share their band token.
+    GalileoE1B_BOC11,
+    GalileoE1C_BOC11,
+    GalileoE5aI,
+    GalileoE5aQ,
+)
+
+# Constellation of each displayed signal, from GNSSSignals' `get_constellation_id`: which
+# constellation broadcasts a signal is the signal's own fact, not something to be recovered
+# from the spelling of its id.
+const SIGNAL_CONSTELLATIONS =
+    Dict(get_signal_id(S) => get_constellation_id(S) for S in DISPLAYED_SIGNALS)
+
+# Display rank of each signal — its position in `DISPLAYED_SIGNALS`. Only ever compared
+# within one constellation and PRN (see `sat_sort_key`), so one global ordering suffices.
+const SIGNAL_ORDER = Dict(get_signal_id(S) => i for (i, S) in enumerate(DISPLAYED_SIGNALS))
+
+# Display name per constellation, from `get_constellation_name` — so a constellation whose
+# name differs from its id (a future `:NavIC` reading "NavIC (IRNSS)") reads correctly in
+# the DOA legend without a table here.
+const CONSTELLATION_NAMES =
+    Dict(get_constellation_id(S) => get_constellation_name(S) for S in DISPLAYED_SIGNALS)
+
+# Constellation of a `get_signal_id` symbol, used to group, order and colour satellites in
+# the CN0 bars and the DOA plot. Keyed by symbol because that is what `sat_data` and
+# `pvt.sats` carry — the signal *type* is long gone by the time the GUI runs. A signal the
+# GUI does not know (e.g. one defined downstream) falls into `:Other`, which the letter,
+# order and colour tables all carry an entry for, so the GUI degrades instead of erroring.
+constellation_of(signal_id::Symbol) = get(SIGNAL_CONSTELLATIONS, signal_id, :Other)
+
+# Display name of a constellation id, for the DOA legend. An unknown constellation prints
+# its id.
+constellation_name(constellation::Symbol) =
+    get(CONSTELLATION_NAMES, constellation, string(constellation))
+
 function sat_label(system_key::Symbol, prn::Integer)
     sys = get(CONSTELLATION_LETTERS, constellation_of(system_key), "?")
     band = get(BAND_ABBREVIATIONS, system_key, string(system_key))
@@ -47,42 +109,43 @@ function sat_label(system_key::Symbol, prn::Integer)
 end
 
 # Display order for the CN0 bar chart: by constellation (GPS, then Galileo, then the
-# rest), then PRN, then band (ascending frequency within a constellation). Unlisted
-# constellations/signals sort last (rank 99) but keep a stable order among themselves.
+# rest), then PRN, then signal (`SIGNAL_ORDER`: ascending band within a constellation, data
+# component before pilot). Unlisted constellations/signals sort last (rank 99) but keep a
+# stable order among themselves.
 const CONSTELLATION_ORDER =
     Dict(:GPS => 1, :Galileo => 2, :GLONASS => 3, :BeiDou => 4, :Other => 5)
 
-const BAND_ORDER = Dict(
-    :GPSL1CA => 1,
-    :GPSL1C_D => 2,
-    :GPSL1C_P => 3,
-    :GPSL2CM => 4,
-    :GPSL2CL => 5,
-    :GPSL5I => 6,
-    :GPSL5Q => 7,
-    :GalileoE1B => 1,
-    :GalileoE1C => 2,
-    :GalileoE5aI => 3,
-    :GalileoE5aQ => 4,
-)
-
 # Sort key for a `(get_signal_id, prn)` satellite-data key: constellation, then PRN,
-# then band.
+# then signal.
 sat_sort_key((system_key, prn)::Tuple{Symbol,Int}) = (
     get(CONSTELLATION_ORDER, constellation_of(system_key), 99),
     prn,
-    get(BAND_ORDER, system_key, 99),
+    get(SIGNAL_ORDER, system_key, 99),
 )
 
-# Frequency-band display order for inter-frequency biases (L1 < L2 < L5 …), matching the
-# per-constellation band order of the CN0 bar chart. Unlisted bands sort last (rank 99).
-const IFB_BAND_ORDER = Dict(:L1 => 1, :L2 => 2, :L5 => 3)
+# Frequency bands in display order (L1 < L2 < L5, i.e. ascending band number), used to rank
+# and label the inter-frequency biases — matching the per-constellation band order of the
+# CN0 bar chart. As types, for the same reason as `DISPLAYED_SIGNALS`.
+const DISPLAYED_BANDS = (L1, L2, L5)
 
-# Time-system display order for inter-system biases (GPS < Galileo < …), mirroring
-# `CONSTELLATION_ORDER`. Keyed by `nameof(typeof(time_system))` (`:GPST`, `:GST`, …).
-const TIME_SYSTEM_ORDER = Dict(:GPST => 1, :GST => 2, :GLONASST => 3, :BDT => 4)
+# Rank and display name per band, keyed by `get_band_id` — exactly what
+# `pvt.inter_frequency_biases` is keyed by. The name comes from `get_band_name`; here it is
+# the band's own label that is wanted (an inter-frequency bias is one RF-chain delay of one
+# shared carrier, so it has no constellation), unlike the per-signal `BAND_ABBREVIATIONS`.
+# An unlisted band sorts last (rank 99) and prints its id.
+const BAND_ORDER = Dict(get_band_id(B) => i for (i, B) in enumerate(DISPLAYED_BANDS))
+const BAND_NAMES = Dict(get_band_id(B) => get_band_name(B) for B in DISPLAYED_BANDS)
 
-# Re-express every inter-frequency bias against the lowest-ordered band (by `IFB_BAND_ORDER`)
+band_name(band::Symbol) = get(BAND_NAMES, band, string(band))
+
+# Time systems in display order (GPS < Galileo < …), mirroring `CONSTELLATION_ORDER`, used
+# to rank the inter-system biases. Keyed by `get_time_system_id`, which is also how a
+# `pvt.inter_system_biases` key — a `TimeSystem` *instance* — reduces to a symbol.
+const DISPLAYED_TIME_SYSTEMS = (GPST, GST)
+const TIME_SYSTEM_ORDER =
+    Dict(get_time_system_id(T) => i for (i, T) in enumerate(DISPLAYED_TIME_SYSTEMS))
+
+# Re-express every inter-frequency bias against the lowest-ordered band (by `BAND_ORDER`)
 # in its connected coverage component, independent of the reference band `calc_pvt` picks.
 # `calc_pvt` anchors each component's IFBs on a reference band it chooses per solve, and that
 # choice can flip between solves (e.g. L1 ↔ L5) — which makes a plotted bias jump and its
@@ -98,7 +161,7 @@ function ifbs_vs_lowest_band(pvt)
         push!(get!(() -> Tuple{Symbol,typeof(1.0m)}[], adj, band), (ifb.reference, ifb.value))
         push!(get!(() -> Tuple{Symbol,typeof(1.0m)}[], adj, ifb.reference), (band, -ifb.value))
     end
-    rank(b) = get(IFB_BAND_ORDER, b, 99)
+    rank(b) = get(BAND_ORDER, b, 99)
     visited = Set{Symbol}()
     for start in keys(adj)
         start in visited && continue
@@ -137,23 +200,13 @@ function isbs_vs_lowest_system(pvt)
     for (sys, v) in pvt.inter_system_biases
         bias[sys] = v
     end
-    rank(s) = get(TIME_SYSTEM_ORDER, nameof(typeof(s)), 99)
+    rank(s) = get(TIME_SYSTEM_ORDER, get_time_system_id(s), 99)
     ref = argmin(rank, keys(bias))
     for sys in keys(bias)
         sys == ref || push!(out, (sys, bias[sys] - bias[ref], ref))
     end
     sort!(out; by = t -> rank(t[1]))
     return out
-end
-
-# Constellation of a `get_signal_id` symbol, used to group and colour satellites in
-# the DOA plot. Derived from the id prefix so it needs no signal-type instance.
-function constellation_of(signal_id::Symbol)
-    s = string(signal_id)
-    startswith(s, "GPS") ? :GPS :
-    startswith(s, "Galileo") ? :Galileo :
-    startswith(s, "GLONASS") ? :GLONASS :
-    startswith(s, "BeiDou") ? :BeiDou : :Other
 end
 
 # Per-constellation DOA marker colour (both the UnicodePlots points and the legend).
@@ -263,12 +316,16 @@ function pvt_details_lines(pvt)
     # Inter-system biases re-anchored on the lowest-ordered time system present (GPS <
     # Galileo < …) rather than `calc_pvt`'s reference system, so the displayed anchor is
     # stable across solves. All share that one anchor, so it goes in the heading.
+    # The anchor is spelled out in full ("GPS Time") since it is stated once and explains
+    # what the rows are measured against; the rows themselves use the compact ids ("GPST")
+    # to keep the narrow panel readable. Unlike `get_band_name` / `get_constellation_name`,
+    # `get_time_system_name` has no id-derived fallback, so a time system declared outside
+    # GNSSSignals must state its own name to be shown here.
     isbs = isbs_vs_lowest_system(pvt)
     if !isempty(isbs)
-        ref = string(nameof(typeof(isbs[1][3])))
-        push!(lines, "Inter-system biases (vs $ref):")
+        push!(lines, "Inter-system biases (vs $(get_time_system_name(isbs[1][3]))):")
         for (sys, bias, _) in isbs
-            push!(lines, "  $(nameof(typeof(sys))): $(_fmt2(ustrip(m, bias))) m")
+            push!(lines, "  $(get_time_system_id(sys)): $(_fmt2(ustrip(m, bias))) m")
         end
     end
 
@@ -280,7 +337,11 @@ function pvt_details_lines(pvt)
     if !isempty(ifbs)
         push!(lines, "Inter-frequency biases:")
         for (band, value, reference) in ifbs
-            push!(lines, "  $band (vs $reference): $(_fmt2(ustrip(m, value))) m")
+            push!(
+                lines,
+                "  $(band_name(band)) (vs $(band_name(reference))): " *
+                "$(_fmt2(ustrip(m, value))) m",
+            )
         end
     end
 

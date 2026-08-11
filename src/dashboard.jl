@@ -34,6 +34,7 @@ using ..GNSSReceiver:
     CONSTELLATION_COLORS,
     GUIData,
     MIN_SPEED_FOR_HEADING,
+    constellation_name,
     constellation_of,
     pvt_details_lines,
     sat_label,
@@ -352,12 +353,14 @@ end
 
 # Constellation legend as an ANSI-coloured string (parsed back into spans by `_paint_plot!`),
 # so the legend markers use exactly the same terminal colours as the plotted points.
+# Each constellation is named by `constellation_name` (GNSSSignals'
+# `get_constellation_name`) rather than printing the raw id symbol.
 function _legend_ansi(present)
     io = IOContext(IOBuffer(), :color => true)
     for (i, c) in enumerate(present)
         i == 1 || print(io, "   ")
         printstyled(io, "●"; color = get(CONSTELLATION_COLORS, c, :white))
-        print(io, " ", c)
+        print(io, " ", constellation_name(c))
     end
     String(take!(io.io))
 end
