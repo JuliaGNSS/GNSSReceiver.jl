@@ -316,14 +316,15 @@ function pvt_details_lines(pvt)
     # Inter-system biases re-anchored on the lowest-ordered time system present (GPS <
     # Galileo < …) rather than `calc_pvt`'s reference system, so the displayed anchor is
     # stable across solves. All share that one anchor, so it goes in the heading.
-    # The anchor is spelled out in full ("GPS Time") since it is stated once and explains
-    # what the rows are measured against; the rows themselves use the compact ids ("GPST")
-    # to keep the narrow panel readable. Unlike `get_band_name` / `get_constellation_name`,
-    # `get_time_system_name` has no id-derived fallback, so a time system declared outside
-    # GNSSSignals must state its own name to be shown here.
+    # Anchor and rows both use the compact `get_time_system_id` (`GPST`), not the spelled-out
+    # `get_time_system_name` ("GPS Time"): this panel is 42% of the terminal, so at an
+    # 80-column terminal it has 30 usable columns — exactly the width of this heading with an
+    # id. A name overruns and is clipped ("(vs GPS Ti"), and the longer the scale's name the
+    # worse it gets — "Galileo System Time" already clips at 100 columns, and it becomes the
+    # anchor as soon as a third time system is tracked without GPS. Ids stay bounded.
     isbs = isbs_vs_lowest_system(pvt)
     if !isempty(isbs)
-        push!(lines, "Inter-system biases (vs $(get_time_system_name(isbs[1][3]))):")
+        push!(lines, "Inter-system biases (vs $(get_time_system_id(isbs[1][3]))):")
         for (sys, bias, _) in isbs
             push!(lines, "  $(get_time_system_id(sys)): $(_fmt2(ustrip(m, bias))) m")
         end

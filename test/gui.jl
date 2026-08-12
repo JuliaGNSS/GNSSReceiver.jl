@@ -536,10 +536,11 @@ end
             Dict{Symbol,InterFrequencyBias}(:L5 => InterFrequencyBias(5.67u"m", :L1)),
     )
     lines = GNSSReceiver.pvt_details_lines(pvt)
-    # The anchor is spelled out in full (`get_time_system_name`) since it is stated once
-    # and says what the rows are measured against; the rows use the compact ids
-    # (`get_time_system_id`) to fit the narrow panel.
-    @test "Inter-system biases (vs GPS Time):" in lines
+    # Anchor and rows both use `get_time_system_id`. The heading is then exactly the 30
+    # columns this panel has at an 80-column terminal; the spelled-out name would be
+    # clipped there, and "Galileo System Time" already clips at 100 columns.
+    @test "Inter-system biases (vs GPST):" in lines
+    @test length("Inter-system biases (vs GPST):") <= 30
     @test "  GST: 12.34 m" in lines
     # Bands are named through `get_band_name`.
     @test "  L5 (vs L1): 5.67 m" in lines
