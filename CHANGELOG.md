@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.3.1](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v3.3.0...v3.3.1) (2026-08-12)
+
+
+### Bug Fixes
+
+* **gui:** keep the inter-system-bias anchor as a compact id ([cc38edb](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/cc38edb8bab76e156f14952cd96e7216cf289874))
+
 # [3.3.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v3.2.0...v3.3.0) (2026-08-05)
 
 
