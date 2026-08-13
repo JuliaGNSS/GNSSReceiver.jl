@@ -1,5 +1,31 @@
 # Changelog
 
+# [4.0.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v3.3.1...v4.0.0) (2026-08-13)
+
+
+* feat(vt)!: vector tracking (VDLL / VDFLL) through a navigation Kalman filter ([01b4a79](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/01b4a79ddb4f487ed445a9b2a53dab951012cb3f))
+
+
+### BREAKING CHANGES
+
+* `receive` no longer accepts `code_lock_cn0_threshold`, and
+`ReceiverState` no longer accepts `doppler_estimator`. Both entry points take
+`vector_tracking::Union{Bool,VectorTracking} = false` instead, from which the
+Doppler estimator is derived — `VectorPLLAndDLL` when
+true, the conventional FLL-assisted PLL/DLL when false — so that the estimator
+sizing acquisition is always the one the receiver state bakes in. The C/N0 code
+lock threshold now always comes from the per-system
+`get_default_code_lock_cn0_threshold`. The GUI's fixed "not enough satellites" threshold
+is likewise gone — the minimum count is layout-dependent (3 + one clock per
+GNSS time system + one IFB per extra band), so the dashboard reports decoding
+progress and lets the fix's own appearance signal success.
+
+The dependency floors move with it: PositionVelocityTime 5.0.3 replacing `4.0.1`, and
+KalmanFilters and Geodesy become direct dependencies. Tracking needs no bump — 3.3.0
+already pins the `Tracking = "6"` major that `VectorPLLAndDLL` requires.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
 ## [3.3.1](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v3.3.0...v3.3.1) (2026-08-12)
 
 
