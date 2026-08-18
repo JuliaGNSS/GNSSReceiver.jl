@@ -186,16 +186,20 @@ let
         expected_hdop = 0.91
         expected_vdop = 1.13
         expected_tdop = 0.72
-        # Baselined on Tracking 6's default NWPR estimator, midway between the two
-        # backends. Within ~1 dB of the moment ratio's numbers these replaced: every
-        # satellite here is 40 dB-Hz or better, where a coherent estimator loses little to
-        # loop phase noise. The exception is PRN 13, 2 dB lower — also the least steadily
-        # tracked satellite of the eleven, its per-record estimate dipping to ~27 dB-Hz
-        # during the run, which is exactly what a coherent estimate charges for and the
-        # moment ratio's noise floor hid.
+        # Baselined on Tracking 7's default estimator, the measured noise reference. It
+        # reads a median 1.0 dB above the NWPR numbers these replaced (+2.4 dB on PRN 13,
+        # -1.0 on PRN 28), because it divides by a floor measured through the same despread
+        # rather than by one inferred from a ~5 ms coherent sum of the prompt: the residual
+        # loop phase noise inside that window used to be charged to the signal, and PRN 13 —
+        # the least steadily tracked of the eleven — was charged the most.
+        #
+        # One baseline for both backends, and now a sharp one: the two agree to 0.02 dB,
+        # where they used to differ by ~1. The reference despreads through each backend's
+        # own quantiser, so the integer backend's quantisation loss lands in the numerator
+        # and the denominator alike and cancels, instead of showing up as a CN0 difference.
         expected_cn0_dbhz = Dict(
-            5 => 50.6, 7 => 41.4, 8 => 41.3, 13 => 45.0, 15 => 47.6,
-            18 => 40.1, 20 => 43.6, 21 => 41.4, 24 => 40.3, 28 => 49.6, 30 => 47.9,
+            5 => 51.7, 7 => 42.4, 8 => 41.3, 13 => 47.4, 15 => 49.4,
+            18 => 41.0, 20 => 43.8, 21 => 43.3, 24 => 41.1, 28 => 48.7, 30 => 48.9,
         )
 
         # Position: 1 m tolerance. Each backend is deterministic (bit-identical run to run),
@@ -235,15 +239,16 @@ let
         # All 11 healthy sats should be in the fix.
         @test length(last_pvt.sats) == 11
 
-        # Per-satellite CN0 at the time of the final PVT fix: ±2 dB-Hz catches sensitivity
-        # regressions in the correlator/post-corr filter. Each backend is deterministic, so
-        # the tolerance covers the float-vs-integer correlator difference (both element types
-        # are asserted against this one baseline), not run-to-run noise.
+        # Per-satellite CN0 at the time of the final PVT fix: ±1 dB-Hz catches sensitivity
+        # regressions in the correlator/post-corr filter and in the noise reference the
+        # estimate now divides by. Each backend is deterministic and the two agree to
+        # 0.02 dB (see the baseline above), so the tolerance is margin for arithmetic drift
+        # across platforms rather than a spread the two element types actually show.
         for (prn, expected_dbhz) in expected_cn0_dbhz
             key = (signal_id, prn)
             @test haskey(last_sat_data, key)
             cn0_dbhz = ustrip(last_sat_data[key].cn0)
-            @test isapprox(cn0_dbhz, expected_dbhz, atol = 2.0)
+            @test isapprox(cn0_dbhz, expected_dbhz, atol = 1.0)
         end
     end
 

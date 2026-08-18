@@ -344,9 +344,9 @@ end
 end
 
 @testset "GUI with a non-finite CN0" begin
-    # Tracking's NWPR CN0 estimator reports `-Inf dB-Hz` for a channel with no
-    # detectable signal (a tracked satellite in a deep outage) and `NaN dB-Hz` for a
-    # correlator that has accumulated nothing yet. `barplot` throws on a negative bar
+    # Tracking's CN0 estimator reports `-Inf dB-Hz` for a channel with no detectable
+    # signal (a tracked satellite in a deep outage) and `NaN dB-Hz` for a correlator that
+    # has accumulated nothing yet. `barplot` throws on a negative bar
     # value, so both must be floored to 0 rather than reaching it — otherwise one such
     # satellite takes the whole dashboard down on render.
     @test GNSSReceiver.Dashboard._cn0_db(-Inf * dBHz) == 0.0
@@ -463,7 +463,7 @@ end
 end
 
 @testset "GUI CN0 bars survive an unmeasurable satellite" begin
-    # Tracking's default NWPR estimator reports `-Inf dBHz` for a satellite whose CN0 it
+    # Tracking's default estimator reports `-Inf dBHz` for a satellite whose CN0 it
     # cannot measure — and a negative dB-Hz figure just above that — while the detectors may
     # still be holding it, so such a satellite does reach the bar chart.
     # `UnicodePlots.barplot` throws on any value below zero ("all values have to be ≥ 0"),

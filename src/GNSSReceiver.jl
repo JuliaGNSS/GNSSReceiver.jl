@@ -363,6 +363,30 @@ function create_tracked_sat(
     )
 end
 
+# The per-signal noise references a `TrackState` is built with. `Tracking` measures the
+# noise floor once per *signal* (keyed by `get_signal_id`) and divides each record's
+# prompt power by that measured density — the receiver leaves every signal on Tracking's
+# default CN0 estimator, which is the one that reads it, so every tracked signal needs an
+# entry or its CN0 reads `-Inf dBHz`. That means both halves of a `CombinedSignal` (pilot
+# and data are separate `TrackedSignal`s, each with their own estimator), and one shared
+# entry where two groups carry the same signal — the floor is a property of the
+# modulation, not of how the receiver grouped it.
+#
+# `CorrelatorNoiseEstimator`'s defaults are Tracking's own (1 s sliding window, 1.5-chip
+# taps, ±5 kHz carrier dither); nothing here is receiver-specific.
+create_noise_estimators(systems::Tuple) =
+    _noise_estimators(_flatten_systems(map(tracking_signals, systems)))
+
+# Fold one single-entry NamedTuple per signal together. The deduplication is `merge`'s,
+# and that is the point: it resolves the shared keys in the *type* domain, where a
+# value-level "have I seen this id yet?" test infers as a union of key sets and takes the
+# whole `TrackState`'s type down with it.
+_noise_estimators(::Tuple{}) = NamedTuple()
+_noise_estimators(signals::Tuple) =
+    merge(_noise_estimator(first(signals)), _noise_estimators(Base.tail(signals)))
+_noise_estimator(signal) =
+    NamedTuple{(get_signal_id(signal),)}((CorrelatorNoiseEstimator(),))
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Pilot + data combined tracking
 #
@@ -574,7 +598,7 @@ function ReceiverState(
         sats = Dictionary{Int,typeof(template)}(Int[], typeof(template)[])
         SignalGroup(get_band(first(sigs)), sats, sigs, num_ants)
     end)
-    track_state = TrackState(groups, doppler_estimator)
+    track_state = TrackState(groups, doppler_estimator, create_noise_estimators(systems))
     receiver_sat_states = NamedTuple{group_keys}(map(systems) do system
         DS = decoder_state_type(system)
         Dictionary{Int,ReceiverSatState{DS}}()

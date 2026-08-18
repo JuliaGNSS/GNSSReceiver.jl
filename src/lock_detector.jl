@@ -51,24 +51,39 @@ receiver never raises it, so every record is currently one code block and the cr
 exactly `cn0_threshold` — the `N > 1` behaviour above only engages once that is plumbed
 through.
 
-The estimate itself comes from Tracking's default CN0 estimator, which as of Tracking 6 is
-the narrowband/wideband power ratio (`NWPRCN0Estimator`) rather than the moment ratio.
-`cn0_threshold` is unchanged in units and meaning, but the number it is compared against
-is a different — and far better behaved — statistic:
+The estimate itself comes from Tracking's default CN0 estimator, which as of Tracking 7 is
+the measured noise reference (`NoiseRefCN0Estimator`): each record's prompt power is divided
+by a noise density Tracking measures by despreading the signal's own code at a randomised
+phase, through the same correlator the satellites go through. `cn0_threshold` is unchanged
+in units and meaning, but the number it is compared against is a different — and better
+behaved — statistic:
 
-  - the moment ratio manufactured signal power out of noise, reporting a median of
-    ~27.6 dB-Hz on pure noise, so a threshold below ~30 dB-Hz could never trip and one at
-    30 dB-Hz was cleared by noise on ~19 % of records. NWPR reports `-Inf dB-Hz` on noise
-    and clears no finite threshold, so the out-of-lock dwell is now spent monotonically: a
-    satellite that dies drops after exactly `out_of_lock_time_threshold`, rather than the
-    ~1.3× that the detector used to take paying time back on the noise realizations that
-    cleared the threshold;
-  - NWPR measures *coherent* CN0, so residual loop phase noise counts against it. With the
-    conventional PLL at 1 ms records and the default ~5 ms coherent window, Tracking
-    measures a median 44.4 dB-Hz at a true 45 dB-Hz and 23.6 dB-Hz at a true 25 dB-Hz: a
-    fraction of a dB on a strong satellite, one to two dB near threshold. The detector is
-    therefore that much stricter than the nominal number suggests; lower `cn0_threshold`
-    by the same if the pre-Tracking-6 sensitivity is wanted back.
+  - it has no noise-only floor to clear. The moment ratio manufactured signal power out of
+    noise, reporting a median of ~27.6 dB-Hz on pure noise, so a threshold below ~30 dB-Hz
+    could never trip and one at 30 dB-Hz was cleared by noise on ~19 % of records. The
+    noise reference's per-record terms average to about zero there — `-Inf dB-Hz` on about
+    half the realizations and single digits on the rest — so the out-of-lock dwell is spent
+    monotonically: a satellite that dies drops after exactly `out_of_lock_time_threshold`,
+    rather than the ~1.3× the detector used to take paying time back on the noise
+    realizations that cleared the threshold;
+  - it reads the true CN0 rather than a biased one, because the floor is measured instead of
+    inferred from the same prompts. In the synthetic model the tests drive (a perfectly
+    phase-locked prompt in unit-power noise) it lands within 0.1 dB of the truth from
+    25 dB-Hz up, where the moment ratio reads 2.9 dB high at 25 dB-Hz. On the ION reference
+    recording it reads a median 1.0 dB above what the narrowband/wideband ratio (Tracking
+    6's default) reported, and up to 2.4 dB on the least steadily tracked satellite: that
+    estimator summed ~5 ms of prompts coherently and charged the loop's residual phase noise
+    to the signal, and this one does not;
+  - `T` is applied per record, as the record is folded, rather than when the estimate is
+    read. That changes nothing for the detector — it multiplies the record's own `T` back in
+    either way — but it does mean `estimate_cn0` reports the same true CN0 whatever the
+    record length, instead of a number that has to be read together with one.
+
+An unmeasured channel — a `TrackState` with no noise source for the signal, or one whose
+window is still empty — reports `-Inf dB-Hz`, which needs no special handling in the
+threshold test (it linearizes to `0 Hz`). The receiver provisions a noise source for every
+signal it tracks (`GNSSReceiver.create_noise_estimators`), so that is the transient before
+the first measurement rather than a configuration a user can land in.
 """
 struct CodeLockDetector <: AbstractLockDetector
     cn0_threshold::typeof(1.0dBHz)
@@ -107,7 +122,7 @@ end
 #
 # Written as a negated `>=` so that a non-finite CN0 counts as *out* of lock: the moments
 # estimator degenerates to `NaN` for an all-zero prompt buffer, and `NaN < threshold` is
-# `false` — which would otherwise hold a dead channel in lock indefinitely. NWPR's "no
+# `false` — which would otherwise hold a dead channel in lock indefinitely. Tracking's "no
 # detectable signal" is `-Inf dB-Hz`, which needs no special handling: it linearizes to
 # `0 Hz` and so fails the comparison against every finite threshold.
 function is_below_cn0_threshold(lock_detector::CodeLockDetector, cn0, integration_time)

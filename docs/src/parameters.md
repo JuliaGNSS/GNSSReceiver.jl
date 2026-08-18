@@ -117,20 +117,25 @@ recovers exactly that much. Anchoring to the code period rather than to the symb
 keeps the number meaning the same thing for the default one-block cadence and stays
 defined for pilot signals, which have no data rate.
 
-The CN0 itself is estimated by Tracking, whose default estimator is the
-narrowband/wideband power ratio (NWPR) as of Tracking 6. The threshold keeps its units and
-its meaning, but the statistic it is compared against changed: NWPR reports `-Inf dBHz` on
-noise instead of the moment ratio's ~27.6 dB-Hz floor, so a dead or falsely acquired
-channel now drops out of lock promptly rather than clearing a 30 dB-Hz threshold on ~19 %
-of records. Because NWPR measures *coherent* CN0, residual loop phase noise counts against
-it: with the conventional PLL at 1 ms records and the default ~5 ms coherent window,
-Tracking measures a median 44.4 dB-Hz at a true 45 dB-Hz and 23.6 dB-Hz at a true
-25 dB-Hz — a fraction of a dB on a strong satellite, one to two dB near threshold. The
-threshold is not a `receive` keyword: it comes from the per-signal default
+The CN0 itself is estimated by Tracking, whose default estimator is the measured noise
+reference (`NoiseRefCN0Estimator`) as of Tracking 7: it divides each record's prompt power
+by a noise density measured by despreading the signal's own code at a randomised phase,
+through the same correlator the satellites go through, rather than inferring a floor from
+the prompt stream. The receiver provisions one such reference per tracked signal
+automatically, so nothing has to be configured for it.
+
+The threshold keeps its units and its meaning, but the statistic it is compared against is
+a better behaved one. It has no noise-only floor to clear — on pure noise the estimate is
+`-Inf dBHz` or single digits, against the moment ratio's ~27.6 dB-Hz — so a dead or falsely
+acquired channel drops out of lock promptly rather than clearing a 30 dB-Hz threshold on
+~19 % of records. And because the floor is measured rather than inferred, the number is the
+true CN0: on the ION reference recording it reads a median 1.0 dB above what the
+narrowband/wideband ratio (Tracking 6's default) reported, and up to 2.4 dB on the least
+steadily tracked satellite, whose loop phase noise that coherent estimator charged to the
+signal. The threshold is not a `receive` keyword: it comes from the per-signal default
 (`GNSSReceiver.get_default_code_lock_cn0_threshold`, 30 dB-Hz) that each satellite's
-`CodeLockDetector` is constructed with, which is where the pre-Tracking-6 sensitivity would
-have to be bought back. The estimate is also what `sat_data[…].cn0` reports and what the GUI
-plots, so displayed CN0s near and below threshold are lower (and truer) than they used to be.
+`CodeLockDetector` is constructed with, which is where sensitivity would have to be traded.
+The estimate is also what `sat_data[…].cn0` reports and what the GUI plots.
 
 The remaining detector timings (out-of-lock, warm-up and carrier integration windows) are
 set at detector construction; see their docstrings in the [API Reference](@ref) for the
