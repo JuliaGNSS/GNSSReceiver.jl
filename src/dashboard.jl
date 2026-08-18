@@ -274,7 +274,7 @@ end
 # CN0 in dBHz as a plain rounded number, floored at the 0 dB (1 Hz) baseline — the same
 # reference an `Inf` CN0 got in the old GUI. `barplot` throws on anything negative or
 # non-finite ("all values have to be ≥ 0"), and both are reachable for a satellite the
-# detectors are still holding: Tracking's NWPR estimator reports `-Inf dBHz` for "no
+# detectors are still holding: Tracking's CN0 estimator reports `-Inf dBHz` for "no
 # detectable signal" and a negative dBHz figure just above that (any CN0 under 1 Hz),
 # while `Inf`/`NaN` come from a degenerate prompt buffer. Such a satellite draws an empty
 # bar instead of taking the whole panel — and with it the dashboard — down.

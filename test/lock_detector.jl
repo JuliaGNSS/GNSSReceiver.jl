@@ -116,8 +116,9 @@ end
     # The moments CN0 estimator degenerates to `NaN` for an all-zero prompt buffer (a
     # dead correlator channel) and to `Inf` when it sees no noise at all. `NaN` must
     # count as out of lock rather than hold lock forever through a failed comparison.
-    # `-Inf dBHz` is the default NWPR estimator's "no detectable signal", so it is the
-    # value a noise-only channel now actually reports.
+    # `-Inf dBHz` is the default estimator's "no detectable signal" — an unmeasured
+    # channel, or a noise reference whose per-record terms have not cleared zero — so it is
+    # a value a channel actually reports.
     detector = GNSSReceiver.CodeLockDetector(;
         cn0_threshold = 30u"dBHz",
         reference_integration_time = REFERENCE_T,
@@ -157,20 +158,35 @@ end
 # ratio `cn0` integrated over `T` is a constant signal amplitude in complex Gaussian noise.
 # The estimators recover `SNR = A²/σ²`, and `randn(ComplexF64)` has unit total power, so
 # `σ² = 1` and `A = √(CN0·T)`. The amplitude is constant — a perfectly phase-locked loop —
-# which is what lets NWPR's coherent narrowband sum reach the truth here; in a real loop its
-# residual phase noise costs a dB or two near threshold (see `CodeLockDetector`).
+# so both estimators reach the truth here; in a real loop the residual phase noise shrinks
+# the prompt and costs a fraction of a dB near threshold (see `CodeLockDetector`).
 #
-# Two estimators are exercised: Tracking's per-signal default (`NWPRCN0Estimator` as of
-# Tracking 6 — what the receiver actually runs on), and the `MomentsCN0Estimator` that used
+# Two estimators are exercised: Tracking's per-signal default (`NoiseRefCN0Estimator` as of
+# Tracking 7 — what the receiver actually runs on), and the `MomentsCN0Estimator` that used
 # to be the default. Fed the identical prompt stream, so anything that holds for both is a
 # property of the detector rather than of one estimator's normalization. Passed as a
 # zero-argument factory because both buffer into a mutable array that must not be shared
 # between realizations.
+#
+# The two are fed through different `update` arities, and that difference is what Tracking 7
+# changes for this file: the moment ratio infers its noise floor from the prompt stream and
+# takes a bare prompt, while the noise reference divides by a *measured* density and needs
+# the record's `CN0UpdateContext` — that density and the record's own integration time. In
+# this model the noise is `randn(ComplexF64)`, i.e. unit power per record, so the density
+# that reproduces it is `N₀ = σ²·T = T`: `|P|²/N₀ - 1/T` then has expectation
+# `(CN0·T + 1)/T - 1/T = CN0`, the same truth the moment ratio recovers from `A²/σ²`.
 # ---------------------------------------------------------------------------------------
 
 const NUM_PROMPTS = 100
 default_estimator() = Tracking.default_cn0_estimator(GPSL1CA(), NUM_PROMPTS)
 moments_estimator() = MomentsCN0Estimator(NUM_PROMPTS)
+
+# Fold one record's prompt in. The moment ratio (like any estimator that reads the prompt
+# stream alone) takes the two-argument form; everything else gets the context the tracking
+# loop would have built for this record.
+fold_prompt(estimator::MomentsCN0Estimator, prompt, context) =
+    Tracking.update(estimator, prompt)
+fold_prompt(estimator, prompt, context) = Tracking.update(estimator, prompt, context)
 
 function synthetic_tracked_signal(
     cn0,
@@ -183,10 +199,19 @@ function synthetic_tracked_signal(
     base = TrackedSignal(signal; num_prompts_for_cn0_estimation = num_prompts)
     integration_time = num_code_blocks * GNSSReceiver.primary_code_period(signal)
     amplitude = sqrt(ustrip(uconvert(NoUnits, Unitful.linear(cn0) * integration_time)))
+    # Unit noise power per record ⇒ a measured density of `T` (see above). Only a
+    # noise-referenced estimator reads either field.
+    context = Tracking.CN0UpdateContext(
+        signal,
+        Tracking.get_bit_buffer(base),
+        num_code_blocks;
+        noise_density = integration_time,
+        integration_time,
+    )
     rng = Random.Xoshiro(seed)
     estimator = make_estimator()
     for _ = 1:num_prompts
-        estimator = Tracking.update(estimator, amplitude + randn(rng, ComplexF64))
+        estimator = fold_prompt(estimator, amplitude + randn(rng, ComplexF64), context)
     end
     TrackedSignal(
         base;
@@ -241,15 +266,14 @@ function synthetic_drive(
     detector
 end
 
-@testset "Detector statistic is immune to Tracking's CN0 normalization ($name)" for (
-    name,
-    make_estimator,
-) in (("default estimator", default_estimator), ("moments", moments_estimator))
-    # One prompt buffer, presented as an N-block record for several N. `estimate_cn0`
-    # divides by the record's integration time, so it reports 10·log10(N) dB lower — but
-    # the detector multiplies the same time back in, so its statistic, and therefore its
-    # decision, must be bit-identical. This is what makes the threshold independent of how
-    # Tracking chooses to normalize — and of which estimator it swaps in as its default.
+@testset "Detector statistic is immune to Tracking's CN0 normalization (moments)" begin
+    # One prompt buffer, presented as an N-block record for several N. The moment ratio
+    # divides by the record's integration time when the estimate is *read*, so it reports
+    # 10·log10(N) dB lower — but the detector multiplies the same time back in, so its
+    # statistic, and therefore its decision, must be bit-identical. This is what makes the
+    # threshold independent of how Tracking chooses to normalize. Tracking's default
+    # divides per record instead, which the testset below covers.
+    make_estimator = moments_estimator
     detector = synthetic_detector()
     one_block = synthetic_tracked_signal(30.0dBHz, 1, 7; make_estimator)
     reference_cn0 = estimate_cn0(one_block)
@@ -273,6 +297,36 @@ end
         @test snr == reference_snr
         @test synthetic_is_below(detector, relabelled) ==
               synthetic_is_below(detector, one_block)
+    end
+end
+
+@testset "The noise reference applies the integration time per record" begin
+    # The other half of the same seam, for the estimator Tracking 7 defaults to. It divides
+    # by `T` as it folds each record — where that record's own length is known — so
+    # `estimate_cn0` reports the true CN0 whatever the record length, and relabelling a
+    # buffer after the fact cannot move it. The detector needs no case distinction either
+    # way: what it thresholds is the record's post-integration SNR, and it multiplies the
+    # record's own `T` back in regardless of when the estimator divided it out.
+    one_block = synthetic_tracked_signal(30.0dBHz, 1, 7; make_estimator = default_estimator)
+    @test isapprox(ustrip(estimate_cn0(one_block)), 30.0, atol = 2.0)
+
+    for num_blocks in (2, 4, 20)
+        relabelled =
+            TrackedSignal(one_block; last_fully_integrated_num_code_blocks = num_blocks)
+        # Bit-identical, not merely close: `estimate_cn0` never reads the argument.
+        @test estimate_cn0(relabelled) == estimate_cn0(one_block)
+
+        # A genuine N-block record at the same CN0 — the amplitude grows with the record,
+        # and the per-record divisor grows with it — lands on the same truth rather than on
+        # N times it. That is what makes the number the detector credits `T` to a real CN0
+        # under the new default as much as under the old one.
+        folded = synthetic_tracked_signal(
+            30.0dBHz,
+            num_blocks,
+            7;
+            make_estimator = default_estimator,
+        )
+        @test isapprox(ustrip(estimate_cn0(folded)), 30.0, atol = 2.0)
     end
 end
 
@@ -305,8 +359,9 @@ end
 ) in (("default estimator", default_estimator), ("moments", moments_estimator))
     # The statistical consequence of the above, over many noise realizations, with wide
     # margins rather than any single realization's outcome. The margins are wide enough to
-    # hold for both estimators even though they disagree by ~3 dB near threshold (the moment
-    # ratio's noise floor reads 27.9 dBHz where NWPR reads a true 25.0).
+    # hold for both estimators even though they disagree by ~3 dB near threshold: at a true
+    # 25 dBHz the noise reference's median is 25.1, while the moment ratio's noise floor
+    # puts it at 27.9.
     detector = synthetic_detector()
 
     # 22 dBHz is ~8 dB under the threshold: a one-block record almost always drops it,
@@ -352,10 +407,12 @@ end
 end
 
 @testset "Tracking's default estimator has no noise-only false alarms" begin
-    # What Tracking 6's default estimator changes for the detector. NWPR reports
-    # `-Inf dBHz` on pure noise rather than the moment ratio's ~27.6 dBHz floor, so a dead
-    # or falsely acquired channel clears no threshold at all — at any record length, since
-    # the credit multiplies a linear CN0 of zero.
+    # What Tracking's default estimator changes for the detector. The moment ratio
+    # manufactures ~27.6 dBHz out of pure noise; the noise reference divides by a floor it
+    # measured rather than by one it inferred from the same prompts, so on pure noise its
+    # per-record terms average to about zero — `-Inf dBHz` on about half the realizations,
+    # single digits on the rest. Either way a dead or falsely acquired channel clears no
+    # threshold at all, at any record length.
     detector = synthetic_detector()
     for num_code_blocks in (1, 20)
         @test synthetic_hold_rate(
@@ -396,7 +453,7 @@ end
     # on ~20% of noise realizations, so a failing signal accumulates out-of-lock time at
     # only ~0.6·signal_duration per update (the detector pays time back on the realizations
     # that pass) and needs ~85 updates to cross a 200 ms threshold. 200 updates leaves
-    # comfortable margin; NWPR gets there in 70.
+    # comfortable margin; the noise reference gets there in 70.
 
     # A healthy signal warms up and stays locked.
     healthy = synthetic_drive(synthetic_detector(), 45.0dBHz, 1, 1:200; make_estimator)
