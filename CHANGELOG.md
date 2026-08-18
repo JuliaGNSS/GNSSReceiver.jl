@@ -1,5 +1,12 @@
 # Changelog
 
+# [4.1.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.0.0...v4.1.0) (2026-08-18)
+
+
+### Features
+
+* support Tracking 7; measure the noise floor per tracked signal ([7c1d962](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/7c1d962bee9330ddfbef017fe82c0e5da6f0e7d0))
+
 # [4.0.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v3.3.1...v4.0.0) (2026-08-13)
 
 
