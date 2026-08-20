@@ -1,5 +1,12 @@
 # Changelog
 
+# [4.2.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.1.0...v4.2.0) (2026-08-20)
+
+
+### Features
+
+* support Tracking 8; reference the C/N₀ to the beamformer's own noise ([1dcc956](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/1dcc9568c300c62c6d82fed5d80c74d2aec8ba6f)), closes [JuliaGNSS/PositionVelocityTime.jl#73](https://github.com/JuliaGNSS/PositionVelocityTime.jl/issues/73)
+
 # [4.1.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.0.0...v4.1.0) (2026-08-18)
 
 
