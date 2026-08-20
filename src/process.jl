@@ -582,7 +582,13 @@ function update_all_receiver_sat_states(receiver_sat_states, track_state, system
                     ),
                     update(
                         receiver_sat_state.carrier_lock_detector,
-                        get_last_fully_integrated_filtered_prompt(
+                        # Every prompt this chunk produced, not just the last one: the
+                        # phase-lock indicator averages over records, and a 4 ms chunk over
+                        # a 1 ms code period completes four of them. Tracking clears this
+                        # buffer at the start of each `track!`, so it holds exactly the
+                        # records of the chunk just processed — and it is the live vector,
+                        # so it must not be retained past this call.
+                        get_filtered_prompts(
                             track_state,
                             group_key,
                             prn,

@@ -257,23 +257,85 @@ end
 """
     CarrierLockDetector <: AbstractLockDetector
 
-Declares carrier lock from the prompt correlator using the standard low-pass filtered
-in-phase/quadrature amplitude test. Over each `integration_code_periods` block it
-compares the filtered in-phase amplitude against the filtered quadrature amplitude; too
-little in-phase dominance accumulates out-of-lock time, and lock is lost once it reaches
-`out_of_lock_code_periods`.
+Declares carrier lock from the prompt correlator using the Van Dierendonck
+narrowband-difference / narrowband-power phase-lock indicator
 
-As for [`CodeLockDetector`](@ref), all three timings are counts of
-`reference_integration_time` — one primary code period of the signal the detector runs on
-(see [`AbstractLockDetector`](@ref)). The defaults reproduce this receiver's historical
-absolute values on GPS L1 C/A, whose code period is 1 ms: a 4 s dwell and an 80 ms warm-up
-and integration block.
+```
+PLI = Σ(Iₖ² − Qₖ²) / Σ(Iₖ² + Qₖ²)
+```
+
+accumulated over every prompt the tracking loops produce. For a prompt of amplitude `A`
+in noise of total variance `σ²` — post-integration SNR `ρ = A²/σ² = CN0·T` — at carrier
+phase error `φ`,
+
+```
+E[Iₖ² − Qₖ²] = A²·cos(2φ)      E[Iₖ² + Qₖ²] = A² + σ²
+```
+
+so `E[PLI] = cos(2φ)·ρ/(ρ+1)`. Lock is declared while `PLI ≥ phase_lock_threshold`; the
+out-of-lock dwell clears outright on any favourable chunk, so declaring loss needs a
+*consecutive* run of failures. Its default `out_of_lock_code_periods` of 4000 is 4 s on
+GPS L1 C/A, matching both this receiver's historical value and Ward's
+`L0 = 240 × 20 ms = 4.8 s`.
+
+This replaces a low-pass-filtered `|I|`-versus-`|Q|` amplitude comparison
+(`lowpass(|I|)/K2 > lowpass(|Q|)` with `K1 = 0.0247`, `K2 = 1.5` — the detector of
+Kaplan & Hegarty §5.11.2). Three concrete reasons:
+
+  * **It sees every prompt.** The old detector was fed one prompt per processing chunk,
+    discarding three of every four at the receiver's 4 ms chunk over a 1 ms code period.
+  * **Its averaging is continuous.** The old filter state was reset every 80 ms block, so
+    the value actually tested had only reached ~39% of its asymptote — `K1 = 0.0247` is
+    specified for 20 ms epochs and gives a 40-epoch time constant, which the 20-update
+    block truncated.
+  * **Its expectation is known in closed form**, so a threshold maps to an explicit phase
+    error at a given C/N0. The old comparison only approaches a phase test at high SNR;
+    at low SNR it degenerates into an implicit SNR test (at perfect phase lock it flips at
+    `ρ ≈ 0.54`, i.e. ~27.4 dBHz over a 1 ms record), and that crossover is a consequence of
+    `K2` rather than something you can read off it.
+
+`phase_lock_threshold` defaults to `0.25`, matching PocketSDR's `THRES_PLI`. Because the
+indicator saturates at `ρ/(ρ+1)`, a threshold has to be read together with the C/N0 one: at
+the default 30 dBHz over a 1 ms record `ρ = 1`, so even perfect phase lock reads only `0.5`,
+and `0.25` demands `cos(2φ) ≥ 0.5` — `|φ| ≤ 30°`, comparable to the 33.7° `K2 = 1.5`
+implied. A threshold above `0.5` would be unreachable at the C/N0 the code detector still
+accepts. Read as a pure sensitivity floor the default is `ρ ≥ 1/3`, i.e. 25.2 dBHz at a 1 ms
+record, so — as before — the code detector's 30 dBHz stays the binding limit and the carrier
+detector is left to judge phase.
+
+The two sums are tracked as exponential moving averages sharing one gain, so the indicator
+is continuous. `smoothing_records` sets the averaging window; the default of 200 keeps the
+noise-only indicator's median at 0.00 and its 99th percentile at 0.12 — both well clear of
+the 0.25 threshold — while a 36 dBHz signal reads 0.78 against its 0.80 asymptote.
+
+The window is counted in **records, not code periods**, unlike the two timings: the gain is
+applied once per prompt, and a prompt is one record spanning
+`get_last_fully_integrated_num_code_blocks` code blocks. The timings stay honest in code
+periods because they are driven by `signal_duration`, which is real elapsed time; this
+average has no access to that. The two coincide today only because Tracking's
+`preferred_num_code_blocks_to_integrate` is 1 and this receiver never raises it (see
+[`CodeLockDetector`](@ref)) — once that is plumbed through, a 200-record window will be
+200·N code periods long.
+
+Those noise-only figures are **asymptotic**, and the 80-code-period warm-up is shorter than
+the 200-record window, so the first judgement is made on an average that has not converged.
+Measured over 4000 noise realizations at the default window, the p99 settles at 0.12 but is
+0.17 at 200 records, 0.26 at 80 (max 0.38) and 0.35 at 40 — i.e. at the moment the warm-up
+ends a noise-only channel is above threshold 1.2% of the time. The warm-up is deliberately
+*not* lengthened to match: clearing the dwell on any favourable chunk, together with the
+4000-code-period dwell, means declaring loss needs a consecutive run of failures, so an
+early excursion in either direction is absorbed. In the other direction the early window is
+already tight enough: at the code-lock threshold (`ρ = 1`, perfect phase lock) the indicator
+is below 0.25 for 0.1% of realizations at 80 records and none at 200.
 """
 struct CarrierLockDetector <: AbstractLockDetector
-    prev_filtered_inphase::Float64
-    prev_filtered_quadrature::Float64
-    integration_time::typeof(1.0s)
-    integration_time_threshold::typeof(1.0s)
+    # Exponential moving averages of I² − Q² and I² + Q², sharing `smoothing_gain`. The gain
+    # is applied once per *record*, so — unlike the two timings below — the window it implies
+    # is a count of records rather than of code periods.
+    filtered_coherent_power::Float64
+    filtered_total_power::Float64
+    smoothing_gain::Float64
+    phase_lock_threshold::Float64
     out_of_lock_time::typeof(1.0s)
     out_of_lock_time_threshold::typeof(1.0s)
     wait_time::typeof(1.0s)
@@ -282,23 +344,45 @@ end
 
 function CarrierLockDetector(;
     reference_integration_time = 1ms,
+    phase_lock_threshold = 0.25,
+    smoothing_records = 200,
     out_of_lock_code_periods = 4000,
     warm_up_code_periods = 80,
-    integration_code_periods = 80,
 )
     T = code_period_reference(reference_integration_time)
     check_code_periods(:out_of_lock_code_periods, out_of_lock_code_periods; positive = true)
     check_code_periods(:warm_up_code_periods, warm_up_code_periods)
-    check_code_periods(
-        :integration_code_periods,
-        integration_code_periods;
-        positive = true,
+    # A window shorter than one record gives a gain above 1, which makes the "moving average"
+    # overshoot every sample; a window of 0 gives an infinite gain, which turns both averages
+    # into `NaN` on the first prompt. `is_below_phase_lock_threshold` reads a non-finite
+    # average as out of lock — correctly, for a dead correlator — so the channel would then be
+    # silently dead from construction rather than loudly misconfigured.
+    isfinite(smoothing_records) && smoothing_records >= 1 || throw(
+        ArgumentError(
+            "smoothing_records is the averaging window in records and sets the moving " *
+            "averages' gain to 1/smoothing_records, so it must be a finite number ≥ 1, " *
+            "got $smoothing_records",
+        ),
+    )
+    # The indicator is `cos(2φ)·ρ/(ρ+1)`, so it lives in `[-1, 1]`: a threshold at or above 1
+    # is unreachable at any C/N0 and holds the channel permanently out of lock, one at or
+    # below −1 is met by anything and never reports loss. In practice the ceiling is lower
+    # still — the indicator saturates at `ρ/(ρ+1)`, which is 0.5 at the 30 dBHz the code
+    # detector accepts over a one-block record — but that bound moves with the record length,
+    # so only the mathematical one is enforced.
+    isfinite(phase_lock_threshold) && -1 < phase_lock_threshold < 1 || throw(
+        ArgumentError(
+            "phase_lock_threshold is compared against cos(2φ)·ρ/(ρ+1) ∈ [-1, 1], so it " *
+            "must be strictly inside that range (and below ρ/(ρ+1) ≈ 0.5 at the code " *
+            "detector's own 30 dBHz over a one-block record to be reachable at all), got " *
+            "$phase_lock_threshold",
+        ),
     )
     CarrierLockDetector(
         0.0,
         0.0,
-        0.0s,
-        integration_code_periods * T,
+        1 / smoothing_records,
+        phase_lock_threshold,
         0.0s,
         out_of_lock_code_periods * T,
         0.0s,
@@ -306,38 +390,86 @@ function CarrierLockDetector(;
     )
 end
 
-function update(lock_detector::CarrierLockDetector, prompt, signal_duration)
-    K1 = 0.0247
-    K2 = 1.5
-    next_filtered_inphase =
-        (abs(real(prompt)) - lock_detector.prev_filtered_inphase) * K1 +
-        lock_detector.prev_filtered_inphase
-    next_filtered_quadrature =
-        (abs(imag(prompt)) - lock_detector.prev_filtered_quadrature) * K1 +
-        lock_detector.prev_filtered_quadrature
+"""
+    phase_lock_indicator(lock_detector::CarrierLockDetector)
 
+The smoothed phase-lock indicator, or `NaN` before any prompt has been folded in.
+"""
+phase_lock_indicator(lock_detector::CarrierLockDetector) =
+    lock_detector.filtered_total_power > 0 ?
+    lock_detector.filtered_coherent_power / lock_detector.filtered_total_power : NaN
+
+function is_below_phase_lock_threshold(lock_detector::CarrierLockDetector)
+    # A non-finite moving average means a non-finite prompt reached the detector — a dead or
+    # saturated correlator channel. That has to fail *closed*, exactly as a non-finite CN0
+    # does in `is_below_cn0_threshold`: `NaN` poisons both averages permanently, and since
+    # `NaN > 0` is `false` it would otherwise look like "nothing measured yet" forever and
+    # hold the channel in lock indefinitely.
+    (
+        isfinite(lock_detector.filtered_total_power) &&
+        isfinite(lock_detector.filtered_coherent_power)
+    ) || return true
+    # Genuinely nothing folded in yet: the warm-up owns that window, so not out of lock.
+    lock_detector.filtered_total_power > 0 || return false
+    # Negated `>=` so any remaining non-finite indicator counts as out of lock too.
+    !(phase_lock_indicator(lock_detector) >= lock_detector.phase_lock_threshold)
+end
+
+"""
+    update(lock_detector::CarrierLockDetector, prompts, signal_duration)
+
+Fold every prompt of one processing chunk into the indicator, then advance the timers once
+by `signal_duration`.
+
+`prompts` is the whole sequence of filtered prompt correlator values the chunk produced
+(Tracking's `get_filtered_prompts`), not just the last one: at the receiver's default 4 ms
+chunk over a 1 ms code period, reading only `get_last_fully_integrated_filtered_prompt`
+would discard three of every four. A lone prompt is accepted too, for callers that have
+only one. An empty sequence — a chunk too short to complete a record — advances the timers
+without inventing evidence.
+"""
+function update(lock_detector::CarrierLockDetector, prompts, signal_duration)
+    coherent = lock_detector.filtered_coherent_power
+    total = lock_detector.filtered_total_power
+    K = lock_detector.smoothing_gain
+    for prompt in prompts
+        inphase_power, quadrature_power = real(prompt)^2, imag(prompt)^2
+        coherent += K * (inphase_power - quadrature_power - coherent)
+        total += K * (inphase_power + quadrature_power - total)
+    end
+    # The verdict is read off the *updated* averages, so a chunk is judged on everything it
+    # contributed rather than on the state that preceded it.
+    measured = CarrierLockDetector(
+        coherent,
+        total,
+        K,
+        lock_detector.phase_lock_threshold,
+        lock_detector.out_of_lock_time,
+        lock_detector.out_of_lock_time_threshold,
+        lock_detector.wait_time,
+        lock_detector.wait_time_threshold,
+    )
     out_of_lock_time = lock_detector.out_of_lock_time
-    next_integration_time = lock_detector.integration_time + signal_duration
-    if next_integration_time >= lock_detector.integration_time_threshold
-        if lock_detector.wait_time >= lock_detector.wait_time_threshold
-            if next_filtered_inphase / K2 < next_filtered_quadrature
-                out_of_lock_time += next_integration_time
-            else
-                out_of_lock_time = 0.0s
-            end
-        end
-        next_filtered_inphase = 0.0
-        next_filtered_quadrature = 0.0
-        next_integration_time = 0.0s
+    if lock_detector.wait_time >= lock_detector.wait_time_threshold
+        # Cleared outright rather than paid back one-for-one: this is the "optimistic"
+        # detector of Kaplan & Hegarty §5.11.2, which "decides quickly and changes its mind
+        # slowly". A marginal satellite's indicator dips below threshold intermittently, and
+        # a paying-back accumulator would random-walk across any threshold.
+        out_of_lock_time =
+            is_below_phase_lock_threshold(measured) ? out_of_lock_time + signal_duration :
+            0.0s
     end
     CarrierLockDetector(
-        next_filtered_inphase,
-        next_filtered_quadrature,
-        next_integration_time,
-        lock_detector.integration_time_threshold,
+        coherent,
+        total,
+        K,
+        lock_detector.phase_lock_threshold,
         out_of_lock_time,
         lock_detector.out_of_lock_time_threshold,
         min(lock_detector.wait_time + signal_duration, lock_detector.wait_time_threshold),
         lock_detector.wait_time_threshold,
     )
 end
+
+update(lock_detector::CarrierLockDetector, prompt::Complex, signal_duration) =
+    update(lock_detector, (prompt,), signal_duration)

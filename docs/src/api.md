@@ -54,6 +54,7 @@ AbstractLockDetector
 CodeLockDetector
 CarrierLockDetector
 is_in_lock
+phase_lock_indicator
 ```
 
 ## Beamforming
