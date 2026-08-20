@@ -161,16 +161,25 @@ end
 # `time_out_of_lock` is the `ReceiverSatState`'s own out-of-lock timer, which gates
 # the reacquisition back-off (`should_reacquire`) — pass a value past the first
 # back-off step (200 ms) to make the sat eligible for reacquisition.
-out_of_lock_code_detector() =
-    GNSSReceiver.CodeLockDetector(
-        30.0u"dBHz",
-        1u"ms",       # reference_integration_time: GPS L1 C/A's code period
-        Inf * u"s",   # coherence_limit: uncapped
-        250u"ms",
-        200u"ms",
-        80u"ms",
-        80u"ms",
+# Driven through `update` rather than written field by field, so it stays correct across a
+# retuning of the stage timings (and across the struct layout, which now nests a `LockDwell`).
+function out_of_lock_code_detector()
+    detector = GNSSReceiver.CodeLockDetector(;
+        cn0_threshold = 30.0u"dBHz",
+        # GPS L1 C/A's code period, which every timing is a multiple of.
+        reference_integration_time = 1u"ms",
     )
+    # Enough clean evidence to latch out of the pull-in stage, so the loop below only has to
+    # spend the (tighter) steady-state dwell.
+    for _ = 1:100
+        detector = GNSSReceiver.update(detector, 45.0u"dBHz", 1u"ms", 4u"ms")
+    end
+    @assert GNSSReceiver.has_pulled_in(detector)
+    while GNSSReceiver.is_in_lock(detector)
+        detector = GNSSReceiver.update(detector, 0.0u"dBHz", 1u"ms", 4u"ms")
+    end
+    detector
+end
 
 function out_of_lock_sat_state(system, prn; time_out_of_lock = 0.0u"s")
     GNSSReceiver.ReceiverSatState(
@@ -208,13 +217,213 @@ function single_sat_track_state(system, prn; num_ants = NumAnts(1))
     )
 end
 
+
+# ---------------------------------------------------------------------------------------
+# The ranging-readiness gate on the PVT solve. `is_in_lock` is deliberately generous
+# through the acquisition → tracking handover so a converging satellite is kept rather than
+# dropped and reacquired; `is_ranging_ready` is what stops that tolerance from leaking a
+# code phase that is still walking the coarse acquisition estimate in — a pseudorange wrong
+# by metres to tens of metres — into the solve. The gate lives in `collect_pvt_sat_states!`,
+# so it is asserted there and not only on the detectors.
+# ---------------------------------------------------------------------------------------
+
+# GPS L1 C/A's code period, the reference integration time its detectors are configured in.
+const PVT_GATE_REFERENCE_T = 1u"ms"
+
+fresh_code_detector() = GNSSReceiver.CodeLockDetector(;
+    cn0_threshold = 30.0u"dBHz",
+    reference_integration_time = PVT_GATE_REFERENCE_T,
+)
+
+fresh_carrier_detector() =
+    GNSSReceiver.CarrierLockDetector(; reference_integration_time = PVT_GATE_REFERENCE_T)
+
+# Detectors driven to ranging readiness through `update` on healthy evidence, exactly as
+# `out_of_lock_code_detector` above drives one to loss: the helper never touches a field, so
+# it stays independent of the dwell's layout, of its stage timings and of how ranging
+# readiness is decided. The loop asks the detector instead of counting a fixed number of
+# updates (~680 code periods of clean evidence on GPS L1 C/A today), so retuning the
+# thresholds cannot silently turn this into a different test; the cap only stops a runaway
+# loop if readiness became unreachable.
+function ranging_ready_code_detector(; max_updates = 10_000)
+    detector = fresh_code_detector()
+    updates = 0
+    while !GNSSReceiver.is_ranging_ready(detector)
+        detector =
+            GNSSReceiver.update(detector, 45.0u"dBHz", PVT_GATE_REFERENCE_T, 4u"ms")
+        updates += 1
+        @assert updates <= max_updates "code detector never reported ranging readiness"
+    end
+    detector
+end
+
+function ranging_ready_carrier_detector(; max_updates = 10_000)
+    detector = fresh_carrier_detector()
+    # A strongly in-phase prompt: the phase-lock indicator converges to cos(0)·ρ/(ρ+1),
+    # far above the 0.25 threshold. Four per chunk, as a 4 ms chunk over a 1 ms code
+    # period really produces.
+    prompts = ntuple(_ -> complex(10.0, 0.1), 4)
+    updates = 0
+    while !GNSSReceiver.is_ranging_ready(detector)
+        detector = GNSSReceiver.update(detector, prompts, 4u"ms")
+        updates += 1
+        @assert updates <= max_updates "carrier detector never reported ranging readiness"
+    end
+    detector
+end
+
+# A satellite that has been in lock long past `time_in_lock_before_calculating_pvt`, so the
+# only thing the PVT gate can still object to is the state of its lock detectors.
+function pvt_sat_state(
+    system,
+    prn,
+    code_lock_detector,
+    carrier_lock_detector;
+    time_in_lock = 5.0u"s",
+    in_vt_loop = false,
+)
+    GNSSReceiver.ReceiverSatState(
+        prn,
+        GNSSDecoderState(system, prn),
+        code_lock_detector,
+        carrier_lock_detector,
+        uconvert(u"s", float(time_in_lock)),
+        0.0u"s",
+        0,
+        in_vt_loop,
+    )
+end
+
+@testset "is_ranging_ready on a ReceiverSatState needs both detectors" begin
+    system = GPSL1CA()
+    ready_code = ranging_ready_code_detector()
+    ready_carrier = ranging_ready_carrier_detector()
+    fresh_code = fresh_code_detector()
+    fresh_carrier = fresh_carrier_detector()
+
+    # The per-detector premise of the test: driven detectors are ready, fresh ones are not.
+    @test GNSSReceiver.is_ranging_ready(ready_code)
+    @test GNSSReceiver.is_ranging_ready(ready_carrier)
+    @test !GNSSReceiver.is_ranging_ready(fresh_code)
+    @test !GNSSReceiver.is_ranging_ready(fresh_carrier)
+
+    combinations = Dictionary(
+        [(false, false), (true, false), (false, true), (true, true)],
+        [
+            pvt_sat_state(system, 1, fresh_code, fresh_carrier),
+            pvt_sat_state(system, 1, ready_code, fresh_carrier),
+            pvt_sat_state(system, 1, fresh_code, ready_carrier),
+            pvt_sat_state(system, 1, ready_code, ready_carrier),
+        ],
+    )
+    # An AND, not an OR and not just one of the two: only the state whose *both* detectors
+    # have settled may be ranged on.
+    for ((code_ready, carrier_ready), state) in pairs(combinations)
+        @test GNSSReceiver.is_ranging_ready(state) == (code_ready && carrier_ready)
+        # And ranging readiness is a strictly later gate than lock: every one of these
+        # satellites is in lock, including the three that must not be ranged on.
+        @test GNSSReceiver.is_in_lock(state)
+    end
+
+    # A vector-loop member is judged on its code detector alone, mirroring `is_in_lock`. The
+    # navigation filter steers both its NCOs through an outage, so its code stays aligned
+    # while its carrier phase-lock indicator is starved of prompts — ANDing the carrier latch
+    # would permanently exclude a member that joined the loop before that latch fired.
+    @test GNSSReceiver.is_ranging_ready(
+        pvt_sat_state(system, 1, ready_code, fresh_carrier; in_vt_loop = true),
+    )
+    @test !GNSSReceiver.is_ranging_ready(
+        pvt_sat_state(system, 1, ready_code, fresh_carrier),
+    )
+    # But a member whose *code* detector has not settled is still not rangeable.
+    @test !GNSSReceiver.is_ranging_ready(
+        pvt_sat_state(system, 1, fresh_code, ready_carrier; in_vt_loop = true),
+    )
+end
+
+@testset "collect_pvt_sat_states! admits only ranging-ready satellites" begin
+    system = GPSL1CA()
+    key = get_signal_id(system)
+    track_state = single_sat_track_state(system, 5)
+    time_in_lock_before_pvt = 2u"s"
+
+    not_ready = pvt_sat_state(system, 5, fresh_code_detector(), fresh_carrier_detector())
+    ready = pvt_sat_state(
+        system,
+        5,
+        ranging_ready_code_detector(),
+        ranging_ready_carrier_detector(),
+    )
+    # The two states differ in ranging readiness and in nothing else the gate looks at:
+    # both are in lock and both are well past the time-in-lock threshold. So a satellite
+    # kept by the handover tolerance is still refused a pseudorange.
+    for state in (not_ready, ready)
+        @test GNSSReceiver.is_in_lock(state)
+        @test state.time_in_lock > time_in_lock_before_pvt
+    end
+    @test !GNSSReceiver.is_ranging_ready(not_ready)
+    @test GNSSReceiver.is_ranging_ready(ready)
+
+    states = PositionVelocityTime.SatelliteState[]
+    GNSSReceiver.collect_pvt_sat_states!(
+        states,
+        (system,),
+        (; key => Dictionary([5], [not_ready])),
+        track_state,
+        time_in_lock_before_pvt,
+    )
+    @test isempty(states)
+
+    GNSSReceiver.collect_pvt_sat_states!(
+        states,
+        (system,),
+        (; key => Dictionary([5], [ready])),
+        track_state,
+        time_in_lock_before_pvt,
+    )
+    @test length(states) == 1
+    # PVT is handed the ranging signal, and the satellite's own decoder and code phase.
+    @test states[1].system == GNSSReceiver.ranging_signal(system)
+    @test states[1].code_phase == get_code_phase(get_sat_state(track_state, key, 5))
+    @test states[1].decoder === ready.decoder
+
+    # The gate is not the time gate in disguise: readiness alone does not admit a satellite
+    # that has not yet been in lock long enough to have decoded usable data.
+    empty!(states)
+    GNSSReceiver.collect_pvt_sat_states!(
+        states,
+        (system,),
+        (;
+            key => Dictionary(
+                [5],
+                [
+                    pvt_sat_state(
+                        system,
+                        5,
+                        ranging_ready_code_detector(),
+                        ranging_ready_carrier_detector();
+                        time_in_lock = 1.0u"s",
+                    ),
+                ],
+            )
+        ),
+        track_state,
+        time_in_lock_before_pvt,
+    )
+    @test isempty(states)
+end
+
 @testset "PVT waits for the satellites' loops to settle" begin
     # `time_in_lock_before_calculating_pvt` keeps a freshly locked satellite out of the
     # solve until its loops have settled: the pseudorange is built from the tracked code
-    # phase, and during pull-in that phase is still a transient.
+    # phase, and during pull-in that phase is still a transient. Its detectors are driven to
+    # ranging readiness first, so the *time* gate is the only thing this testset varies —
+    # `is_ranging_ready`, the other half of the same conjunction, is covered above.
     system = GPSL1CA()
     key = get_signal_id(system)
     track_state = single_sat_track_state(system, 1)
+    ready_code = ranging_ready_code_detector()
+    ready_carrier = ranging_ready_carrier_detector()
     settled(time_in_lock) = (;
         key => Dictionary(
             [1],
@@ -222,8 +431,8 @@ end
                 GNSSReceiver.ReceiverSatState(
                     1,
                     GNSSDecoderState(system, 1),
-                    GNSSReceiver.CodeLockDetector(),
-                    GNSSReceiver.CarrierLockDetector(),
+                    ready_code,
+                    ready_carrier,
                     time_in_lock,
                     0.0u"s",
                     0,

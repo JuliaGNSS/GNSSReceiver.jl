@@ -1751,6 +1751,14 @@ function run_vt_iteration(
         receiver_group_states = receiver_sat_states[group_key]
         tracked_sats = get_sat_states(track_state, group_key)
         eligible_prns = vt_eligible_prns(receiver_group_states, keys(tracked_sats))
+        # NOTE: this list is deliberately gated on `is_in_lock` and not on
+        # `is_ranging_ready`, even though admitting a satellite whose code phase is still
+        # tens of metres out into the navigation filter is a real question. It serves two
+        # purposes at once — the membership list handed to `enable_vt!` and the
+        # measurement-eligibility list handed to `collect_vt_members!` below — so gating it
+        # would also withhold discriminators from *existing* members, which is wrong. The
+        # two uses need separating first; the filter meanwhile has its own innovation-based
+        # release.
         prns_in_lock = filter(prn -> is_in_lock(receiver_group_states[prn]), eligible_prns)
         enable_vt!(track_state, group_key, prns_in_lock)
         member_prns = [get_prn(sat) for sat in tracked_sats if in_vt_loop(sat)]

@@ -282,6 +282,25 @@ function is_in_lock(state::ReceiverSatState)
     end
 end
 
+# Whether the satellite's loops have settled enough to range on. `is_in_lock` decides whether
+# to keep *tracking* a satellite and is deliberately tolerant through the handover; this
+# decides whether its measurements are trustworthy. See
+# `is_ranging_ready(::AbstractLockDetector)`.
+function is_ranging_ready(state::ReceiverSatState)
+    if state.in_vt_loop
+        # Code detector only, mirroring `is_in_lock` above and for a sharper reason: a
+        # coasted vector-loop member's carrier phase-lock indicator is starved through the
+        # outage, so its carrier latch may never have fired. ANDing it unconditionally would
+        # permanently exclude a member that joined the loop before that happened — while the
+        # navigation filter was steering both its NCOs and keeping the code aligned, which is
+        # exactly the state in which its pseudorange *is* usable.
+        is_ranging_ready(state.code_lock_detector)
+    else
+        is_ranging_ready(state.code_lock_detector) &&
+            is_ranging_ready(state.carrier_lock_detector)
+    end
+end
+
 function increase_time_out_of_lock(state::ReceiverSatState, time::Unitful.Time)
     @reset state.time_in_lock = 0.0s
     @reset state.time_out_of_lock = state.time_out_of_lock + time
