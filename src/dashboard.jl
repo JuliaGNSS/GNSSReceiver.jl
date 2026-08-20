@@ -283,17 +283,26 @@ function _cn0_db(cn0)
     isfinite(db) ? max(round(db; digits = 1), 0.0) : 0.0
 end
 
-# Bar colour for one satellite in the CN0 panel. Every satellite shown is in lock, so the
-# three colours separate the reasons it may still not be contributing to the fix:
+# Bar colour for one satellite in the CN0 panel. The three colours separate the reasons a
+# tracked satellite may not be contributing to the fix:
 #
 #   * red    — the satellite declares itself unhealthy in its navigation message. Worst news
 #              and unrelated to our own tracking, so it wins over the readiness stage.
-#   * yellow — healthy, but its loops have not settled enough to range on yet: the handover
-#              is deliberately tolerated, so this is normal for the first second or so after
-#              acquisition (see `is_ranging_ready`). Without this state such a satellite is
-#              indistinguishable from one the PVT solve ignores for no visible reason.
+#   * yellow — healthy, but the receiver is not ranging on it: either its loops have not
+#              settled enough yet (the handover is deliberately tolerated, so this is normal
+#              for the first second or so after acquisition — see `is_ranging_ready`), or it
+#              has lost lock and is only still on screen because the vector-tracking filter
+#              is carrying it through an outage. Both are what `collect_pvt_sat_states!`
+#              withholds from the solve, and without this state such a satellite would be
+#              indistinguishable from one the solve ignores for no visible reason.
 #   * green  — healthy and contributing.
-_sat_bar_color(sat) = !sat.is_healthy ? :red : sat.is_ranging_ready ? :green : :yellow
+#
+# Both conditions are needed. A scalar-tracked satellite is dropped from tracking the moment
+# it loses lock, so `is_in_lock` is constant-true for it — but a vector-loop member is not
+# dropped, and its `is_ranging_ready` stays latched from before the outage by design, so
+# readiness alone would paint a coasting member green.
+_sat_bar_color(sat) =
+    !sat.is_healthy ? :red : (sat.is_ranging_ready && sat.is_in_lock) ? :green : :yellow
 
 function _render_cn0(buf, area::Rect, gui_data, num_dots)
     # One marker column carries both memberships, which are different sets: the vector loop

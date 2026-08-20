@@ -5,8 +5,9 @@ Per-satellite summary emitted for each processed chunk: the estimated carrier-to
 density ratio `cn0`, the latest fully integrated `prompt` correlator value (a scalar
 for single-antenna, an `SVector` for multi-antenna), whether the satellite reports
 itself `is_healthy`, whether its tracking loops are currently closed by the
-vector-tracking navigation filter (`in_vt_loop`; always `false` when VT is disabled), and
-whether those loops have settled enough to range on (`is_ranging_ready`).
+vector-tracking navigation filter (`in_vt_loop`; always `false` when VT is disabled),
+whether those loops have settled enough to range on (`is_ranging_ready`) and whether the
+lock detectors currently declare it locked (`is_in_lock`).
 
 Loop membership is not the same as having determined the solution: a member coasting
 through an obscuration stays `in_vt_loop` and keeps being steered by the filter, but
@@ -18,15 +19,24 @@ and scalar tracking alike — see [`VTStatus`](@ref) for the coasted ones.
 `is_ranging_ready` is what the *receiver* says about its own loops. Both must hold for the
 satellite to contribute to the PVT solution.
 
-Every satellite present in a chunk's `sat_data` is in lock — `remove_lost_satellites` drops
-the others before the payload is built — so there is no separate `is_in_lock` field. What
-`is_ranging_ready` distinguishes is the stage *within* lock: the acquisition → tracking
+What `is_ranging_ready` distinguishes is the stage *within* lock: the acquisition → tracking
 handover is deliberately tolerated (the point is to keep a converging satellite rather than
 drop and reacquire it), so a satellite can be tracked and reported here for some time before
 its code phase is trustworthy enough to range on — from 680 code periods for a healthy
 signal up to 2000 for one whose evidence never comes cleanly. Without this field such a
-satellite is indistinguishable from one the PVT solve is ignoring for no reason. See
-[`is_ranging_ready`](@ref GNSSReceiver.is_ranging_ready) and
+satellite is indistinguishable from one the PVT solve is ignoring for no reason.
+
+`is_in_lock` is the other half of that picture, and it is *not* constant-true here: a
+satellite that loses lock is normally dropped from tracking before the next payload is built
+(`remove_lost_satellites`), but a vector-loop member never is — the navigation filter keeps
+steering it through an outage and decides itself when to release it. Such a member reports
+`in_vt_loop && !is_in_lock`, and `is_ranging_ready` stays latched from before the outage
+(deliberately: the filter kept both its NCOs steered, so it is rangeable the moment the
+signal returns). So `is_ranging_ready` alone does not answer "would the receiver range on
+this satellite right now?" — `collect_pvt_sat_states!` requires both, and a consumer that
+colours or filters on readiness wants both too. See
+[`is_ranging_ready`](@ref GNSSReceiver.is_ranging_ready),
+[`is_in_lock`](@ref GNSSReceiver.is_in_lock) and
 [`LockDwell`](@ref GNSSReceiver.LockDwell).
 """
 struct SatelliteDataOfInterest{P<:Union{<:Complex,<:AbstractVector{<:Complex}}}
@@ -35,40 +45,58 @@ struct SatelliteDataOfInterest{P<:Union{<:Complex,<:AbstractVector{<:Complex}}}
     is_healthy::Bool
     in_vt_loop::Bool
     is_ranging_ready::Bool
+    is_in_lock::Bool
 end
 
 # Back-compat / convenience: a satellite summary built without VT membership defaults to
-# not being in the vector loop, and one built without a readiness flag to being ready. The
-# two defaults point in opposite directions on purpose: absent membership is genuinely "not
-# a member", whereas absent readiness is absent *information*, and reporting it as
-# not-ready would recolour an older caller's display for a satellite it never made any
-# claim about. The receiver itself always fills both in (`build_sat_data`).
+# not being in the vector loop, and one built without a readiness or lock flag to being
+# ready and locked. The defaults point in opposite directions on purpose: absent membership
+# is genuinely "not a member", whereas absent readiness or lock is absent *information*, and
+# reporting either as false would recolour an older caller's display for a satellite it
+# never made any claim about. The receiver itself always fills all three in
+# (`build_sat_data`).
 SatelliteDataOfInterest(
     cn0,
     prompt::P,
     is_healthy,
 ) where {P<:Union{<:Complex,<:AbstractVector{<:Complex}}} =
-    SatelliteDataOfInterest{P}(cn0, prompt, is_healthy, false, true)
+    SatelliteDataOfInterest{P}(cn0, prompt, is_healthy, false, true, true)
 SatelliteDataOfInterest{P}(
     cn0,
     prompt,
     is_healthy,
 ) where {P<:Union{<:Complex,<:AbstractVector{<:Complex}}} =
-    SatelliteDataOfInterest{P}(cn0, prompt, is_healthy, false, true)
+    SatelliteDataOfInterest{P}(cn0, prompt, is_healthy, false, true, true)
 SatelliteDataOfInterest(
     cn0,
     prompt::P,
     is_healthy,
     in_vt_loop,
 ) where {P<:Union{<:Complex,<:AbstractVector{<:Complex}}} =
-    SatelliteDataOfInterest{P}(cn0, prompt, is_healthy, in_vt_loop, true)
+    SatelliteDataOfInterest{P}(cn0, prompt, is_healthy, in_vt_loop, true, true)
 SatelliteDataOfInterest{P}(
     cn0,
     prompt,
     is_healthy,
     in_vt_loop,
 ) where {P<:Union{<:Complex,<:AbstractVector{<:Complex}}} =
-    SatelliteDataOfInterest{P}(cn0, prompt, is_healthy, in_vt_loop, true)
+    SatelliteDataOfInterest{P}(cn0, prompt, is_healthy, in_vt_loop, true, true)
+SatelliteDataOfInterest(
+    cn0,
+    prompt::P,
+    is_healthy,
+    in_vt_loop,
+    is_ranging_ready,
+) where {P<:Union{<:Complex,<:AbstractVector{<:Complex}}} =
+    SatelliteDataOfInterest{P}(cn0, prompt, is_healthy, in_vt_loop, is_ranging_ready, true)
+SatelliteDataOfInterest{P}(
+    cn0,
+    prompt,
+    is_healthy,
+    in_vt_loop,
+    is_ranging_ready,
+) where {P<:Union{<:Complex,<:AbstractVector{<:Complex}}} =
+    SatelliteDataOfInterest{P}(cn0, prompt, is_healthy, in_vt_loop, is_ranging_ready, true)
 
 """
     VTStatus
@@ -166,6 +194,14 @@ is_sat_ranging_ready_at(sat_state_dict, prn) =
 is_sat_in_vt_loop_at(sat_state_dict, prn) =
     haskey(sat_state_dict, prn) && sat_state_dict[prn].in_vt_loop
 
+# Lock verdict of the satellite's detectors, or `false` for one the receiver holds no state
+# for yet — same fail-safe direction again. Constant-true for a scalar-tracked satellite,
+# which is dropped from tracking as soon as it loses lock, but not for a vector-loop member:
+# the navigation filter carries that one through an outage (`remove_lost_satellites`), so the
+# payload has to report the outage rather than imply it away.
+is_sat_in_lock_at(sat_state_dict, prn) =
+    haskey(sat_state_dict, prn) && is_in_lock(sat_state_dict[prn])
+
 # Prompt correlator value of a satellite's ranging signal (the pilot, for a combined
 # system) — the quantity `SatelliteDataOfInterest` reports.
 _ranging_prompt(sat_state) =
@@ -206,6 +242,7 @@ function build_sat_data(receiver_state)
                     is_sat_healthy_at(sat_state_dict, prn),
                     is_sat_in_vt_loop_at(sat_state_dict, prn),
                     is_sat_ranging_ready_at(sat_state_dict, prn),
+                    is_sat_in_lock_at(sat_state_dict, prn),
                 ),
             )
         end

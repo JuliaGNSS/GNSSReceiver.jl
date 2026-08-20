@@ -5,11 +5,13 @@ GNSSReceiver.jl ships a live, interactive **terminal dashboard** (built on
 processes samples. It lays out four panels:
 
 - **Carrier-to-Noise-Density Ratio (CN0)** — a bar per tracked satellite (labelled with
-  the RINEX-style satellite id and band, e.g. `G05 L1`). Every satellite shown is in lock,
-  and the colour says whether it is contributing to the fix: **green** when it is healthy
-  and its tracking loops have settled enough to range on, **yellow** when it is healthy but
-  still settling — normal for roughly the first second after acquisition, see the lock
-  detection section of [Acquisition & Tracking Parameters](@ref) — and **red** when the
+  the RINEX-style satellite id and band, e.g. `G05 L1`). The colour says whether the
+  satellite is contributing to the fix: **green** when it is healthy, in lock and its
+  tracking loops have settled enough to range on, **yellow** when it is healthy but the
+  receiver is not ranging on it — either still settling, normal for roughly the first second
+  after acquisition (see the lock detection section of
+  [Acquisition & Tracking Parameters](@ref)), or a vector-loop member that has lost lock and
+  is being carried through an outage by the navigation filter — and **red** when the
   satellite declares itself unhealthy in its navigation message.
 - **Satellite Direction-of-Arrival** — a sky plot of the satellites in view, each drawn at
   its azimuth/elevation and labelled with its PRN, coloured by constellation (green GPS,

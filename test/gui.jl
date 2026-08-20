@@ -303,20 +303,22 @@ end
     @test !occursin("re-acquiring", out)
 end
 
-# The CN0 panel's three bar colours. Every satellite in `sat_data` is in lock, so the colour
-# is what tells a user *why* a locked satellite may still not be in the fix: an unhealthy
-# satellite (its own navigation message) from one whose loops have not settled enough to
-# range on yet (our own tracking, normal right after the handover). Before this distinction
-# existed the latter was indistinguishable from a satellite the PVT solve ignored for no
-# visible reason.
+# The CN0 panel's three bar colours. The colour is what tells a user *why* a tracked
+# satellite may still not be in the fix: an unhealthy satellite (its own navigation message)
+# from one the receiver is not ranging on (our own tracking — normal right after the
+# handover, and also the state of a vector-loop member coasting through an outage). Before
+# this distinction existed the latter was indistinguishable from a satellite the PVT solve
+# ignored for no visible reason.
 @testset "CN0 bar colour separates unhealthy from still-settling" begin
-    sat(; healthy, ranging_ready) = GNSSReceiver.SatelliteDataOfInterest{ComplexF64}(
-        45.0dBHz,
-        complex(1.0, 0.0),
-        healthy,
-        false,
-        ranging_ready,
-    )
+    sat(; healthy, ranging_ready, in_lock = true) =
+        GNSSReceiver.SatelliteDataOfInterest{ComplexF64}(
+            45.0dBHz,
+            complex(1.0, 0.0),
+            healthy,
+            false,
+            ranging_ready,
+            in_lock,
+        )
     color(; kwargs...) = GNSSReceiver.Dashboard._sat_bar_color(sat(; kwargs...))
 
     @test color(; healthy = true, ranging_ready = true) == :green
@@ -326,6 +328,17 @@ end
     @test color(; healthy = false, ranging_ready = true) == :red
     @test color(; healthy = false, ranging_ready = false) == :red
 
+    # A vector-loop member coasting through an obscuration: out of lock, so
+    # `collect_pvt_sat_states!` withholds it from the solve, but healthy and still latched
+    # ranging-ready from before the outage (deliberately — the filter keeps both its NCOs
+    # steered, so it is rangeable the moment the signal returns). Readiness alone would paint
+    # it green, i.e. "healthy and contributing", which is exactly the confusion yellow exists
+    # to remove. Only a vector-loop member reaches this state; a scalar-tracked satellite is
+    # dropped from tracking as soon as it loses lock.
+    @test color(; healthy = true, ranging_ready = true, in_lock = false) == :yellow
+    @test color(; healthy = true, ranging_ready = false, in_lock = false) == :yellow
+    @test color(; healthy = false, ranging_ready = true, in_lock = false) == :red
+
     # All three colours are distinct, so the states are actually distinguishable on screen.
     @test length(
         unique(
@@ -334,13 +347,16 @@ end
         ),
     ) == 3
 
-    # A summary built through the back-compat positional forms reports as ready, so an older
-    # caller's display is coloured exactly as it was before the field existed.
+    # A summary built through the back-compat positional forms reports as ready and locked, so
+    # an older caller's display is coloured exactly as it was before the fields existed.
     @test GNSSReceiver.Dashboard._sat_bar_color(
         GNSSReceiver.SatelliteDataOfInterest(45.0dBHz, complex(1.0, 0.0), true),
     ) == :green
     @test GNSSReceiver.Dashboard._sat_bar_color(
         GNSSReceiver.SatelliteDataOfInterest(45.0dBHz, complex(1.0, 0.0), true, true),
+    ) == :green
+    @test GNSSReceiver.Dashboard._sat_bar_color(
+        GNSSReceiver.SatelliteDataOfInterest(45.0dBHz, complex(1.0, 0.0), true, true, true),
     ) == :green
 end
 

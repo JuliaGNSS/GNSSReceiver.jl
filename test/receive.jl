@@ -235,4 +235,17 @@ end
     # `is_sat_healthy_at`, which a satellite the receiver holds no state for also fails.
     @test !GNSSReceiver.is_sat_ranging_ready_at(states, 99)
     @test !GNSSReceiver.is_sat_healthy_at(states, 99)
+
+    # The lock verdict is reported alongside it, and is NOT constant-true in the payload: a
+    # vector-loop member that has lost lock is deliberately kept in tracking
+    # (`remove_lost_satellites`), and its ranging readiness stays latched from before the
+    # outage. So readiness alone does not answer "would the receiver range on this satellite
+    # right now?" — `collect_pvt_sat_states!` requires both, and a consumer needs both.
+    @test GNSSReceiver.is_sat_in_lock_at(states, 1)
+    @test !GNSSReceiver.is_sat_in_lock_at(states, 99)
+    coasting = sat_state(GNSSReceiver.set_out_of_lock(ready_code_detector()))
+    coasting = @set coasting.in_vt_loop = true
+    coasted_states = Dictionary([1], [coasting])
+    @test GNSSReceiver.is_sat_ranging_ready_at(coasted_states, 1)
+    @test !GNSSReceiver.is_sat_in_lock_at(coasted_states, 1)
 end
