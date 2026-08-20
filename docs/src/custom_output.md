@@ -36,7 +36,7 @@ read are:
 | Field | What it holds | Useful accessors |
 |---|---|---|
 | `track_state` | Tracking's per-satellite loop state, grouped by signal | `get_sat_states(track_state, group_key)`, then per `sat_state`: `get_prn`, `get_carrier_doppler`, `get_code_phase`, `get_carrier_phase`, `estimate_cn0` (from [Tracking](https://github.com/JuliaGNSS/Tracking.jl)) |
-| `receiver_sat_states` | A `NamedTuple` keyed by signal id (`:GPSL1CA`, …); each value is a `Dictionaries.Dictionary{Int,ReceiverSatState}` keyed by PRN | `GNSSReceiver.is_sat_healthy(…​.decoder)`, plus the decoded ephemeris in `…​.decoder` (from [GNSSDecoder](https://github.com/JuliaGNSS/GNSSDecoder.jl)) |
+| `receiver_sat_states` | A `NamedTuple` keyed by signal id (`:GPSL1CA`, …); each value is a `Dictionaries.Dictionary{Int,ReceiverSatState}` keyed by PRN | `GNSSReceiver.is_sat_healthy(…​.decoder)`, plus the decoded ephemeris in `…​.decoder` (from [GNSSDecoder](https://github.com/JuliaGNSS/GNSSDecoder.jl)); `GNSSReceiver.is_in_lock(…)` and `GNSSReceiver.is_ranging_ready(…)` for the lock stage (see [Acquisition & Tracking Parameters](@ref)) |
 | `pvt` | Current PVT solution | fields of `PositionVelocityTime.PVTSolution` |
 | `runtime` | Elapsed signal time | — |
 

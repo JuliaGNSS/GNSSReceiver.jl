@@ -303,6 +303,47 @@ end
     @test !occursin("re-acquiring", out)
 end
 
+# The CN0 panel's three bar colours. Every satellite in `sat_data` is in lock, so the colour
+# is what tells a user *why* a locked satellite may still not be in the fix: an unhealthy
+# satellite (its own navigation message) from one whose loops have not settled enough to
+# range on yet (our own tracking, normal right after the handover). Before this distinction
+# existed the latter was indistinguishable from a satellite the PVT solve ignored for no
+# visible reason.
+@testset "CN0 bar colour separates unhealthy from still-settling" begin
+    sat(; healthy, ranging_ready) = GNSSReceiver.SatelliteDataOfInterest{ComplexF64}(
+        45.0dBHz,
+        complex(1.0, 0.0),
+        healthy,
+        false,
+        ranging_ready,
+    )
+    color(; kwargs...) = GNSSReceiver.Dashboard._sat_bar_color(sat(; kwargs...))
+
+    @test color(; healthy = true, ranging_ready = true) == :green
+    @test color(; healthy = true, ranging_ready = false) == :yellow
+    # An unhealthy satellite reads red whatever our loops think of it: it is the worse news,
+    # and it is not something better tracking can fix.
+    @test color(; healthy = false, ranging_ready = true) == :red
+    @test color(; healthy = false, ranging_ready = false) == :red
+
+    # All three colours are distinct, so the states are actually distinguishable on screen.
+    @test length(
+        unique(
+            color(; healthy = h, ranging_ready = r) for
+            (h, r) in ((true, true), (true, false), (false, true))
+        ),
+    ) == 3
+
+    # A summary built through the back-compat positional forms reports as ready, so an older
+    # caller's display is coloured exactly as it was before the field existed.
+    @test GNSSReceiver.Dashboard._sat_bar_color(
+        GNSSReceiver.SatelliteDataOfInterest(45.0dBHz, complex(1.0, 0.0), true),
+    ) == :green
+    @test GNSSReceiver.Dashboard._sat_bar_color(
+        GNSSReceiver.SatelliteDataOfInterest(45.0dBHz, complex(1.0, 0.0), true, true),
+    ) == :green
+end
+
 @testset "GUI with no data" begin
     sat_data_type = GNSSReceiver.SatelliteDataOfInterest{SVector{2,ComplexF64}}
     gui_data = GNSSReceiver.GUIData(

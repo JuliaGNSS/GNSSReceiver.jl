@@ -283,6 +283,18 @@ function _cn0_db(cn0)
     isfinite(db) ? max(round(db; digits = 1), 0.0) : 0.0
 end
 
+# Bar colour for one satellite in the CN0 panel. Every satellite shown is in lock, so the
+# three colours separate the reasons it may still not be contributing to the fix:
+#
+#   * red    — the satellite declares itself unhealthy in its navigation message. Worst news
+#              and unrelated to our own tracking, so it wins over the readiness stage.
+#   * yellow — healthy, but its loops have not settled enough to range on yet: the handover
+#              is deliberately tolerated, so this is normal for the first second or so after
+#              acquisition (see `is_ranging_ready`). Without this state such a satellite is
+#              indistinguishable from one the PVT solve ignores for no visible reason.
+#   * green  — healthy and contributing.
+_sat_bar_color(sat) = !sat.is_healthy ? :red : sat.is_ranging_ready ? :green : :yellow
+
 function _render_cn0(buf, area::Rect, gui_data, num_dots)
     # One marker column carries both memberships, which are different sets: the vector loop
     # (`in_vt_loop`) and the satellites whose measurements determined this fix (`pvt.sats`).
@@ -306,8 +318,8 @@ function _render_cn0(buf, area::Rect, gui_data, num_dots)
             tstyle(:text_dim); max_x = right(inner))
         return
     end
-    # Bars sorted by constellation (GPS, then Galileo, …), then PRN, then band; coloured
-    # green (healthy) / red (unhealthy). The mark goes right after the PRN (`G03* L1`), with a
+    # Bars sorted by constellation (GPS, then Galileo, …), then PRN, then band; coloured by
+    # `_sat_bar_color`. The mark goes right after the PRN (`G03* L1`), with a
     # blank in that column for an unmarked bar, so no space precedes it, all labels stay one
     # width, and `barplot`'s right-justification keeps the PRN/band columns aligned.
     # `sat_label` is `<sys><2-digit prn> <3-char band>`, so the mark goes at index 4. The column
@@ -343,7 +355,7 @@ function _render_cn0(buf, area::Rect, gui_data, num_dots)
         lbl[1:3] * mark * lbl[4:end]
     end
     cn0s = [_cn0_db(gui_data.sat_data[key].cn0) for key in shown_keys]
-    colors = [gui_data.sat_data[key].is_healthy ? :green : :red for key in shown_keys]
+    colors = [_sat_bar_color(gui_data.sat_data[key]) for key in shown_keys]
     labelw = maximum(length, labels)
     # Chrome `barplot` draws around the bars themselves: the label column, then `" ┤"`
     # between label and bar, then the value printed after the bar (" 45.1" — a space plus up
