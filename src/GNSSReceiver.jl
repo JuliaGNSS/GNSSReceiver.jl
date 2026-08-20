@@ -233,7 +233,9 @@ function ReceiverSatState(
             cn0_threshold = code_lock_cn0_threshold,
             reference_integration_time = primary_code_period(acq.system),
         ),
-        CarrierLockDetector(),
+        CarrierLockDetector(;
+            reference_integration_time = primary_code_period(acq.system),
+        ),
         0.0s,
         0.0s,
         0,
@@ -254,7 +256,9 @@ function ReceiverSatState(
             # The detector runs on the ranging signal, so its code period is the reference.
             reference_integration_time = primary_code_period(ranging_signal(system)),
         ),
-        CarrierLockDetector(),
+        CarrierLockDetector(;
+            reference_integration_time = primary_code_period(ranging_signal(system)),
+        ),
         0.0s,
         0.0s,
         0,

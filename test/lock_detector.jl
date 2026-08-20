@@ -2,14 +2,62 @@
 # to, so a record of this length is credited exactly `cn0_threshold` (no relaxation).
 const REFERENCE_T = 1u"ms"
 
+@testset "Detector timings scale with the primary code period" begin
+    # This is the headline fix: the same code-period counts must become proportionally
+    # longer absolute times on a longer code, because Tracking's loop bandwidths are
+    # `0.018 / T_code` and so every loop time constant scales with `T_code`.
+    for (code_period, factor) in ((1u"ms", 1), (4u"ms", 4), (10u"ms", 10))
+        code = GNSSReceiver.CodeLockDetector(; reference_integration_time = code_period)
+        @test code.reference_integration_time ≈ code_period
+        @test code.out_of_lock_time_threshold ≈ factor * 200u"ms"
+        @test code.wait_time_threshold ≈ factor * 80u"ms"
+
+        carrier = GNSSReceiver.CarrierLockDetector(; reference_integration_time = code_period)
+        @test carrier.out_of_lock_time_threshold ≈ factor * 4u"s"
+        @test carrier.wait_time_threshold ≈ factor * 80u"ms"
+        @test carrier.integration_time_threshold ≈ factor * 80u"ms"
+    end
+
+    # On GPS L1 C/A the defaults reproduce the historical absolute timings exactly, so the
+    # signal the receiver was tuned against sees no change at all.
+    l1ca = GNSSReceiver.primary_code_period(GPSL1CA())
+    @test GNSSReceiver.CodeLockDetector(;
+        reference_integration_time = l1ca,
+    ).out_of_lock_time_threshold ≈ 200u"ms"
+    @test GNSSReceiver.CarrierLockDetector(;
+        reference_integration_time = l1ca,
+    ).out_of_lock_time_threshold ≈ 4u"s"
+
+    # Tracking reports integration times in `Hz^-1`; that must configure identically, so the
+    # constructors have to `uconvert` rather than assume seconds.
+    in_inverse_hz = uconvert(u"Hz^-1", 4u"ms")
+    @test GNSSReceiver.CodeLockDetector(;
+        reference_integration_time = in_inverse_hz,
+    ).out_of_lock_time_threshold ≈ 800u"ms"
+    @test GNSSReceiver.CarrierLockDetector(;
+        reference_integration_time = in_inverse_hz,
+    ).integration_time_threshold ≈ 320u"ms"
+
+    # A count that cannot describe a timing is rejected rather than silently scaled into a
+    # negative threshold, which would read as "out of lock" from the very first update.
+    @test_throws ArgumentError GNSSReceiver.CodeLockDetector(; out_of_lock_code_periods = 0)
+    @test_throws ArgumentError GNSSReceiver.CodeLockDetector(; warm_up_code_periods = -1)
+    @test_throws ArgumentError GNSSReceiver.CarrierLockDetector(;
+        integration_code_periods = NaN,
+    )
+    @test_throws ArgumentError GNSSReceiver.CodeLockDetector(;
+        reference_integration_time = 0u"ms",
+    )
+end
+
 @testset "CodeLockDetector accumulates and pays back out-of-lock time" begin
     # Warm up past the wait-time threshold with a healthy CN0 so the detector
     # starts arming its out-of-lock timer.
     detector = GNSSReceiver.CodeLockDetector(;
         cn0_threshold = 30u"dBHz",
         reference_integration_time = REFERENCE_T,
-        out_of_lock_time_threshold = 200u"ms",
-        wait_time_threshold = 80u"ms",
+        out_of_lock_code_periods = 200,
+        warm_up_code_periods = 80,
     )
     for _ = 1:20
         detector = GNSSReceiver.update(detector, 45u"dBHz", REFERENCE_T, 4u"ms")
@@ -38,8 +86,8 @@ end
     detector = GNSSReceiver.CodeLockDetector(;
         cn0_threshold = 30u"dBHz",
         reference_integration_time = REFERENCE_T,
-        out_of_lock_time_threshold = 200u"ms",
-        wait_time_threshold = 80u"ms",
+        out_of_lock_code_periods = 200,
+        warm_up_code_periods = 80,
     )
     for _ = 1:20
         detector = GNSSReceiver.update(detector, 45u"dBHz", REFERENCE_T, 4u"ms")
@@ -62,12 +110,12 @@ end
 end
 
 @testset "CodeLockDetector stays neutral before the wait time elapses" begin
-    # Before `wait_time_threshold` is reached a bad CN0 must not accumulate any
+    # Before the warm-up elapses a bad CN0 must not accumulate any
     # out-of-lock time (the detector is still warming up).
     detector = GNSSReceiver.CodeLockDetector(;
         cn0_threshold = 30u"dBHz",
         reference_integration_time = REFERENCE_T,
-        wait_time_threshold = 80u"ms",
+        warm_up_code_periods = 80,
     )
     detector = GNSSReceiver.update(detector, 5u"dBHz", REFERENCE_T, 4u"ms")
     @test detector.out_of_lock_time == 0u"s"
@@ -145,6 +193,23 @@ end
     state = GNSSReceiver.ReceiverSatState(GPSL1CA(), 1)
     @test state.code_lock_detector.reference_integration_time ==
           GNSSReceiver.primary_code_period(GPSL1CA())
+    # Both detectors must be anchored, not just the code one.
+    @test state.code_lock_detector.out_of_lock_time_threshold ≈ 200u"ms"
+    @test state.carrier_lock_detector.out_of_lock_time_threshold ≈ 4u"s"
+
+    # Galileo E1B's 4 ms code period gives timings 4× longer, matching its 4× slower loops —
+    # the property whose absence made lock detection fail on the slower signals. Built from
+    # the code period directly rather than through `ReceiverSatState(GalileoE1B(), 1)`: that
+    # would construct a `GNSSDecoderState`, pulling in Galileo's FEC decoder (Aff3ct), whose
+    # binary does not load on Windows. The `ReceiverSatState` wiring is already covered by
+    # the GPS L1 C/A case above; what is E1B-specific here is only the code period.
+    e1b_period = GNSSReceiver.primary_code_period(GalileoE1B())
+    @test GNSSReceiver.CodeLockDetector(;
+        reference_integration_time = e1b_period,
+    ).out_of_lock_time_threshold ≈ 800u"ms"
+    @test GNSSReceiver.CarrierLockDetector(;
+        reference_integration_time = e1b_period,
+    ).out_of_lock_time_threshold ≈ 16u"s"
 end
 
 # ---------------------------------------------------------------------------------------
@@ -425,7 +490,7 @@ end
 
     # The consequence end to end: the out-of-lock dwell is spent monotonically instead of
     # being paid back on the realizations the moment ratio let through, so lock is lost in
-    # exactly `wait_time_threshold + out_of_lock_time_threshold` of signal — 20 + 50 updates
+    # exactly the warm-up plus the out-of-lock dwell — 20 + 50 updates
     # of 4 ms — rather than the ~85 the moment ratio needs.
     duration = 4u"ms"
     for num_updates in (69, 70)
@@ -479,9 +544,10 @@ end
 
 @testset "CarrierLockDetector accumulates out-of-lock on weak in-phase power" begin
     detector = GNSSReceiver.CarrierLockDetector(;
-        out_of_lock_time_threshold = 200u"ms",
-        wait_time_threshold = 80u"ms",
-        integration_time_threshold = 80u"ms",
+        reference_integration_time = REFERENCE_T,
+        out_of_lock_code_periods = 200,
+        warm_up_code_periods = 80,
+        integration_code_periods = 80,
     )
     # A prompt dominated by its quadrature component fails the in-phase dominance
     # test each integration block, so out-of-lock time accumulates and lock is lost.

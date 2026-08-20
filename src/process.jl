@@ -839,8 +839,11 @@ end
 # ~0.2, 0.8, 1.8, 3.2 s … out of lock — never every frame. The bound matters: an
 # unthrottled full-grid `acquire!` per frame is prohibitively expensive at high
 # sampling rates on churny urban signal. The optimistic lock detector bounds the
-# rate further — a re-detected sat is `is_in_lock` for a ~20-update grace, so
-# `time_out_of_lock` stays 0 and no new attempt fires while it is converging.
+# rate further — a re-detected sat is `is_in_lock` for its detector's warm-up, so
+# `time_out_of_lock` stays 0 and no new attempt fires while it is converging. That
+# grace is 80 primary code periods of the ranging signal, which is 20 updates only
+# on GPS L1 C/A at the default 4 ms chunk; on a 10 ms code it is 200 updates, and
+# in seconds it grows with the code period exactly as the tracking loops do.
 # `reacquire_backoff` sets the base step; `max_reacquire_attempts` caps total
 # attempts before falling back to the periodic full scan (`acquire_every`).
 function should_reacquire(state; reacquire_backoff = 200ms, max_reacquire_attempts = 5)
