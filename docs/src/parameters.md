@@ -101,15 +101,19 @@ float backend with no full-scale value. See [Getting Started](@ref).
 ## Lock detection
 
 A satellite contributes to the PVT solution only while it is *in lock*. Lock is declared
-per satellite by a [`CodeLockDetector`](@ref GNSSReceiver.CodeLockDetector) **and** a
-[`CarrierLockDetector`](@ref GNSSReceiver.CarrierLockDetector). Both track elapsed signal
-time, so their behaviour is independent of how the signal is chunked, and both take their
-timings as counts of the ranging signal's primary code period rather than in seconds, so
-they mean the same thing on every signal (see [Timings scale with the code period](@ref)).
+per satellite by a [`CodeLockDetector`](@ref GNSSReceiver.CodeLockDetector) — a threshold on
+the post-integration SNR — **and** a
+[`CarrierLockDetector`](@ref GNSSReceiver.CarrierLockDetector) — the narrowband
+difference/power phase-lock indicator `Σ(I²−Q²)/Σ(I²+Q²)`, fed every prompt the tracking
+loops produce. Both track elapsed signal time, so their behaviour is independent of how the
+signal is chunked, and both take their timings as counts of the ranging signal's primary
+code period rather than in seconds, so they mean the same thing on every signal (see
+[Timings scale with the code period](@ref)).
 
-The detector thresholds and timings (the code-lock CN0 threshold, out-of-lock, warm-up and
-carrier integration windows) are set at detector construction from per-signal defaults; see
-their docstrings in the [API Reference](@ref).
+The detector thresholds and timings (the code-lock CN0 threshold, the carrier phase-lock
+threshold and its smoothing window, and the out-of-lock and warm-up windows) are set at
+detector construction from per-signal defaults; see their docstrings in the
+[API Reference](@ref).
 
 The CN0 threshold is referred to a record spanning **one primary code period**, because what
 decides detectability is the post-integration SNR `CN0 · T` rather than CN0 on its own.
@@ -159,8 +163,7 @@ it is correct — but only 50 on Galileo E1B and 20 on GPS L1C-D, against loops 
 and ten times slower. That is why lock detection failed on the slower signals while GPS
 L1 C/A looked fine. The GPS L1 C/A numbers are unchanged.
 
-The counts themselves (out-of-lock, warm-up and carrier integration windows) are set at
-detector construction; see the
+The counts themselves are set at detector construction; see the
 [`CodeLockDetector`](@ref GNSSReceiver.CodeLockDetector) and
 [`CarrierLockDetector`](@ref GNSSReceiver.CarrierLockDetector) docstrings in the
 [API Reference](@ref) for the defaults.
