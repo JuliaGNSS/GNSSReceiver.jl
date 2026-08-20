@@ -464,12 +464,21 @@ function remove_lost_satellites(receiver_sat_states, track_state)
 end
 
 # Append the PVT-ready satellites of the given `systems` (every constellation
-# across all bands) to `states`. A satellite is ready once it is in lock and has
-# been in lock for `time_in_lock_before_calculating_pvt` — long enough for its
-# loops to have settled onto the signal, so the code phase the pseudorange is
-# built from is the tracked one and not a pull-in transient. Called by the
-# combined multi-band PVT solve (`update_pvt`); `calc_pvt` itself further filters
-# to satellites whose navigation data is fully decoded and healthy.
+# across all bands) to `states`. A satellite is ready once it is in lock, its loops have
+# settled enough to range on (`is_ranging_ready`), and it has been in lock for
+# `time_in_lock_before_calculating_pvt` — long enough to have decoded usable data. Called by
+# the combined multi-band PVT solve (`update_pvt`); `calc_pvt` itself further filters to
+# satellites whose navigation data is fully decoded and healthy.
+#
+# The `is_ranging_ready` gate is what keeps the lock detectors' tolerance through the
+# acquisition → tracking handover from costing accuracy. `is_in_lock` is deliberately generous
+# there — the whole point is to keep a converging satellite rather than drop and reacquire it —
+# but while the loops are still walking the coarse acquisition estimate in, the code phase
+# carries a converging bias, and a pseudorange built from it is wrong by tens of metres
+# (measured on a 0.25-chip handover: 44-64 m at 200 code periods, 5-44 m at 600).
+# `time_in_lock_before_calculating_pvt` alone does not cover this: it counts from the handover,
+# so it can elapse while the loops are still settling — and on a code longer than 1 ms the
+# settling takes proportionally longer while that gate stays fixed in seconds.
 function collect_pvt_sat_states!(
     states,
     systems,
@@ -481,6 +490,7 @@ function collect_pvt_sat_states!(
         group_key = signal_group_key(system)
         for receiver_sat_state in receiver_sat_states[group_key]
             if is_in_lock(receiver_sat_state) &&
+               is_ranging_ready(receiver_sat_state) &&
                receiver_sat_state.time_in_lock > time_in_lock_before_calculating_pvt
                 # Hand PVT the *ranging* signal (the pilot, for a combined spec) as
                 # `system` and the *data* decoder separately: PVT derives the code /

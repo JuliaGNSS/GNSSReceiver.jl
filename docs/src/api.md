@@ -51,9 +51,12 @@ SatelliteDataOfInterest
 
 ```@docs
 AbstractLockDetector
+LockDwell
 CodeLockDetector
 CarrierLockDetector
 is_in_lock
+has_pulled_in
+is_ranging_ready
 phase_lock_indicator
 ```
 

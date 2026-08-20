@@ -2,6 +2,419 @@
 # to, so a record of this length is credited exactly `cn0_threshold` (no relaxation).
 const REFERENCE_T = 1u"ms"
 
+# The absolute timings this receiver used before the detectors were scaled to the code period,
+# reproduced by passing the equivalent code-period counts — so a test can assert that the old
+# configuration fails where the new one holds.
+old_absolute_code_kwargs(code_period) = (
+    warm_up_code_periods = round(Int, ustrip(u"s", 80u"ms") / ustrip(u"s", code_period)),
+    out_of_lock_code_periods = round(Int, ustrip(u"s", 200u"ms") / ustrip(u"s", code_period)),
+    # A single unstaged dwell: no pull-in credit at all.
+    pull_in_code_periods = 0,
+    confirm_code_periods = 0,
+    pull_in_out_of_lock_code_periods =
+        round(Int, ustrip(u"s", 200u"ms") / ustrip(u"s", code_period)),
+)
+
+# ---------------------------------------------------------------------------------------
+# LockDwell — the staging shared by both detectors
+# ---------------------------------------------------------------------------------------
+
+@testset "LockDwell accumulates nothing during the warm-up" begin
+    dwell = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        warm_up_code_periods = 80,
+    )
+    for _ = 1:20
+        dwell = GNSSReceiver.update(dwell, true, 4u"ms")
+    end
+    # Exactly 80 ms of signal has passed, all of it warm-up.
+    @test dwell.elapsed ≈ 80u"ms"
+    @test dwell.out_of_lock_time == 0u"s"
+    @test GNSSReceiver.is_in_lock(dwell)
+
+    # The very next chunk is past the warm-up and does count.
+    dwell = GNSSReceiver.update(dwell, true, 4u"ms")
+    @test dwell.out_of_lock_time ≈ 4u"ms"
+end
+
+@testset "LockDwell tolerates more while pulling in than in steady state" begin
+    dwell = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        warm_up_code_periods = 0,
+        out_of_lock_code_periods = 200,
+        pull_in_out_of_lock_code_periods = 600,
+        pull_in_code_periods = 800,
+    )
+    @test !dwell.pulled_in
+    # 400 ms of continuous out-of-lock evidence — twice the steady-state threshold — is
+    # still tolerated, because the handover has not finished.
+    for _ = 1:100
+        dwell = GNSSReceiver.update(dwell, true, 4u"ms")
+    end
+    @test dwell.out_of_lock_time ≈ 400u"ms"
+    @test !dwell.pulled_in
+    @test GNSSReceiver.is_in_lock(dwell)
+    @test GNSSReceiver.current_out_of_lock_time_threshold(dwell) ≈ 600u"ms"
+
+    # Past the pull-in threshold it is lost: 600 ms accumulated.
+    for _ = 1:50
+        dwell = GNSSReceiver.update(dwell, true, 4u"ms")
+    end
+    @test dwell.out_of_lock_time >= 600u"ms"
+    @test !GNSSReceiver.is_in_lock(dwell)
+end
+
+@testset "LockDwell latches steady state on sustained good evidence" begin
+    dwell = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        warm_up_code_periods = 0,
+        confirm_code_periods = 200,
+        pull_in_code_periods = 800,
+    )
+    # 196 ms of clean evidence is not yet a confirmation.
+    for _ = 1:49
+        dwell = GNSSReceiver.update(dwell, false, 4u"ms")
+    end
+    @test !dwell.pulled_in
+    @test dwell.settled_time ≈ 196u"ms"
+
+    # 200 ms is, and it latches well before `pull_in_time_threshold` (800 ms) expires.
+    dwell = GNSSReceiver.update(dwell, false, 4u"ms")
+    @test dwell.pulled_in
+    @test dwell.elapsed ≈ 200u"ms"
+    @test GNSSReceiver.current_out_of_lock_time_threshold(dwell) ≈ 200u"ms"
+
+    # And it never goes back: a later bad patch keeps the tighter steady threshold, which
+    # is what makes a fade after a successful handover detected on the steady timescale.
+    for _ = 1:10
+        dwell = GNSSReceiver.update(dwell, true, 4u"ms")
+    end
+    @test dwell.pulled_in
+    @test dwell.settled_time == 0u"s"
+end
+
+@testset "Ranging readiness is a separate, later latch than the dwell stage" begin
+    # The two questions have different natural timescales and one threshold cannot serve both.
+    # `pulled_in` may fire as soon as the C/N0 deficit clears, so a fade is caught on the
+    # steady-state timescale; ranging must wait for the CODE LOOP, which is far slower. On BPSK
+    # the prompt only loses `1 − |Δτ|`, so a GPS L1 C/A satellite looks healthy almost at once
+    # while its DLL (`1/B_L` = 1000 code periods) is still walking the handover error in:
+    # measured residual code phase after 200 code periods of clean evidence is 0.09-0.19 chip
+    # (26-54 m of pseudorange error), versus 0.007-0.09 chip (2-27 m) after 600.
+    dwell = GNSSReceiver.LockDwell(;
+        reference_integration_time = GNSSReceiver.primary_code_period(GPSL1CA()),
+    )
+    @test dwell.ranging_confirm_time_threshold > dwell.confirm_time_threshold
+    @test dwell.ranging_confirm_time_threshold >= 0.5u"s"   # ≥ half a DLL time constant
+    # Still free against `receive`'s own 2 s `time_in_lock_before_calculating_pvt` gate on
+    # GPS L1 C/A, so being conservative costs no time to first fix.
+    @test dwell.warm_up_time_threshold + dwell.ranging_confirm_time_threshold < 2u"s"
+    # Ranging can never be ready before the handover is declared over, however it is configured.
+    floored = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        confirm_code_periods = 500,
+        ranging_confirm_code_periods = 100,
+    )
+    @test floored.ranging_confirm_time_threshold >= floored.confirm_time_threshold
+
+    # Driven end to end: the dwell tightens first, ranging follows later.
+    d = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        warm_up_code_periods = 0,
+        confirm_code_periods = 200,
+        ranging_confirm_code_periods = 600,
+    )
+    for _ = 1:50
+        d = GNSSReceiver.update(d, false, 4u"ms")
+    end
+    @test GNSSReceiver.has_pulled_in(d)          # dwell tightened at 200 code periods
+    @test !GNSSReceiver.is_ranging_ready(d)      # but not yet trustworthy to range on
+    for _ = 1:100
+        d = GNSSReceiver.update(d, false, 4u"ms")
+    end
+    @test GNSSReceiver.is_ranging_ready(d)       # 600 code periods of clean evidence
+    # Both latches are monotone: a later bad patch does not revoke them.
+    for _ = 1:10
+        d = GNSSReceiver.update(d, true, 4u"ms")
+    end
+    @test GNSSReceiver.has_pulled_in(d)
+    @test GNSSReceiver.is_ranging_ready(d)
+end
+
+@testset "Ranging readiness has a timer backstop, so it cannot be blocked forever" begin
+    # The property this exists for: `settled_time` is cleared by ANY out-of-lock verdict, so an
+    # uninterrupted run of `ranging_confirm_code_periods` is a bar a satellite can fail
+    # indefinitely — and `is_in_lock` will happily keep tracking it meanwhile, which means it is
+    # excluded from the PVT solve silently and permanently. That is an availability regression,
+    # because PVT needs four satellites.
+    #
+    # The regime is real, not adversarial. Under Tracking's default noise-reference estimator
+    # the CODE detector rarely blocks the run — measured steady-state per-chunk out-of-lock
+    # rates with no handover error are 0.58 at the 30 dBHz threshold itself, 0.10 one dB above
+    # it and 0.00 from two dB up — but the CARRIER detector does: its phase-lock indicator
+    # needs 460 to 590 code periods to come up through the handover (measured on GPS L1 C/A at
+    # 34 dBHz), well after the code detector is happy, and `is_ranging_ready` on a
+    # `ReceiverSatState` ANDs the two. Either way the deterministic case decides it: any
+    # disturbance recurring on a period shorter than the required run defeats the evidence
+    # path at every C/N0, which is what the sweep below covers.
+    #
+    # Any disturbance recurring faster than the required run defeats the evidence path, so it is
+    # tested over a range of periods, including 2 — a 50% duty cycle, which also defeats the
+    # obvious alternative of accumulating the evidence cumulatively with payback (zero net drift,
+    # so a paying accumulator never reaches the bar either).
+    for period in (2, 4, 10, 20, 50, 150)
+        dwell = GNSSReceiver.LockDwell(; reference_integration_time = REFERENCE_T)
+        for i = 1:1000                       # 4 s of signal
+            dwell = GNSSReceiver.update(dwell, mod(i, period) == 0, 4u"ms")
+        end
+        @test GNSSReceiver.is_in_lock(dwell)         # tracked throughout
+        @test GNSSReceiver.has_pulled_in(dwell)      # and pulled in, via its own timer
+        @test dwell.settled_time < dwell.ranging_confirm_time_threshold  # never a clean run
+        @test GNSSReceiver.is_ranging_ready(dwell)   # yet admitted to ranging, by the backstop
+    end
+
+    # It latches on the timer, at the timer — not earlier, not on the evidence path.
+    dwell = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        warm_up_code_periods = 0,
+        ranging_pull_in_code_periods = 2000,
+    )
+    for i = 1:500
+        dwell = GNSSReceiver.update(dwell, isodd(i), 4u"ms")
+        @test GNSSReceiver.is_ranging_ready(dwell) == (dwell.elapsed >= 2000u"ms")
+    end
+
+    # A healthy satellite still latches on the evidence, well before the timer: the documented
+    # GPS L1 C/A behaviour (80 code periods of warm-up plus 600 of clean evidence) is unchanged.
+    healthy = GNSSReceiver.LockDwell(;
+        reference_integration_time = GNSSReceiver.primary_code_period(GPSL1CA()),
+    )
+    ready_at = nothing
+    for _ = 1:1000
+        healthy = GNSSReceiver.update(healthy, false, 4u"ms")
+        GNSSReceiver.is_ranging_ready(healthy) && ready_at === nothing &&
+            (ready_at = healthy.elapsed)
+    end
+    @test ready_at ≈ 680u"ms"
+    @test ready_at < healthy.ranging_pull_in_time_threshold
+
+    # On GPS L1 C/A the backstop is 2 s, exactly `receive`'s default
+    # `time_in_lock_before_calculating_pvt` — `time_in_lock` accumulates from the handover at the
+    # same rate as `elapsed`, so the backstop costs no time to first fix there at all.
+    @test healthy.ranging_pull_in_time_threshold ≈ 2u"s"
+    # Two code-loop time constants (`1/B_L` = 1000 code periods): the loop has had over three
+    # times the elapsed time the evidence path needs, so the handover residual the backstop
+    # admits is smaller than the 2-27 m the evidence path already accepts.
+    @test healthy.ranging_pull_in_time_threshold ≈ 2 * 1000 * 1u"ms"
+
+    # The backstop is guarded, so a channel that is genuinely failing is dropped by `is_in_lock`
+    # rather than admitted by the timer. A dwell whose clock is over the steady-state threshold
+    # when the timer expires is NOT admitted; it is admitted once the clock is paid back down.
+    guarded = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        warm_up_code_periods = 0,
+        out_of_lock_code_periods = 200,
+        pull_in_out_of_lock_code_periods = 600,
+        pull_in_code_periods = 100,
+        # Short enough that the 300 ms of accumulation below happens after the backstop has
+        # expired, which is the situation the guard exists for. `ranging_confirm` has to come
+        # down with it, since the backstop is floored at it.
+        ranging_confirm_code_periods = 100,
+        ranging_pull_in_code_periods = 200,
+    )
+    for _ = 1:75                            # 300 ms out of lock: over the steady threshold
+        guarded = GNSSReceiver.update(guarded, true, 4u"ms")
+    end
+    @test guarded.elapsed >= guarded.ranging_pull_in_time_threshold
+    @test guarded.out_of_lock_time > guarded.out_of_lock_time_threshold
+    @test !GNSSReceiver.is_ranging_ready(guarded)
+    for _ = 1:30                            # pay it back below the steady threshold
+        guarded = GNSSReceiver.update(guarded, false, 4u"ms")
+    end
+    @test GNSSReceiver.is_ranging_ready(guarded)
+
+    # Sustained failure is never admitted: pure out-of-lock evidence loses lock and stays out.
+    failing = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        warm_up_code_periods = 0,
+    )
+    for _ = 1:1000
+        failing = GNSSReceiver.update(failing, true, 4u"ms")
+    end
+    @test !GNSSReceiver.is_in_lock(failing)
+    @test !GNSSReceiver.is_ranging_ready(failing)
+
+    # `is_ranging_ready ⟹ has_pulled_in` holds structurally, not by the thresholds happening to
+    # be ordered: the timer path takes the freshly computed `pulled_in` as a conjunct, so even a
+    # backstop configured to expire before the pull-in timer cannot admit ranging first.
+    perverse = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        warm_up_code_periods = 0,
+        confirm_code_periods = 10_000,       # `pulled_in`'s evidence path can never fire, so
+        pull_in_code_periods = 800,          # only its timer, at 800 code periods, can promote
+        ranging_confirm_code_periods = 100,  # and ranging's evidence path never fires either,
+        ranging_pull_in_code_periods = 100,  # so only its backstop, at 100, can admit
+    )
+    # Alternating evidence never builds a 100-code-period run, so neither evidence path can fire
+    # here; the backstop is 700 code periods early, and must still wait for `pulled_in`.
+    longest_run = 0u"ms"
+    for i = 1:400
+        perverse = GNSSReceiver.update(perverse, isodd(i), 4u"ms")
+        longest_run = max(longest_run, perverse.settled_time)
+        GNSSReceiver.is_ranging_ready(perverse) && @test GNSSReceiver.has_pulled_in(perverse)
+    end
+    @test longest_run <= 4.001u"ms"
+    @test GNSSReceiver.has_pulled_in(perverse)
+    @test GNSSReceiver.is_ranging_ready(perverse)
+
+    # And floored at `ranging_confirm_code_periods`: a backstop expiring before the evidence path
+    # could fire would replace the criterion rather than back it up.
+    floored_backstop = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        ranging_confirm_code_periods = 600,
+        ranging_pull_in_code_periods = 100,
+    )
+    @test floored_backstop.ranging_pull_in_time_threshold >=
+          floored_backstop.ranging_confirm_time_threshold
+
+    # The backstop must not touch the dwell: a fade after a successful handover is still noticed
+    # on the steady-state timescale (200 code periods), which is the whole reason the two latches
+    # are separate in the first place.
+    faded = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        warm_up_code_periods = 0,
+    )
+    for _ = 1:200
+        faded = GNSSReceiver.update(faded, false, 4u"ms")
+    end
+    @test GNSSReceiver.is_ranging_ready(faded)
+    fade_chunks = 0
+    while GNSSReceiver.is_in_lock(faded)
+        faded = GNSSReceiver.update(faded, true, 4u"ms")
+        fade_chunks += 1
+    end
+    @test 50 <= fade_chunks <= 51                # 200 ms, not the 600 ms pull-in allowance
+    @test GNSSReceiver.is_ranging_ready(faded)   # still monotone through the fade
+end
+
+@testset "LockDwell rejects a configuration that would silently kill the channel" begin
+    # These counts are multiplied by the code period into thresholds, so a bad one is not
+    # rejected anywhere downstream — it just scales into a threshold that is never met. A
+    # negative dwell makes `out_of_lock_time < threshold` false from the first update, i.e. a
+    # channel that is out of lock before it has seen any evidence, and a zero one does the same
+    # because `is_in_lock` tests `<`. Fail loudly at construction instead.
+    ok(; kwargs...) = GNSSReceiver.LockDwell(; reference_integration_time = REFERENCE_T, kwargs...)
+    @test ok() isa GNSSReceiver.LockDwell
+    for zero_allowed in (
+        :warm_up_code_periods,
+        :pull_in_code_periods,
+        :confirm_code_periods,
+        :ranging_confirm_code_periods,
+        :ranging_pull_in_code_periods,
+    )
+        @test ok(; (zero_allowed => 0,)...) isa GNSSReceiver.LockDwell
+        @test_throws ArgumentError ok(; (zero_allowed => -1,)...)
+        @test_throws ArgumentError ok(; (zero_allowed => NaN,)...)
+    end
+    # The two dwells additionally have to be strictly positive.
+    for dwell_kwarg in (:out_of_lock_code_periods, :pull_in_out_of_lock_code_periods)
+        @test_throws ArgumentError ok(; (dwell_kwarg => 0,)...)
+        @test_throws ArgumentError ok(; (dwell_kwarg => -200,)...)
+        @test_throws ArgumentError ok(; (dwell_kwarg => Inf,)...)
+    end
+    # `reference_integration_time` is one primary code period, so it has to be a positive
+    # duration; zero would collapse every threshold to zero at once.
+    @test_throws ArgumentError GNSSReceiver.LockDwell(; reference_integration_time = 0u"ms")
+    @test_throws ArgumentError GNSSReceiver.LockDwell(; reference_integration_time = -1u"ms")
+    @test_throws ArgumentError GNSSReceiver.LockDwell(; reference_integration_time = Inf * u"s")
+end
+
+@testset "LockDwell needs an uninterrupted run to confirm" begin
+    # A satellite that only intermittently looks good must NOT be promoted to steady state
+    # early — that is the regime a struggling pull-in is in, and it needs the credit.
+    dwell = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        warm_up_code_periods = 0,
+        confirm_code_periods = 200,
+        pull_in_code_periods = 800,
+    )
+    for i = 1:150
+        dwell = GNSSReceiver.update(dwell, isodd(i), 4u"ms")
+        # Every other chunk is favourable, so the run never gets past a single chunk.
+        @test dwell.settled_time <= 4.001u"ms"
+    end
+    # 600 ms of alternating evidence never accumulated a 200 ms clean run.
+    @test dwell.elapsed ≈ 600u"ms"
+    @test !dwell.pulled_in
+end
+
+@testset "LockDwell never declares loss at the stage transition" begin
+    # Accumulate more than the steady-state threshold during pull-in, then let the pull-in
+    # timer expire. If the tighter threshold simply took over, the satellite would be
+    # declared lost on the spot; the latch must wait until the clock is back under it.
+    dwell = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        warm_up_code_periods = 0,
+        out_of_lock_code_periods = 200,
+        pull_in_out_of_lock_code_periods = 600,
+        # Long enough that the whole 300 ms of accumulation below happens inside the
+        # pull-in window, so the window expires with the clock already over the
+        # steady-state threshold — the situation the guard exists for.
+        pull_in_code_periods = 300,
+    )
+    for _ = 1:75
+        dwell = GNSSReceiver.update(dwell, true, 4u"ms")
+    end
+    @test dwell.out_of_lock_time ≈ 300u"ms"   # over the steady threshold
+    @test dwell.elapsed >= dwell.pull_in_time_threshold
+    @test !dwell.pulled_in                     # so it has NOT been promoted
+    @test GNSSReceiver.is_in_lock(dwell)       # and is still held
+
+    # Paying the clock back down below the steady threshold promotes it, and it stays
+    # locked throughout — no discontinuity.
+    for _ = 1:30
+        dwell = GNSSReceiver.update(dwell, false, 4u"ms")
+        @test GNSSReceiver.is_in_lock(dwell)
+    end
+    @test dwell.pulled_in
+    @test dwell.out_of_lock_time < 200u"ms"
+end
+
+@testset "LockDwell credits good evidence by payback or by reset" begin
+    paying = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        warm_up_code_periods = 0,
+        resets_on_lock = false,
+    )
+    resetting = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        warm_up_code_periods = 0,
+        resets_on_lock = true,
+    )
+    for _ = 1:25
+        paying = GNSSReceiver.update(paying, true, 4u"ms")
+        resetting = GNSSReceiver.update(resetting, true, 4u"ms")
+    end
+    @test paying.out_of_lock_time ≈ 100u"ms"
+    @test resetting.out_of_lock_time ≈ 100u"ms"
+
+    # One good chunk: the paying dwell gives back one chunk, the resetting one clears.
+    paying = GNSSReceiver.update(paying, false, 4u"ms")
+    resetting = GNSSReceiver.update(resetting, false, 4u"ms")
+    @test paying.out_of_lock_time ≈ 96u"ms"
+    @test resetting.out_of_lock_time == 0u"s"
+
+    # Payback never goes negative.
+    for _ = 1:100
+        paying = GNSSReceiver.update(paying, false, 4u"ms")
+    end
+    @test paying.out_of_lock_time == 0u"s"
+end
+
+# ---------------------------------------------------------------------------------------
+# CodeLockDetector
+# ---------------------------------------------------------------------------------------
+
 @testset "Detector timings scale with the primary code period" begin
     # This is the headline fix: the same code-period counts must become proportionally
     # longer absolute times on a longer code, because Tracking's loop bandwidths are
@@ -9,12 +422,20 @@ const REFERENCE_T = 1u"ms"
     for (code_period, factor) in ((1u"ms", 1), (4u"ms", 4), (10u"ms", 10))
         code = GNSSReceiver.CodeLockDetector(; reference_integration_time = code_period)
         @test code.reference_integration_time ≈ code_period
-        @test code.out_of_lock_time_threshold ≈ factor * 200u"ms"
-        @test code.wait_time_threshold ≈ factor * 80u"ms"
+        @test code.dwell.out_of_lock_time_threshold ≈ factor * 200u"ms"
+        @test code.dwell.warm_up_time_threshold ≈ factor * 80u"ms"
+        @test code.dwell.pull_in_out_of_lock_time_threshold ≈ factor * 600u"ms"
+        @test code.dwell.pull_in_time_threshold ≈ factor * 800u"ms"
+        @test code.dwell.confirm_time_threshold ≈ factor * 200u"ms"
+        @test code.dwell.ranging_confirm_time_threshold ≈ factor * 600u"ms"
+        @test code.dwell.ranging_pull_in_time_threshold ≈ factor * 2000u"ms"
 
         carrier = GNSSReceiver.CarrierLockDetector(; reference_integration_time = code_period)
-        @test carrier.out_of_lock_time_threshold ≈ factor * 4u"s"
-        @test carrier.wait_time_threshold ≈ factor * 80u"ms"
+        @test carrier.dwell.out_of_lock_time_threshold ≈ factor * 4u"s"
+        @test carrier.dwell.warm_up_time_threshold ≈ factor * 80u"ms"
+        # `pull_in_out_of_lock_code_periods` is floored at the steady value, so the carrier
+        # detector's two stages are equal: it is deliberately unstaged.
+        @test carrier.dwell.pull_in_out_of_lock_time_threshold ≈ factor * 4u"s"
     end
 
     # On GPS L1 C/A the defaults reproduce the historical absolute timings exactly, so the
@@ -22,20 +443,20 @@ const REFERENCE_T = 1u"ms"
     l1ca = GNSSReceiver.primary_code_period(GPSL1CA())
     @test GNSSReceiver.CodeLockDetector(;
         reference_integration_time = l1ca,
-    ).out_of_lock_time_threshold ≈ 200u"ms"
+    ).dwell.out_of_lock_time_threshold ≈ 200u"ms"
     @test GNSSReceiver.CarrierLockDetector(;
         reference_integration_time = l1ca,
-    ).out_of_lock_time_threshold ≈ 4u"s"
+    ).dwell.out_of_lock_time_threshold ≈ 4u"s"
 
     # Tracking reports integration times in `Hz^-1`; that must configure identically, so the
     # constructors have to `uconvert` rather than assume seconds.
     in_inverse_hz = uconvert(u"Hz^-1", 4u"ms")
     @test GNSSReceiver.CodeLockDetector(;
         reference_integration_time = in_inverse_hz,
-    ).out_of_lock_time_threshold ≈ 800u"ms"
+    ).dwell.out_of_lock_time_threshold ≈ 800u"ms"
     @test GNSSReceiver.CarrierLockDetector(;
         reference_integration_time = in_inverse_hz,
-    ).wait_time_threshold ≈ 320u"ms"
+    ).dwell.warm_up_time_threshold ≈ 320u"ms"
 
     # A count that cannot describe a timing is rejected rather than silently scaled into a
     # negative threshold, which would read as "out of lock" from the very first update.
@@ -62,20 +483,23 @@ end
         detector = GNSSReceiver.update(detector, 45u"dBHz", REFERENCE_T, 4u"ms")
     end
     @test GNSSReceiver.is_in_lock(detector)
-    @test detector.out_of_lock_time == 0u"s"
+    @test detector.dwell.out_of_lock_time == 0u"s"
 
-    # CN0 below threshold accumulates out-of-lock time until lock is declared lost.
-    for _ = 1:60
+    # CN0 below threshold accumulates out-of-lock time until lock is declared lost. A fresh
+    # detector is still in its pull-in stage, so what it tolerates is the 600-code-period
+    # pull-in allowance, not the 200 of steady state: 150 updates of 4 ms.
+    for _ = 1:150
         detector = GNSSReceiver.update(detector, 10u"dBHz", REFERENCE_T, 4u"ms")
     end
     @test !GNSSReceiver.is_in_lock(detector)
-    @test detector.out_of_lock_time >= 200u"ms"
+    @test detector.dwell.out_of_lock_time >= 600u"ms"
+    @test !GNSSReceiver.has_pulled_in(detector)
 
     # A healthy CN0 again pays the accumulated out-of-lock time back down.
-    accumulated = detector.out_of_lock_time
+    accumulated = detector.dwell.out_of_lock_time
     detector = GNSSReceiver.update(detector, 45u"dBHz", REFERENCE_T, 4u"ms")
-    @test detector.out_of_lock_time < accumulated
-    @test detector.out_of_lock_time == accumulated - 4u"ms"
+    @test detector.dwell.out_of_lock_time < accumulated
+    @test detector.dwell.out_of_lock_time == accumulated - 4u"ms"
 end
 
 @testset "CodeLockDetector caps the out-of-lock dwell so recovery is bounded" begin
@@ -96,16 +520,41 @@ end
         detector = GNSSReceiver.update(detector, 10u"dBHz", REFERENCE_T, 4u"ms")
     end
     @test !GNSSReceiver.is_in_lock(detector)
-    @test detector.out_of_lock_time ==
-          GNSSReceiver.OUT_OF_LOCK_TIME_CAP_FACTOR * detector.out_of_lock_time_threshold
+    # The cap follows the *current stage*, not the fixed steady-state threshold. Capping a
+    # pull-in detector at twice 200 ms would silently truncate its 600 ms allowance to 400.
+    @test !GNSSReceiver.has_pulled_in(detector)
+    @test detector.dwell.out_of_lock_time ==
+          GNSSReceiver.OUT_OF_LOCK_TIME_CAP_FACTOR *
+          GNSSReceiver.current_out_of_lock_time_threshold(detector)
+    @test detector.dwell.out_of_lock_time == 1200u"ms"
 
-    # One threshold's worth of good signal therefore brings it back, not sixty seconds':
-    # 51 updates of 4 ms pay 204 ms off the 400 ms cap, crossing back under the threshold.
-    for _ = 1:51
+    # One stage threshold's worth of good signal therefore brings it back, not sixty
+    # seconds': 151 updates of 4 ms pay 604 ms off the 1200 ms cap, crossing back under the
+    # 600 ms the pull-in stage tolerates.
+    for _ = 1:151
         detector = GNSSReceiver.update(detector, 45u"dBHz", REFERENCE_T, 4u"ms")
     end
     @test GNSSReceiver.is_in_lock(detector)
-    @test detector.out_of_lock_time < detector.out_of_lock_time_threshold
+    @test detector.dwell.out_of_lock_time <
+          GNSSReceiver.current_out_of_lock_time_threshold(detector)
+
+    # Once the handover has latched closed the cap tightens with the stage: twice 200 ms.
+    settled = GNSSReceiver.CodeLockDetector(;
+        cn0_threshold = 30u"dBHz",
+        reference_integration_time = REFERENCE_T,
+    )
+    for _ = 1:100
+        settled = GNSSReceiver.update(settled, 45u"dBHz", REFERENCE_T, 4u"ms")
+    end
+    @test GNSSReceiver.has_pulled_in(settled)
+    for _ = 1:15_000
+        settled = GNSSReceiver.update(settled, 10u"dBHz", REFERENCE_T, 4u"ms")
+    end
+    @test settled.dwell.out_of_lock_time == 400u"ms"
+    for _ = 1:51
+        settled = GNSSReceiver.update(settled, 45u"dBHz", REFERENCE_T, 4u"ms")
+    end
+    @test GNSSReceiver.is_in_lock(settled)
 end
 
 @testset "CodeLockDetector stays neutral before the wait time elapses" begin
@@ -117,7 +566,7 @@ end
         warm_up_code_periods = 80,
     )
     detector = GNSSReceiver.update(detector, 5u"dBHz", REFERENCE_T, 4u"ms")
-    @test detector.out_of_lock_time == 0u"s"
+    @test detector.dwell.out_of_lock_time == 0u"s"
     @test GNSSReceiver.is_in_lock(detector)
 end
 
@@ -181,6 +630,65 @@ end
     @test GNSSReceiver.is_below_cn0_threshold(detector, minus_inf_cn0, 20 * REFERENCE_T)
 end
 
+@testset "CodeLockDetector survives the handover transient it used to fail" begin
+    # The bug this staging exists to fix, reduced to a deterministic regression. A marginal
+    # satellite reads several dB below its true C/N0 through the handover, because the prompt
+    # sits off the correlation peak until the loops have pulled the coarse acquisition
+    # estimate in. Measured on synthetic handovers at this receiver's own worst-case residual,
+    # the peak accumulated out-of-lock demand for a satellite the receiver should keep is 292
+    # code periods (GPS L1 C/A at 32 dBHz), and it runs into the thousands within a dB of
+    # threshold — against a steady-state dwell of 200.
+    #
+    # Replayed here on a 10 ms code, where the old absolute 200 ms dwell is only 20 code
+    # periods: a satellite 4 dB under threshold for 2.5 s is dropped by that configuration and
+    # held by the scaled, staged one.
+    code_period = GNSSReceiver.primary_code_period(GPSL1C_D())
+    @test code_period ≈ 10u"ms"
+    transient_cn0 = 26u"dBHz"
+    recovered_cn0 = 40u"dBHz"
+
+    scaled = GNSSReceiver.CodeLockDetector(;
+        cn0_threshold = 30u"dBHz",
+        reference_integration_time = code_period,
+    )
+    absolute = GNSSReceiver.CodeLockDetector(;
+        cn0_threshold = 30u"dBHz",
+        reference_integration_time = code_period,
+        old_absolute_code_kwargs(code_period)...,
+    )
+    # 2.5 s of depressed CN0 at 10 ms records, then recovery.
+    for _ = 1:250
+        scaled = GNSSReceiver.update(scaled, transient_cn0, code_period, 10u"ms")
+        absolute = GNSSReceiver.update(absolute, transient_cn0, code_period, 10u"ms")
+    end
+    @test !GNSSReceiver.is_in_lock(absolute)   # the old configuration drops it
+    @test GNSSReceiver.is_in_lock(scaled)      # the new one holds it
+
+    # Recovery: 1.7 s of accumulated out-of-lock time to pay back, then `confirm_code_periods`
+    # (200, i.e. 2 s here) of uninterrupted good evidence to leave the pull-in stage.
+    for _ = 1:400
+        scaled = GNSSReceiver.update(scaled, recovered_cn0, code_period, 10u"ms")
+    end
+    @test GNSSReceiver.is_in_lock(scaled)
+    @test scaled.dwell.out_of_lock_time == 0u"s"
+    @test scaled.dwell.pulled_in
+    # It latched on the evidence, not on the timer — `pull_in_time_threshold` is 8 s here
+    # and only 6.5 s of signal has passed.
+    @test scaled.dwell.elapsed < scaled.dwell.pull_in_time_threshold
+
+    # Having converged, it is now held to the steady-state timescale: a genuine fade is
+    # noticed after 200 code periods — 2 s on this 10 ms code — rather than after the
+    # generous 600-period pull-in allowance.
+    for _ = 1:199
+        scaled = GNSSReceiver.update(scaled, 5u"dBHz", code_period, 10u"ms")
+    end
+    @test GNSSReceiver.is_in_lock(scaled)
+    for _ = 1:2
+        scaled = GNSSReceiver.update(scaled, 5u"dBHz", code_period, 10u"ms")
+    end
+    @test !GNSSReceiver.is_in_lock(scaled)
+end
+
 @testset "ReceiverSatState anchors the threshold to the ranging signal's code period" begin
     # The reference must come from the signal the detector actually runs on, not from a
     # hard-coded 1 ms: GPS L1 C/A's code period is 1 ms, Galileo E1B's is 4 ms.
@@ -193,8 +701,8 @@ end
     @test state.code_lock_detector.reference_integration_time ==
           GNSSReceiver.primary_code_period(GPSL1CA())
     # Both detectors must be anchored, not just the code one.
-    @test state.code_lock_detector.out_of_lock_time_threshold ≈ 200u"ms"
-    @test state.carrier_lock_detector.out_of_lock_time_threshold ≈ 4u"s"
+    @test state.code_lock_detector.dwell.out_of_lock_time_threshold ≈ 200u"ms"
+    @test state.carrier_lock_detector.dwell.out_of_lock_time_threshold ≈ 4u"s"
 
     # Galileo E1B's 4 ms code period gives timings 4× longer, matching its 4× slower loops —
     # the property whose absence made lock detection fail on the slower signals. Built from
@@ -205,10 +713,10 @@ end
     e1b_period = GNSSReceiver.primary_code_period(GalileoE1B())
     @test GNSSReceiver.CodeLockDetector(;
         reference_integration_time = e1b_period,
-    ).out_of_lock_time_threshold ≈ 800u"ms"
+    ).dwell.out_of_lock_time_threshold ≈ 800u"ms"
     @test GNSSReceiver.CarrierLockDetector(;
         reference_integration_time = e1b_period,
-    ).out_of_lock_time_threshold ≈ 16u"s"
+    ).dwell.out_of_lock_time_threshold ≈ 16u"s"
 end
 
 # ---------------------------------------------------------------------------------------
@@ -462,11 +970,15 @@ end
     @test 0.1 < false_alarm_one_block < 0.35
 
     # The out-of-lock dwell is what actually suppresses those transients: end to end, pure
-    # noise loses lock for every record length.
+    # noise loses lock for every record length. 500 updates rather than 200, because a fresh
+    # detector is in its pull-in stage (600 code periods) and the moment ratio pays time back
+    # on the ~22% of noise realizations that clear the threshold, so the clock climbs at only
+    # ~0.55 of `signal_duration` per update.
     for num_code_blocks in (1, 20)
-        driven = synthetic_drive(synthetic_detector(), 0.0dBHz, num_code_blocks, 1:200)
+        driven = synthetic_drive(synthetic_detector(), 0.0dBHz, num_code_blocks, 1:500)
         @test !GNSSReceiver.is_in_lock(driven)
-        @test driven.out_of_lock_time >= driven.out_of_lock_time_threshold
+        @test driven.dwell.out_of_lock_time >=
+              GNSSReceiver.current_out_of_lock_time_threshold(driven)
     end
 end
 
@@ -489,10 +1001,10 @@ end
 
     # The consequence end to end: the out-of-lock dwell is spent monotonically instead of
     # being paid back on the realizations the moment ratio let through, so lock is lost in
-    # exactly the warm-up plus the out-of-lock dwell — 20 + 50 updates
-    # of 4 ms — rather than the ~85 the moment ratio needs.
+    # exactly the warm-up plus the dwell the detector's *current stage* allows — a fresh
+    # detector is in pull-in, so 20 + 150 updates of 4 ms.
     duration = 4u"ms"
-    for num_updates in (69, 70)
+    for num_updates in (169, 170)
         driven = synthetic_drive(
             synthetic_detector(),
             0.0dBHz,
@@ -501,8 +1013,8 @@ end
             signal_duration = duration,
             make_estimator = default_estimator,
         )
-        @test GNSSReceiver.is_in_lock(driven) == (num_updates < 70)
-        @test driven.out_of_lock_time ≈ (num_updates - 20) * duration
+        @test GNSSReceiver.is_in_lock(driven) == (num_updates < 170)
+        @test driven.dwell.out_of_lock_time ≈ (num_updates - 20) * duration
     end
 end
 
@@ -519,26 +1031,29 @@ end
     # that pass) and needs ~85 updates to cross a 200 ms threshold. 200 updates leaves
     # comfortable margin; the noise reference gets there in 70.
 
-    # A healthy signal warms up and stays locked.
+    # A healthy signal warms up, stays locked, and latches out of its pull-in stage.
     healthy = synthetic_drive(synthetic_detector(), 45.0dBHz, 1, 1:200; make_estimator)
     @test GNSSReceiver.is_in_lock(healthy)
-    @test healthy.out_of_lock_time == 0u"s"
+    @test healthy.dwell.out_of_lock_time == 0u"s"
+    @test GNSSReceiver.has_pulled_in(healthy)
 
-    # Then it collapses: lock is lost once `out_of_lock_time_threshold` accumulates.
+    # Then it collapses: lock is lost once the steady-state dwell accumulates — the tighter
+    # threshold, because the handover latched closed while the signal was healthy.
     collapsed = synthetic_drive(healthy, 5.0dBHz, 1, 201:400; make_estimator)
     @test !GNSSReceiver.is_in_lock(collapsed)
-    @test collapsed.out_of_lock_time >= collapsed.out_of_lock_time_threshold
+    @test collapsed.dwell.out_of_lock_time >=
+          GNSSReceiver.current_out_of_lock_time_threshold(collapsed)
 
     # A 20 dBHz signal is 10 dB under the threshold, so one-block records drop it — but
     # 20-block records hold it without ever accumulating any out-of-lock time at all,
     # because the 13 dB of credited integration time covers the shortfall. Same CN0, same
     # code path; only the record length differs. This is the fix in one comparison.
-    on_one_block = synthetic_drive(synthetic_detector(), 20.0dBHz, 1, 1:200; make_estimator)
+    on_one_block = synthetic_drive(synthetic_detector(), 20.0dBHz, 1, 1:500; make_estimator)
     on_twenty_blocks =
-        synthetic_drive(synthetic_detector(), 20.0dBHz, 20, 1:200; make_estimator)
+        synthetic_drive(synthetic_detector(), 20.0dBHz, 20, 1:500; make_estimator)
     @test !GNSSReceiver.is_in_lock(on_one_block)
     @test GNSSReceiver.is_in_lock(on_twenty_blocks)
-    @test on_twenty_blocks.out_of_lock_time == 0u"s"
+    @test on_twenty_blocks.dwell.out_of_lock_time == 0u"s"
 end
 
 # ---------------------------------------------------------------------------------------
@@ -602,7 +1117,7 @@ end
     end
     @test GNSSReceiver.phase_lock_indicator(detector) < 0
     @test GNSSReceiver.is_below_phase_lock_threshold(detector)
-    @test detector.out_of_lock_time > 0u"s"
+    @test detector.dwell.out_of_lock_time > 0u"s"
 
     # Sustained, it loses lock once the 4 s dwell is exhausted.
     for _ = 1:1000
@@ -624,7 +1139,7 @@ end
     @test GNSSReceiver.phase_lock_indicator(detector) > 0.25
     # Once the indicator is back above threshold the accumulated time clears outright —
     # the "optimistic" credit, so a *consecutive* run of failures is needed to declare loss.
-    @test detector.out_of_lock_time == 0u"s"
+    @test detector.dwell.out_of_lock_time == 0u"s"
     @test GNSSReceiver.is_in_lock(detector)
 end
 
@@ -638,7 +1153,7 @@ end
         detector = GNSSReceiver.update(detector, prompt, 4u"ms")
     end
     @test GNSSReceiver.is_in_lock(detector)
-    @test detector.out_of_lock_time <= 4.001u"ms"
+    @test detector.dwell.out_of_lock_time <= 4.001u"ms"
 end
 
 @testset "CarrierLockDetector uses every prompt of the chunk" begin
@@ -715,7 +1230,7 @@ end
     # An empty prompt sequence (no record completed this chunk) still advances the timers
     # without inventing evidence.
     empty_chunk = GNSSReceiver.update(fresh, ComplexF64[], 4u"ms")
-    @test empty_chunk.wait_time ≈ 4u"ms"
+    @test empty_chunk.dwell.elapsed ≈ 4u"ms"
     @test isnan(GNSSReceiver.phase_lock_indicator(empty_chunk))
     @test GNSSReceiver.is_in_lock(empty_chunk)
 end
@@ -741,8 +1256,8 @@ end
     # 50 chunks of 40 ms against one of 4 ms: 500× the signal time, the same 50 gain steps.
     # The timers, driven by `signal_duration`, do see the difference — the second detector
     # has run its warm-up out while the first has barely started it.
-    @test over_one_chunk.wait_time ≈ 4u"ms"
-    @test over_fifty_chunks.wait_time ≈ over_fifty_chunks.wait_time_threshold
+    @test over_one_chunk.dwell.elapsed ≈ 4u"ms"
+    @test over_fifty_chunks.dwell.elapsed ≈ 2u"s"
 end
 
 @testset "CarrierLockDetector rejects a configuration that would silently kill the channel" begin
@@ -754,16 +1269,7 @@ end
     @test isnan(
         GNSSReceiver.phase_lock_indicator(
             GNSSReceiver.update(
-                GNSSReceiver.CarrierLockDetector(
-                    0.0,
-                    0.0,
-                    Inf,
-                    0.25,
-                    0.0u"s",
-                    4u"s",
-                    80u"ms",
-                    80u"ms",
-                ),
+                GNSSReceiver.CarrierLockDetector(0.0, 0.0, Inf, 0.25, carrier_detector().dwell),
                 complex(1.0, 0.0),
                 4u"ms",
             ),
@@ -787,6 +1293,13 @@ end
     @test_throws ArgumentError carrier_detector(; phase_lock_threshold = -1.0)
     @test_throws ArgumentError carrier_detector(; phase_lock_threshold = NaN)
     @test carrier_detector(; phase_lock_threshold = 0.9) isa GNSSReceiver.CarrierLockDetector
+
+    # The dwell's own validation reaches through the detector constructors' `dwell_kwargs...`.
+    @test_throws ArgumentError carrier_detector(; out_of_lock_code_periods = 0)
+    @test_throws ArgumentError GNSSReceiver.CodeLockDetector(;
+        reference_integration_time = REFERENCE_T,
+        warm_up_code_periods = -80,
+    )
 end
 
 @testset "CarrierLockDetector's quoted noise figures are asymptotic" begin
@@ -815,7 +1328,11 @@ end
     # The warm-up is deliberately not lengthened to the window: clearing the dwell on any
     # favourable chunk, together with the 4000-code-period dwell, means loss needs a
     # *consecutive* run of failures, so an early excursion in either direction is absorbed.
-    @test carrier_detector().wait_time_threshold ≈ 80u"ms"
+    @test carrier_detector().dwell.warm_up_time_threshold ≈ 80u"ms"
+    # Raising the carrier warm-up to match the window would push `is_ranging_ready` — which
+    # ANDs both detectors — from 680 code periods out to 800.
+    @test carrier_detector().dwell.warm_up_time_threshold +
+          carrier_detector().dwell.ranging_confirm_time_threshold ≈ 680u"ms"
     # In the false-drop direction the early window is already tight enough: at the code-lock
     # threshold (ρ = 1, perfect phase lock) the indicator is essentially never below 0.25.
     at_threshold = map(1:1000) do seed
