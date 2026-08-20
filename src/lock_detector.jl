@@ -9,6 +9,30 @@ The detectors track elapsed signal time rather than a number of `update` calls, 
 their behaviour is independent of how the incoming signal is chunked: each `update`
 is handed the `signal_duration` it represents and accumulates that duration into its
 timers.
+
+## Why the timings are in primary code periods, not seconds
+
+`Tracking` sizes its default loop bandwidths from the primary code period `T`, at
+`B_L·T ≈ 0.018`: `B_L = 0.018/T` for the carrier loop and `B_L/18` for the code loop. So
+every loop time constant scales with `T` — `1/B_L` is `55.6·T` for the carrier and
+`1000·T` for the code loop:
+
+| signal | `T` | carrier `B_L` | code `B_L` | `1/B_L` carrier | `1/B_L` code |
+|---|---|---|---|---|---|
+| GPS L1 C/A | 1 ms | 18 Hz | 1 Hz | 56 ms | 1.0 s |
+| Galileo E1B | 4 ms | 4.5 Hz | 0.25 Hz | 222 ms | 4.0 s |
+| GPS L1C-D | 10 ms | 1.8 Hz | 0.1 Hz | 556 ms | 10.0 s |
+
+A dwell fixed in *seconds* therefore means something different on every signal. The 200 ms
+this receiver used to allow is 200 code periods on GPS L1 C/A — enough — but only 50 on
+Galileo E1B and 20 on GPS L1C-D, against loops that are 4× and 10× slower. That is why lock
+detection failed on the slower signals while GPS L1 C/A looked fine. Counted in code
+periods the same number means the same thing everywhere, and the GPS L1 C/A defaults are
+reproduced exactly (`T = 1 ms`, so 200 code periods *is* 200 ms).
+
+So every detector takes a `reference_integration_time` — one primary code period of the
+signal it runs on, which the receiver passes from `primary_code_period` — and takes its
+timings as counts of that period. The fields themselves stay in seconds.
 """
 abstract type AbstractLockDetector end
 
@@ -16,9 +40,10 @@ abstract type AbstractLockDetector end
     CodeLockDetector <: AbstractLockDetector
 
 Declares code lock from the estimated carrier-to-noise density ratio. After a
-`wait_time_threshold` warm-up it accumulates out-of-lock time whenever the CN0 is below
+`warm_up_code_periods` warm-up it accumulates out-of-lock time whenever the CN0 is below
 `cn0_threshold` (and pays it back down otherwise); lock is lost once the accumulated
-out-of-lock time reaches `out_of_lock_time_threshold`.
+out-of-lock time reaches `out_of_lock_code_periods`. Both timings are counts of
+`reference_integration_time` — see [`AbstractLockDetector`](@ref).
 
 The accumulated time is capped at twice that threshold. Since it is paid back at the rate
 it is spent, an uncapped dwell would make re-declaring lock take as long as the outage that
@@ -87,8 +112,9 @@ the first measurement rather than a configuration a user can land in. At four or
 antennas the same `-Inf` can extend over the first chunk or two, while the array's spatial
 noise covariance is still rank-deficient in its own dimensions — and only for a receiver
 fed buffers of about one code period, since a longer chunk clears it within its first call.
-Either way the detector's own warm-up (`wait_time_threshold`, 80 ms) is orders of magnitude
-longer, so it never accumulates against it.
+Either way the detector's own warm-up (`warm_up_code_periods`, 80 code periods) is orders of
+magnitude longer — on every signal, since it scales with the code period too — so it never
+accumulates against it.
 """
 struct CodeLockDetector <: AbstractLockDetector
     cn0_threshold::typeof(1.0dBHz)
@@ -106,18 +132,51 @@ function CodeLockDetector(;
     # see `primary_code_period` and the `ReceiverSatState` constructors.
     reference_integration_time = 1ms,
     coherence_limit = Inf * s,
-    out_of_lock_time_threshold = 200ms,
-    wait_time_threshold = 80ms,
+    out_of_lock_code_periods = 200,
+    warm_up_code_periods = 80,
 )
+    # `reference_integration_time` may arrive as `Tracking`'s `Hz^-1`; normalise once so
+    # every stored duration is in seconds.
+    T = code_period_reference(reference_integration_time)
+    check_code_periods(:out_of_lock_code_periods, out_of_lock_code_periods; positive = true)
+    check_code_periods(:warm_up_code_periods, warm_up_code_periods)
     CodeLockDetector(
         cn0_threshold,
-        reference_integration_time,
+        T,
         coherence_limit,
         0.0s,
-        out_of_lock_time_threshold,
+        out_of_lock_code_periods * T,
         0.0s,
-        wait_time_threshold,
+        warm_up_code_periods * T,
     )
+end
+
+# One primary code period, normalised to seconds. Every detector timing is a multiple of it.
+function code_period_reference(reference_integration_time)
+    T = uconvert(s, reference_integration_time)
+    T > zero(T) && isfinite(ustrip(T)) || throw(
+        ArgumentError(
+            "reference_integration_time must be a finite, positive duration — it is one " *
+            "primary code period of the signal the detector runs on — got $T",
+        ),
+    )
+    T
+end
+
+# Reject a code-period count that cannot describe a timing before it is silently scaled into
+# one: a negative count scales into a negative threshold, and `out_of_lock_time < threshold`
+# would then be false from the first update, so the channel would be dead on arrival rather
+# than loudly misconfigured. The dwells have to be *strictly* positive for the same reason —
+# `is_in_lock` tests `<`, so a zero threshold is never satisfied. A warm-up may legitimately
+# be zero. `NaN` fails both comparisons, so it is caught here too.
+function check_code_periods(name::Symbol, value; positive::Bool = false)
+    isfinite(value) && (positive ? value > 0 : value >= 0) || throw(
+        ArgumentError(
+            "$name must be a finite, $(positive ? "strictly positive" : "non-negative") " *
+            "number of code periods, got $value",
+        ),
+    )
+    value
 end
 
 # Post-integration SNR of the last fully integrated record against the SNR
@@ -199,10 +258,16 @@ end
     CarrierLockDetector <: AbstractLockDetector
 
 Declares carrier lock from the prompt correlator using the standard low-pass filtered
-in-phase/quadrature amplitude test. Over each `integration_time_threshold` block it
+in-phase/quadrature amplitude test. Over each `integration_code_periods` block it
 compares the filtered in-phase amplitude against the filtered quadrature amplitude; too
 little in-phase dominance accumulates out-of-lock time, and lock is lost once it reaches
-`out_of_lock_time_threshold`.
+`out_of_lock_code_periods`.
+
+As for [`CodeLockDetector`](@ref), all three timings are counts of
+`reference_integration_time` — one primary code period of the signal the detector runs on
+(see [`AbstractLockDetector`](@ref)). The defaults reproduce this receiver's historical
+absolute values on GPS L1 C/A, whose code period is 1 ms: a 4 s dwell and an 80 ms warm-up
+and integration block.
 """
 struct CarrierLockDetector <: AbstractLockDetector
     prev_filtered_inphase::Float64
@@ -216,19 +281,28 @@ struct CarrierLockDetector <: AbstractLockDetector
 end
 
 function CarrierLockDetector(;
-    out_of_lock_time_threshold = 4s,
-    wait_time_threshold = 80ms,
-    integration_time_threshold = 80ms,
+    reference_integration_time = 1ms,
+    out_of_lock_code_periods = 4000,
+    warm_up_code_periods = 80,
+    integration_code_periods = 80,
 )
+    T = code_period_reference(reference_integration_time)
+    check_code_periods(:out_of_lock_code_periods, out_of_lock_code_periods; positive = true)
+    check_code_periods(:warm_up_code_periods, warm_up_code_periods)
+    check_code_periods(
+        :integration_code_periods,
+        integration_code_periods;
+        positive = true,
+    )
     CarrierLockDetector(
         0.0,
         0.0,
         0.0s,
-        integration_time_threshold,
+        integration_code_periods * T,
         0.0s,
-        out_of_lock_time_threshold,
+        out_of_lock_code_periods * T,
         0.0s,
-        wait_time_threshold,
+        warm_up_code_periods * T,
     )
 end
 

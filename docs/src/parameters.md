@@ -103,7 +103,9 @@ float backend with no full-scale value. See [Getting Started](@ref).
 A satellite contributes to the PVT solution only while it is *in lock*. Lock is declared
 per satellite by a [`CodeLockDetector`](@ref GNSSReceiver.CodeLockDetector) **and** a
 [`CarrierLockDetector`](@ref GNSSReceiver.CarrierLockDetector). Both track elapsed signal
-time, so their behaviour is independent of how the signal is chunked.
+time, so their behaviour is independent of how the signal is chunked, and both take their
+timings as counts of the ranging signal's primary code period rather than in seconds, so
+they mean the same thing on every signal (see [Timings scale with the code period](@ref)).
 
 The detector thresholds and timings (the code-lock CN0 threshold, out-of-lock, warm-up and
 carrier integration windows) are set at detector construction from per-signal defaults; see
@@ -137,9 +139,31 @@ signal. The threshold is not a `receive` keyword: it comes from the per-signal d
 `CodeLockDetector` is constructed with, which is where sensitivity would have to be traded.
 The estimate is also what `sat_data[…].cn0` reports and what the GUI plots.
 
-The remaining detector timings (out-of-lock, warm-up and carrier integration windows) are
-set at detector construction; see their docstrings in the [API Reference](@ref) for the
-defaults.
+### Timings scale with the code period
+
+Every detector timing is configured as a multiple of the ranging signal's **primary code
+period** rather than in seconds, because that is what the tracking loops' time constants
+scale with: Tracking sizes its default bandwidths at `B_L·T ≈ 0.018`, so a 1 ms code gets an
+18 Hz carrier / 1 Hz code loop while a 10 ms code gets 1.8 Hz / 0.1 Hz — every `1/B_L` is a
+fixed number of code periods.
+
+| Signal | Code period | Warm-up (80 `T`) | Code dwell (200 `T`) | Carrier dwell (4000 `T`) |
+|---|---|---|---|---|
+| GPS L1 C/A | 1 ms | 80 ms | 200 ms | 4 s |
+| Galileo E1B | 4 ms | 320 ms | 800 ms | 16 s |
+| GPS L1C-D | 10 ms | 800 ms | 2 s | 40 s |
+
+A dwell fixed in seconds means something different on every signal: the 200 ms this receiver
+used to allow is 200 code periods on GPS L1 C/A — the signal it was tuned against, and where
+it is correct — but only 50 on Galileo E1B and 20 on GPS L1C-D, against loops that are four
+and ten times slower. That is why lock detection failed on the slower signals while GPS
+L1 C/A looked fine. The GPS L1 C/A numbers are unchanged.
+
+The counts themselves (out-of-lock, warm-up and carrier integration windows) are set at
+detector construction; see the
+[`CodeLockDetector`](@ref GNSSReceiver.CodeLockDetector) and
+[`CarrierLockDetector`](@ref GNSSReceiver.CarrierLockDetector) docstrings in the
+[API Reference](@ref) for the defaults.
 
 ## PVT
 
