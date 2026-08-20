@@ -373,19 +373,26 @@ end
 # modulation, not of how the receiver grouped it.
 #
 # `CorrelatorNoiseEstimator`'s defaults are Tracking's own (1 s sliding window, 1.5-chip
-# taps, ±5 kHz carrier dither); nothing here is receiver-specific.
-create_noise_estimators(systems::Tuple) =
-    _noise_estimators(_flatten_systems(map(tracking_signals, systems)))
+# taps, ±5 kHz carrier dither); the antenna count is the one thing that is not a default,
+# and it is not configuration either. An `M`-antenna reference measures the array's `M×M`
+# spatial noise covariance, which each satellite reduces to its own scalar floor through
+# its beamforming weights (`N₀ = wᴴR̂w`, see `create_post_corr_filter`); measured on fewer
+# antennas than the group tracks, the floor and the prompt it is divided into would
+# describe different arrays, and Tracking rejects the mismatch at construction.
+create_noise_estimators(systems::Tuple, num_ants::NumAnts) =
+    _noise_estimators(_flatten_systems(map(tracking_signals, systems)), num_ants)
 
 # Fold one single-entry NamedTuple per signal together. The deduplication is `merge`'s,
 # and that is the point: it resolves the shared keys in the *type* domain, where a
 # value-level "have I seen this id yet?" test infers as a union of key sets and takes the
 # whole `TrackState`'s type down with it.
-_noise_estimators(::Tuple{}) = NamedTuple()
-_noise_estimators(signals::Tuple) =
-    merge(_noise_estimator(first(signals)), _noise_estimators(Base.tail(signals)))
-_noise_estimator(signal) =
-    NamedTuple{(get_signal_id(signal),)}((CorrelatorNoiseEstimator(),))
+_noise_estimators(::Tuple{}, ::NumAnts) = NamedTuple()
+_noise_estimators(signals::Tuple, num_ants::NumAnts) = merge(
+    _noise_estimator(first(signals), num_ants),
+    _noise_estimators(Base.tail(signals), num_ants),
+)
+_noise_estimator(signal, num_ants::NumAnts) =
+    NamedTuple{(get_signal_id(signal),)}((CorrelatorNoiseEstimator(; num_ants),))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pilot + data combined tracking
@@ -598,7 +605,8 @@ function ReceiverState(
         sats = Dictionary{Int,typeof(template)}(Int[], typeof(template)[])
         SignalGroup(get_band(first(sigs)), sats, sigs, num_ants)
     end)
-    track_state = TrackState(groups, doppler_estimator, create_noise_estimators(systems))
+    track_state =
+        TrackState(groups, doppler_estimator, create_noise_estimators(systems, num_ants))
     receiver_sat_states = NamedTuple{group_keys}(map(systems) do system
         DS = decoder_state_type(system)
         Dictionary{Int,ReceiverSatState{DS}}()

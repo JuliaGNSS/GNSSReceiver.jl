@@ -83,7 +83,12 @@ An unmeasured channel — a `TrackState` with no noise source for the signal, or
 window is still empty — reports `-Inf dB-Hz`, which needs no special handling in the
 threshold test (it linearizes to `0 Hz`). The receiver provisions a noise source for every
 signal it tracks (`GNSSReceiver.create_noise_estimators`), so that is the transient before
-the first measurement rather than a configuration a user can land in.
+the first measurement rather than a configuration a user can land in. At four or more
+antennas the same `-Inf` can extend over the first chunk or two, while the array's spatial
+noise covariance is still rank-deficient in its own dimensions — and only for a receiver
+fed buffers of about one code period, since a longer chunk clears it within its first call.
+Either way the detector's own warm-up (`wait_time_threshold`, 80 ms) is orders of magnitude
+longer, so it never accumulates against it.
 """
 struct CodeLockDetector <: AbstractLockDetector
     cn0_threshold::typeof(1.0dBHz)
