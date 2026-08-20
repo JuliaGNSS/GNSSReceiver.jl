@@ -231,6 +231,11 @@ For multiple antennas (`NumAnts(N)` with `N > 1`) the post-correlation filter is
 [`EigenBeamformer`](@ref GNSSReceiver.EigenBeamformer). The number of antenna channels in
 each measurement channel must equal `N` in `num_ants`.
 
+The reported C/N₀ is referenced to the beamformer's own output: Tracking measures the
+array's `N×N` spatial noise covariance `R̂` once per signal and each satellite reduces it
+through its current weights, `N₀ = wᴴR̂w`. So the array gain a well-steered beam buys shows
+up in C/N₀, and only that — a beamformer's weight scaling cancels out of the ratio.
+
 ## Full reference
 
 The complete, authoritative list of keyword arguments — with their exact defaults — is in
