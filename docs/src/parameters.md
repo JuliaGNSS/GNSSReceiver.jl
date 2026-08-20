@@ -181,10 +181,12 @@ at the 30 dB-Hz threshold itself, 0.10 one dB above it and 0.00 from two dB up),
 carrier detector does: its phase-lock indicator takes 460 to 590 code periods to come up
 through the handover. And against any disturbance recurring on a period shorter than the run
 the evidence path never fires at all, at any C/N0. The backstop admits such a satellite once
-enough signal has *elapsed* — two code-loop time constants — with its out-of-lock clock still
-inside what steady state tolerates. What it concedes is a few metres of extra code-phase
-thermal jitter (1σ of 0.039 chip, 11 m, at 30 dB-Hz against 0.004 chip, 1.2 m, at 45), not a
-converging handover bias.
+enough signal has *elapsed* — two code-loop time constants — with its out-of-lock clock paid
+down to zero. What it shortens is the *length* of the clean run it asks for, not the
+requirement that the channel be clean: a channel failing steadily enough never to pay its debt
+off is dropped by the dwell rather than admitted here. What it concedes is a few metres of
+extra code-phase thermal jitter (1σ of 0.039 chip, 11 m, at 30 dB-Hz against 0.004 chip,
+1.2 m, at 45), not a converging handover bias.
 
 One residual case is left open deliberately: a satellite whose accumulated out-of-lock time
 parks *between* the steady-state and pull-in allowances — 200 to 600 code periods — never

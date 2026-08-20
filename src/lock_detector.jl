@@ -137,11 +137,27 @@ run: measured steady-state per-chunk out-of-lock rates with no handover error ar
 code detector holds at all completes a clean run easily. The **carrier** detector is what
 blocks it: its 460-to-590-code-period pull-in transient resets `settled_time` well after the
 code detector is happy, and any recurring disturbance shorter than the run reopens the same
-hole at any C/N0. So `ranging_pull_in_time_threshold` (2000 code periods) backstops it, under
-the same guard as `pulled_in`'s timer — the out-of-lock clock must be within what steady state
-tolerates, so a channel that is genuinely failing is dropped by `is_in_lock` rather than
-admitted by the timer. It also takes `pulled_in` as a conjunct, so "ranging is never ready
-before the handover is over" holds structurally rather than by threshold ordering.
+hole at any C/N0. So `ranging_pull_in_time_threshold` (2000 code periods) backstops it. It
+also takes `pulled_in` as a conjunct, so "ranging is never ready before the handover is over"
+holds structurally rather than by threshold ordering.
+
+What the backstop relaxes is the *length* of the clean run, not the requirement that the
+channel be clean at all: it fires only with the out-of-lock clock paid down to **zero**. A
+weaker guard — "the clock is within what steady state tolerates" — reads like the one
+`pulled_in`'s timer uses, but the two are not the same test. `pulled_in`'s guard exists to
+stop the *threshold switch itself* from declaring loss, so it is only ever consulted where the
+pull-in allowance exceeds the steady-state one. A health guard has to be reachable instead,
+and the tolerance form is not: the clock can never exceed `elapsed - warm_up_time_threshold`,
+so wherever the dwell outlasts the backstop it cannot fail before the timer fires. The carrier
+detector is exactly that case — a 4000-code-period dwell against a 2000-period backstop — and
+under the tolerance form a channel whose phase-lock indicator had never once passed would be
+admitted to ranging at 2000 code periods, then held there by `resets_on_lock` on one
+favourable chunk in a thousand. Requiring zero is reachable for both detectors (a single
+favourable chunk clears it under `resets_on_lock`, a repaid debt otherwise), cannot be made
+vacuous by any configuration, and keeps the deterministic case the backstop exists for: a
+disturbance recurring faster than the clean run still leaves the clock at zero between
+disturbances, whereas a channel failing steadily enough never to pay its debt off is dropped
+by `is_in_lock` rather than admitted here.
 
 Two code-loop time constants (`1/B_L` = 1000 code periods) rather than anything shorter,
 because the backstop admits a measurement it has not seen clean evidence for, and what the
@@ -194,16 +210,24 @@ The defaults are sized from measured handover transients (see the type's docstri
 1 ms code period, reproduce this receiver's historical absolute timings: an 80 ms warm-up and a
 200 ms steady-state dwell.
 
-`pull_in_out_of_lock_code_periods` is floored at `out_of_lock_code_periods`, so the pull-in
-stage can never be *stricter* than steady state however the steady-state dwell is set. A
-detector whose steady-state dwell already exceeds the pull-in default — the carrier one, at
-4000 code periods — is therefore effectively unstaged, which is correct: it clears its
-accumulator on any favourable chunk, so its dwell already asks for a consecutive run of
-failures far longer than any handover transient.
+Three floors are applied, in the constructor body rather than in the keyword defaults, so
+they hold for every caller rather than only for one that leaves the keyword alone:
 
-`ranging_pull_in_code_periods` is floored at `ranging_confirm_code_periods` for the
-mirror-image reason: a backstop that expired before the evidence path could fire would replace
-the criterion rather than back it up.
+  * `pull_in_out_of_lock_code_periods` is floored at `out_of_lock_code_periods`, so the
+    pull-in stage can never be *stricter* than steady state however the steady-state dwell is
+    set — otherwise `pulled_in` latching would *loosen* the detector and a freshly acquired
+    satellite would be held to a tighter dwell than a converged one. A detector whose
+    steady-state dwell already exceeds the pull-in default — the carrier one, at 4000 code
+    periods — is therefore effectively unstaged, which is correct: it clears its accumulator
+    on any favourable chunk, so its dwell already asks for a consecutive run of failures far
+    longer than any handover transient;
+  * `ranging_confirm_code_periods` is floored at `confirm_code_periods`, since ranging can
+    never be ready before the handover is declared over;
+  * `ranging_pull_in_code_periods` is floored at that *effective* ranging-confirm count — the
+    already-floored one, not the raw keyword — for the mirror-image reason: a backstop that
+    expired before the evidence path could fire would replace the criterion rather than back
+    it up. Flooring against the raw value would miss exactly the case where
+    `confirm_code_periods` is what raised the evidence bar.
 """
 function LockDwell(;
     reference_integration_time,
@@ -213,7 +237,7 @@ function LockDwell(;
     ranging_confirm_code_periods = 600,
     ranging_pull_in_code_periods = 2000,
     out_of_lock_code_periods = 200,
-    pull_in_out_of_lock_code_periods = max(600, out_of_lock_code_periods),
+    pull_in_out_of_lock_code_periods = 600,
     resets_on_lock = false,
 )
     T = code_period_reference(reference_integration_time)
@@ -228,6 +252,17 @@ function LockDwell(;
         pull_in_out_of_lock_code_periods;
         positive = true,
     )
+    # The documented floors, applied here so they bind for every caller — a keyword default
+    # only ever protects the caller who does not pass the keyword. Each one is floored against
+    # the *effective* value of what it is ordered against, so the ordering is transitive: the
+    # backstop follows the ranging-confirm bar that `confirm_code_periods` may itself have
+    # raised, not the raw keyword.
+    staged_out_of_lock_code_periods =
+        max(pull_in_out_of_lock_code_periods, out_of_lock_code_periods)
+    effective_ranging_confirm_code_periods =
+        max(ranging_confirm_code_periods, confirm_code_periods)
+    effective_ranging_pull_in_code_periods =
+        max(ranging_pull_in_code_periods, effective_ranging_confirm_code_periods)
     LockDwell(
         0.0s,
         0.0s,
@@ -237,9 +272,9 @@ function LockDwell(;
         warm_up_code_periods * T,
         pull_in_code_periods * T,
         confirm_code_periods * T,
-        max(ranging_confirm_code_periods, confirm_code_periods) * T,
-        max(ranging_pull_in_code_periods, ranging_confirm_code_periods) * T,
-        pull_in_out_of_lock_code_periods * T,
+        effective_ranging_confirm_code_periods * T,
+        effective_ranging_pull_in_code_periods * T,
+        staged_out_of_lock_code_periods * T,
         out_of_lock_code_periods * T,
         resets_on_lock,
     )
@@ -310,12 +345,20 @@ function update(dwell::LockDwell, is_out_of_lock::Bool, signal_duration)
     # The timer path takes the freshly computed `pulled_in` as a conjunct rather than relying
     # on the thresholds being ordered, so "ranging is never ready before the handover is over"
     # holds structurally however the two timers are configured.
+    #
+    # It also demands a *zero* out-of-lock clock, not merely one inside what steady state
+    # tolerates: the clock can never exceed `elapsed - warm_up_time_threshold`, so the
+    # tolerance form cannot fail before the timer fires wherever the dwell outlasts the
+    # backstop — the carrier detector's 4000-code-period dwell against its 2000-period
+    # backstop is exactly that, and a channel whose indicator never once passed would be
+    # admitted. What the backstop relaxes is the *length* of the clean run, not the
+    # requirement that the channel be clean; see the type's docstring.
     ranging_ready =
         dwell.ranging_ready ||
         (iszero(out_of_lock_time) && settled_time >= dwell.ranging_confirm_time_threshold) ||
         (
             pulled_in &&
-            out_of_lock_time < dwell.out_of_lock_time_threshold &&
+            iszero(out_of_lock_time) &&
             elapsed >= dwell.ranging_pull_in_time_threshold
         )
     LockDwell(
@@ -367,9 +410,9 @@ drop and reacquire it. But while the loops are still walking the coarse acquisit
 in, the code phase — and so the pseudorange — carries a converging bias, measured at tens of
 metres. This latches after `ranging_confirm_time_threshold` of uninterrupted good evidence or,
 for a satellite whose evidence is never uninterrupted, once `ranging_pull_in_time_threshold` of
-signal has elapsed with the out-of-lock clock inside what steady state tolerates. It never
-un-latches: a satellite whose loops settled once has settled, and later disturbances are
-[`is_in_lock`](@ref)'s business — which also means a vector-tracking member carried through an
+signal has elapsed with nothing left on the out-of-lock clock — the backstop shortens the clean
+run it asks for, it does not waive it. It never un-latches: a satellite whose loops settled
+once has settled, and later disturbances are [`is_in_lock`](@ref)'s business — which also means a vector-tracking member carried through an
 outage is immediately rangeable again on return, as it should be, since the navigation filter
 kept both its NCOs steered throughout.
 

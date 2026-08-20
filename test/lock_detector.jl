@@ -64,6 +64,34 @@ end
     @test !GNSSReceiver.is_in_lock(dwell)
 end
 
+@testset "LockDwell's pull-in stage can never be stricter than steady state" begin
+    # The floor is applied in the constructor body, not in the keyword default, so it binds
+    # for a caller that passes the keyword too. Otherwise `pulled_in` latching would *loosen*
+    # the detector: a freshly acquired satellite would be held to the tighter dwell of the two
+    # and a converged one to the looser, which is the staging inverted.
+    inverted = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        out_of_lock_code_periods = 200,
+        pull_in_out_of_lock_code_periods = 50,
+    )
+    @test inverted.pull_in_out_of_lock_time_threshold ≈ 200u"ms"
+    @test GNSSReceiver.current_out_of_lock_time_threshold(inverted) ≈ 200u"ms"
+    # A pull-in allowance above the steady-state dwell is of course kept as given.
+    staged = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        out_of_lock_code_periods = 200,
+        pull_in_out_of_lock_code_periods = 600,
+    )
+    @test staged.pull_in_out_of_lock_time_threshold ≈ 600u"ms"
+    # And the default floor still holds against a steady-state dwell longer than it — the
+    # carrier detector's own 4000 code periods, which leaves it deliberately unstaged.
+    unstaged = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        out_of_lock_code_periods = 4000,
+    )
+    @test unstaged.pull_in_out_of_lock_time_threshold ≈ 4000u"ms"
+end
+
 @testset "LockDwell latches steady state on sustained good evidence" begin
     dwell = GNSSReceiver.LockDwell(;
         reference_integration_time = REFERENCE_T,
@@ -207,9 +235,10 @@ end
     # admits is smaller than the 2-27 m the evidence path already accepts.
     @test healthy.ranging_pull_in_time_threshold ≈ 2 * 1000 * 1u"ms"
 
-    # The backstop is guarded, so a channel that is genuinely failing is dropped by `is_in_lock`
-    # rather than admitted by the timer. A dwell whose clock is over the steady-state threshold
-    # when the timer expires is NOT admitted; it is admitted once the clock is paid back down.
+    # The backstop is guarded on a *zero* out-of-lock clock: what it relaxes is the length of
+    # the clean run, not the requirement that the channel be clean. A dwell with anything left
+    # on the clock is not admitted however long it has run; it is admitted once the debt is
+    # paid off in full — being merely inside what steady state tolerates is not enough.
     guarded = GNSSReceiver.LockDwell(;
         reference_integration_time = REFERENCE_T,
         warm_up_code_periods = 0,
@@ -217,8 +246,9 @@ end
         pull_in_out_of_lock_code_periods = 600,
         pull_in_code_periods = 100,
         # Short enough that the 300 ms of accumulation below happens after the backstop has
-        # expired, which is the situation the guard exists for. `ranging_confirm` has to come
-        # down with it, since the backstop is floored at it.
+        # expired, which is the situation the guard exists for. Both confirm counts have to
+        # come down with it, since the backstop is floored at the larger of them.
+        confirm_code_periods = 100,
         ranging_confirm_code_periods = 100,
         ranging_pull_in_code_periods = 200,
     )
@@ -228,10 +258,35 @@ end
     @test guarded.elapsed >= guarded.ranging_pull_in_time_threshold
     @test guarded.out_of_lock_time > guarded.out_of_lock_time_threshold
     @test !GNSSReceiver.is_ranging_ready(guarded)
-    for _ = 1:30                            # pay it back below the steady threshold
+    for _ = 1:30                            # back under the steady threshold, but not to zero
         guarded = GNSSReceiver.update(guarded, false, 4u"ms")
     end
+    @test guarded.out_of_lock_time < guarded.out_of_lock_time_threshold
+    @test !iszero(guarded.out_of_lock_time)
+    @test !GNSSReceiver.is_ranging_ready(guarded)
+    for _ = 1:45                            # pay off the rest of the debt
+        guarded = GNSSReceiver.update(guarded, false, 4u"ms")
+    end
+    @test iszero(guarded.out_of_lock_time)
     @test GNSSReceiver.is_ranging_ready(guarded)
+
+    # The guard has to be *reachable*, which is what makes it a health test rather than
+    # decoration. A tolerance guard is not: the clock can never exceed
+    # `elapsed - warm_up_time_threshold`, so wherever the dwell outlasts the backstop it
+    # cannot fail before the timer fires. That is the carrier detector's own configuration —
+    # a 4000-code-period dwell against a 2000-period backstop — and a channel whose
+    # phase-lock indicator never once passes must not be admitted to ranging there.
+    never_passing = GNSSReceiver.CarrierLockDetector(;
+        reference_integration_time = REFERENCE_T,
+    )
+    @test never_passing.dwell.out_of_lock_time_threshold >
+          never_passing.dwell.ranging_pull_in_time_threshold
+    for _ = 1:1200                          # 4.8 s: well past both the backstop and the dwell
+        # Pure quadrature, so the indicator sits at -1.0 — out of lock on every chunk.
+        never_passing = GNSSReceiver.update(never_passing, complex(0.1, 10.0), 4u"ms")
+        @test !GNSSReceiver.is_ranging_ready(never_passing)
+    end
+    @test !GNSSReceiver.is_in_lock(never_passing)   # dropped by the dwell, as it should be
 
     # Sustained failure is never admitted: pure out-of-lock evidence loses lock and stays out.
     failing = GNSSReceiver.LockDwell(;
@@ -247,16 +302,18 @@ end
     # `is_ranging_ready ⟹ has_pulled_in` holds structurally, not by the thresholds happening to
     # be ordered: the timer path takes the freshly computed `pulled_in` as a conjunct, so even a
     # backstop configured to expire before the pull-in timer cannot admit ranging first.
+    # Both confirm counts are 100 code periods against runs that never get past one chunk, so
+    # neither evidence path can fire: `pulled_in` can only be promoted by its timer at 800 code
+    # periods, and ranging only by its backstop, which the flooring leaves at 100.
     perverse = GNSSReceiver.LockDwell(;
         reference_integration_time = REFERENCE_T,
         warm_up_code_periods = 0,
-        confirm_code_periods = 10_000,       # `pulled_in`'s evidence path can never fire, so
-        pull_in_code_periods = 800,          # only its timer, at 800 code periods, can promote
-        ranging_confirm_code_periods = 100,  # and ranging's evidence path never fires either,
-        ranging_pull_in_code_periods = 100,  # so only its backstop, at 100, can admit
+        confirm_code_periods = 100,
+        pull_in_code_periods = 800,
+        ranging_confirm_code_periods = 100,
+        ranging_pull_in_code_periods = 100,
     )
-    # Alternating evidence never builds a 100-code-period run, so neither evidence path can fire
-    # here; the backstop is 700 code periods early, and must still wait for `pulled_in`.
+    # The backstop is 700 code periods early, and must still wait for `pulled_in`.
     longest_run = 0u"ms"
     for i = 1:400
         perverse = GNSSReceiver.update(perverse, isodd(i), 4u"ms")
@@ -276,6 +333,19 @@ end
     )
     @test floored_backstop.ranging_pull_in_time_threshold >=
           floored_backstop.ranging_confirm_time_threshold
+
+    # Floored against the *effective* evidence bar, not the raw keyword: `confirm_code_periods`
+    # can be what raised it, and a backstop ordered only against the raw value would then
+    # expire before the evidence path could possibly fire — the very case the floor exists for.
+    transitively_floored = GNSSReceiver.LockDwell(;
+        reference_integration_time = REFERENCE_T,
+        confirm_code_periods = 500,
+        ranging_confirm_code_periods = 100,
+        ranging_pull_in_code_periods = 300,
+    )
+    @test transitively_floored.ranging_confirm_time_threshold ≈ 500u"ms"
+    @test transitively_floored.ranging_pull_in_time_threshold >=
+          transitively_floored.ranging_confirm_time_threshold
 
     # The backstop must not touch the dwell: a fade after a successful handover is still noticed
     # on the steady-state timescale (200 code periods), which is the whole reason the two latches
