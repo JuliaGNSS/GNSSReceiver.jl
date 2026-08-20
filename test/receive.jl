@@ -182,3 +182,57 @@ end
     @test !isempty(data)
     @test eltype(data) == Int
 end
+
+# The wiring that puts the lock stage into the emitted payload. `SatelliteDataOfInterest`
+# reports `is_ranging_ready` so that a satellite kept through the acquisition handover — in
+# lock, deliberately, but not yet trustworthy to range on — is distinguishable from one the
+# PVT solve is ignoring for no visible reason.
+@testset "Emitted satellite data reports the ranging stage" begin
+    # Detectors driven through `update`, never by writing fields, so this stays independent
+    # of the dwell's layout and of how ranging readiness is decided.
+    function ready_code_detector()
+        detector = GNSSReceiver.CodeLockDetector(;
+            cn0_threshold = 30.0u"dBHz",
+            reference_integration_time = 1u"ms",
+        )
+        updates = 0
+        while !GNSSReceiver.is_ranging_ready(detector)
+            detector = GNSSReceiver.update(detector, 45.0u"dBHz", 1u"ms", 4u"ms")
+            updates += 1
+            @assert updates <= 10_000 "detector never reported ranging readiness"
+        end
+        detector
+    end
+
+    sat_state(code_detector) = GNSSReceiver.ReceiverSatState(
+        1,
+        GNSSDecoderState(GPSL1CA(), 1),
+        code_detector,
+        GNSSReceiver.CarrierLockDetector(; reference_integration_time = 1u"ms"),
+        5.0u"s",
+        0.0u"s",
+        0,
+        false,
+    )
+
+    # A fresh detector is in lock but not ranging-ready; a driven one is both.
+    fresh = GNSSReceiver.CodeLockDetector(;
+        cn0_threshold = 30.0u"dBHz",
+        reference_integration_time = 1u"ms",
+    )
+    settling = sat_state(fresh)
+    @test GNSSReceiver.is_in_lock(settling)
+    @test !GNSSReceiver.is_ranging_ready(settling)
+
+    states = Dictionary([1], [settling])
+    @test !GNSSReceiver.is_sat_ranging_ready_at(states, 1)
+    # The carrier detector gates too, so a ready *code* detector alone is not enough.
+    @test !GNSSReceiver.is_sat_ranging_ready_at(
+        Dictionary([1], [sat_state(ready_code_detector())]),
+        1,
+    )
+    # Absent state must never read as ready — the same fail-safe direction as
+    # `is_sat_healthy_at`, which a satellite the receiver holds no state for also fails.
+    @test !GNSSReceiver.is_sat_ranging_ready_at(states, 99)
+    @test !GNSSReceiver.is_sat_healthy_at(states, 99)
+end
