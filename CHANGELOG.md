@@ -1,5 +1,21 @@
 # Changelog
 
+# [4.3.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.2.0...v4.3.0) (2026-08-20)
+
+
+### Bug Fixes
+
+* enforce the lock dwell's documented invariants in the code ([568dad6](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/568dad6a11ed220cf787ec9bbe7a0f9ce77c6ea9)), closes [#118](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/118)
+* **gui:** treat a coasting vector-loop member as not contributing ([9a97b65](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/9a97b6554151e8aacf020d8f285a66f58b146c0c))
+
+
+### Features
+
+* **gui:** draw still-settling satellites yellow in the CN0 panel ([874f402](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/874f4028d4b115b161af11a33173a0d27242e13c))
+* read every prompt into a Van Dierendonck carrier phase-lock indicator ([38a71cb](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/38a71cb2da3c4d07879dd591708335912cf64cd0))
+* scale the lock detectors' timings to the ranging signal's code period ([cdf3b4b](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/cdf3b4b4cde02c9e31506edfbcef61464c44c1c2))
+* stage the lock detectors through the acquisition handover ([9b89bff](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/9b89bff12ecb4d9497ee12978ad2d57b1d80bb70)), closes [#118](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/118) [#118](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/118) [#118](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/118)
+
 # [4.2.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.1.0...v4.2.0) (2026-08-20)
 
 
