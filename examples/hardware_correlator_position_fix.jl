@@ -120,7 +120,10 @@ const CN0_FLOOR_DBHZ = 38.0              # calibration satellite quality gate
 # these are compared against reads ~7 dB optimistic at a 10 ms coherent
 # integration (measured against synthetic truth, issue #107), so 30 here is
 # nearer 23 dBHz in truth.
-const RX_FLOOR_DBHZ = 25.0
+# 30, not lower: this scan's own noise floor sits at ~27 dBHz (every
+# undetected PRN reports 26.7-27.3 with a Doppler pinned to a grid edge), so a
+# floor below that admits all 32 and spends channels on noise.
+const RX_FLOOR_DBHZ = 30.0
 const MAX_RX_PRNS = 8
 const MAX_SECONDS = length(ARGS) >= 1 ? parse(Float64, ARGS[1]) : 600.0
 const RUN_AFTER_FIX = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 30.0
