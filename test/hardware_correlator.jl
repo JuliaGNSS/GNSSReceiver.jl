@@ -528,7 +528,13 @@ end
     sampling_freq = 4e6Hz
     fs = 4e6
     chunk = 4000                      # 1 ms
-    num_chunks = 700                  # 700 ms of signal
+    # 1.4 s of signal. The link pushes one NCO update per *chunk* (see
+    # `push_nco_updates!`) rather than one per folded epoch, because that is how
+    # often a correction can actually reach a device; a device like this one,
+    # which honours `apply_at_sample` strictly, used to receive a whole per-epoch
+    # sequence during a catch-up and could replay it, so it pulled in within
+    # 700 ms. Same convergence, more signal to get there.
+    num_chunks = 1400
     true_doppler = 1200.0             # Hz
     initial_code_phase = 137.4        # chips
     amplitude = 0.126                 # ≈ 45 dBHz against unit-variance noise
@@ -712,6 +718,97 @@ end
     folds = fold_closed_epochs!(link, empty_state, band_measurements)
     @test folds == 2
     @test link.skipped_epochs == 0
+end
+
+@testset "A chunk's dumps reach the loops as one record spanning the chunk" begin
+    # The loop filter's proportional term is a frequency sized to act for exactly
+    # one update interval, and a hardware NCO holds the last word it was given
+    # until the next arrives. Feedback can only reach the device once per chunk,
+    # so a chunk's dumps have to be folded into ONE record whose
+    # `integrated_samples` is the real elapsed interval — otherwise the device is
+    # left holding a one-epoch-sized correction for a whole chunk (or for however
+    # long the host stays behind) and it over-corrects. Measured on sky, that is
+    # what inverted ~1 % of navigation bits and stopped every ephemeris (#107).
+    system = GPSL1CA()
+    prn = 9
+    sdr = RecordingSDR(EPL, 1)
+    link = HardwareCorrelatorLink(sdr; sampling_freq = 4e6Hz, reference_signal = system)
+    track_state = TrackState(system, [TrackedSat(system, prn, 0.0, 0.0Hz)])
+    link.assignments[1] = GNSSReceiver.HardwareChannelAssignment(:default, prn, 1)
+    link.channel_of[link.assignments[1]] = 1
+    signal() = Tracking.get_signals(get_sat_state(track_state, prn))[1]
+    outputs() = Tracking.get_correlator_outputs(get_sat_state(track_state, prn), 1)
+
+    # Before bit sync the length is pinned to one block: the sync detectors take
+    # exactly one prompt per code block and `Tracking` errors on anything else.
+    @test GNSSReceiver.coherent_integration_blocks(
+        link, get_sat_state(track_state, prn), 1) == 1
+    for k = 1:4
+        GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 4000k))
+    end
+    @test length(outputs()) == 4
+    @test all(o -> o.integrated_samples == 4000, outputs())
+    empty!(outputs())
+
+    # Post-sync the ceiling is a whole navigation bit, but the per-chunk flush is
+    # what decides the actual length.
+    bit_buffer = Tracking.get_bit_buffer(signal())
+    synced = typeof(bit_buffer)(
+        bit_buffer.code_block_buffer, bit_buffer.code_block_buffer_length, true, 0,
+        Int8(1), complex(0.0, 0.0), 0, bit_buffer.soft_bits, bit_buffer.phase_acc)
+    Tracking.get_sat_states(track_state)[prn] = Tracking.TrackedSat(
+        get_sat_state(track_state, prn);
+        signals = (Tracking.TrackedSignal(signal(); bit_buffer = synced),))
+    @test GNSSReceiver.coherent_integration_blocks(
+        link, get_sat_state(track_state, prn), 1) == 20
+
+    # Two dumps arrive (a 2 ms chunk keeping up). Neither reaches the estimator on
+    # its own; the flush hands over their coherent sum, tagged with the summed
+    # sample count and the newest dump's index.
+    link.last_record_end[1] = typemin(Int64)
+    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 100_000; prompt = 3 + 4im))
+    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 104_000; prompt = 1 + 2im))
+    @test isempty(outputs())
+    GNSSReceiver.flush_partial_records!(link, track_state)
+    record = only(outputs())
+    @test record.integrated_samples == 8000
+    @test record.sample_index == 104_000
+    @test Tracking.get_prompt(record.correlator) ≈ 4 + 6im
+    # The spacing metadata is still the host's, not the wire's.
+    @test Tracking.get_early_late_sample_spacing(
+        record.correlator, 4e6Hz, get_code_frequency(system)) ==
+          Tracking.get_early_late_sample_spacing(
+        get_correlator(get_sat_state(track_state, prn), 1), 4e6Hz,
+        get_code_frequency(system))
+    empty!(outputs())
+
+    # A catch-up burst is where this matters: 20 dumps in one chunk become one
+    # 20 ms record, so the loop's Δt — and with it Tracking's 1/n bandwidth
+    # scaling — is the interval that actually elapsed, not one epoch.
+    gaps_before = link.lost_record_gaps
+    for k = 1:20
+        GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 104_000 + 4000k))
+    end
+    GNSSReceiver.flush_partial_records!(link, track_state)
+    # Continuous records, so no gap record: the burst is one output, nothing else.
+    @test link.lost_record_gaps == gaps_before
+    burst = only(outputs())
+    @test burst.integrated_samples == 80_000
+    @test Tracking.get_prompt(burst.correlator) ≈ 20 + 0im
+    empty!(outputs())
+
+    # Nothing accumulated ⇒ the flush is a no-op rather than a zero record, which
+    # `Tracking` would read as a gap and credit to the bit clock.
+    GNSSReceiver.flush_partial_records!(link, track_state)
+    @test isempty(outputs())
+
+    # A channel that changes occupant must not carry its predecessor's partial
+    # into the newcomer's fold.
+    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 200_000))
+    @test link.partial_blocks[1] == 1
+    GNSSReceiver.release_stale_channels!(
+        link, TrackState(system, [TrackedSat(system, prn + 1, 0.0, 0.0Hz)]))
+    @test link.partial_blocks[1] == 0
 end
 
 @testset "A hole in a channel's record stream is reported to the bit clock" begin

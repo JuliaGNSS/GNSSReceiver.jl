@@ -1122,27 +1122,83 @@ function main()
     start!(sdr; dump_source = :dma, epoch_period = 50)
     sdr.device_origin = origin_prelatch
 
-    # Host-axis slip watch: the floor of (device counter − origin) − delivered
-    # host samples rises only when DMA0 buffers were dropped.
-    let base = Ref{Int64}(typemax(Int64)), win = Ref{Int64}(typemax(Int64)),
-        tick = Ref(0), t0 = time()
+    # Host-axis slip watch, and the correction it feeds back.
+    #
+    # A handover describes the satellite at `valid_at_sample`, a count of raw
+    # samples the *host* has consumed, and GNSSM2SDR turns that into a device
+    # sample by adding a constant `device_origin` latched once at start-up. The
+    # constant is only right while the two counters advance together — and they
+    # do not: DMA0 drops a buffer now and then, so the device counts samples the
+    # host never receives and the offset creeps. Nothing notices, because
+    # everything already tracking is bookkept on the device's own axis
+    # (`CorrelatorDump.sample_index`, and the link's code-phase anchor). Only
+    # *new* handovers are affected, and they are affected fatally: the code
+    # phase is off by the accumulated loss, 0.2558 chips per sample, so a
+    # satellite acquired after ~4 samples of creep is handed a replica off its
+    # own correlation peak and never locks. Measured live: +5431 samples over
+    # 270 s = 366 chips, after which no newly acquired satellite ever locked and
+    # the receiver sat on the three it already had — one short of a fix.
+    #
+    # Measuring the creep needs care. `infl = (device counter − origin) −
+    # delivered host samples` rises by one for every sample the device counts and
+    # drops by `CHUNK` each time the producer hands a chunk over, so it sweeps
+    # `[creep, creep + CHUNK)` and equals the creep only just after a hand-over.
+    # Read at an arbitrary instant it is the creep plus up to a whole chunk of
+    # phase, and a minimum over a handful of sparse reads is still worth about
+    # `CHUNK/n` — which is why the old watch could only justify a 1200-sample
+    # (300-chip) alarm threshold and could not have driven a correction. Waiting
+    # for the hand-over removes the term outright and leaves the creep itself,
+    # good to the few samples the two reads are apart.
+    creep_now = function (timeout_s = 0.05)
+        seen = RAW_CHUNKS[]
+        deadline = time() + timeout_s
+        while RAW_CHUNKS[] == seen
+            time() > deadline && return nothing
+            yield()
+        end
+        chunks = RAW_CHUNKS[]
+        (sample_count(sdr.bank) - sdr.device_origin) - Int64(chunks) * CHUNK
+    end
+
+    # Armed only once calibration has finished rewriting `device_origin` — see
+    # `arm_slip_watch!` below. Everything before that (`refine_origin!`, the
+    # sweep's trial offsets, `+= consumed_before_receive`) moves the origin
+    # deliberately, and a baseline taken across those moves would read the
+    # deliberate part as creep and correct the calibration away.
+    slip_baseline = Ref{Union{Nothing,Int64}}(nothing)
+    let corrected = Ref{Int64}(0)
+        global arm_slip_watch! = function ()
+            samples = filter(!isnothing, [creep_now() for _ = 1:5])
+            slip_baseline[] = isempty(samples) ? nothing : minimum(samples)
+        end
 
         global slip_watch = Timer(10; interval = 10) do _
             try
-                infl = (sample_count(sdr.bank) - sdr.device_origin) -
-                       Int64(RAW_CHUNKS[]) * CHUNK
-                win[] = min(win[], infl)
-                tick[] += 1
-                if tick[] % 6 == 0
-                    if time() - t0 < 130
-                        base[] = min(base[], win[])
-                    elseif base[] != typemax(Int64)
-                        slip = win[] - base[]
-                        slip > 1200 && @warn @sprintf(
-                            "host axis slipped %+d samples (%.0f chips mod 1023) since start — handovers now land off-peak",
-                            slip, mod(slip * 0.2558, 1023.0))
-                    end
-                    win[] = typemax(Int64)
+                isnothing(slip_baseline[]) && return
+                # A hand-over landing between the two reads shows up as one chunk
+                # too low, i.e. a negative slip, which is discarded below; taking
+                # the smallest of a few reads keeps the estimate on the floor.
+                samples = filter(!isnothing, [creep_now() for _ = 1:5])
+                isempty(samples) && return
+                creep = minimum(samples)
+                slip = creep - slip_baseline[]
+                # One sample is 0.256 chips and a handover wants the code phase
+                # inside about half a chip, so there is no point waiting for the
+                # damage to be visible — but stay clear of the read race, which
+                # can only ever be a whole chunk.
+                # Correcting the origin by `slip` lowers the next `creep` reading
+                # by exactly `slip`, i.e. back onto the baseline, so the baseline
+                # itself stays put.
+                if 8 < slip < 4 * CHUNK
+                    sdr.device_origin += slip
+                    corrected[] += slip
+                    @info @sprintf(
+                        "host axis slipped %+d samples (%.1f chips) — device_origin re-anchored, %+d total",
+                        slip, slip * 0.2558, corrected[])
+                elseif slip >= 4 * CHUNK
+                    @warn @sprintf(
+                        "host axis slip %+d samples is implausibly large — not correcting",
+                        slip)
                 end
             catch
             end
@@ -1242,6 +1298,9 @@ function main()
     while Base.n_avail(sdr.dumps) > 0
         take!(sdr.dumps)
     end
+    # This is the last deliberate move of the origin, so the host-axis creep can
+    # now be baselined: from here any growth is DMA0 loss and nothing else.
+    arm_slip_watch!()
     @info "starting receiver ($(consumed_before_receive) samples consumed pre-receive)"
 
     # Decode progress alongside the default payload: bits since preamble sync

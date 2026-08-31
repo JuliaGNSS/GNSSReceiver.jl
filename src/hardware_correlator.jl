@@ -350,6 +350,13 @@ Keywords:
     backlog cannot monopolise one call.
   - `max_catchup_epochs` — how far the fold loop replays before treating the
     shortfall as a stream gap and resynchronising the epoch grid.
+  - `coherent_code_blocks` — how many primary-code blocks the link sums into one
+    record before handing it to the tracking loops, once bit/secondary sync has
+    landed. `nothing` (the default) means *one full symbol*: a whole navigation
+    bit for a data-bearing signal, one secondary-code period for a pilot. `1`
+    restores the old behaviour of folding every dump on its own. See
+    [`coherent_integration_blocks`](@ref) for why this is not optional in
+    practice.
 """
 mutable struct HardwareCorrelatorLink{
     S<:AbstractHardwareCorrelatorSDR,
@@ -409,6 +416,19 @@ mutable struct HardwareCorrelatorLink{
     # How many epochs the fold loop will replay in one chunk before treating the
     # shortfall as a gap and resynchronising the grid (see `fold_closed_epochs!`).
     const max_catchup_epochs::Int
+    # ── Coherent pre-accumulation, per hardware channel ───────────────────────
+    # Requested coherent integration length in primary-code blocks, or 0 for
+    # "one full symbol" (see `coherent_integration_blocks`).
+    const coherent_code_blocks::Int
+    # The partially accumulated record: summed accumulators, the samples and
+    # whole code blocks they span, and the `sample_index` of the newest dump in
+    # it. `partial_blocks == 0` means "nothing accumulated", in which case
+    # `partial_correlator` is undefined rather than zero — a correlator type has
+    # no zero without an instance to take it from.
+    const partial_correlator::Vector{C}
+    const partial_samples::Vector{Int64}
+    const partial_blocks::Vector{Int}
+    const partial_end::Vector{Int64}
     # Sample index at which the currently open epoch closes. `typemin` until the
     # first record arrives and anchors the grid (see `_anchor_epoch_grid!`).
     next_epoch_boundary::Int
@@ -436,6 +456,7 @@ function HardwareCorrelatorLink(
     feedback_delay_epochs::Integer = 2,
     max_dumps_per_drain::Integer = 4096,
     max_catchup_epochs::Integer = 64,
+    coherent_code_blocks::Union{Nothing,Integer} = nothing,
 )
     interval = something(
         doppler_update_interval,
@@ -454,6 +475,13 @@ function HardwareCorrelatorLink(
     max_catchup_epochs >= 1 || throw(
         ArgumentError("max_catchup_epochs must be at least 1 (got $max_catchup_epochs)"),
     )
+    isnothing(coherent_code_blocks) ||
+        coherent_code_blocks >= 1 ||
+        throw(
+            ArgumentError(
+                "coherent_code_blocks must be at least 1 or nothing (got $coherent_code_blocks)",
+            ),
+        )
 
     dump_type = eltype(correlator_dump_channel(sdr))
     dump_type <: CorrelatorDump || throw(
@@ -482,6 +510,11 @@ function HardwareCorrelatorLink(
         zeros(Int64, n),
         zeros(Int64, n),
         Int(max_catchup_epochs),
+        isnothing(coherent_code_blocks) ? 0 : Int(coherent_code_blocks),
+        Vector{_correlator_type(dump_type)}(undef, n),
+        zeros(Int64, n),
+        zeros(Int, n),
+        fill(typemin(Int64), n),
         typemin(Int),
         typemin(Int),
         0,
@@ -596,6 +629,9 @@ function release_stale_channels!(link, track_state)
         link.last_record_end[hw_channel] = typemin(Int64)
         link.lost_record_samples[hw_channel] = 0
         link.overlapping_record_samples[hw_channel] = 0
+        # A part-accumulated record belongs to the satellite that just left; it
+        # can neither be finished nor handed to anyone else.
+        _discard_partial!(link, hw_channel)
         # Any dump still in flight for this channel now refers to a satellite
         # that is gone; `fold_closed_epochs!` drops it as stale.
     end
@@ -679,6 +715,7 @@ function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampl
     link.last_record_end[hw_channel] = typemin(Int64)
     link.lost_record_samples[hw_channel] = 0
     link.overlapping_record_samples[hw_channel] = 0
+    _discard_partial!(link, hw_channel)
     link
 end
 
@@ -770,18 +807,69 @@ function fold_closed_epochs!(link::HardwareCorrelatorLink, track_state, band_mea
     end
 
     folds = 0
+    boundary = link.next_epoch_boundary
     while link.latest_sample_index >= link.next_epoch_boundary
         boundary = link.next_epoch_boundary
         append_epoch_outputs!(link, track_state, boundary)
         # Phase bookkeeping runs before the estimator so a bit-sync phase snap
-        # in this fold sees the anchored, boundary-referenced code phase.
+        # sees the anchored, boundary-referenced code phase — and it runs per
+        # epoch so each boundary's anchor is absorbed where it belongs.
         advance_code_phases!(link, track_state, boundary)
-        Tracking.estimate_dopplers_and_filter_prompt!(track_state, band_measurements)
-        push_nco_updates!(link, track_state, boundary)
         link.next_epoch_boundary = boundary + link.epoch_length
         folds += 1
     end
+    folds == 0 && return 0
+
+    # One estimator pass and one NCO update per *chunk*, not per epoch.
+    #
+    # The host can only get a correction to the device once per chunk, so that is
+    # the interval the loop's output has to be sized for. Running the estimator
+    # per epoch instead pushes one update per epoch, of which the device only
+    # ever keeps the last — and that last one carries a proportional term
+    # computed for a single epoch while the device then holds it for the whole
+    # chunk (or for however long the host stays behind). Coalescing the epochs'
+    # records into one per channel first (`flush_partial_records!`) makes the
+    # record's `integrated_samples`, and therefore the loop's `Δt` and its `1/n`
+    # bandwidth scaling, equal to the interval that actually elapses. See
+    # `coherent_integration_blocks` for the measurement that forced this.
+    flush_partial_records!(link, track_state)
+    Tracking.estimate_dopplers_and_filter_prompt!(track_state, band_measurements)
+    push_nco_updates!(link, track_state, boundary)
     folds
+end
+
+"""
+    flush_partial_records!(link, track_state) -> link
+
+Hand every hardware channel's part-accumulated record to the estimator, so a
+chunk's worth of dumps reaches the loop filters as one record spanning the whole
+chunk. Called once per chunk, immediately before the estimator runs.
+
+Channels with nothing accumulated — and channels whose satellite the receiver
+has already dropped — are skipped.
+"""
+function flush_partial_records!(link::HardwareCorrelatorLink, track_state)
+    for hw_channel in eachindex(link.assignments)
+        link.partial_blocks[hw_channel] == 0 && continue
+        assignment = link.assignments[hw_channel]
+        if isnothing(assignment)
+            _discard_partial!(link, hw_channel)
+            continue
+        end
+        sat_states = get_sat_states(track_state, assignment.group_key)
+        if !haskey(sat_states, assignment.prn)
+            _discard_partial!(link, hw_channel)
+            continue
+        end
+        _emit_partial!(
+            link,
+            track_state,
+            assignment,
+            sat_states[assignment.prn],
+            hw_channel,
+        )
+    end
+    link
 end
 
 """
@@ -909,6 +997,13 @@ function _account_record_continuity!(
         if gap > 0
             link.lost_record_samples[hw_channel] += gap
             link.lost_record_gaps += 1
+            # Close the coherent accumulation *before* the hole: the records
+            # after it are a different stretch of signal, and the gap record has
+            # to reach the bit clock between the two. The partial comes out short
+            # (weak, like the bit straddling the gap) and the next accumulation
+            # re-aligns to the symbol boundary, which is exactly what
+            # `coherent_integration_blocks` measures against the bit buffer.
+            _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
             # Hand the fold a record covering exactly the missing span with a
             # zeroed correlator. `Tracking` reads that as "this much time passed
             # and nothing is known about it": the loop filters, the prompt
@@ -955,22 +1050,214 @@ function _append_dump!(link, track_state, dump)
         hw_channel,
         dump.output,
     )
-    append_correlator_output!(
-        track_state,
-        _retag_spacing(get_correlator(sat_state, assignment.signal_index), dump.output),
-        assignment.group_key,
-        assignment.prn,
-        assignment.signal_index,
-    )
+    _accumulate_dump!(link, track_state, assignment, sat_state, hw_channel, dump.output)
     # Collect the code-phase anchor for the phase bookkeeping. Only the
     # estimator-driver signal carries the sat-shared code phase; dumps are
     # appended in `sample_index` order, so the epoch's freshest anchor wins.
+    # Anchors are collected per *dump*, not per emitted record: the code phase
+    # bookkeeping is about where the device's replica is, which every dump
+    # reports regardless of how many of them the loops get to see at once.
     if assignment.signal_index == 1 && !isnan(dump.code_phase)
         link.anchor_sample[hw_channel] = dump.output.sample_index
         link.anchor_code_phase[hw_channel] = dump.code_phase
     end
     link
 end
+
+"""
+    coherent_integration_blocks(link, sat_state, signal_index) -> Int
+
+How many primary-code blocks the link should sum into one record for this
+signal, right now.
+
+This is a **ceiling**, not the length actually used: the fold flushes whatever
+has accumulated at the end of every processing chunk (see
+[`flush_partial_records!`](@ref)), so a record normally spans exactly the chunk.
+The ceiling only bites when a chunk covers more signal time than one symbol.
+
+**Why records are combined at all.** A loop filter's output is a *frequency*
+that is meant to act for exactly one update interval: the proportional term of
+`filter_loop` is sized to remove a fraction of the measured phase error over
+`Δt`. A hardware correlator's NCO, though, holds whatever word it was last given
+until the next one arrives — so if a correction computed for a 1 ms interval is
+left in place for 20 ms, it over-corrects by twentyfold and *injects* the phase
+error it was meant to remove.
+
+That is not hypothetical. Measured on sky over 200 s (issue #107), the rate at
+which a satellite's 20 ms navigation bit lands past 90° of carrier phase — i.e.
+comes out inverted — tracks how far behind the host was, at constant signal
+strength:
+
+| records the fold delivered in one 2 ms chunk | bits | bit past 90° |
+|---:|---:|---:|
+| 0-2 (host keeping up)  |  362 |  0.8 % |
+| 3-4                    | 5215 |  1.4 % |
+| 5-8                    | 3204 |  3.8 % |
+| 9-16                   | 1020 | 11.0 % |
+| 17-32                  |  302 | 15.9 % |
+| 33+                    |   83 | 26.5 % |
+
+Splitting the same table by bit amplitude keeps the trend (0.9 % → 8.2 % across
+the same backlog range among *strong* bits only), so it is the staleness of the
+feedback and not the C/N₀. One inverted bit spoils one 30-bit word, and
+`GNSSDecoder` needs subframes 1, 2 and 3 to arrive clean *and* mutually
+consistent — 18 s of unbroken words. At one spoiled word per second no
+ephemeris ever completes, which is exactly what issue #107 saw while every
+individual measurement (prompt SNR, code phase, bit clock, C/N₀) looked healthy.
+
+Summing `n` consecutive dumps' accumulators is exactly the correlation the
+device would have produced had it integrated `n` blocks, because its replicas
+run continuously across a dump boundary. Handing the estimator that one record
+makes `Δt` the *real* elapsed interval, and `Tracking` derives everything else
+from the record's own `integrated_samples` — the loop bandwidth scaling by `1/n`
+(so the proportional term shrinks to match), the FLL's integration time, and the
+bit clock's block credit. The correction the device is then left holding is one
+sized for the interval it will actually hold it for.
+
+**The ceiling.** One symbol — a navigation bit for a data-bearing signal, one
+secondary-code period for a pilot — because past it the data flips sign inside
+the integration. Before bit/secondary sync the length is forced to 1: the sync
+detectors consume exactly one prompt per code block and `Tracking`'s
+`_buffer_find_bit` rejects anything else outright.
+
+**Do not raise this to a full symbol by default.** Lengthening the integration
+shrinks the carrier discriminators' unambiguous range to `±1/(4·n·T_block)`
+(`atan` sees phase modulo π, `fll_disc` divides by the integration time), and a
+loop whose residual frequency error is outside that range aliases and runs away
+rather than pulling in. Jumping straight from 1 ms to a 20 ms integration while
+the loop still carries the ±22 Hz of jitter a 1 ms update rate produces was
+measured in the closed-loop reproduction to false-lock and diverge by ~1000 Hz.
+A chunk-length record (2 ms ⇒ ±125 Hz) is comfortably inside; anything longer
+needs the length to be ramped up as the loop settles, which this does not yet do.
+
+The count is measured against the bit buffer's own progress through the current
+symbol, so a partial record — one truncated by a stream gap — lands the *next*
+one back on the symbol boundary instead of straddling it for the rest of the lock.
+"""
+function coherent_integration_blocks(link::HardwareCorrelatorLink, sat_state, signal_index)
+    tracked_signal = Tracking.get_signals(sat_state)[signal_index]
+    bit_buffer = Tracking.get_bit_buffer(tracked_signal)
+    # Pre-sync the detectors need one prompt per code block, and Tracking
+    # enforces it.
+    has_bit_or_secondary_code_been_found(bit_buffer) || return 1
+    signal = get_signal(tracked_signal)
+    # A device replica reproduces the primary code only — nothing in
+    # `assign_channel!` asks it to wipe off a secondary/overlay code — so
+    # consecutive dumps of an overlaid signal carry alternating overlay chips.
+    # Summing across them would cancel the signal rather than accumulate it, so
+    # such signals stay at one block per record until the interface can tell a
+    # device to apply the overlay itself.
+    get_secondary_code_length(signal) == 1 || return 1
+    blocks_per_symbol = _code_blocks_per_symbol(signal)
+    blocks_per_symbol <= 1 && return 1
+    requested =
+        link.coherent_code_blocks == 0 ? blocks_per_symbol :
+        min(link.coherent_code_blocks, blocks_per_symbol)
+    # Land on the symbol boundary the bit buffer is counting toward, so a
+    # truncated record is absorbed once instead of shifting every later one.
+    remaining =
+        blocks_per_symbol -
+        mod(bit_buffer.prompt_accumulator_integrated_code_blocks, blocks_per_symbol)
+    max(1, min(requested, remaining))
+end
+
+# Primary-code blocks in one symbol: a navigation bit where there is data, one
+# secondary-code period for a pilot, and 1 when neither applies (a signal whose
+# symbol *is* the code block, e.g. Galileo E1B).
+function _code_blocks_per_symbol(signal)
+    data_frequency = get_data_frequency(signal)
+    iszero(data_frequency) && return get_secondary_code_length(signal)
+    round(
+        Int,
+        upreferred(
+            get_code_frequency(signal) / (get_code_length(signal) * data_frequency),
+        ),
+    )
+end
+
+# Add one dump to this channel's partial record and, once it spans the coherent
+# integration length, hand the sum to the estimator as a single record.
+#
+# Summing accumulators is the whole trick: the device's replicas run
+# continuously across a dump boundary, so `Σ dumps` IS the accumulator a device
+# that had integrated over the whole span would have produced. The emitted
+# record carries the summed `integrated_samples` and the *last* dump's
+# `sample_index`, which is what makes `Tracking` treat it as one long
+# integration ending there — the loop bandwidth scaling, the integration time
+# the FLL divides by, and the bit clock's block credit all follow from those two
+# numbers.
+function _accumulate_dump!(link, track_state, assignment, sat_state, hw_channel, output)
+    target = coherent_integration_blocks(link, sat_state, assignment.signal_index)
+    blocks = _record_code_blocks(link, sat_state, assignment.signal_index, output)
+    if link.partial_blocks[hw_channel] == 0
+        link.partial_correlator[hw_channel] = output.correlator
+        link.partial_samples[hw_channel] = output.integrated_samples
+        link.partial_blocks[hw_channel] = blocks
+    else
+        link.partial_correlator[hw_channel] = _add_accumulators(
+            link.partial_correlator[hw_channel],
+            output.correlator,
+        )
+        link.partial_samples[hw_channel] += output.integrated_samples
+        link.partial_blocks[hw_channel] += blocks
+    end
+    link.partial_end[hw_channel] = output.sample_index
+    link.partial_blocks[hw_channel] >= target &&
+        _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
+    link
+end
+
+# Whole primary-code blocks a record spans, recovered from its sample count the
+# same way `Tracking` recovers it for the bit clock, so the two cannot disagree
+# about how much signal time a record represents.
+function _record_code_blocks(link, sat_state, signal_index, output)
+    signal = get_signal(Tracking.get_signals(sat_state)[signal_index])
+    max(
+        1,
+        round(
+            Int,
+            output.integrated_samples * ustrip(Hz, get_code_frequency(signal)) /
+            (get_code_length(signal) * link.sampling_freq_hz),
+        ),
+    )
+end
+
+# Hand the accumulated record to the estimator and start a fresh one. A no-op
+# when nothing is accumulated, so it is safe to call as a flush.
+function _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
+    link.partial_blocks[hw_channel] == 0 && return link
+    append_correlator_output!(
+        track_state,
+        _retag_spacing(
+            get_correlator(sat_state, assignment.signal_index),
+            Tracking.CorrelatorOutput(
+                link.partial_correlator[hw_channel],
+                link.partial_samples[hw_channel],
+                link.partial_end[hw_channel],
+            ),
+        ),
+        assignment.group_key,
+        assignment.prn,
+        assignment.signal_index,
+    )
+    link.partial_samples[hw_channel] = 0
+    link.partial_blocks[hw_channel] = 0
+    link.partial_end[hw_channel] = typemin(Int64)
+    link
+end
+
+# Throw away a partial record without emitting it. Used where the accumulation
+# cannot be completed or attributed: a channel changing occupant.
+function _discard_partial!(link, hw_channel)
+    link.partial_samples[hw_channel] = 0
+    link.partial_blocks[hw_channel] = 0
+    link.partial_end[hw_channel] = typemin(Int64)
+    link
+end
+
+# Sum two correlators' accumulators, keeping everything else from the first.
+_add_accumulators(a::Tracking.AbstractCorrelator, b::Tracking.AbstractCorrelator) =
+    @set a.accumulators = get_accumulators(a) .+ get_accumulators(b)
 
 # Take the dump's accumulators, but the *host's* correlator spacing metadata.
 #
@@ -1004,10 +1291,18 @@ _retag_spacing(template::Tracking.AbstractCorrelator, output::Tracking.Correlato
 Push one [`NCOUpdate`](@ref) per assigned hardware channel and return how many
 were sent.
 
-Called right after the estimator folded an epoch, so the Dopplers read back are
-this epoch's. All updates are scheduled at the same future sample —
-`boundary + feedback_delay_epochs × Δ` — which is what keeps the loop delay a
-known constant instead of PCIe jitter.
+Called once per chunk, right after the estimator folded it, so the Dopplers read
+back are the newest. All updates are scheduled at the same future sample —
+`feedback_delay_epochs × Δ` past the *newest record the host has seen* — which is
+what keeps the loop delay a known constant instead of PCIe jitter.
+
+The reference is `latest_sample_index` rather than the epoch `boundary` because
+the two part company exactly when it matters. `boundary` is where the fold grid
+has got to; when the host is behind, that is in the past, and scheduling a
+correction at a sample the device passed milliseconds ago asks it to apply the
+update late by however far behind the host is — or, on a device that honours the
+schedule strictly, to discard it. Anchoring to the newest record keeps the
+correction a fixed, small distance in the *device's* future either way.
 
 A full ring means the device's writer is not keeping up; the updates are
 dropped rather than blocking the receiver, and counted in `link.dropped_dumps`'
@@ -1015,7 +1310,9 @@ sibling diagnostics.
 """
 function push_nco_updates!(link::HardwareCorrelatorLink, track_state, boundary)
     channel = nco_update_channel(link.sdr)
-    apply_at_sample = boundary + link.feedback_delay_epochs * link.epoch_length
+    apply_at_sample =
+        max(boundary, link.latest_sample_index) +
+        link.feedback_delay_epochs * link.epoch_length
     empty!(link.nco_buffer)
     for hw_channel in eachindex(link.assignments)
         assignment = link.assignments[hw_channel]
