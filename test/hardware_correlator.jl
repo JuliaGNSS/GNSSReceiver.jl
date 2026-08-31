@@ -828,6 +828,13 @@ end
     link.channel_of[link.assignments[1]] = 1
 
     outputs() = Tracking.get_correlator_outputs(get_sat_state(track_state, prn), 1)
+    # Blocks the bit clock has been told about. Pre-sync that is the length of
+    # the hard-decision search window, which advances one per code period of
+    # signal time — whether or not a prompt was measured for it.
+    blocks() =
+        Tracking.get_bit_buffer(
+            Tracking.get_signals(get_sat_state(track_state, prn))[1],
+        ).code_block_buffer_length
 
     # The first record on a fresh channel has nothing to be continuous with.
     GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 4000))
@@ -841,25 +848,32 @@ end
     @test length(outputs()) == 2
 
     # Three records lost: the next one starts 12000 samples late. The gap is
-    # accounted, and a zeroed record spanning exactly the hole is appended
-    # *before* the real one so the fold credits the bit clock in the right
-    # place. Without it the satellite's navigation bit boundary would move by
-    # three code periods for the rest of its lock.
+    # accounted and the three code periods it spans are credited to the bit
+    # clock, so the satellite's navigation bit boundary does not move for the
+    # rest of its lock.
+    #
+    # It is credited as *elapsed time*, not as a measurement. This used to
+    # append a record spanning the hole with a zeroed correlator, which every
+    # discriminator then read as 0/0 — so what is pinned here is that the bit
+    # clock moved by exactly the hole and that nothing was put into the
+    # correlator outputs to move it.
+    before = blocks()
     GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 24_000))
     @test link.lost_record_gaps == 1
     @test link.lost_record_samples[1] == 12_000
-    @test length(outputs()) == 4
-    gap = outputs()[3]
-    @test gap.integrated_samples == 12_000
-    @test iszero(Tracking.get_prompt(gap.correlator))
-    @test outputs()[4].sample_index == 24_000
+    @test blocks() - before == 3      # 12000 samples = 3 GPS L1 C/A code periods
+    @test length(outputs()) == 3      # the three real records, and nothing else
+    @test all(o -> !iszero(Tracking.get_prompt(o.correlator)), outputs())
+    @test outputs()[3].sample_index == 24_000
 
     # A record that starts before the previous one ended is an overlap, not a
     # hole — a duplicate or a device counter step back. Counted, never credited.
+    overlap_before = blocks()
     GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 26_000))
     @test link.overlapping_record_samples[1] == 2000
     @test link.lost_record_gaps == 1
-    @test length(outputs()) == 5
+    @test blocks() == overlap_before  # an overlap is not elapsed time
+    @test length(outputs()) == 4
 
     # Reassigning the channel starts a fresh record stream: the old occupant's
     # end sample says nothing about where the new one's first record begins.
