@@ -20,8 +20,9 @@
 # the Saastamoinen tropospheric delay, as in the scalar PVT solve. Which of
 # those biases a given epoch can actually determine is decided per cycle, the
 # way `decide_bias_layout` decides it for the scalar solve — including the
-# broadcast-GGTO collapse of the Galileo clock onto the GPS one when the
-# measurements do not support both (see `assess_bias_observability`).
+# broadcast-offset collapse of a Galileo or BeiDou clock onto the GPS one (the
+# GGTO / BGTO) when the measurements do not support both (see
+# `assess_bias_observability`).
 #
 # The loop split with `Tracking`: the `VectorPLLAndDLL` Doppler estimator
 # accumulates each satellite's discriminators and applies the NCO corrections
@@ -1003,20 +1004,20 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 # Bias observability
 
-# Accuracy (m) credited to the broadcast Galileo–GPS Time Offset when it is used
-# to collapse the two clock states onto one. The GGTO is broadcast to a few
-# nanoseconds, so a few metres of pseudorange — good enough to remove a clock
-# unknown under satellite starvation, but far too coarse to constrain a
-# solution whose geometry can observe the offset directly, which is why the
+# Accuracy (m) credited to a broadcast offset to GPS Time — the Galileo GGTO or the
+# BeiDou BGTO — when it is used to collapse that constellation's clock state onto the GPS
+# one. Both are broadcast to a few nanoseconds, so a few metres of pseudorange — good
+# enough to remove a clock unknown under satellite starvation, but far too coarse to
+# constrain a solution whose geometry can observe the offset directly, which is why the
 # collapse is only applied when the independent layout is not supported.
-const GGTO_STD = 3.0
+const GPST_OFFSET_STD = 3.0
 
 # The bias-layout decision for one measurement set, mirroring
 # `PositionVelocityTime.decide_bias_layout` for the navigation filter.
 #
 # `num_unknowns` is the number of parameters this cycle's pseudoranges have to
 # determine — 3 position components plus the clock biases and the *observable*
-# inter-frequency biases of the layout in force, the merged one where the GGTO
+# inter-frequency biases of the layout in force, the merged one where the clock
 # collapse applies (see `epoch_bias_unknowns`). It is the measurement count the
 # epoch must reach to be solvable, and so accounts for the bias unknowns a
 # multi-GNSS, multi-band configuration adds beyond the bare four.
@@ -1037,16 +1038,20 @@ const GGTO_STD = 3.0
 # scalar solve leaves that to `calc_pvt`'s checks on the assembled design; here
 # it is reported as `VTStatus`'s `position_std` rather than policed.
 #
-# `ggto_constraint` is `(gst_state, gpst_state, isb)`: the collapse, expressed
-# as the linear pseudo-measurement `x[gst_state] - x[gpst_state] = isb` rather
-# than as a merged design-matrix column, so the filter keeps a fixed state
-# dimension and the Galileo clock stays available (and keeps tracking the shared
-# oscillator drift) for the epochs where the geometry does observe it.
+# `gpst_offset_constraints` holds one `(state, gpst_state, isb)` per collapsed time
+# system: the collapse, expressed as the linear pseudo-measurement
+# `x[state] - x[gpst_state] = isb` rather than as a merged design-matrix column, so the
+# filter keeps a fixed state dimension and that constellation's clock stays available
+# (and keeps tracking the shared oscillator drift) for the epochs where the geometry does
+# observe it. It is a vector rather than one entry because a mixed epoch can collapse
+# several systems at once — Galileo through its GGTO and BeiDou through its BGTO,
+# independently — which is what `decide_bias_layout` does on the scalar side. Empty when
+# nothing is collapsed.
 struct BiasObservability
     num_unknowns::Int
     num_distinct_sats_required::Int
     num_distinct_sats::Int
-    ggto_constraint::Union{Nothing,Tuple{Int,Int,Float64}}
+    gpst_offset_constraints::Vector{Tuple{Int,Int,Float64}}
 end
 
 # Whether a measurement set can determine the navigation state under the layout it was
@@ -1080,10 +1085,10 @@ end
 # Decide the bias layout for this cycle's measurement set, following
 # `decide_bias_layout`: estimate every bias independently when the
 # (constellation × band) coverage graph is connected and there are enough
-# measurements, and otherwise fall back to the broadcast-GGTO collapse — which
+# measurements, and otherwise fall back to the broadcast clock collapse — which
 # both removes a clock unknown (the scarce-satellite case) and reconnects a
-# disjoint GPS/Galileo band split (the disconnected case, where a band's
-# inter-frequency bias is collinear with the stranded constellation's clock).
+# disjoint band split (the disconnected case, where a band's inter-frequency
+# bias is collinear with the stranded constellation's clock).
 function assess_bias_observability(
     vt::VectorTrackingState,
     members::AbstractVector{VTMember},
@@ -1111,63 +1116,72 @@ function assess_bias_observability(
         num_unknowns,
         num_distinct_required,
         num_distinct_sats,
-        nothing,
+        Tuple{Int,Int,Float64}[],
     )
     if num_components == 1 && is_epoch_solvable(independent, num_measurements)
         return independent
     end
 
-    # Connected-but-scarce or disconnected: collapse the Galileo clock onto the
-    # GPS one via the broadcast GGTO. Worth doing only when both clocks are
-    # actually in play this cycle — otherwise it would replace a well-observed
-    # clock state with the coarser broadcast value for nothing.
-    gst_state = findfirst(==(GNSSSignals.GST()), layout.time_systems)
+    # Connected-but-scarce or disconnected: collapse every non-GPS clock that this cycle
+    # has a broadcast offset to GPS Time for onto the GPS one — Galileo through its GGTO,
+    # BeiDou through its BGTO, and each independently of the other, exactly as
+    # `decide_bias_layout` does. Worth doing only for a system whose clock and the GPS one
+    # are both in play this cycle; otherwise it would replace a well-observed clock state
+    # with the coarser broadcast value for nothing.
     gpst_state = findfirst(==(GNSSSignals.GPST()), layout.time_systems)
-    if !isnothing(gst_state) &&
-       !isnothing(gpst_state) &&
-       GNSSSignals.GST() in time_systems &&
-       GNSSSignals.GPST() in time_systems
-        ggto_index = findfirst(
-            j ->
-                members[j].clock_bias_index == gst_state &&
-                    PositionVelocityTime.ggto_available(members[j].sat_state.decoder),
-            candidate_indices,
-        )
-        if !isnothing(ggto_index)
-            member = members[candidate_indices[ggto_index]]
-            # Per the OS SIS ICD the GGTO is GST − GPST, and the clock states are
-            # in metres of pseudorange, so the Galileo clock sits −c·GGTO from
-            # the GPS one — the same sign convention `decide_bias_layout` uses
-            # for its `inter_system_biases[GST()]`.
+    constraints = Tuple{Int,Int,Float64}[]
+    collapsed = GNSSSignals.TimeSystem[]
+    if !isnothing(gpst_state) && GNSSSignals.GPST() in time_systems
+        for state in eachindex(layout.time_systems)
+            time_system = layout.time_systems[state]
+            (time_system == GNSSSignals.GPST() || time_system ∉ time_systems) && continue
+            # The offset is one constellation-wide value whichever of the system's
+            # satellites reports it, so the first decoded copy per system converts all of
+            # that system's measurements — the rule `calc_gpst_range_offsets` follows.
+            offset_index = findfirst(
+                j ->
+                    members[j].clock_bias_index == state &&
+                        PositionVelocityTime.gpst_offset_available(
+                            members[j].sat_state.decoder,
+                        ),
+                candidate_indices,
+            )
+            isnothing(offset_index) && continue
+            member = members[candidate_indices[offset_index]]
+            # The broadcast offset is Δt_systems = (that system's time) − GPST, and the
+            # clock states are in metres of pseudorange, so that system's clock sits
+            # −c·Δt_systems from the GPS one — the same sign convention
+            # `decide_bias_layout` gives its `inter_system_biases`.
             isb =
                 -PositionVelocityTime.SPEEDOFLIGHT *
-                PositionVelocityTime.calc_ggto_offset(member.sat_state.decoder, member.time)
-            # The unknowns have to be recounted on the merged graph rather than simply
-            # decremented: dropping the Galileo clock removes one unknown, but merging the
-            # two constellations can also reconnect two coverage components — which is the
-            # point of the collapse in the disconnected case — and every band that stops
-            # being a component reference then becomes an observable, and countable,
-            # inter-frequency bias again. `decide_bias_layout` recounts for the same reason.
-            merged_unknowns, merged_distinct_required, _ = epoch_bias_unknowns(
-                [
-                    ts == GNSSSignals.GST() ? GNSSSignals.GPST() : ts for
-                    ts in time_systems
-                ],
-                bands,
-            )
-            # Reported even when the merged layout is still short of its conditions, where
-            # `decide_bias_layout` would fall back to the independent one and call the epoch
-            # unsolvable: the merge can only lower both requirements (it drops a clock
-            # unknown and can add back at most one inter-frequency bias), so the two agree
-            # on solvability, and applying the constraint on a starved epoch is free
-            # information rather than a decision.
-            return BiasObservability(
-                merged_unknowns,
-                merged_distinct_required,
-                num_distinct_sats,
-                (gst_state, gpst_state, isb),
-            )
+                PositionVelocityTime.calc_gpst_offset(member.sat_state.decoder, member.time)
+            push!(constraints, (state, gpst_state, isb))
+            push!(collapsed, time_system)
         end
+    end
+    if !isempty(constraints)
+        # The unknowns have to be recounted on the merged graph rather than simply
+        # decremented: dropping a clock removes one unknown, but merging two
+        # constellations can also reconnect two coverage components — which is the
+        # point of the collapse in the disconnected case — and every band that stops
+        # being a component reference then becomes an observable, and countable,
+        # inter-frequency bias again. `decide_bias_layout` recounts for the same reason.
+        merged_unknowns, merged_distinct_required, _ = epoch_bias_unknowns(
+            [ts ∈ collapsed ? GNSSSignals.GPST() : ts for ts in time_systems],
+            bands,
+        )
+        # Reported even when the merged layout is still short of its conditions, where
+        # `decide_bias_layout` would fall back to the independent one and call the epoch
+        # unsolvable: the merge can only lower both requirements (it drops a clock unknown
+        # per collapsed system and can add back at most one inter-frequency bias each), so
+        # the two agree on solvability, and applying the constraints on a starved epoch is
+        # free information rather than a decision.
+        return BiasObservability(
+            merged_unknowns,
+            merged_distinct_required,
+            num_distinct_sats,
+            constraints,
+        )
     end
 
     # No collapse available: the layout stays independent, and the epoch is solvable only
@@ -1818,7 +1832,7 @@ function run_vt_iteration(
     # layout actually in force. Until a measurement set is gathered it is the bare floor —
     # 3 position components and one clock, from four distinct satellites none of which are
     # there — so an epoch with no candidates at all counts as unsolvable.
-    observability = BiasObservability(4, 4, 0, nothing)
+    observability = BiasObservability(4, 4, 0, Tuple{Int,Int,Float64}[])
     if !isempty(candidate_indices)
         z_pseudoranges = [
             measured_pseudoranges[j] +
@@ -1855,8 +1869,8 @@ function run_vt_iteration(
 
         if !isempty(candidate_indices)
             # Bias layout for this measurement set: what it has to determine, and
-            # whether the Galileo clock has to be collapsed onto the GPS one
-            # through the broadcast GGTO to get there.
+            # which non-GPS clocks have to be collapsed onto the GPS one through
+            # their broadcast offset to GPS Time to get there.
             observability = assess_bias_observability(vt, members, candidate_indices)
 
             included = members[candidate_indices]
@@ -1905,20 +1919,27 @@ function run_vt_iteration(
                 candidate_indices
             R_meas = R[R_rows, R_rows]
 
-            # The GGTO collapse rides along as one extra measurement row — the
-            # broadcast offset between the two clock states — appended after the
+            # Each clock collapse rides along as one extra measurement row — the
+            # broadcast offset between two clock states — appended after the
             # satellite rows so the residual slice below is unaffected.
-            if !isnothing(observability.ggto_constraint)
-                gst_state, gpst_state, isb = observability.ggto_constraint
-                z = vcat(z, isb)
+            if !isempty(observability.gpst_offset_constraints)
+                constraints = observability.gpst_offset_constraints
+                z = vcat(z, [isb for (_, _, isb) in constraints])
                 h_sats = h
                 h =
                     x -> vcat(
                         h_sats(x),
-                        x[idxs.clock_biases[gst_state]] -
-                        x[idxs.clock_biases[gpst_state]],
+                        [
+                            x[idxs.clock_biases[state]] -
+                            x[idxs.clock_biases[gpst_state]] for
+                            (state, gpst_state, _) in constraints
+                        ],
                     )
-                R_meas = cat(R_meas, GGTO_STD^2; dims = (1, 2))
+                R_meas = cat(
+                    R_meas,
+                    Diagonal(fill(GPST_OFFSET_STD^2, length(constraints)));
+                    dims = (1, 2),
+                )
             end
 
             mu = measurement_update(x_predicted, P_predicted, z, h, R_meas)

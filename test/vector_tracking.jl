@@ -5,7 +5,8 @@
 # missing — `aff3ct_jll` ships no `libaff3ct_jl` for Windows, and building the cache throws
 # there. `GNSSDecoderState` parameterises its cache (`CA<:AbstractGNSSCache`) though, and
 # none of these testsets decode a bit: they only read ephemeris, health and GGTO, all of
-# which dispatch on the data or the constants (e.g. `get_data_frequency`, `ggto_available`)
+# which dispatch on the data or the constants (e.g. `get_data_frequency`,
+# `gpst_offset_available`)
 # and never touch the cache. So build the decoder states here with a cache that does nothing
 # but subtype `AbstractGNSSCache` — on every platform, not just the ones without AFF3CT.
 struct StubGNSSCache <: GNSSDecoder.AbstractGNSSCache end
@@ -15,8 +16,11 @@ stub_cache_decoder(prn, data, constants) =
 
 # GPS decoders build fine everywhere, so only Galileo needs the stub.
 test_decoder_state(system, prn) = GNSSDecoderState(system, prn)
-test_decoder_state(::Union{GalileoE1B,GalileoE1B_BOC11}, prn) =
-    stub_cache_decoder(prn, GNSSDecoder.GalileoE1BData(), GNSSDecoder.GalileoE1BConstants())
+test_decoder_state(::Union{GalileoE1B,GalileoE1B_BOC11}, prn) = stub_cache_decoder(
+    prn,
+    GNSSDecoder.GalileoINAVData(),
+    GNSSDecoder.GalileoE1BConstants(),
+)
 test_decoder_state(::GalileoE5aI, prn) =
     stub_cache_decoder(prn, GNSSDecoder.GalileoE5aData(), GNSSDecoder.GalileoE5aConstants())
 
@@ -475,7 +479,7 @@ end
     @test gates[1] > 4e6
 end
 
-@testset "Bias observability and the GGTO collapse" begin
+@testset "Bias observability and the broadcast-clock collapse" begin
     # GPS on L1 + Galileo on E1B and E5a: 2 clock biases, 1 inter-frequency
     # bias, so a full independent layout needs 3 + 2 + 1 = 6 pseudoranges.
     layout = GNSSReceiver.NavFilterLayout((GPSL1CA(), GalileoE1B(), GalileoE5aI()))
@@ -505,7 +509,7 @@ end
     members = [gps(i) for i = 1:5]
     obs = GNSSReceiver.assess_bias_observability(vt, members, 1:5)
     @test obs.num_unknowns == 4          # 3 position + 1 GPS clock
-    @test isnothing(obs.ggto_constraint) # nothing to collapse
+    @test isempty(obs.gpst_offset_constraints) # nothing to collapse
 
     # All three signals present and plentiful: everything is estimated
     # independently, with no broadcast GGTO error entering the solution.
@@ -515,7 +519,7 @@ end
     @test obs.num_distinct_sats_required == 5 # 3 position + 2 clocks
     @test obs.num_distinct_sats == 8
     @test GNSSReceiver.is_epoch_solvable(obs, 8)
-    @test isnothing(obs.ggto_constraint)
+    @test isempty(obs.gpst_offset_constraints)
 
     # The same layout with only five measurements is one short. Without a
     # decoded GGTO there is nothing to collapse onto, so the epoch stays
@@ -526,7 +530,7 @@ end
     @test obs.num_unknowns == 6
     @test length(members) < obs.num_unknowns
     @test !GNSSReceiver.is_epoch_solvable(obs, length(members))
-    @test isnothing(obs.ggto_constraint)
+    @test isempty(obs.gpst_offset_constraints)
 
     # With the GGTO decoded, the Galileo clock collapses onto the GPS one: one
     # unknown fewer, and the collapse is handed back as the pseudo-measurement
@@ -547,12 +551,12 @@ end
         clock_bias_index = gal_clock,
         decoder = with_ggto(test_decoder_state(GalileoE1B(), 4), 1e-9),
     )
-    @test PositionVelocityTime.ggto_available(ggto_e1b.sat_state.decoder)
+    @test PositionVelocityTime.gpst_offset_available(ggto_e1b.sat_state.decoder)
     members = [gps(1), gps(2), gps(3), ggto_e1b, e5a(5)]
     obs = GNSSReceiver.assess_bias_observability(vt, members, 1:5)
     @test obs.num_unknowns == 5
     @test length(members) >= obs.num_unknowns
-    gst_state, gpst_state, isb = obs.ggto_constraint
+    gst_state, gpst_state, isb = only(obs.gpst_offset_constraints)
     @test gst_state == gal_clock
     @test gpst_state == gps_clock
     @test isb ≈ -PositionVelocityTime.SPEEDOFLIGHT * 1e-9
@@ -571,7 +575,7 @@ end
     members = [gps(1), gps(2), gps(3), gps(4), gps(5), gps(6), e5a(7)]
     obs = GNSSReceiver.assess_bias_observability(vt, members, 1:7)
     @test obs.num_unknowns == 5
-    @test isnothing(obs.ggto_constraint) # this E5a member carries no GGTO
+    @test isempty(obs.gpst_offset_constraints) # this E5a member carries no GGTO
     members[7] = _test_member(;
         prn = 7,
         group_key = :GalileoE5aI,
@@ -586,7 +590,7 @@ end
     # 1 IFB. The two effects happen to cancel here; they are separately real.
     obs = GNSSReceiver.assess_bias_observability(vt, members, 1:7)
     @test obs.num_unknowns == 5
-    @test !isnothing(obs.ggto_constraint)
+    @test length(obs.gpst_offset_constraints) == 1
 
     # A band whose component reference carries no measurement this cycle is not an unknown
     # of the cycle: with the L1 satellites gone, the L5 delay is collinear with the (single)
@@ -607,7 +611,7 @@ end
     @test obs.num_unknowns == 4
     @test obs.num_distinct_sats == 4
     @test GNSSReceiver.is_epoch_solvable(obs, 4)
-    @test isnothing(obs.ggto_constraint)
+    @test isempty(obs.gpst_offset_constraints)
 
     # With both bands present the bias is observable again and does count.
     l1(prn) = _test_member(; prn, group_key = :GPSL1CA)
@@ -637,6 +641,70 @@ end
     )
     @test obs.num_distinct_sats == 4
     @test GNSSReceiver.is_epoch_solvable(obs, 7)
+
+    # A mixed epoch collapses each non-GPS clock through its own broadcast offset —
+    # Galileo through the GGTO, BeiDou through the BGTO — independently and in one cycle,
+    # which is what `decide_bias_layout` does on the scalar side. B1I is on its own
+    # carrier, so the independent layout's coverage graph is disconnected (GPS and Galileo
+    # on L1, BeiDou alone on B1I) and the collapse is what reconnects it: two clock
+    # unknowns go and the B1I inter-frequency bias becomes observable, and countable,
+    # again — 3 + 3 clocks + 0 IFBs recounted as 3 + 1 clock + 1 IFB.
+    tri = GNSSReceiver.NavFilterLayout((GPSL1CA(), GalileoE1B(), BeiDouB1I()))
+    vt_tri = GNSSReceiver.VectorTrackingState(VectorTracking(), tri)
+    gal_tri = tri.clock_bias_index_by_group[:GalileoE1B]
+    bds_tri = tri.clock_bias_index_by_group[:BeiDouB1I]
+    # The legacy D1 message broadcasts the BGTO as a bare `A_0GPS`/`A_1GPS` pair with no
+    # reference epoch, so at `time = 0.0` the offset is `A_0GPS` itself.
+    function with_bgto(decoder, a_0gps)
+        data = decoder.data
+        data = @set data.A_0GPS = a_0gps
+        data = @set data.A_1GPS = 0.0
+        data = @set data.WN = 0
+        @set decoder.data = data
+    end
+    gal_member = _test_member(;
+        prn = 4,
+        group_key = :GalileoE1B,
+        signal = GalileoE1B(),
+        clock_bias_index = gal_tri,
+        decoder = with_ggto(test_decoder_state(GalileoE1B(), 4), 1e-9),
+    )
+    bds_member = _test_member(;
+        prn = 21,
+        group_key = :BeiDouB1I,
+        signal = BeiDouB1I(),
+        clock_bias_index = bds_tri,
+        decoder = with_bgto(test_decoder_state(BeiDouB1I(), 21), 3e-9),
+    )
+    @test PositionVelocityTime.gpst_offset_available(bds_member.sat_state.decoder)
+    gps_tri = tri.clock_bias_index_by_group[:GPSL1CA]
+    gps_of(prn) = _test_member(; prn, group_key = :GPSL1CA, clock_bias_index = gps_tri)
+    mixed = [gps_of(1), gps_of(2), gps_of(3), gal_member, bds_member]
+    obs = GNSSReceiver.assess_bias_observability(vt_tri, mixed, 1:5)
+    @test obs.num_unknowns == 5              # 3 position + the surviving GPS clock + 1 IFB
+    @test obs.num_distinct_sats_required == 4
+    @test GNSSReceiver.is_epoch_solvable(obs, 5)
+    @test length(obs.gpst_offset_constraints) == 2
+    by_state = Dict(
+        state => (ref, isb) for (state, ref, isb) in obs.gpst_offset_constraints
+    )
+    @test by_state[gal_tri][1] == gps_tri
+    @test by_state[gal_tri][2] ≈ -PositionVelocityTime.SPEEDOFLIGHT * 1e-9
+    @test by_state[bds_tri][1] == gps_tri
+    @test by_state[bds_tri][2] ≈ -PositionVelocityTime.SPEEDOFLIGHT * 3e-9
+
+    # Only the systems that actually carry an offset collapse: drop the BeiDou one's BGTO
+    # and its clock stays an unknown of its own while Galileo's still merges.
+    mixed[5] = _test_member(;
+        prn = 21,
+        group_key = :BeiDouB1I,
+        signal = BeiDouB1I(),
+        clock_bias_index = bds_tri,
+    )
+    obs = GNSSReceiver.assess_bias_observability(vt_tri, mixed, 1:5)
+    @test length(obs.gpst_offset_constraints) == 1
+    @test only(obs.gpst_offset_constraints)[1] == gal_tri
+    @test obs.num_unknowns == 5               # 3 position + GPS clock + BeiDou clock
 
     # The position uncertainty reported with the solution is the root sum of the position
     # variances, read off the position block of P.

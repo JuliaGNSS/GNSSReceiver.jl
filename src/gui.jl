@@ -25,10 +25,11 @@ GUIData(
 # band is appended after a space (`G30 L5`). This keeps the satellite ID
 # unambiguous — `G05` is GPS PRN 5, never "GPS L5" — and drops the I/Q/CA signal
 # component for compactness. Band tokens use the familiar frequency-band names
-# (GPS L1/L2/L5, Galileo E1/E5a); the modernized GPS L1C civil signal keeps "L1C"
-# so it is not confused with L1 C/A ("L1"). The band token is right-padded to the
-# widest name (3 chars: "E5a"/"L1C") so every label is the same width and the bars
-# line up in a column regardless of band.
+# (GPS L1/L2/L5, Galileo E1/E5a/E5b/E6, BeiDou B1I/B1C/B2a/B2b/B3I); the modernized GPS
+# L1C civil signal keeps "L1C" so it is not confused with L1 C/A ("L1"). The band token is
+# right-padded to the widest name (3 chars — "E5a", "L1C", "B2a" and the rest) so every
+# label is the same width and the bars line up in a column regardless of band. Every PRN
+# still fits two digits, BeiDou's 63 included.
 const CONSTELLATION_LETTERS =
     Dict(:GPS => "G", :Galileo => "E", :GLONASS => "R", :BeiDou => "C", :Other => "?")
 
@@ -39,6 +40,12 @@ const CONSTELLATION_LETTERS =
 # (Galileo calls 1575.42 MHz E1 and 1176.45 MHz E5a), so it is stated here. The "L1C"
 # entries are a further display choice of ours: IS-GPS-800 calls that band L1, but the bar
 # chart spells the modernized signal "L1C" so it cannot be misread as L1 C/A.
+#
+# BeiDou is the one constellation whose band label alone would be ambiguous, so its
+# tokens are the ICD's *signal* labels: BDS calls both 1561.098 MHz and 1575.42 MHz "B1"
+# and both 1176.45 MHz and 1207.14 MHz "B2", so "B1"/"B2" would name two different
+# carriers each. "B1I", "B1C", "B2a", "B2b" and "B3I" are the labels the five ICDs are
+# titled with, and the ones RINEX 3 distinguishes those carriers by.
 const BAND_ABBREVIATIONS = Dict(
     :GPSL1CA => "L1",
     :GPSL1C_D => "L1C",
@@ -56,6 +63,17 @@ const BAND_ABBREVIATIONS = Dict(
     :GalileoE1C_BOC11 => "E1",
     :GalileoE5aI => "E5a",
     :GalileoE5aQ => "E5a",
+    :GalileoE5bI => "E5b",
+    :GalileoE5bQ => "E5b",
+    :GalileoE6B => "E6",
+    :GalileoE6C => "E6",
+    :BeiDouB1I => "B1I",
+    :BeiDouB1C_D => "B1C",
+    :BeiDouB1C_P => "B1C",
+    :BeiDouB2aI => "B2a",
+    :BeiDouB2aQ => "B2a",
+    :BeiDouB2bI => "B2b",
+    :BeiDouB3I => "B3I",
 )
 
 # Every signal the GUI knows how to display, listed in the order the CN0 bar chart shows
@@ -83,6 +101,22 @@ const DISPLAYED_SIGNALS = (
     GalileoE1C_BOC11,
     GalileoE5aI,
     GalileoE5aQ,
+    # `GalileoE5aQP` is deliberately absent: the E5a quasi-pilot is an acquisition aid
+    # (OS SIS ICD Issue 2.2 §2.3.1.4), not a component to range on — its 330-chip code
+    # repeats every 2/31 ms — and this receiver has no acquisition path that uses it.
+    GalileoE5bI,
+    GalileoE5bQ,
+    GalileoE6B,
+    GalileoE6C,
+    # BeiDou by ascending band number, which puts the legacy B1I before B1C on the other
+    # B1 carrier just as GPS L1 C/A precedes L1C.
+    BeiDouB1I,
+    BeiDouB1C_D,
+    BeiDouB1C_P,
+    BeiDouB2aI,
+    BeiDouB2aQ,
+    BeiDouB2bI,
+    BeiDouB3I,
 )
 
 # Constellation of each displayed signal, from GNSSSignals' `get_constellation_id`: which
@@ -134,25 +168,36 @@ sat_sort_key((system_key, prn)::Tuple{Symbol,Int}) = (
     get(SIGNAL_ORDER, system_key, 99),
 )
 
-# Frequency bands in display order (L1 < L2 < L5, i.e. ascending band number), used to rank
-# and label the inter-frequency biases — matching the per-constellation band order of the
-# CN0 bar chart. As types, for the same reason as `DISPLAYED_SIGNALS`.
-const DISPLAYED_BANDS = (L1, L2, L5)
+# Every frequency band the GUI ranks and labels, used for the inter-frequency biases. As
+# types, for the same reason as `DISPLAYED_SIGNALS`. The order written here is immaterial —
+# `BAND_ORDER` sorts them — so this is simply the set of bands GNSSSignals defines.
+const DISPLAYED_BANDS = (L1, L2, L5, B1I, B3I, E5b, E6)
 
 # Rank and display name per band, keyed by `get_band_id` — exactly what
 # `pvt.inter_frequency_biases` is keyed by. The name comes from `get_band_name`; here it is
 # the band's own label that is wanted (an inter-frequency bias is one RF-chain delay of one
 # shared carrier, so it has no constellation), unlike the per-signal `BAND_ABBREVIATIONS`.
 # An unlisted band sorts last (rank 99) and prints its id.
-const BAND_ORDER = Dict(get_band_id(B) => i for (i, B) in enumerate(DISPLAYED_BANDS))
+#
+# Ranked by *descending* carrier frequency — the only rule that survives bands from more
+# than one constellation, since a band is one shared RF carrier with no constellation of
+# its own (1207.14 MHz is E5b to Galileo and B2b to BeiDou). Sorted rather than
+# hand-ordered, so adding a band above cannot put it in the wrong place. No tie-break is
+# needed: band identity in GNSSSignals *is* the carrier, so two `Band`s on one frequency
+# would be one `Band`; the test asserting `length(BAND_ORDER) == length(DISPLAYED_BANDS)`
+# catches a collision on `get_band_id` should that invariant ever break.
+const BAND_ORDER = Dict(
+    get_band_id(B) => i for (i, B) in
+    enumerate(sort(collect(DISPLAYED_BANDS); by = B -> -get_center_frequency(B)))
+)
 const BAND_NAMES = Dict(get_band_id(B) => get_band_name(B) for B in DISPLAYED_BANDS)
 
 band_name(band::Symbol) = get(BAND_NAMES, band, string(band))
 
-# Time systems in display order (GPS < Galileo < …), mirroring `CONSTELLATION_ORDER`, used
-# to rank the inter-system biases. Keyed by `get_time_system_id`, which is also how a
+# Time systems in display order (GPS < Galileo < BeiDou), mirroring `CONSTELLATION_ORDER`,
+# used to rank the inter-system biases. Keyed by `get_time_system_id`, which is also how a
 # `pvt.inter_system_biases` key — a `TimeSystem` *instance* — reduces to a symbol.
-const DISPLAYED_TIME_SYSTEMS = (GPST, GST)
+const DISPLAYED_TIME_SYSTEMS = (GPST, GST, BDT)
 const TIME_SYSTEM_ORDER =
     Dict(get_time_system_id(T) => i for (i, T) in enumerate(DISPLAYED_TIME_SYSTEMS))
 

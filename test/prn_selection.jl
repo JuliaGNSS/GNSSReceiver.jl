@@ -5,8 +5,22 @@
     # modernized GPS signals only on newer blocks.
     @test G.broadcasting_prns(GPSL1CA()) === nothing
     @test G.broadcasting_prns(GalileoE5aI()) === nothing
+    @test G.broadcasting_prns(GalileoE5bI()) === nothing
+    @test G.broadcasting_prns(GalileoE6B()) === nothing
     @test !isnothing(G.broadcasting_prns(GPSL5I()))
     @test issubset(G.broadcasting_prns(GPSL5I()), G.broadcasting_prns(GPSL2CM()))
+
+    # B1C/B2a/B2b are BDS-3 MEO/IGSO signals, so they are restricted to the PRNs BDS-3
+    # assigns those orbits (19-50) — its GEO satellites (59-62) and all of BDS-2 (below
+    # 19) are excluded. B1I/B3I are on every BeiDou satellite ever flown, so unrestricted.
+    for signal in (BeiDouB1C_D(), BeiDouB1C_P(), BeiDouB2aI(), BeiDouB2aQ(), BeiDouB2bI())
+        @test G.broadcasting_prns(signal) == 19:50
+        # Inside the PRNs the B2b ICD defines a ranging code for; outside them GNSSSignals
+        # has an all-zero code column, which correlates to nothing.
+        @test issubset(G.broadcasting_prns(signal), 6:58)
+    end
+    @test G.broadcasting_prns(BeiDouB1I()) === nothing
+    @test G.broadcasting_prns(BeiDouB3I()) === nothing
 
     gps = [1, 4, 7, 8, 9, 11, 13, 17, 18, 19, 28, 30]
     gal = [3, 9, 11, 12, 24, 25, 31, 33]
@@ -33,6 +47,14 @@
     # `nothing` ⇒ constellation default, still capability-filtered.
     @test G.search_prns(nothing, GPSL1CA()) == collect(1:32)
     @test G.search_prns(nothing, GPSL5I()) == G.broadcasting_prns(GPSL5I())
+
+    # BeiDou's default is its whole 1:63 PRN space — a GPS-sized 1:32 default would
+    # silently skip most of BDS-3 — and the BDS-3 signals narrow it to the MEO/IGSO PRNs.
+    @test G.search_prns(nothing, BeiDouB1I()) == collect(1:63)
+    @test G.search_prns(nothing, BeiDouB2aI()) == collect(19:50)
+    @test G.search_prns((BeiDou = [3, 20, 60],), BeiDouB1I()) == [3, 20, 60]
+    # 3 is BDS-2 and 60 is a BDS-3 GEO; neither carries B1C.
+    @test G.search_prns((BeiDou = [3, 20, 60],), BeiDouB1C_D()) == [20]
 
     # Backwards compatible: a plain collection applies to every system.
     @test G.search_prns([1, 8, 30, 7], GPSL5I()) == [1, 8, 30]  # 7 is not L5-capable

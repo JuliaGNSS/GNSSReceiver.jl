@@ -683,7 +683,12 @@ end
     end
     @test GNSSReceiver.constellation_of(:GPSL1CA) === :GPS
     @test GNSSReceiver.constellation_of(:GalileoE5aQ) === :Galileo
+    @test GNSSReceiver.constellation_of(:GalileoE5bI) === :Galileo
+    @test GNSSReceiver.constellation_of(:GalileoE6B) === :Galileo
+    @test GNSSReceiver.constellation_of(:BeiDouB1I) === :BeiDou
+    @test GNSSReceiver.constellation_of(:BeiDouB2bI) === :BeiDou
     @test GNSSReceiver.constellation_name(:Galileo) == "Galileo"
+    @test GNSSReceiver.constellation_name(:BeiDou) == "BeiDou"
     # A signal the GUI does not know lands in `:Other` instead of erroring — the id no
     # longer has to begin with its constellation's name for this to work.
     @test GNSSReceiver.constellation_of(:SomeFutureSignal) === :Other
@@ -697,6 +702,14 @@ end
     @test GNSSReceiver.sat_label(:GPSL1C_P, 30) == "G30 L1C"
     @test GNSSReceiver.sat_label(:GalileoE1B, 24) == "E24 E1 "
     @test GNSSReceiver.sat_label(:GalileoE5aQ, 7) == "E07 E5a"
+    @test GNSSReceiver.sat_label(:GalileoE5bI, 24) == "E24 E5b"
+    @test GNSSReceiver.sat_label(:GalileoE6B, 24) == "E24 E6 "
+    # BeiDou takes the ICD's signal labels, since its own band numbers name two carriers
+    # each — and its PRN space reaches 63 without widening the label.
+    @test GNSSReceiver.sat_label(:BeiDouB1I, 6) == "C06 B1I"
+    @test GNSSReceiver.sat_label(:BeiDouB1C_P, 21) == "C21 B1C"
+    @test GNSSReceiver.sat_label(:BeiDouB2bI, 46) == "C46 B2b"
+    @test GNSSReceiver.sat_label(:BeiDouB3I, 63) == "C63 B3I"
     @test allequal(
         length(GNSSReceiver.sat_label(id, 1)) for
         id in keys(GNSSReceiver.BAND_ABBREVIATIONS)
@@ -706,12 +719,17 @@ end
     # each signal's position in `DISPLAYED_SIGNALS` (ascending band, data before pilot).
     # A BOC(1,1) approximation ranks with the E1 signal it stands in for, so it sorts
     # before E5a rather than after everything known.
+    # BeiDou sorts after Galileo, its legacy B1I before B1C on the other B1 carrier.
     keys_ = [
+        (:BeiDouB1C_D, 5),
         (:GalileoE5aI, 5),
+        (:GalileoE6B, 5),
         (:GPSL5I, 5),
         (:GPSL1CA, 5),
         (:GalileoE1B, 5),
+        (:BeiDouB1I, 5),
         (:GPSL1CA, 3),
+        (:GalileoE5bI, 5),
         (:GalileoE1B_BOC11, 5),
     ]
     @test sort(keys_; by = GNSSReceiver.sat_sort_key) == [
@@ -721,6 +739,10 @@ end
         (:GalileoE1B, 5),
         (:GalileoE1B_BOC11, 5),
         (:GalileoE5aI, 5),
+        (:GalileoE5bI, 5),
+        (:GalileoE6B, 5),
+        (:BeiDouB1I, 5),
+        (:BeiDouB1C_D, 5),
     ]
     # An unknown signal sorts last (`:Other`) instead of erroring.
     unknown_last =
@@ -735,14 +757,21 @@ end
         @test GNSSReceiver.band_name(get_band_id(B)) == get_band_name(B)
     end
     @test GNSSReceiver.band_name(get_band_id(L1)) == "L1"
-    @test GNSSReceiver.BAND_ORDER[get_band_id(L1)] <
-          GNSSReceiver.BAND_ORDER[get_band_id(L2)] <
-          GNSSReceiver.BAND_ORDER[get_band_id(L5)]
-    @test GNSSReceiver.band_name(:E6) == "E6"   # a band we don't rank still prints
+    # Ranked by descending carrier frequency, which reproduces L1 < L2 < L5 and is the
+    # only rule that can rank bands of different constellations against each other — the
+    # BeiDou and Galileo bands interleave with the GPS ones rather than following them.
+    rank(B) = GNSSReceiver.BAND_ORDER[get_band_id(B)]
+    @test rank(L1) < rank(L2) < rank(L5)
+    @test rank(L1) < rank(B1I) < rank(E6) < rank(B3I) < rank(L2) < rank(E5b) < rank(L5)
+    # Every displayed band is ranked exactly once, whatever order the tuple lists them in.
+    @test length(GNSSReceiver.BAND_ORDER) == length(GNSSReceiver.DISPLAYED_BANDS)
+    # A band we don't rank still prints, by its id.
+    @test GNSSReceiver.band_name(:SomeFutureBand) == "SomeFutureBand"
 
-    # Time systems are ranked by `get_time_system_id`, GPS before Galileo.
+    # Time systems are ranked by `get_time_system_id`, GPS before Galileo before BeiDou.
     @test GNSSReceiver.TIME_SYSTEM_ORDER[get_time_system_id(GPST())] <
-          GNSSReceiver.TIME_SYSTEM_ORDER[get_time_system_id(GST())]
+          GNSSReceiver.TIME_SYSTEM_ORDER[get_time_system_id(GST())] <
+          GNSSReceiver.TIME_SYSTEM_ORDER[get_time_system_id(BDT())]
 end
 
 @testset "PVT diagnostics name time systems and bands" begin

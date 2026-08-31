@@ -46,12 +46,32 @@
     @test G.acquisition_signal(l2c, fs, nothing) isa GPSL2CM
     @test G.acquisition_signal(l2c, fs, 0.67Hz) isa GPSL2CL
 
+    # The new pilots land on the branches `acquisition_signal`'s comment claims for them.
+    # E5b-Q, E6-C and B2a-Q all carry a length-100 secondary over a 1 ms code, so they
+    # behave exactly as E5a-Q does: unacquirable coherently at N>1, hence the data
+    # component at any requested resolution.
+    e5b = G.CombinedSignal(GalileoE5bQ(), GalileoE5bI())
+    e6 = G.CombinedSignal(GalileoE6C(), GalileoE6B())
+    b2a = G.CombinedSignal(BeiDouB2aQ(), BeiDouB2aI())
+    @test G.acquisition_signal(e5b, fs, 100Hz) isa GalileoE5bI
+    @test G.acquisition_signal(e5b, fs, 10Hz) isa GalileoE5bI
+    @test G.acquisition_signal(e6, fs, 100Hz) isa GalileoE6B
+    @test G.acquisition_signal(b2a, fs, 100Hz) isa BeiDouB2aI
+    # B1C-P is the L1C-P case: a 10 ms code already resolves 100 Hz at N=1, so its
+    # length-1800 secondary never comes into play and the pilot always wins.
+    b1c = G.CombinedSignal(BeiDouB1C_P(), BeiDouB1C_D())
+    @test G.acquisition_signal(b1c, fs, 100Hz) isa BeiDouB1C_P
+    @test G.acquisition_signal(b1c, fs, nothing) isa BeiDouB1C_P
+
     # A plain (non-combined) signal is always its own acquisition signal (the exact
-    # object passed in is returned unchanged).
+    # object passed in is returned unchanged). BeiDou B1I, B3I and B2b-I have no pilot
+    # component at all, so they are only ever used this way.
     l1ca = GPSL1CA()
     e1b = GalileoE1B()
+    b1i = BeiDouB1I()
     @test G.acquisition_signal(l1ca, fs, 100Hz) === l1ca
     @test G.acquisition_signal(e1b, fs, nothing) === e1b
+    @test G.acquisition_signal(b1i, fs, 100Hz) === b1i
 end
 
 @testset "signal_group_key uses the ranging signal (matches pvt.sats)" begin
