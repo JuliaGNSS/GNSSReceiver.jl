@@ -1388,6 +1388,17 @@ function main()
         doppler_estimator = ConventionalAssistedPLLAndDLL(;
             carrier_loop_filter_bandwidth = 12.0Hz,
         ),
+        # Hold a satellite through a fade rather than dropping it at the
+        # default 30 dBHz. Losing lock is not free here: reacquisition builds a
+        # fresh `GNSSDecoderState`, so the ~30 s of consecutive error-free
+        # subframes an ephemeris needs starts over, and a fix needs four
+        # satellites to finish that run *at the same time*. Measured on sky: the
+        # 31-40 dBHz satellites breathe several dB either side of the threshold
+        # and cycle in and out every few tens of seconds, which is exactly long
+        # enough to never finish. The floor still has to sit above where the
+        # loops themselves let go — 24 dBHz is ~6 dB of fade margin on a 1 ms
+        # discriminator, not an invitation to track noise.
+        code_lock_cn0_threshold = 24.0u"dBHz",
         extract = my_extract,
     )
 
