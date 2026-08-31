@@ -840,9 +840,20 @@ function _arm_noise_channel!(link, signal, sampling_freq)
     # cross-correlation with a strong satellite happens to be unusually high is
     # then one observation in the window, not the window.
     link.noise_prn = Int32(mod(Int(link.noise_prn), 32) + 1)
-    # Taps a whole chip apart, so the three of them are three independent looks
-    # at the same noise — which is exactly what pooling them assumes.
-    el_sample_spacing = max(1, round(Int, 2 * link.sampling_freq_hz / ustrip(Hz, code_frequency)))
+    # The same quantised spacing a tracked satellite gets, asked of `Tracking` the
+    # same way `_assign!` asks. Wider taps would be better — at a whole chip the
+    # three of them are three *independent* looks, which is what pooling them
+    # assumes — but a device's code RAM reaches a bounded number of chips either
+    # side of prompt (the M2SDR's is ±1, and it rejects anything further), and a
+    # spacing it refuses is a channel that never starts. At half a chip the taps
+    # are correlated, so the window's variance improves a little more slowly
+    # than `1/M`; each tap on its own is still an unbiased look at the noise
+    # power, so the density itself is unaffected.
+    el_sample_spacing = Tracking.get_early_late_sample_spacing(
+        Tracking.EarlyPromptLateCorrelator(num_ants = Tracking.NumAnts(size(link.noise_accumulator, 1))),
+        sampling_freq,
+        code_frequency,
+    )
     assign_channel!(
         link.sdr,
         link.noise_channel,
