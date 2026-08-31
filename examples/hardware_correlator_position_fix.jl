@@ -120,7 +120,7 @@ const CN0_FLOOR_DBHZ = 38.0              # calibration satellite quality gate
 # these are compared against reads ~7 dB optimistic at a 10 ms coherent
 # integration (measured against synthetic truth, issue #107), so 30 here is
 # nearer 23 dBHz in truth.
-const RX_FLOOR_DBHZ = 30.0
+const RX_FLOOR_DBHZ = 25.0
 const MAX_RX_PRNS = 8
 const MAX_SECONDS = length(ARGS) >= 1 ? parse(Float64, ARGS[1]) : 600.0
 const RUN_AFTER_FIX = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 30.0
@@ -1370,7 +1370,11 @@ function main()
         prns = strong_prns,
         acq_min_doppler_coverage = ACQ_COVERAGE,
         acq_coherent_integration_time = 10ms,
-        acq_noncoherent_rounds = 3,
+        # Five rounds rather than three: the satellites that decide whether
+        # there is a fourth at all sit at 25-32 dBHz, where detection
+        # sensitivity is what stands between "searched" and "handed over",
+        # and the scan runs off the processing task anyway.
+        acq_noncoherent_rounds = 5,
         max_meas = 2^11,
         # The first acquisition fires as soon as the buffer fills (the timer
         # starts at -Inf). With asynchronous acquisition the periodic rescan
