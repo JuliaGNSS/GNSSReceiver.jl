@@ -690,7 +690,15 @@ end
 
 # One antenna: the scalar Σ|x|². An array: the raw spatial covariance Σ x·xᴴ,
 # which is what a beamformer's weights reduce to that satellite's own floor.
-_accumulated_power(samples::AbstractVector) = sum(abs2, samples)
+#
+# Every sample is widened before it is squared. Integer sample types are the
+# normal case for a front end (`Complex{Int16}` here), and Julia's integer
+# arithmetic does not widen: `abs2` on a `Complex{Int16}` whose magnitude
+# exceeds 181 wraps *inside the element* — `sum` then adds up already-corrupted
+# terms in `Int64` and returns a plausible-looking number that is too small by
+# a random factor. A noise floor too small by 5x is a C/N₀ too high by 7 dB, on
+# every satellite, with nothing else looking wrong.
+_accumulated_power(samples::AbstractVector) = sum(x -> abs2(ComplexF64(x)), samples)
 function _accumulated_power(samples::AbstractMatrix)
     n = size(samples, 2)
     acc = zero(SMatrix{n,n,ComplexF64})
