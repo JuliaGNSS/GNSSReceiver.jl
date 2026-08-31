@@ -80,6 +80,20 @@ using SignalChannels:
 export ReceiverState,
     receive,
     VectorTracking,
+    AbstractHardwareCorrelatorSDR,
+    CorrelatorDump,
+    NCOUpdate,
+    HardwareCorrelatorLink,
+    raw_sample_channel,
+    correlator_dump_channel,
+    nco_update_channel,
+    num_hardware_channels,
+    assign_channel!,
+    release_channel!,
+    dropped_dump_count!,
+    correlator_gain,
+    epoch_strobe,
+    is_epoch_strobe,
     CombinedSignal,
     read_files,
     read_uint8_iq_file,
@@ -674,8 +688,12 @@ function ReceiverState(
     acquisition_buffers::NamedTuple;
     num_ants::NumAnts = NumAnts(1),
     vector_tracking::Union{Bool,VectorTracking} = false,
+    # `nothing` ⇒ derived from `vector_tracking`; an explicit estimator overrides
+    # it (a hardware-correlator loop retunes the loop-filter bandwidths).
+    doppler_estimator = nothing,
 )
-    doppler_estimator = doppler_estimator_for(vector_tracking)
+    doppler_estimator =
+        something(doppler_estimator, doppler_estimator_for(vector_tracking))
     systems = _flatten_systems(band_systems)
     assert_decodable(systems)
     group_keys = map(signal_group_key, systems)
@@ -746,16 +764,19 @@ function ReceiverState(
     num_samples_for_acquisition,
     num_ants::NumAnts = NumAnts(1),
     vector_tracking::Union{Bool,VectorTracking} = false,
+    doppler_estimator = nothing,
 ) where {T}
     systems = as_systems(systems)
     band_key = get_band_id(system_band(first(systems)))
     buffers = NamedTuple{(band_key,)}((SampleBuffer(T, num_samples_for_acquisition),))
-    ReceiverState((systems,), buffers; num_ants, vector_tracking)
+    ReceiverState((systems,), buffers; num_ants, vector_tracking, doppler_estimator)
 end
 
 include("read_file.jl")
+include("hardware_correlator.jl")
 include("receive.jl")
 include("process.jl")
+include("async_acquisition.jl")
 include("gui.jl")
 # The terminal dashboard is a Tachikoma app in its own module, so the UI framework's
 # exports stay out of `GNSSReceiver`'s namespace; only `gui` crosses back over.

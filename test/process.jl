@@ -587,15 +587,15 @@ end
     @test isempty(acquired)
 end
 
-@testset "try_to_reacquire_lost_satellites counts failed reacquisitions" begin
+@testset "Fast per-satellite reacquisition is off by default" begin
+    # `max_reacquire_attempts` defaults to 0, so no fast attempt ever fires: a
+    # full-grid `acquire!` per lost satellite is seconds of CPU on an embedded
+    # host, and the periodic rescan (`acquire_every`) recovers losses instead.
     system = GPSL1CA()
     num_ants = NumAnts(1)
     sampling_freq = 5e6Hz
     acq_plan = plan_acquire(system, float(sampling_freq), collect(1:32))
 
-    # Fill the acquisition buffer with noise so the reacquisition attempt runs but the
-    # (deterministic) acquisition finds nothing, driving the failed-reacquisition
-    # counter path.
     rng = Random.Xoshiro(1)
     noise = randn(rng, ComplexF64, 20000) * 512
     acquisition_buffer = GNSSReceiver.SampleBuffers.buffer(
@@ -607,9 +607,10 @@ end
     track_state = single_sat_track_state(system, 5)
     receiver_sat_states = Dictionary(
         [5],
-        [out_of_lock_sat_state(system, 5; time_out_of_lock = 0.25u"s")],
+        [out_of_lock_sat_state(system, 5; time_out_of_lock = 100.0u"s")],
     )
-    @test GNSSReceiver.should_reacquire(receiver_sat_states[5])
+    # However long a satellite has been out of lock, the default schedules nothing.
+    @test !GNSSReceiver.should_reacquire(receiver_sat_states[5])
 
     _, updated_receiver_sat_states = GNSSReceiver.try_to_reacquire_lost_satellites(
         track_state,
@@ -624,5 +625,49 @@ end
         20000,
         true,
     )
-    @test updated_receiver_sat_states[5].num_unsuccessful_reacquisition == 1
+    # No attempt ⇒ nothing counted, and the states come back untouched.
+    @test updated_receiver_sat_states === receiver_sat_states
+    @test updated_receiver_sat_states[5].num_unsuccessful_reacquisition == 0
+end
+
+@testset "The reacquisition back-off is quadratic in the attempt count" begin
+    # The schedule itself, with the knobs enabled: attempt n+1 waits for the
+    # n-th back-off step, so attempts land at ~0.2, 0.8, 1.8, 3.2 s out of lock
+    # at a 200 ms base — never once per frame — and stop after
+    # `max_reacquire_attempts`.
+    system = GPSL1CA()
+    knobs = (; reacquire_backoff = 200u"ms", max_reacquire_attempts = 3)
+    state(n, t) = GNSSReceiver.ReceiverSatState(
+        5,
+        GNSSDecoderState(system, 5),
+        out_of_lock_code_detector(),
+        GNSSReceiver.CarrierLockDetector(),
+        0.0u"s",
+        uconvert(u"s", float(t)),
+        n,
+        false,
+    )
+    for (n, due) in enumerate((0.2u"s", 0.8u"s", 1.8u"s"))
+        @test !GNSSReceiver.should_reacquire(state(n - 1, due - 1u"ms"); knobs...)
+        @test GNSSReceiver.should_reacquire(state(n - 1, due); knobs...)
+    end
+    # Attempts are capped, however long the satellite stays out of lock.
+    @test !GNSSReceiver.should_reacquire(state(3, 60u"s"); knobs...)
+    # And a satellite that is in lock is never a candidate.
+    @test !GNSSReceiver.should_reacquire(
+        GNSSReceiver.ReceiverSatState(system, 5);
+        knobs...,
+    )
+end
+
+@testset "A counted failed reacquisition advances the back-off" begin
+    system = GPSL1CA()
+    s0 = out_of_lock_sat_state(system, 5; time_out_of_lock = 0.25u"s")
+    s1 = GNSSReceiver.increment_num_unsuccessful_reacquisition(s0)
+    @test s1.num_unsuccessful_reacquisition == 1
+    knobs = (; reacquire_backoff = 200u"ms", max_reacquire_attempts = 3)
+    # The first attempt was due at 0.2 s; having spent it, the same satellite
+    # has to wait until 0.8 s for the next one.
+    @test GNSSReceiver.should_reacquire(s0; knobs...)
+    @test !GNSSReceiver.should_reacquire(s1; knobs...)
 end
