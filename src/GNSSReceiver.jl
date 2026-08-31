@@ -150,15 +150,25 @@ end
 
 # Default PRNs to search per system. Kept conservative to bound the
 # acquisition cost; override via the `prns` keyword of `receive`. The
-# per-constellation supertypes let us default to each system's real PRN range:
-# GPS allocates 1:32, Galileo 1:36 (searching only 1:32 would silently skip the
-# higher Galileo PRNs).
+# per-constellation supertypes let us default to each system's allocated PRN range:
+# GPS 1:32, Galileo 1:36, BeiDou 1:63 — searching only 1:32 would silently skip the
+# higher Galileo PRNs, and, on BeiDou, every satellite above it.
+#
+# BeiDou's 1:63 is the allocated ranging-code space GNSSSignals bakes codes over, NOT a
+# satellite count: BDS flies far fewer than 63, and the space is sparse in the middle.
+# It is still the right default. A range that is too wide costs acquisition time, one
+# that is too narrow silently drops a satellite, and the only way to narrow it honestly
+# would be a hand-maintained snapshot of which PRNs are live — the very thing the GPS
+# block lists below have to carry a caveat for. 1:32 in particular would not be a
+# conservative choice here but a wrong one, since BDS assigns PRNs either side of it
+# (its GEO satellites alone run 59-63, BDS-SIS-ICD-B1I-3.0 §5.1.1).
 default_prns(::AbstractGNSSSignal) = 1:32
 default_prns(::AbstractGalileoSignal) = 1:36
+default_prns(::AbstractBeiDouSignal) = 1:63
 
 # PRNs that actually broadcast a given signal. The modernized GPS civil signals
 # live only on newer satellite blocks — L5 on Block IIF and III, L2C on Block
-# IIR-M, IIF and III — whereas L1 C/A (and every non-GPS signal) is on the whole
+# IIR-M, IIF and III — whereas L1 C/A (and every Galileo signal) is on the whole
 # constellation. Restricting acquisition to these PRNs avoids blind-searching
 # satellites that cannot carry the signal (the GPS L5 search drops from 32 PRNs to
 # ~20). `nothing` means "no restriction — search all requested PRNs".
@@ -171,11 +181,30 @@ const GPS_L5_PRNS =
     [1, 3, 4, 6, 8, 9, 10, 11, 14, 18, 20, 21, 23, 24, 25, 26, 27, 28, 30, 32]
 const GPS_L2C_PRNS = sort(union(GPS_L5_PRNS, [5, 7, 12, 15, 17, 29, 31]))
 
+# BeiDou splits the same way, and one generation further: B1I and B3I are carried by every
+# satellite BDS has flown, while B1C, B2a and B2b are BDS-3 signals broadcast by its MEO
+# and IGSO satellites only ("shall not be transmitted by the Geostationary Earth Orbit
+# (GEO) satellites", BDS-SIS-ICD-B1C-1.0 §1, matched by B2a's §1). Because BDS assigns
+# PRNs by generation and orbit, that turns into a PRN range: BDS-3 MEO and IGSO
+# satellites occupy PRN 19-50, its GEO satellites 59-62, and every PRN below 19 is
+# BDS-2. B2b's ranging codes independently stop in the same place — the ICD defines
+# them for PRN 6-58 only, and an all-zero GNSSSignals code column correlates to nothing.
+#
+# B1I and B3I take the unrestricted default: this predicate answers "can a satellite at
+# this PRN carry this signal at all", not "is one live there now" — availability is the
+# tracking loops' business.
+const BEIDOU_BDS3_MEO_IGSO_PRNS = 19:50
+
 broadcasting_prns(::AbstractGNSSSignal) = nothing
 broadcasting_prns(::GPSL5I) = GPS_L5_PRNS
 broadcasting_prns(::GPSL5Q) = GPS_L5_PRNS
 broadcasting_prns(::GPSL2CM) = GPS_L2C_PRNS
 broadcasting_prns(::GPSL2CL) = GPS_L2C_PRNS
+broadcasting_prns(::BeiDouB1C_D) = BEIDOU_BDS3_MEO_IGSO_PRNS
+broadcasting_prns(::BeiDouB1C_P) = BEIDOU_BDS3_MEO_IGSO_PRNS
+broadcasting_prns(::BeiDouB2aI) = BEIDOU_BDS3_MEO_IGSO_PRNS
+broadcasting_prns(::BeiDouB2aQ) = BEIDOU_BDS3_MEO_IGSO_PRNS
+broadcasting_prns(::BeiDouB2bI) = BEIDOU_BDS3_MEO_IGSO_PRNS
 
 # The candidate PRNs the caller asked to search for `system`. `prns` may be:
 #   * `nothing`                       ⇒ the constellation default (`default_prns`);
@@ -482,8 +511,10 @@ const MAX_SECONDARY_CODE_ROTATIONS = 32
 # overshoots even at `nc == 1`); comparing windows in absolute time catches both.
 #
 # Net: L1C-P / B1C-P take the pilot; L5Q pilot at ≤50 Hz else L5I data; E1C pilot at
-# ≤10 Hz else E1B data; L2CL falls to L2CM data above ~0.67 Hz; E5aQ / B2a-Q (L=100>32)
-# always fall back to data. A plain (non-combined) signal is its own acquisition signal.
+# ≤10 Hz else E1B data; L2CL falls to L2CM data above ~0.67 Hz; E5aQ / E5bQ / E6-C /
+# B2a-Q (L=100>32) always fall back to data. A plain (non-combined) signal — B1I, B3I
+# and B2b-I among them, none of which has a pilot component — is its own acquisition
+# signal.
 acquisition_signal(system::AbstractGNSSSignal, sampling_freq, acq_doppler_resolution) = system
 function acquisition_signal(system::CombinedSignal, sampling_freq, acq_doppler_resolution)
     pilot, data = system.pilot, system.data
