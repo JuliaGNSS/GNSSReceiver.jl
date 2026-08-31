@@ -1336,20 +1336,23 @@ function _account_record_continuity!(
             # re-aligns to the symbol boundary, which is exactly what
             # `coherent_integration_blocks` measures against the bit buffer.
             _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
-            # Hand the fold a record covering exactly the missing span with a
-            # zeroed correlator. `Tracking` reads that as "this much time passed
-            # and nothing is known about it": the loop filters, the prompt
-            # filter and the C/N0 estimator skip it (they would only be poisoned
-            # by a zero prompt), while the bit clock is credited the blocks it
-            # covers. The bit straddling the gap comes out weak, and every bit
-            # after it stays on the 20 ms grid.
-            append_correlator_output!(
+            # Tell the fold that this much signal time passed and nothing is
+            # known about it. This used to append a record spanning the gap with
+            # a *zeroed* correlator, which was a lie the consumer was expected to
+            # see through: a zero correlator is a measurement of nothing, so
+            # every discriminator computes 0/0 and the NaN leaves the loop filter
+            # as a NaN Doppler. The guards in `Tracking`'s discriminators stop
+            # that being fatal, but they turn it into a *quiet* wrong: a
+            # zero-error measurement the loop filter should never have seen, a
+            # zero prompt through the prompt filter, and a zero-power record
+            # averaged into the C/N0 estimate. `advance_bit_clock!` says the one
+            # thing that is actually true and moves nothing else.
+            #
+            # The bit straddling the gap still comes out weak, and every bit
+            # after it stays on the 20 ms grid — which is the whole point.
+            Tracking.advance_bit_clock!(
                 track_state,
-                Tracking.CorrelatorOutput(
-                    zero(get_correlator(sat_state, assignment.signal_index)),
-                    gap,
-                    record_start,
-                ),
+                _gap_code_blocks(link, sat_state, assignment.signal_index, gap),
                 assignment.group_key,
                 assignment.prn,
                 assignment.signal_index,
@@ -1545,6 +1548,19 @@ function _accumulate_dump!(link, track_state, assignment, sat_state, hw_channel,
     link.partial_blocks[hw_channel] >= target &&
         _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
     link
+end
+
+# Whole primary-code blocks a *gap* spans. Same arithmetic as
+# `_record_code_blocks` but without its `max(1, …)` floor: a gap shorter than one
+# code block rounds to zero blocks and must credit nothing, where a record always
+# represents at least the block it was integrated over.
+function _gap_code_blocks(link, sat_state, signal_index, gap_samples)
+    signal = get_signal(Tracking.get_signals(sat_state)[signal_index])
+    round(
+        Int,
+        gap_samples * ustrip(Hz, get_code_frequency(signal)) /
+        (get_code_length(signal) * link.sampling_freq_hz),
+    )
 end
 
 # Whole primary-code blocks a record spans, recovered from its sample count the
