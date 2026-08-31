@@ -262,11 +262,12 @@ end
     link.assignments[1] = GNSSReceiver.HardwareChannelAssignment(:default, prn, 1)
     link.channel_of[link.assignments[1]] = 1
     sampling_freqs = (L1 = 4e6Hz,)
+    band_systems = ((system,),)
     # Balanced accumulators: discriminators read zero, so the Dopplers stay put
     # and every epoch advances the replica by exactly one code length.
     balanced = (; late = 400.0 + 0im, prompt = 1000.0 + 0im, early = 400.0 + 0im)
 
-    fold!() = GNSSReceiver.fold_closed_epochs!(link, track_state, sampling_freqs)
+    fold!() = GNSSReceiver.fold_closed_epochs!(link, track_state, sampling_freqs, band_systems)
     phase() = get_code_phase(get_sat_state(track_state, prn))
 
     # A dump without a reported replica phase cannot anchor anything: the seed
@@ -615,8 +616,12 @@ end
     #    loop gain.
     @test length(results) > 0
     @test !isempty(sdr.handovers)
-    handover = first(sdr.handovers)
-    @test handover.prn == prn
+    # The bank's first handover is the C/N0 reference's own open-loop channel
+    # (it is armed before the satellites, so that it cannot be the thing that
+    # loses the last free channel), so address the satellite's by its PRN.
+    satellite_handovers = filter(h -> h.prn == prn, sdr.handovers)
+    @test !isempty(satellite_handovers)
+    handover = first(satellite_handovers)
     expected_spacing = get_early_late_sample_spacing(
         EarlyPromptLateCorrelator(num_ants = NumAnts(1)),
         sampling_freq,
@@ -660,6 +665,7 @@ end
 end
 
 @testset "A stream gap resynchronises instead of replaying every epoch" begin
+    band_systems = ((GPSL1CA(),),)
     sdr = RecordingSDR(EPL, 2)
     link = HardwareCorrelatorLink(
         sdr;
@@ -687,7 +693,7 @@ end
     # one. The grid must jump instead.
     put!(sdr.dumps, [dump_at(1, 1, 4_000_000)])
     drain_dumps!(link)
-    folds = fold_closed_epochs!(link, empty_state, band_measurements)
+    folds = fold_closed_epochs!(link, empty_state, band_measurements, band_systems)
     @test folds <= 1
     @test link.skipped_epochs > 900
     # And the grid is back in step with the newest record, not a second behind.
@@ -696,6 +702,7 @@ end
 end
 
 @testset "A normal one-or-two-epoch backlog is still folded, not skipped" begin
+    band_systems = ((GPSL1CA(),),)
     sdr = RecordingSDR(EPL, 2)
     link = HardwareCorrelatorLink(
         sdr;
@@ -715,7 +722,7 @@ end
     put!(sdr.dumps, [epoch_strobe(epl(0, 0, 0), 0), epoch_strobe(epl(0, 0, 0), 8000)])
     drain_dumps!(link)
     # Two epochs behind is a backlog, well inside the catch-up bound: fold both.
-    folds = fold_closed_epochs!(link, empty_state, band_measurements)
+    folds = fold_closed_epochs!(link, empty_state, band_measurements, band_systems)
     @test folds == 2
     @test link.skipped_epochs == 0
 end

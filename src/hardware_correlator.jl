@@ -452,6 +452,25 @@ mutable struct HardwareCorrelatorLink{
     const partial_samples::Vector{Int64}
     const partial_blocks::Vector{Int}
     const partial_end::Vector{Int64}
+    # ── Noise reference ───────────────────────────────────────────────────────
+    # Where the C/N₀ estimator's noise density comes from: `:channel` spends a
+    # hardware channel on an open-loop despread (the documented FPGA recipe),
+    # `:samples` meters Σ|x|² off the raw stream. See `append_noise_observations!`.
+    const noise_source::Symbol
+    # The channel the open-loop reference occupies, or 0 while it has none. It
+    # is never handed to a satellite and never receives an `NCOUpdate`.
+    noise_channel::Int
+    # The decoy PRN it currently replicates, and how many epochs since it was
+    # last re-armed onto a fresh PRN / phase / carrier offset.
+    noise_prn::Int32
+    noise_epochs_since_rearm::Int
+    const noise_rearm_epochs::Int
+    # This chunk's pooled accumulation: `Σ b·bᴴ` over every tap of every dump
+    # the noise channel produced (a 1×1 matrix for one antenna), the number of
+    # independent looks that pooled, and the samples one look spans.
+    const noise_accumulator::Matrix{ComplexF64}
+    noise_looks::Int
+    noise_samples_per_look::Int
     # Sample index at which the currently open epoch closes. `typemin` until the
     # first record arrives and anchors the grid (see `_anchor_epoch_grid!`).
     next_epoch_boundary::Int
@@ -481,6 +500,8 @@ function HardwareCorrelatorLink(
     max_catchup_epochs::Integer = 64,
     coherent_code_blocks::Union{Nothing,Integer} = nothing,
     correlator_gain = nothing,
+    noise_source::Symbol = :channel,
+    noise_rearm_interval = 1u"s",
 )
     interval = something(
         doppler_update_interval,
@@ -499,9 +520,19 @@ function HardwareCorrelatorLink(
     max_catchup_epochs >= 1 || throw(
         ArgumentError("max_catchup_epochs must be at least 1 (got $max_catchup_epochs)"),
     )
-    gain = something(correlator_gain, GNSSReceiver.correlator_gain(sdr))
+    noise_source in (:channel, :samples) || throw(
+        ArgumentError("noise_source must be :channel or :samples (got $noise_source)"),
+    )
+    # A `:channel` reference rides the device's own datapath, so the replica
+    # amplitude divides out of the C/N₀ ratio and the declared gain is neither
+    # needed nor wanted; a `:samples` reference does not, and needs it exactly.
+    gain =
+        noise_source === :channel ? 1.0 :
+        Float64(something(correlator_gain, GNSSReceiver.correlator_gain(sdr)))
     gain > 0 ||
         throw(ArgumentError("correlator_gain must be positive (got $gain)"))
+    noise_rearm_epochs =
+        max(1, round(Int, upreferred(noise_rearm_interval * sampling_freq) / epoch_length))
     isnothing(coherent_code_blocks) ||
         coherent_code_blocks >= 1 ||
         throw(
@@ -543,6 +574,14 @@ function HardwareCorrelatorLink(
         zeros(Int64, n),
         zeros(Int, n),
         fill(typemin(Int64), n),
+        noise_source,
+        0,
+        Int32(0),
+        0,
+        noise_rearm_epochs,
+        zeros(ComplexF64, _num_ants(_correlator_type(dump_type)), _num_ants(_correlator_type(dump_type))),
+        0,
+        0,
         typemin(Int),
         typemin(Int),
         0,
@@ -611,50 +650,56 @@ function advance_tracking!(
 
     link.dropped_dumps += dropped_dump_count!(link.sdr)
 
-    # The fold's C/N0 estimator reads a measured noise density, and on this path
-    # nothing else would ever fill it. Do it before the fold, from this chunk's
-    # own samples.
-    append_noise_observations!(link, track_state, band_measurements, band_systems)
-
     drain_dumps!(link)
-    fold_closed_epochs!(link, track_state, band_measurements)
+    fold_closed_epochs!(link, track_state, band_measurements, band_systems)
 
     track_state
 end
 
 """
-    append_noise_observations!(link, track_state, band_measurements, band_systems)
+    append_noise_observations!(link, track_state, band_systems, band_measurements)
 
 Give every signal's noise estimator this chunk's measured noise density.
 
-`Tracking`'s default C/N0 estimator divides a record's prompt power by a
-*measured* density rather than inferring a floor from the prompt's own moments.
-On the software path `track!` fills that reference itself, from the correlate
-phase's dithered wrong-PRN taps. There is no correlate phase here, so without
-this the window would stay empty for the whole run: every satellite would report
-`-Inf dBHz` and the code lock detector would drop it on the first chunk that
-looked at C/N0.
+`Tracking`'s default C/N₀ estimator divides a record's prompt power by a
+*measured* density rather than inferring a floor from the prompt's own moments,
+and on this path nothing else fills it: without this every satellite reports
+`-Inf dBHz` and the code lock detector drops it on the first chunk that looks.
 
-The raw stream is still there — acquisition reads it — and that is enough,
-because a noise *density* is a property of the band and not of a satellite.
-`noise_observation_from_samples` is `Tracking`'s power-monitor source for
-exactly this: the degenerate one-sample sub-integration of the same continuum
-the despread taps sit at the other end of, where the replica collapses to a
-single ±1 and the window mean is the sample variance. One pass over samples the
-receiver already holds, once per chunk, shared by every signal in the band.
+Two sources, chosen by the link's `noise_source`:
 
-The satellites' own power rides in that sum, as it does in any power monitor;
-at GNSS levels it is tens of dB below the noise and moves the density by far
-less than the estimator's own spread.
+  - `:channel` (the default, and the one `Tracking`'s FPGA recipe prescribes)
+    spends one hardware channel on an **open-loop despread** — see
+    [`ensure_noise_channel!`](@ref). Its taps ride the device's own quantise →
+    despread → accumulate datapath, so the replica amplitude, the input scaling
+    and the code amplitude are common to numerator and denominator and divide
+    out of the ratio. That is also what makes the floor the *post-correlation*
+    one, `N₀ + ∫S_I(f)·|G(f)|²df`, measured through the consumer's own code
+    rather than modelled.
+  - `:samples` meters `Σ|x|²` over the chunk's raw samples instead. It is the
+    documented power-monitor builder and it reduces to the same `N₀` on white
+    input, so on a thermal-dominated band the two agree — but it weights every
+    frequency flatly, so a coloured interferer moves it by an amount that has
+    nothing to do with what the despreading modulation would actually collect.
+    It also needs the device's replica amplitude declared by hand
+    ([`correlator_gain`](@ref)), because nothing cancels. Kept as a control and
+    as a fallback for a device that cannot spare a channel.
+
+A noise *density* is a property of the band and the modulation, not of a
+satellite, so one observation serves every satellite tracking that signal.
 """
-function append_noise_observations!(link, track_state, band_measurements, band_systems)
+function append_noise_observations!(link, track_state, band_systems, band_measurements)
     isempty(track_state.noise_estimators) && return track_state
-    _append_band_noise!(
-        track_state,
-        Tuple(band_measurements),
-        band_systems,
-        keys(track_state.noise_estimators),
-    )
+    if link.noise_source === :channel
+        _flush_channel_noise!(link, track_state, band_systems, band_measurements)
+    else
+        _append_band_noise!(
+            track_state,
+            Tuple(band_measurements),
+            band_systems,
+            keys(track_state.noise_estimators),
+        )
+    end
     track_state
 end
 
@@ -681,7 +726,7 @@ end
 _append_signal_noise!(track_state, observation, ::Tuple{}, configured) = track_state
 function _append_signal_noise!(track_state, observation, signals::Tuple, configured)
     signal_id = get_signal_id(first(signals))
-    # A signal only has an estimator if its C/N0 estimator reads a density;
+    # A signal only has an estimator if its C/N₀ estimator reads a density;
     # appending to one that has none is an error, not a no-op.
     signal_id in configured &&
         Tracking.append_noise_observation!(track_state, observation, signal_id)
@@ -731,9 +776,154 @@ acquired in the same chunk.
 """
 function sync_hardware_channels!(link, track_state, band_systems, band_measurements)
     release_stale_channels!(link, track_state)
+    # Before the satellites, so the reference is not the thing that loses the
+    # last free channel: with no density every satellite's C/N₀ reads
+    # `-Inf dBHz` and they are all dropped, which costs far more than the one
+    # channel.
+    ensure_noise_channel!(link, track_state, band_systems, band_measurements)
     assign_new_channels!(link, track_state, band_systems, band_measurements)
     link
 end
+
+"""
+    ensure_noise_channel!(link, track_state, band_systems, band_measurements)
+
+Keep one hardware channel running an **open-loop despread** as the C/N₀
+estimator's noise reference, and re-arm it periodically.
+
+The channel is an ordinary tracking channel programmed with a *decoy* PRN: same
+code generator, same carrier NCO, same quantisation, same accumulators as every
+satellite. That is the whole point — the reference is then model-free by
+construction, because the replica amplitude, the input scaling and the code
+amplitude are common to it and to the taps it is divided into, and cancel. It
+also makes the measured floor the post-correlation one, weighted by the
+despreading modulation's own spectrum, rather than flat received power.
+
+It is open loop: no discriminator, no loop filter, and `push_nco_updates!` never
+sends it an `NCOUpdate`. Its code Doppler is left at zero while the sky's is
+not, so the relative code phase slides several chips a second and any chance
+alignment decays on its own; every `noise_rearm_epochs` it is additionally
+re-armed onto the next PRN of the family, a fresh uniform code phase and a
+carrier offset drawn from ±5 kHz. Randomising is what keeps a chance alignment
+from becoming a permanent bias, and it is why the reference needs to know
+nothing about which satellites are tracked.
+"""
+function ensure_noise_channel!(link, track_state, band_systems, band_measurements)
+    link.noise_source === :channel || return link
+    isempty(track_state.noise_estimators) && return link
+    signal = _noise_reference_signal(band_systems)
+    isnothing(signal) && return link
+    if link.noise_channel == 0
+        hw_channel = _find_free_channel(link)
+        isnothing(hw_channel) && return link
+        link.noise_channel = hw_channel
+        link.noise_epochs_since_rearm = link.noise_rearm_epochs
+    end
+    link.noise_epochs_since_rearm >= link.noise_rearm_epochs || return link
+    _arm_noise_channel!(link, signal, _band_sampling_frequency(band_measurements, signal))
+end
+
+# The reference despreads one signal, and it is the same one the epoch grid and
+# the handovers are referenced to: the ranging signal of the first system.
+function _noise_reference_signal(band_systems)
+    for systems in band_systems, system in systems
+        for signal in tracking_signals(system)
+            return signal
+        end
+    end
+    nothing
+end
+
+function _arm_noise_channel!(link, signal, sampling_freq)
+    code_frequency = get_code_frequency(signal)
+    # Rotate through the family rather than picking one and staying: a PRN whose
+    # cross-correlation with a strong satellite happens to be unusually high is
+    # then one observation in the window, not the window.
+    link.noise_prn = Int32(mod(Int(link.noise_prn), 32) + 1)
+    # Taps a whole chip apart, so the three of them are three independent looks
+    # at the same noise — which is exactly what pooling them assumes.
+    el_sample_spacing = max(1, round(Int, 2 * link.sampling_freq_hz / ustrip(Hz, code_frequency)))
+    assign_channel!(
+        link.sdr,
+        link.noise_channel,
+        Int(link.noise_prn),
+        (rand() * 10_000 - 5_000) * Hz,   # carrier dither, ±5 kHz
+        0.0Hz,                            # open loop: the replica free-runs
+        rand() * get_code_length(signal), # uniform code phase
+        link.samples_consumed;
+        el_sample_spacing,
+        signal,
+    )
+    link.noise_epochs_since_rearm = 0
+    # A re-arm invalidates whatever was part-accumulated against the old PRN.
+    _reset_noise_accumulator!(link)
+    link
+end
+
+function _reset_noise_accumulator!(link)
+    fill!(link.noise_accumulator, zero(ComplexF64))
+    link.noise_looks = 0
+    link.noise_samples_per_look = 0
+    link
+end
+
+# Pool one noise dump: `Σ b·bᴴ` over its taps. The taps are kept apart for a
+# satellite because their differences are the discriminants; here they are three
+# independent looks and nothing about their relative values means anything, so
+# they are summed. For an antenna array the pooled payload is the array's
+# spatial covariance, whose diagonal is each antenna's own floor.
+function _accumulate_noise_dump!(link, output)
+    accumulators = get_accumulators(output.correlator)
+    for tap in accumulators
+        _add_outer!(link.noise_accumulator, tap)
+        link.noise_looks += 1
+    end
+    # Every tap of one dump integrates the same samples, so the span of a look
+    # is the dump's own length, counted once.
+    link.noise_samples_per_look = output.integrated_samples
+    link
+end
+
+_add_outer!(acc::Matrix{ComplexF64}, tap::Number) = (acc[1, 1] += abs2(tap); acc)
+function _add_outer!(acc::Matrix{ComplexF64}, tap)
+    for j in eachindex(tap), i in eachindex(tap)
+        acc[i, j] += tap[i] * conj(tap[j])
+    end
+    acc
+end
+
+# Hand the chunk's pooled accumulation to every signal that asked for a density,
+# then start a fresh one. `M` is the number of independent looks rather than the
+# sample count: it is what makes observations from producers of different
+# granularity combinable, and what the sliding window weights by.
+function _flush_channel_noise!(link, track_state, band_systems, band_measurements)
+    link.noise_looks == 0 && return track_state
+    signal = _noise_reference_signal(band_systems)
+    isnothing(signal) && return track_state
+    sampling_freq = _band_sampling_frequency(band_measurements, signal)
+    observation = Tracking.noise_observation_from_correlator(
+        _pooled_noise(link),
+        link.noise_looks,
+        link.noise_looks * link.noise_samples_per_look,
+        sampling_freq;
+        prn = Int(link.noise_prn),
+        duration = link.noise_samples_per_look / sampling_freq,
+    )
+    _append_signal_noise!(
+        track_state,
+        observation,
+        _flatten_systems(map(tracking_signals, _flatten_systems(band_systems))),
+        keys(track_state.noise_estimators),
+    )
+    _reset_noise_accumulator!(link)
+    track_state
+end
+
+_pooled_noise(link) =
+    size(link.noise_accumulator, 1) == 1 ? real(link.noise_accumulator[1, 1]) :
+    SMatrix{size(link.noise_accumulator, 1),size(link.noise_accumulator, 2),ComplexF64}(
+        link.noise_accumulator,
+    )
 
 function release_stale_channels!(link, track_state)
     for hw_channel in eachindex(link.assignments)
@@ -797,6 +987,7 @@ end
 
 function _find_free_channel(link)
     for hw_channel in eachindex(link.assignments)
+        hw_channel == link.noise_channel && continue
         isnothing(link.assignments[hw_channel]) && return hw_channel
     end
     nothing
@@ -914,7 +1105,12 @@ epoch, turning a transient stall into a much longer one. Past
 containing the newest record: the skipped epochs carried no data, so nothing is
 lost by not folding them, and the loop resumes in real time.
 """
-function fold_closed_epochs!(link::HardwareCorrelatorLink, track_state, band_measurements)
+function fold_closed_epochs!(
+    link::HardwareCorrelatorLink,
+    track_state,
+    band_measurements,
+    band_systems,
+)
     link.next_epoch_boundary == typemin(Int) && return 0
 
     # A jump this large is a gap, not a backlog: skip to the current epoch
@@ -937,6 +1133,7 @@ function fold_closed_epochs!(link::HardwareCorrelatorLink, track_state, band_mea
         advance_code_phases!(link, track_state, boundary)
         link.next_epoch_boundary = boundary + link.epoch_length
         folds += 1
+        link.noise_epochs_since_rearm += 1
     end
     folds == 0 && return 0
 
@@ -953,6 +1150,10 @@ function fold_closed_epochs!(link::HardwareCorrelatorLink, track_state, band_mea
     # bandwidth scaling, equal to the interval that actually elapses. See
     # `coherent_integration_blocks` for the measurement that forced this.
     flush_partial_records!(link, track_state)
+    # The fold's C/N₀ estimator reads a measured noise density and nothing else
+    # on this path fills it, so the reference has to land before the estimator
+    # runs, not after it.
+    append_noise_observations!(link, track_state, band_systems, band_measurements)
     Tracking.estimate_dopplers_and_filter_prompt!(track_state, band_measurements)
     push_nco_updates!(link, track_state, boundary)
     folds
@@ -1153,6 +1354,14 @@ end
 function _append_dump!(link, track_state, dump)
     hw_channel = Int(dump.channel)
     checkbounds(Bool, link.assignments, hw_channel) || (link.stale_dumps += 1; return link)
+    if hw_channel == link.noise_channel
+        # A dump still carrying the previous decoy PRN was produced before the
+        # re-arm took effect; pooling it would credit the window a look at a
+        # replica the accumulator is no longer about.
+        dump.prn == link.noise_prn ? _accumulate_noise_dump!(link, dump.output) :
+        (link.stale_dumps += 1)
+        return link
+    end
     assignment = link.assignments[hw_channel]
     # A dump whose channel is free, or whose PRN no longer matches the channel's
     # occupant, was produced before a reassignment took effect. Folding it into
@@ -1409,6 +1618,10 @@ _add_accumulators(a::Tracking.AbstractCorrelator, b::Tracking.AbstractCorrelator
 # `g ×` the host's prompt reads `20·log10(g)` dB too high — 42 dB for a replica
 # of amplitude 127. See `append_noise_observations!` for where the floor comes
 # from.
+# Antenna count off the correlator *type*, so the noise accumulator can be sized
+# before any dump has arrived.
+_num_ants(::Type{<:Tracking.AbstractCorrelator{M}}) where {M} = M
+
 _retag_spacing(
     template::Tracking.AbstractCorrelator,
     output::Tracking.CorrelatorOutput,
