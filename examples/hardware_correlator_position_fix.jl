@@ -110,6 +110,18 @@ const FRAC = 24
 const SWEEP_MARGIN = 24_000              # samples ahead for sweep commits (6 ms)
 const ACQ_COVERAGE = 25_000.0Hz          # one-sided; LO offset ~14 kHz + Doppler
 const CN0_FLOOR_DBHZ = 38.0              # calibration satellite quality gate
+# Floor for the *receiver's* PRN search set, which is a different question from
+# the calibration gate above: calibration needs one satellite strong enough for
+# a code-phase sweep to show an unambiguous peak, while the receiver wants every
+# satellite it might reach four of. `receive` applies its own CFAR detector
+# (`acq_pfa`) before any handover, so a PRN listed here that is not really there
+# costs a slice of one background scan and nothing else — whereas a PRN left out
+# can never be tracked, however good it gets later. Note the acquisition C/N₀
+# these are compared against reads ~7 dB optimistic at a 10 ms coherent
+# integration (measured against synthetic truth, issue #107), so 30 here is
+# nearer 23 dBHz in truth.
+const RX_FLOOR_DBHZ = 30.0
+const MAX_RX_PRNS = 8
 const MAX_SECONDS = length(ARGS) >= 1 ? parse(Float64, ARGS[1]) : 600.0
 const RUN_AFTER_FIX = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 30.0
 # Periodic rescan cadence. Acquisition now runs off the processing task
@@ -1108,7 +1120,7 @@ function main()
     # Only drive 8 of the 20 hardware channels: every channel dumps at ~1 kHz
     # whether assigned or not (there is no per-channel enable), so the CSR
     # poller's ioctl load scales with the bank size — and 8 is plenty for a fix.
-    sdr = M2SDRCorrelator(CSR_CSV, stream.channel; fs = FS, n_channels = 5)
+    sdr = M2SDRCorrelator(CSR_CSV, stream.channel; fs = FS, n_channels = 8)
     @info "gateware exposes $(GNSSReceiver.num_hardware_channels(sdr)) channels"
 
     # Poll dumps over CSR (the doc'd bring-up path: DMA1's IRQ cadence is far
@@ -1237,10 +1249,21 @@ function main()
     end
     results, _ = acquire_prns(stream, collect(1:32); noncoherent = 10)
     strong = sort(filter(r -> r.CN0 > CN0_FLOOR_DBHZ, results); by = r -> -r.CN0)
-    @info "acquired $(length(strong)) satellites above $(CN0_FLOOR_DBHZ) dBHz:"
-    for r in strong[1:min(end, 8)]
-        @info @sprintf("  PRN %2d  CN0 %.1f dBHz  doppler %+7.0f Hz",
-                       r.prn, r.CN0, ustrip(Hz, r.carrier_doppler))
+    @info string(
+        "acquired ",
+        count(r -> r.CN0 > RX_FLOOR_DBHZ, results),
+        " satellites above ",
+        RX_FLOOR_DBHZ,
+        " dBHz, of which ",
+        length(strong),
+        " clear the ",
+        CN0_FLOOR_DBHZ,
+        " dBHz calibration gate:",
+    )
+    for r in sort(filter(r -> r.CN0 > RX_FLOOR_DBHZ, results); by = r -> -r.CN0)
+        @info @sprintf("  PRN %2d  CN0 %.1f dBHz  doppler %+7.0f Hz%s",
+                       r.prn, r.CN0, ustrip(Hz, r.carrier_doppler),
+                       r.CN0 > CN0_FLOOR_DBHZ ? "  (calibration candidate)" : "")
     end
     isempty(strong) && error("no satellites acquired — check antenna/RF")
 
@@ -1311,7 +1334,15 @@ function main()
     # `found`/`nsoft` expose Tracking's bit-buffer state: whether bit sync ever
     # happened and how many soft bits this chunk carried to the decoder.
 
-    strong_prns = [Int(r.prn) for r in strong[1:min(end, 6)]]
+    # A fix needs four satellites tracked *at the same time*, so the search set
+    # is everything the scan saw above `RX_FLOOR_DBHZ` — not just the handful
+    # that cleared the calibration gate — capped at what the bank can hold.
+    strong_prns = [
+        Int(r.prn) for r in sort(
+            filter(r -> r.CN0 > RX_FLOOR_DBHZ, results);
+            by = r -> -r.CN0,
+        )[1:min(end, min(MAX_RX_PRNS, GNSSReceiver.num_hardware_channels(sdr)))]
+    ]
     @info "receiver PRN set: $strong_prns"
     bit_log = isempty(BIT_LOG_NAME) ? nothing :
               open(joinpath(dirname(@__FILE__), BIT_LOG_NAME), "w")
