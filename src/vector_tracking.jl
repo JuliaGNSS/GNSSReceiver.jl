@@ -388,8 +388,10 @@ model and Kalman state/covariance, whether the vector loop is `running` (it
 starts running with the first scalar PVT fix and falls back on prolonged
 measurement starvation), which clock-bias state is the reporting reference
 (`primary_clock_index`, seeded from the fix's reference system and maintained by
-`report_primary_clock_index`), the system-time epoch `reference_time` the pseudoranges are
-referenced to, how long the filter has been coasting on epochs it could
+`report_primary_clock_index`), the epoch `reference_time` the pseudoranges are
+referenced to — always on the *GPS Time count* (see `VTMember.time_gpst_count`),
+so it does not move when the primary clock changes — how long the filter has been
+coasting on epochs it could
 not solve (see `run_vt_iteration`), and the per-member report of the latest
 update (`member_sats`).
 """
@@ -574,7 +576,15 @@ struct VTMember
     code_frequency::Float64 # Hz
     available::Bool        # usable as a measurement this cycle (in code lock)
     sat_state::SatelliteState # decoder + phase snapshot (atmosphere, transmit time)
-    time::Float64          # corrected transmit time (system time of week, s)
+    time::Float64          # corrected transmit time (own system's time of week, s)
+    # The same instant expressed on the GPS Time count: `time` minus the system's
+    # defined scale offset (0 for GPST/GST, −14 s for BDT — a BDT second-of-week reads
+    # 14 s below the GPS time of week for the same instant). Everything that
+    # *differences* times across members — `reference_time` and the pseudoranges —
+    # uses this field, mirroring `calc_pvt`'s `calc_time_scale_offsets`; everything
+    # that evaluates a broadcast polynomial (ephemeris, clock, `calc_gpst_offset`)
+    # keeps the own-scale `time`.
+    time_gpst_count::Float64
     sat_position::SVector{3,Float64}
     sat_velocity::SVector{3,Float64}
     sat_clock_drift::Float64 # s/s
@@ -688,6 +698,13 @@ function collect_vt_members!(
 )
     ranging = ranging_signal(system)
     code_frequency = ustrip(Hz, get_code_frequency(ranging))
+    # Seconds this system's time-of-week count reads above the GPS Time count for the
+    # same instant (0 for GPST/GST, −14 for BDT). Subtracted from the transmit time to
+    # put every member on one count before anything differences them — without it a
+    # BeiDou pseudorange is 14 s × c ≈ 4.2×10⁹ m off against a GPS-referenced
+    # `reference_time`, the exact error `calc_pvt` removes via
+    # `calc_time_scale_offsets`.
+    scale_offset = PositionVelocityTime.time_scale_offset_to_gpst(get_time_system(ranging))
     chip_length = PositionVelocityTime.SPEEDOFLIGHT / code_frequency
     wavelength =
         PositionVelocityTime.SPEEDOFLIGHT / ustrip(Hz, get_center_frequency(ranging))
@@ -717,8 +734,9 @@ function collect_vt_members!(
         sat_state =
             SatelliteState(receiver_group_states[prn].decoder, ranging, tracked_sat)
         time = PositionVelocityTime.calc_corrected_time(sat_state)
+        time_gpst_count = time - scale_offset
         sat_pv = calc_satellite_position_and_velocity(sat_state.decoder, time)
-        pseudorange = pseudorange_from_tows(ustrip(s, reference_time), time)
+        pseudorange = pseudorange_from_tows(ustrip(s, reference_time), time_gpst_count)
         pseudorange_rate = wavelength * ustrip(Hz, get_carrier_doppler(tracked_sat))
         # Early-late spacing in chips at the current code rate (measurement
         # noise model input).
@@ -742,6 +760,7 @@ function collect_vt_members!(
                 prn in available_prns && has_accumulated_discriminators(estimator_state),
                 sat_state,
                 time,
+                time_gpst_count,
                 SVector{3,Float64}(PositionVelocityTime.get_sat_position(sat_pv)),
                 SVector{3,Float64}(PositionVelocityTime.get_sat_velocity(sat_pv)),
                 PositionVelocityTime.calc_satellite_clock_drift(sat_state.decoder, time),
@@ -782,8 +801,9 @@ function vt_atmospheric_delays(
     # The Niell mapping's seasonal term takes the day of year, derived the way `calc_pvt`
     # derives it: from a decoded satellite's absolute week plus the time of week. Any
     # member's decoder dates the epoch — every member has finished decoding (that is what
-    # made it a member) and the time systems differ by nanoseconds against a one-year
-    # period — so the first one serves. `vt.time_epoch_offset` would date it too, but it
+    # made it a member) and the time systems differ by at most their defined scale offset,
+    # 14 s for BDT, against a one-year period — so the first one serves.
+    # `vt.time_epoch_offset` would date it too, but it
     # resolves at the END of a cycle, so it is still `nothing` on the first one.
     first_state = first(sat_states)
     week = PositionVelocityTime.get_week(first_state.decoder; approximate_year)
@@ -1370,10 +1390,12 @@ end
 # after which a solution can no longer lose its timestamp, and a timestamp is how every
 # consumer tells a fix from a non-fix.
 #
-# Caching it survives a change of primary clock: each system's week count and start epoch
-# address the same instant (that is what `system_start_epoch` compensates for), so two time
-# systems' offsets differ only by their broadcast time offset — nanoseconds, against a
-# quantity used to stamp a 100 ms cycle.
+# Caching it survives a change of primary clock: `reference_time` runs on the GPS Time
+# count regardless of which clock reports (`VTMember.time_gpst_count`), and the scale
+# offset folded in below puts every system's `week·604800 + start epoch` onto that same
+# count — BDT's, for instance, lands 14 s below GPST's, exactly compensating the 14 s its
+# seconds-of-week read low. What remains between two systems' cached offsets is their
+# broadcast steering — nanoseconds, against a quantity used to stamp a 100 ms cycle.
 function resolve_time_epoch_offset(
     vt::VectorTrackingState,
     systems,
@@ -1395,7 +1417,16 @@ function resolve_time_epoch_offset(
             approximate_year = pvt_approximate_year,
         )
         start_time = PositionVelocityTime.system_start_epoch(data_signal(system))
-        return week * SECONDS_PER_WEEK + start_time.second
+        # `reference_time` is a GPS-Time-count time of week, so the epoch that anchors it
+        # must absorb the system's scale offset: a BDT week·604800 + start epoch pairs
+        # with BDT seconds-of-week, which read 14 s below the GPST count.
+        scale_offset = round(
+            Int,
+            PositionVelocityTime.time_scale_offset_to_gpst(
+                get_time_system(data_signal(system)),
+            ),
+        )
+        return week * SECONDS_PER_WEEK + start_time.second + scale_offset
     end
     nothing
 end
@@ -1655,12 +1686,12 @@ function initialize_vector_tracking(
     end
     reference_time =
         (
-            maximum(member.time for member in members) -
+            maximum(member.time_gpst_count for member in members) -
             ustrip(m, pvt.time_correction) / PositionVelocityTime.SPEEDOFLIGHT
         ) * s
     measured_pseudoranges =
         [
-            pseudorange_from_tows(ustrip(s, reference_time), member.time) for
+            pseudorange_from_tows(ustrip(s, reference_time), member.time_gpst_count) for
             member in members
         ] .- vt_atmospheric_delays(
             members,

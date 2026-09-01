@@ -15,7 +15,7 @@ processes samples. It lays out four panels:
   satellite declares itself unhealthy in its navigation message.
 - **Satellite Direction-of-Arrival** — a sky plot of the satellites in view, each drawn at
   its azimuth/elevation and labelled with its PRN, coloured by constellation (green GPS,
-  blue Galileo, red GLONASS, yellow BeiDou), with a legend below. Azimuth runs clockwise
+  blue Galileo, yellow BeiDou), with a legend below. Azimuth runs clockwise
   from North at the top; the rings are elevation, with the zenith at the centre and the
   horizon on the rim, so a satellite moves outward as it sets.
 - **Position Velocity Time (PVT)** — the fix as time (UTC), coordinates, altitude, ground

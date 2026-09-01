@@ -186,9 +186,10 @@ const GPS_L2C_PRNS = sort(union(GPS_L5_PRNS, [5, 7, 12, 15, 17, 29, 31]))
 # and IGSO satellites only ("shall not be transmitted by the Geostationary Earth Orbit
 # (GEO) satellites", BDS-SIS-ICD-B1C-1.0 §1, matched by B2a's §1). Because BDS assigns
 # PRNs by generation and orbit, that turns into a PRN range: BDS-3 MEO and IGSO
-# satellites occupy PRN 19-50, its GEO satellites 59-62, and every PRN below 19 is
-# BDS-2. B2b's ranging codes independently stop in the same place — the ICD defines
-# them for PRN 6-58 only, and an all-zero GNSSSignals code column correlates to nothing.
+# satellites occupy PRN 19-50, the GEO satellites the ICD's 59-63 block, and every PRN
+# below 19 is BDS-2. B2b's ranging codes independently stop in the same place — the ICD
+# defines them for PRN 6-58 only, and an all-zero GNSSSignals code column correlates to
+# nothing.
 #
 # B1I and B3I take the unrestricted default: this predicate answers "can a satellite at
 # this PRN carry this signal at all", not "is one live there now" — availability is the
