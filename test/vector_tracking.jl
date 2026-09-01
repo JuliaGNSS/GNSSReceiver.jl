@@ -66,6 +66,9 @@ function _test_member(;
         available,
         sat_state,
         time,
+        # The same instant on the GPS Time count: differs from `time` by the
+        # signal's defined scale offset (0 for GPST/GST, −14 s for BDT).
+        time - PositionVelocityTime.time_scale_offset_to_gpst(get_time_system(signal)),
         sat_position,
         sat_velocity,
         sat_clock_drift,
@@ -77,6 +80,27 @@ function _test_member(;
         early_late_spacing,
         tcoh,
     )
+end
+
+@testset "Vector-loop times difference on the GPS Time count" begin
+    # One physical instant: a BDT seconds-of-week reads 14 s below the GPS time
+    # of week (GPST is TAI−19, BDT is TAI−33). Everything the vector loop
+    # *differences* across members — `reference_time`, the pseudoranges — must
+    # therefore use `time_gpst_count`, not `time`; mixing raw counts hands every
+    # BeiDou member 14 s × c ≈ 4.2×10⁹ m of structural pseudorange offset that
+    # the ns-scale BGTO collapse constraint then fights rather than absorbs.
+    gps = _test_member(; time = 100.0)
+    bds = _test_member(;
+        group_key = :BeiDouB2aI,
+        signal = BeiDouB2aI(),
+        clock_bias_index = 2,
+        time = 86.0,
+    )
+    @test gps.time_gpst_count == 100.0
+    @test bds.time_gpst_count ≈ gps.time_gpst_count
+    # The own-scale transmit time stays untouched — it is what the ephemeris,
+    # the clock polynomial and `calc_gpst_offset` are evaluated at.
+    @test bds.time == 86.0
 end
 
 @testset "VectorTracking configuration" begin
@@ -691,7 +715,11 @@ end
     @test by_state[gal_tri][1] == gps_tri
     @test by_state[gal_tri][2] ≈ -PositionVelocityTime.SPEEDOFLIGHT * 1e-9
     @test by_state[bds_tri][1] == gps_tri
-    @test by_state[bds_tri][2] ≈ -PositionVelocityTime.SPEEDOFLIGHT * 3e-9
+    # Explicit tolerance: `calc_gpst_offset` recovers the ~ns BDT steering residual by
+    # subtracting the defined 14 s back out of `A_0`, which costs one ULP at 14
+    # (~1.8e-15 s, ≈5.5e-7 m of range) — above the default relative tolerance on a
+    # value this small. Same reasoning as PVT's own BGTO tests.
+    @test by_state[bds_tri][2] ≈ -PositionVelocityTime.SPEEDOFLIGHT * 3e-9 atol = 1e-5
 
     # Only the systems that actually carry an offset collapse: drop the BeiDou one's BGTO
     # and its clock stays an unknown of its own while Galileo's still merges.

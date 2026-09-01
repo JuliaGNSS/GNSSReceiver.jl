@@ -79,8 +79,9 @@ data_channel = receive(
 ```
 
 A plain collection is applied to every system, and `nothing` uses each constellation's
-default range. Each system's search is further restricted to the PRNs that actually
-broadcast its signal.
+default range — GPS 1:32, Galileo 1:36, BeiDou 1:63. Each system's search is further
+restricted to the PRNs that actually broadcast its signal (GPS L5/L2C to the blocks that
+carry them; BeiDou B1C/B2a/B2b to the BDS-3 MEO/IGSO range 19-50).
 
 ## Front end & correlator
 

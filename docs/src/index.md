@@ -15,13 +15,15 @@ a terminal GUI, persist to disk, or post-process in Julia.
 ## Features
 
 - End-to-end **acquire → track → decode → PVT** pipeline over a lock-free sample channel.
-- **Multi-constellation, multi-band**: pass a tuple of systems that share one RF band to
+- **Multi-constellation, multi-band**: GPS (L1 C/A, L1C, L2C, L5), Galileo (E1, E5a,
+  E5b, E6-B) and BeiDou (B1I, B3I, B1C, B2a, B2b), on their GPST/GST/BDT time systems.
+  Pass a tuple of systems that share one RF band to
   fuse them (e.g. `(GPSL1CA(), GalileoE1B())`), or a tuple of measurement channels and
   system groups to fuse several bands into one solution with per-constellation clock
   biases and per-band inter-frequency biases.
 - Pilot + data **combined tracking** via [`CombinedSignal`](@ref): range on the dataless
   pilot, decode the navigation message from the data component (e.g. Galileo E1B/E1C,
-  GPS L5I/L5Q).
+  GPS L5I/L5Q, BeiDou B1C-D/B1C-P).
 - Live reception from any **SoapySDR** device (RTL-SDR, LimeSDR, BladeRF, USRP, …).
 - Offline **replay from files**, including raw 8-bit offset-binary I/Q recordings.
 - **Multi-antenna** processing with eigen-beamforming.
