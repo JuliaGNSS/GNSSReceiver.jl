@@ -1340,13 +1340,15 @@ function _account_record_continuity!(
             # known about it. This used to append a record spanning the gap with
             # a *zeroed* correlator, which was a lie the consumer was expected to
             # see through: a zero correlator is a measurement of nothing, so
-            # every discriminator computes 0/0 and the NaN leaves the loop filter
-            # as a NaN Doppler. The guards in `Tracking`'s discriminators stop
-            # that being fatal, but they turn it into a *quiet* wrong: a
-            # zero-error measurement the loop filter should never have seen, a
-            # zero prompt through the prompt filter, and a zero-power record
-            # averaged into the C/N0 estimate. `advance_bit_clock!` says the one
-            # thing that is actually true and moves nothing else.
+            # every discriminator computes 0/0, the NaN leaves the loop filter
+            # as a NaN Doppler, and a later correlate iteration dies converting
+            # it to a sample count. Guarding the discriminators against that
+            # would only make it quiet — 0 is what a discriminator returns for a
+            # *perfectly tracked* signal, so "no measurement" would enter the
+            # loop filter as "no error", plus a zero prompt through the prompt
+            # filter and a zero-power record in the C/N0 average.
+            # `advance_bit_clock!` says the one thing that is actually true and
+            # moves nothing else.
             #
             # The bit straddling the gap still comes out weak, and every bit
             # after it stays on the 20 ms grid — which is the whole point.
