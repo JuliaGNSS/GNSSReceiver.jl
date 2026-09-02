@@ -46,10 +46,10 @@ function _test_member(;
     coherent_integration_time = nothing,
     decoder = test_decoder_state(signal, prn),
 )
-    c = PositionVelocityTime.SPEEDOFLIGHT
+    c = SPEED_OF_LIGHT
     code_frequency = ustrip(u"Hz", get_code_frequency(signal))
     tcoh = something(coherent_integration_time, get_code_length(signal) / code_frequency)
-    sat_state = PositionVelocityTime.SatelliteState(;
+    sat_state = SatelliteState(;
         decoder,
         system = signal,
         code_phase = 0.0,
@@ -68,7 +68,7 @@ function _test_member(;
         time,
         # The same instant on the GPS Time count: differs from `time` by the
         # signal's defined scale offset (0 for GPST/GST, −14 s for BDT).
-        time - PositionVelocityTime.time_scale_offset_to_gpst(get_time_system(signal)),
+        time - time_scale_offset_to_gpst(get_time_system(signal)),
         sat_position,
         sat_velocity,
         sat_clock_drift,
@@ -575,7 +575,7 @@ end
         clock_bias_index = gal_clock,
         decoder = with_ggto(test_decoder_state(GalileoE1B(), 4), 1e-9),
     )
-    @test PositionVelocityTime.gpst_offset_available(ggto_e1b.sat_state.decoder)
+    @test gpst_offset_available(ggto_e1b.sat_state.decoder)
     members = [gps(1), gps(2), gps(3), ggto_e1b, e5a(5)]
     obs = GNSSReceiver.assess_bias_observability(vt, members, 1:5)
     @test obs.num_unknowns == 5
@@ -583,7 +583,7 @@ end
     gst_state, gpst_state, isb = only(obs.gpst_offset_constraints)
     @test gst_state == gal_clock
     @test gpst_state == gps_clock
-    @test isb ≈ -PositionVelocityTime.SPEEDOFLIGHT * 1e-9
+    @test isb ≈ -SPEED_OF_LIGHT * 1e-9
 
     # A disconnected coverage graph — GPS only on L1, Galileo only on E5a, no
     # E1B to link the bands — leaves the L5 bias collinear with the Galileo
@@ -700,7 +700,7 @@ end
         clock_bias_index = bds_tri,
         decoder = with_bgto(test_decoder_state(BeiDouB1I(), 21), 3e-9),
     )
-    @test PositionVelocityTime.gpst_offset_available(bds_member.sat_state.decoder)
+    @test gpst_offset_available(bds_member.sat_state.decoder)
     gps_tri = tri.clock_bias_index_by_group[:GPSL1CA]
     gps_of(prn) = _test_member(; prn, group_key = :GPSL1CA, clock_bias_index = gps_tri)
     mixed = [gps_of(1), gps_of(2), gps_of(3), gal_member, bds_member]
@@ -713,13 +713,13 @@ end
         state => (ref, isb) for (state, ref, isb) in obs.gpst_offset_constraints
     )
     @test by_state[gal_tri][1] == gps_tri
-    @test by_state[gal_tri][2] ≈ -PositionVelocityTime.SPEEDOFLIGHT * 1e-9
+    @test by_state[gal_tri][2] ≈ -SPEED_OF_LIGHT * 1e-9
     @test by_state[bds_tri][1] == gps_tri
     # Explicit tolerance: `calc_gpst_offset` recovers the ~ns BDT steering residual by
     # subtracting the defined 14 s back out of `A_0`, which costs one ULP at 14
     # (~1.8e-15 s, ≈5.5e-7 m of range) — above the default relative tolerance on a
     # value this small. Same reasoning as PVT's own BGTO tests.
-    @test by_state[bds_tri][2] ≈ -PositionVelocityTime.SPEEDOFLIGHT * 3e-9 atol = 1e-5
+    @test by_state[bds_tri][2] ≈ -SPEED_OF_LIGHT * 3e-9 atol = 1e-5
 
     # Only the systems that actually carry an offset collapse: drop the BeiDou one's BGTO
     # and its clock stays an unknown of its own while Galileo's still merges.
@@ -756,12 +756,12 @@ end
     # One measurement cannot determine three position components and a clock, so the design is
     # rank deficient and `calc_DOP` returns its sentinel.
     lone = [_test_member(; prn = 1, sat_position = SVector(2.6e7, 0.0, 0.0))]
-    H_lone = PositionVelocityTime.calc_H(
+    H_lone = calc_H(
         stack(m.sat_position for m in lone),
         GNSSReceiver.position_and_bias_vector(vt.state, vt.nav_filter.idxs),
         first(GNSSReceiver.dense_bias_columns(lone, vt.primary_clock_index)),
     )
-    @test PositionVelocityTime.calc_DOP(H_lone, ECEF(6.378e6, 0.0, 0.0), 1).GDOP < 0
+    @test calc_DOP(H_lone, ECEF(6.378e6, 0.0, 0.0), 1).GDOP < 0
     pvt = GNSSReceiver.vt_pvt_solution(vt, lone, [1], [1.0u"m"], [0.1u"m/s"])
     @test isnothing(pvt.dop)
 
@@ -806,7 +806,7 @@ end
     epoch = GNSSReceiver.vt_time(vt)
     @test !isnothing(epoch)
     biased_state = copy(vt.state)
-    biased_state[vt.nav_filter.idxs.clock_biases[1]] = PositionVelocityTime.SPEEDOFLIGHT
+    biased_state[vt.nav_filter.idxs.clock_biases[1]] = SPEED_OF_LIGHT
     biased_epoch =
         GNSSReceiver.vt_time(GNSSReceiver.VectorTrackingState(vt; state = biased_state))
     @test AstroTime.value(AstroTime.seconds(epoch - biased_epoch)) ≈ 1.0 rtol = 1e-9
@@ -922,7 +922,7 @@ end
     sat_positions_mat = stack([member.sat_position])
     bias_columns = GNSSReceiver.vt_bias_columns([member], layout)
     J = GNSSReceiver.nav_filter_jacobian(nav, x, [member], sat_positions_mat, bias_columns)
-    c = PositionVelocityTime.SPEEDOFLIGHT
+    c = SPEED_OF_LIGHT
 
     # A predicted pseudorange 10 m beyond the measured one must speed the code
     # NCO up by f_code · 10 m / (T · c): the replica is 10 m late. A predicted
@@ -1094,7 +1094,7 @@ end
 end
 
 @testset "Pseudorange differencing across a GNSS week rollover" begin
-    c = PositionVelocityTime.SPEEDOFLIGHT
+    c = SPEED_OF_LIGHT
     # Receive just after the week rollover (TOW 0.05 s), transmit just before it
     # (TOW 604799.97 s): the 0.08 s light-travel difference straddles 604800 s and
     # must fold back rather than read as a ~604800 s (≈1.8e11 m) pseudorange.

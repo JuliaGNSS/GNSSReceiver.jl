@@ -50,7 +50,7 @@
         (; key => Dictionary([1], [GNSSReceiver.ReceiverSatState(system, 1)]))
     acquisition_buffers = NamedTuple{(bk,)}((GNSSReceiver.SampleBuffer(ComplexF64, 20000),))
     last_time_acquisition_ran = NamedTuple{(bk,)}((-Inf * 1.0u"s",))
-    pvt = PositionVelocityTime.PVTSolution()
+    pvt = PVTSolution()
 
     receiver_state = ReceiverState(
         track_state,
@@ -58,7 +58,7 @@
         acquisition_buffers,
         last_time_acquisition_ran,
         pvt,
-        PositionVelocityTime.SatelliteState[],
+        SatelliteState[],
         nothing,
         0.0u"s",
         -Inf * 1.0u"s",
@@ -88,7 +88,7 @@ end
         num_samples_for_acquisition = 20000,
         num_ants = NumAnts(1),
     )
-    pvt = PositionVelocityTime.PVTSolution()
+    pvt = PVTSolution()
     # No satellites are in lock, so nothing is PVT-ready and the previous solution
     # is returned as-is (same object).
     pvt_out = GNSSReceiver.update_pvt(
@@ -364,7 +364,7 @@ end
     @test !GNSSReceiver.is_ranging_ready(not_ready)
     @test GNSSReceiver.is_ranging_ready(ready)
 
-    states = PositionVelocityTime.SatelliteState[]
+    states = SatelliteState[]
     GNSSReceiver.collect_pvt_sat_states!(
         states,
         (system,),
@@ -442,7 +442,7 @@ end
         )
     )
     collect_ready(time_in_lock, threshold) = GNSSReceiver.collect_pvt_sat_states!(
-        PositionVelocityTime.SatelliteState[],
+        SatelliteState[],
         (system,),
         settled(time_in_lock),
         track_state,
