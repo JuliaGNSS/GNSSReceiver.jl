@@ -28,6 +28,33 @@ using StaticArrays,
     Dictionaries,
     Dates
 
+# The documented measurement-model surface of PositionVelocityTime that the
+# vector-tracking loop consumes. The names are deliberately unexported over
+# there — solver internals rather than every user's vocabulary — and bound
+# explicitly here, at one site, as that package's API reference prescribes.
+using PositionVelocityTime:
+    SPEED_OF_LIGHT,
+    calc_corrected_time,
+    calc_satellite_clock_drift,
+    get_sat_position,
+    get_sat_velocity,
+    fold_week_crossover,
+    BiasColumns,
+    band_ifb_layout,
+    calc_ρ_hat!,
+    calc_H,
+    calc_line_of_sight,
+    calc_DOP,
+    time_scale_offset_to_gpst,
+    gpst_offset_available,
+    calc_gpst_offset,
+    get_week,
+    system_start_epoch,
+    day_of_year,
+    select_ionospheric_correction,
+    predict_atmospheric_delays,
+    calc_course_over_ground
+
 import Geodesy
 using Geodesy: ECEF
 using Unitful: m, s, ms, Hz, dBHz, dB, °, uconvert
@@ -669,8 +696,8 @@ function ReceiverState(
     # One acquisition timer per band, keyed like the buffers.
     band_keys = keys(acquisition_buffers)
     last_time_acquisition_ran = NamedTuple{band_keys}(map(_ -> -Inf * 1.0s, band_keys))
-    pvt = PositionVelocityTime.PVTSolution()
-    pvt_sat_state_buffer = PositionVelocityTime.SatelliteState[]
+    pvt = PVTSolution()
+    pvt_sat_state_buffer = SatelliteState[]
     # The vector-tracking clock/inter-frequency-bias layout is fixed here, from
     # the *configured* systems, so the navigation filter's state dimension
     # never changes mid-run. `vector_tracking` carries the filter's configuration

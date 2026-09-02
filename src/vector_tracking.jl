@@ -134,7 +134,7 @@ end
 # from the currently tracked satellites), so the filter's state dimension is
 # fixed for the whole run; a constellation without current measurements simply
 # coasts on its process noise. The inter-frequency-bias columns follow
-# `PositionVelocityTime.band_ifb_layout`, which creates a column only where the
+# `band_ifb_layout`, which creates a column only where the
 # bias is observable (a band stranded alone on its constellation folds its
 # delay into that constellation's clock instead).
 struct NavFilterLayout
@@ -153,7 +153,7 @@ function NavFilterLayout(systems)
     band_per_group = Symbol[get_band_id(system_band(s)) for s in systems_vector]
     time_systems = unique(time_system_per_group)
     ifb_indices, extra_bands, reference_bands, _ =
-        PositionVelocityTime.band_ifb_layout(time_system_per_group, band_per_group)
+        band_ifb_layout(time_system_per_group, band_per_group)
     clock_bias_index_by_group = Dict(
         signal_group_key(s) => findfirst(==(ts), time_systems) for
         (s, ts) in zip(systems_vector, time_system_per_group)
@@ -319,7 +319,7 @@ function nav_filter_process_noise_covariance(
         num_clock_biases(layout),
         num_ifb(layout),
     )
-    c = PositionVelocityTime.SPEEDOFLIGHT
+    c = SPEED_OF_LIGHT
 
     n = num_nav_states(config, layout)
     Q = zeros(n, n)
@@ -669,12 +669,12 @@ const SECONDS_PER_WEEK = 7 * 24 * 60 * 60
 
 # Pseudorange (m) from the receive and transmit times-of-week. Both are
 # seconds-of-week that wrap at 604800 s, so the small receive − transmit
-# light-travel difference is folded modulo the week (`correct_week_crossovers`
+# light-travel difference is folded modulo the week (`fold_week_crossover`
 # maps a near-±week difference back to near zero) to stay correct when the two
 # straddle a GNSS week rollover.
 pseudorange_from_tows(receive_tow, transmit_tow) =
-    PositionVelocityTime.correct_week_crossovers(receive_tow - transmit_tow) *
-    PositionVelocityTime.SPEEDOFLIGHT
+    fold_week_crossover(receive_tow - transmit_tow) *
+    SPEED_OF_LIGHT
 
 # Gather one group's vector-loop members. `prns` must be fully decoded (their
 # positions come from their ephemerides). `available_prns` are the members
@@ -704,10 +704,10 @@ function collect_vt_members!(
     # BeiDou pseudorange is 14 s × c ≈ 4.2×10⁹ m off against a GPS-referenced
     # `reference_time`, the exact error `calc_pvt` removes via
     # `calc_time_scale_offsets`.
-    scale_offset = PositionVelocityTime.time_scale_offset_to_gpst(get_time_system(ranging))
-    chip_length = PositionVelocityTime.SPEEDOFLIGHT / code_frequency
+    scale_offset = time_scale_offset_to_gpst(get_time_system(ranging))
+    chip_length = SPEED_OF_LIGHT / code_frequency
     wavelength =
-        PositionVelocityTime.SPEEDOFLIGHT / ustrip(Hz, get_center_frequency(ranging))
+        SPEED_OF_LIGHT / ustrip(Hz, get_center_frequency(ranging))
     clock_bias_index = layout.clock_bias_index_by_group[group_key]
     ifb_index = layout.ifb_index_by_group[group_key]
     for prn in prns
@@ -733,7 +733,7 @@ function collect_vt_members!(
             ustrip(s, get_last_fully_integrated_integration_time(tracked_sat, RANGING_SIGNAL_INDEX))
         sat_state =
             SatelliteState(receiver_group_states[prn].decoder, ranging, tracked_sat)
-        time = PositionVelocityTime.calc_corrected_time(sat_state)
+        time = calc_corrected_time(sat_state)
         time_gpst_count = time - scale_offset
         sat_pv = calc_satellite_position_and_velocity(sat_state.decoder, time)
         pseudorange = pseudorange_from_tows(ustrip(s, reference_time), time_gpst_count)
@@ -761,9 +761,9 @@ function collect_vt_members!(
                 sat_state,
                 time,
                 time_gpst_count,
-                SVector{3,Float64}(PositionVelocityTime.get_sat_position(sat_pv)),
-                SVector{3,Float64}(PositionVelocityTime.get_sat_velocity(sat_pv)),
-                PositionVelocityTime.calc_satellite_clock_drift(sat_state.decoder, time),
+                SVector{3,Float64}(get_sat_position(sat_pv)),
+                SVector{3,Float64}(get_sat_velocity(sat_pv)),
+                calc_satellite_clock_drift(sat_state.decoder, time),
                 pseudorange,
                 pseudorange_rate,
                 accumulated_code_discriminator(estimator_state, integration_time),
@@ -797,7 +797,7 @@ function vt_atmospheric_delays(
     sat_states = [member.sat_state for member in members]
     ionospheric_correction =
         enable_ionospheric_correction ?
-        PositionVelocityTime.select_ionospheric_correction(sat_states) : nothing
+        select_ionospheric_correction(sat_states) : nothing
     # The Niell mapping's seasonal term takes the day of year, derived the way `calc_pvt`
     # derives it: from a decoded satellite's absolute week plus the time of week. Any
     # member's decoder dates the epoch — every member has finished decoding (that is what
@@ -806,13 +806,13 @@ function vt_atmospheric_delays(
     # `vt.time_epoch_offset` would date it too, but it
     # resolves at the END of a cycle, so it is still `nothing` on the first one.
     first_state = first(sat_states)
-    week = PositionVelocityTime.get_week(first_state.decoder; approximate_year)
-    doy = PositionVelocityTime._day_of_year(
+    week = get_week(first_state.decoder; approximate_year)
+    doy = day_of_year(
         first_state.system,
         week,
         ustrip(s, reference_time),
     )
-    PositionVelocityTime.predict_atmospheric_delays(
+    predict_atmospheric_delays(
         user_pos,
         sat_states,
         [member.sat_position for member in members],
@@ -830,7 +830,7 @@ end
 # `BiasColumns` form, so its `calc_ρ_hat!` / `calc_H` do the pseudorange
 # modelling (including the earth-rotation correction).
 vt_bias_columns(members::AbstractVector{VTMember}, layout::NavFilterLayout) =
-    PositionVelocityTime.BiasColumns(
+    BiasColumns(
         [member.clock_bias_index for member in members],
         num_clock_biases(layout),
         [member.ifb_index for member in members],
@@ -850,7 +850,7 @@ function dense_bias_columns(members::AbstractVector{VTMember}, primary_clock_ind
         sort!(unique(member.ifb_index for member in members if member.ifb_index != 0))
     clock_column = Dict(state => i for (i, state) in enumerate(clock_states))
     ifb_column = Dict(state => i for (i, state) in enumerate(ifb_states))
-    columns = PositionVelocityTime.BiasColumns(
+    columns = BiasColumns(
         [clock_column[member.clock_bias_index] for member in members],
         length(clock_states),
         [get(ifb_column, member.ifb_index, 0) for member in members],
@@ -863,7 +863,7 @@ end
 # position + clock/IFB sub-vector `ξ = [x, y, z, tc₁.., ifb₁..]`.
 function predict_pseudoranges(ξ, sat_positions_mat, bias_columns)
     num_sats = size(sat_positions_mat, 2)
-    PositionVelocityTime.calc_ρ_hat!(
+    calc_ρ_hat!(
         Vector{Float64}(undef, num_sats),
         sat_positions_mat,
         ξ,
@@ -883,8 +883,11 @@ function predict_pseudorange_rates(
     sat_clock_drifts,
 )
     map(sat_positions, sat_velocities, sat_clock_drifts) do sat_pos, sat_vel, sat_drift
-        e = PositionVelocityTime.calc_e(sat_pos, user_pos)
-        dot(e, sat_vel - user_vel) + sat_drift * PositionVelocityTime.SPEEDOFLIGHT -
+        # `calc_line_of_sight` points receiver→satellite, so the closing speed —
+        # positive while the range shrinks, the Doppler sign — is its dot product
+        # with the *user's* velocity relative to the satellite.
+        e = calc_line_of_sight(sat_pos, user_pos)
+        dot(e, user_vel - sat_vel) + sat_drift * SPEED_OF_LIGHT -
         user_clock_drift
     end
 end
@@ -901,7 +904,7 @@ function nav_filter_jacobian(
 )
     idxs = nav_filter.idxs
     num_sats = length(members)
-    H = PositionVelocityTime.calc_H(
+    H = calc_H(
         sat_positions_mat,
         position_and_bias_vector(x, idxs),
         bias_columns,
@@ -1033,7 +1036,7 @@ end
 const GPST_OFFSET_STD = 3.0
 
 # The bias-layout decision for one measurement set, mirroring
-# `PositionVelocityTime.decide_bias_layout` for the navigation filter.
+# `decide_bias_layout` for the navigation filter.
 #
 # `num_unknowns` is the number of parameters this cycle's pseudoranges have to
 # determine — 3 position components plus the clock biases and the *observable*
@@ -1095,7 +1098,7 @@ is_epoch_solvable(obs::BiasObservability, num_measurements) =
 # demand a measurement for a parameter this epoch cannot and need not determine.
 function epoch_bias_unknowns(time_systems, bands)
     _, extra_bands, _, num_components =
-        PositionVelocityTime.band_ifb_layout(time_systems, bands)
+        band_ifb_layout(time_systems, bands)
     num_distinct_sats_required = 3 + length(unique(time_systems))
     num_distinct_sats_required + length(extra_bands),
     num_distinct_sats_required,
@@ -1161,7 +1164,7 @@ function assess_bias_observability(
             offset_index = findfirst(
                 j ->
                     members[j].clock_bias_index == state &&
-                        PositionVelocityTime.gpst_offset_available(
+                        gpst_offset_available(
                             members[j].sat_state.decoder,
                         ),
                 candidate_indices,
@@ -1173,8 +1176,8 @@ function assess_bias_observability(
             # −c·Δt_systems from the GPS one — the same sign convention
             # `decide_bias_layout` gives its `inter_system_biases`.
             isb =
-                -PositionVelocityTime.SPEEDOFLIGHT *
-                PositionVelocityTime.calc_gpst_offset(member.sat_state.decoder, member.time)
+                -SPEED_OF_LIGHT *
+                calc_gpst_offset(member.sat_state.decoder, member.time)
             push!(constraints, (state, gpst_state, isb))
             push!(collapsed, time_system)
         end
@@ -1248,7 +1251,7 @@ function nco_corrections(
     integration_time,
 )
     T = ustrip(s, integration_time)
-    c = PositionVelocityTime.SPEEDOFLIGHT
+    c = SPEED_OF_LIGHT
     prns = [members[j].prn for j in member_indices]
     code_updates = map(member_indices) do j
         range_error = predicted_pseudoranges[j] - measured_pseudoranges[j]
@@ -1412,17 +1415,17 @@ function resolve_time_epoch_offset(
             receiver_group_states,
         )
         isnothing(prn) && continue
-        week = PositionVelocityTime.get_week(
+        week = get_week(
             receiver_group_states[prn].decoder;
             approximate_year = pvt_approximate_year,
         )
-        start_time = PositionVelocityTime.system_start_epoch(data_signal(system))
+        start_time = system_start_epoch(data_signal(system))
         # `reference_time` is a GPS-Time-count time of week, so the epoch that anchors it
         # must absorb the system's scale offset: a BDT week·604800 + start epoch pairs
         # with BDT seconds-of-week, which read 14 s below the GPST count.
         scale_offset = round(
             Int,
-            PositionVelocityTime.time_scale_offset_to_gpst(
+            time_scale_offset_to_gpst(
                 get_time_system(data_signal(system)),
             ),
         )
@@ -1449,7 +1452,7 @@ function vt_time(vt::VectorTrackingState)
     idxs = vt.nav_filter.idxs
     primary_clock_bias = vt.state[idxs.clock_biases[vt.primary_clock_index]]
     corrected_reference_time =
-        ustrip(s, vt.reference_time) - primary_clock_bias / PositionVelocityTime.SPEEDOFLIGHT
+        ustrip(s, vt.reference_time) - primary_clock_bias / SPEED_OF_LIGHT
     TAIEpoch(
         vt.time_epoch_offset + floor(Int, corrected_reference_time),
         corrected_reference_time - floor(corrected_reference_time),
@@ -1481,12 +1484,12 @@ function vt_pvt_solution(
     else
         included = members[included_indices]
         columns, primary_column = dense_bias_columns(included, vt.primary_clock_index)
-        H = PositionVelocityTime.calc_H(
+        H = calc_H(
             stack(member.sat_position for member in included),
             position_and_bias_vector(vt.state, idxs),
             columns,
         )
-        candidate = PositionVelocityTime.calc_DOP(H, position, primary_column)
+        candidate = calc_DOP(H, position, primary_column)
         candidate.GDOP < 0 ? nothing : candidate
     end
 
@@ -1503,9 +1506,9 @@ function vt_pvt_solution(
         inter_system_biases[time_system] =
             (vt.state[idxs.clock_biases[index]] - primary_clock_bias) * m
     end
-    inter_frequency_biases = Dict{Symbol,PositionVelocityTime.InterFrequencyBias}()
+    inter_frequency_biases = Dict{Symbol,InterFrequencyBias}()
     for (index, band) in enumerate(layout.extra_bands)
-        inter_frequency_biases[band] = PositionVelocityTime.InterFrequencyBias(
+        inter_frequency_biases[band] = InterFrequencyBias(
             vt.state[idxs.ifb[index]] * m,
             layout.reference_bands[index],
         )
@@ -1514,10 +1517,10 @@ function vt_pvt_solution(
     PVTSolution(
         position,
         velocity,
-        PositionVelocityTime.calc_course_over_ground(position, velocity),
+        calc_course_over_ground(position, velocity),
         primary_clock_bias * m,
         vt_time(vt),
-        user_clock_drift / PositionVelocityTime.SPEEDOFLIGHT,
+        user_clock_drift / SPEED_OF_LIGHT,
         dop,
         sats,
         layout.time_systems[vt.primary_clock_index],
@@ -1541,7 +1544,7 @@ function initial_nav_state(vt::VectorTrackingState, pvt)
     layout = vt.layout
     idxs = nav_filter.idxs
     n = size(nav_filter.F, 1)
-    c = PositionVelocityTime.SPEEDOFLIGHT
+    c = SPEED_OF_LIGHT
 
     init_std_pos = 1.0                # m
     init_std_vel = 1.0                # m/s
@@ -1687,7 +1690,7 @@ function initialize_vector_tracking(
     reference_time =
         (
             maximum(member.time_gpst_count for member in members) -
-            ustrip(m, pvt.time_correction) / PositionVelocityTime.SPEEDOFLIGHT
+            ustrip(m, pvt.time_correction) / SPEED_OF_LIGHT
         ) * s
     measured_pseudoranges =
         [

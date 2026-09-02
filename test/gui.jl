@@ -91,15 +91,15 @@ function fixed_gui_data(; runtime = 10.0u"s", pvt_fresh = true)
             sat_keys,
             [sat_data_type(45.0dBHz, zeros(SVector{2,ComplexF64}), true) for _ in sat_keys],
         ),
-        PositionVelocityTime.PVTSolution(;
+        PVTSolution(;
             position = ECEF(4.0e6, 3.9e5, 4.9e6),
             velocity = ECEF(2.0e6, 2.9e5, 1.9e6),
             time = TAIEpoch(2022, 10, 8),
-            dop = PositionVelocityTime.DOP(1.0, 1.0, 1.0, 1.0, 1.0),
+            dop = DOP(1.0, 1.0, 1.0, 1.0, 1.0),
             sats = Dictionary(
                 sat_keys,
                 [
-                    PositionVelocityTime.SatInfo(
+                    SatInfo(
                         ECEF(5e6 + 1e5 * i, 3e6 - 1e5 * i, 1e6 + 2e5 * i),
                         0.0,
                         0.0u"m",
@@ -251,8 +251,8 @@ end
         (:GPSL1CA, 12) => GNSSReceiver.SatelliteDataOfInterest(42.0dBHz, z, true, false),
     ))
     # `pvt.sats` — the satellites that determined the fix — is a different set from the loop.
-    info() = PositionVelocityTime.SatInfo(ECEF(5e6, 3e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s")
-    pvt = PositionVelocityTime.PVTSolution(;
+    info() = SatInfo(ECEF(5e6, 3e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s")
+    pvt = PVTSolution(;
         sats = Dictionary([(:GPSL1CA, 3), (:GPSL1CA, 9)], [info(), info()]),
     )
     render_vt(vt; solution = pvt) = render_gui_text(
@@ -457,13 +457,13 @@ end
                 true,
             ),
         )),
-        PositionVelocityTime.PVTSolution(;
+        PVTSolution(;
             position = ECEF(4.0e6, 3.9e5, 4.9e6),
             velocity = ECEF(2.0e6, 2.9e5, 1.9e6),
             time_correction = 4.5e6u"m",
             time = TAIEpoch(2022, 10, 8),
             relative_clock_drift = 0.1e-6,
-            dop = PositionVelocityTime.DOP(1.0, 1.0, 1.0, 1.0, 1.0),
+            dop = DOP(1.0, 1.0, 1.0, 1.0, 1.0),
             sats = Dictionary(
                 [
                     (:GPSL1CA, 3),
@@ -472,10 +472,10 @@ end
                     (:GPSL1CA, 10),
                 ],
                 [
-                    PositionVelocityTime.SatInfo(ECEF(5e6, 3e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s"),
-                    PositionVelocityTime.SatInfo(ECEF(3e6, 3e6, 2e6), 0.0, 0.0u"m", 0.0u"m/s"),
-                    PositionVelocityTime.SatInfo(ECEF(2e6, 5e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s"),
-                    PositionVelocityTime.SatInfo(ECEF(3e6, 1e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s"),
+                    SatInfo(ECEF(5e6, 3e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s"),
+                    SatInfo(ECEF(3e6, 3e6, 2e6), 0.0, 0.0u"m", 0.0u"m/s"),
+                    SatInfo(ECEF(2e6, 5e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s"),
+                    SatInfo(ECEF(3e6, 1e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s"),
                 ],
             ),
         ),
@@ -547,7 +547,7 @@ end
                 cn0 in (no_signal, 45.0dBHz)
             ],
         ),
-        PositionVelocityTime.PVTSolution(),
+        PVTSolution(),
         10.0u"s",
         true,
     )
@@ -567,7 +567,7 @@ end
             [(:GPSL1CA, prn) for prn in prns],
             [sat_data_type(45.0dBHz, complex(1.0, 0.0), true) for _ in prns],
         ),
-        PositionVelocityTime.PVTSolution(),
+        PVTSolution(),
         10.0u"s",
         true,
     )
@@ -617,12 +617,12 @@ end
     ]
     sat_positions = [ECEF(5e6 + 1e5 * i, 3e6 - 1e5 * i, 1e6 + 2e5 * i) for i in eachindex(keys_)]
     # All residuals 2.0 m ⇒ overall and per-signal RMS are exactly 2.0 m.
-    sats = Dictionary(keys_, [PositionVelocityTime.SatInfo(p, 0.0, 2.0u"m", 0.0u"m/s") for p in sat_positions])
+    sats = Dictionary(keys_, [SatInfo(p, 0.0, 2.0u"m", 0.0u"m/s") for p in sat_positions])
 
-    pvt = PositionVelocityTime.PVTSolution(;
+    pvt = PVTSolution(;
         position = ECEF(4.0e6, 3.9e5, 4.9e6),
         time = TAIEpoch(2022, 10, 8),
-        dop = PositionVelocityTime.DOP(2.5, 2.1, 1.3, 1.6, 0.9),
+        dop = DOP(2.5, 2.1, 1.3, 1.6, 0.9),
         sats,
         reference_system = GPST(),
         inter_system_biases = Dict{GNSSSignals.TimeSystem,typeof(1.0u"m")}(GST() => 12.34u"m"),
@@ -777,7 +777,7 @@ end
 @testset "PVT diagnostics name time systems and bands" begin
     # Anchored on the lowest-ranked time system present (GPS < Galileo) rather than on
     # `calc_pvt`'s `reference_system`, which can flip between solves.
-    pvt = PositionVelocityTime.PVTSolution(;
+    pvt = PVTSolution(;
         reference_system = GST(),
         inter_system_biases =
             Dict{GNSSSignals.TimeSystem,typeof(1.0u"m")}(GPST() => -12.34u"m"),
