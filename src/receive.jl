@@ -554,6 +554,13 @@ construction, and a scan that blocked the chunk pipeline would delay the NCO
 feedback past the epochs it was scheduled for — every channel then free-runs and
 a long enough scan costs every lock. Pass `acquire_async = false` to override
 (e.g. for a deterministic test against a simulated device).
+
+For the same reason the chunk-processing task runs on the *interactive* thread
+pool here (`processing_threadpool = :interactive`): an asynchronous scan's
+`@batch` fills every default-pool thread, and a fold parked behind it resumes
+tens of milliseconds late while the device holds a one-epoch correction — which
+is what turns a strong, phase-locked satellite's bits into parity errors. Start
+Julia with `-t N,M` so the pool exists.
 """
 function receive(
     sdr::AbstractHardwareCorrelatorSDR,
@@ -564,6 +571,7 @@ function receive(
     # `nothing` ⇒ ask the device (`correlator_gain(sdr)`).
     correlator_gain = nothing,
     acquire_async::Bool = true,
+    processing_threadpool::Symbol = :interactive,
     kwargs...,
 )
     link = HardwareCorrelatorLink(
@@ -580,6 +588,7 @@ function receive(
         sampling_freq;
         correlator_source = link,
         acquire_async,
+        processing_threadpool,
         kwargs...,
     )
 end
@@ -657,7 +666,21 @@ function receive(
     # a custom payload — it must be read-only and return an immutable value, since the
     # `ReceiverState` it sees is mutated in place by the next chunk.
     extract = default_data_of_interest,
+    # Thread pool the chunk-processing task runs on. `:default` is right for the
+    # software receiver, whose correlate phase is itself threaded across the
+    # default pool. A hardware-correlator receiver wants `:interactive`: its
+    # per-chunk work is light, and `acquire!`'s `@batch` occupies every
+    # default-pool thread for the length of a scan — a processing task parked
+    # there resumes only when a batch chunk finishes, tens of ms later, during
+    # which the device holds each channel's last NCO word (a correction sized
+    # for one epoch) and the carrier phase slews by hundreds of degrees (issue
+    # #107). Start Julia with interactive threads (`-t N,M`) for it to take
+    # effect; without any, Julia runs `:interactive` tasks on the default pool.
+    processing_threadpool::Symbol = :default,
 ) where {N}
+    processing_threadpool in (:default, :interactive) || throw(
+        ArgumentError("processing_threadpool must be :default or :interactive (got $processing_threadpool)"),
+    )
     n_bands = length(measurement_channels)
     (
         length(systems_per_band) == n_bands &&
@@ -764,7 +787,7 @@ function receive(
     state_ref = Ref(initial_state)
     last_output_ref = Ref(-Inf * 1.0s)
     Base.errormonitor(
-        Threads.@spawn try
+        Threads.@spawn processing_threadpool try
             while true
                 # Take one frame from each band in lock-step; a closed stream ends
                 # the run (`InvalidStateException` from an exhausted, closed channel).

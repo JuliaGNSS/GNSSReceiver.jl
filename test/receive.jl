@@ -249,3 +249,41 @@ end
     @test GNSSReceiver.is_sat_ranging_ready_at(coasted_states, 1)
     @test !GNSSReceiver.is_sat_in_lock_at(coasted_states, 1)
 end
+
+@testset "The processing task's thread pool is selectable" begin
+    sampling_freq = 5e6Hz
+    system = GPSL1CA()
+    num_samples = 20000
+    num_ants = 1
+    max_meas = 2^12
+
+    # A pool Julia does not have is an argument error, not a task that dies later.
+    @test_throws ArgumentError receive(
+        make_noise_channel(Complex{Int16}, num_samples, num_ants),
+        system,
+        sampling_freq;
+        max_meas,
+        processing_threadpool = :bogus,
+    )
+
+    # `:interactive` is where a hardware-correlator receiver runs its fold so an
+    # acquisition worker's `@batch` on the default pool cannot park it (issue
+    # #107). Without interactive threads Julia runs the task on the default
+    # pool, so this exercises the plumbing on any test configuration and the
+    # actual isolation only where the pool exists.
+    pool_seen = Ref(:unset)
+    my_extract(rs) = (runtime = rs.runtime, pool = (pool_seen[] = Threads.threadpool()))
+    data_channel = receive(
+        make_noise_channel(Complex{Int16}, num_samples, num_ants),
+        system,
+        sampling_freq;
+        max_meas,
+        pvt_update_interval = 4u"ms",
+        processing_threadpool = :interactive,
+        extract = my_extract,
+    )
+    data = collect_data(data_channel)
+    @test !isempty(data)
+    expected = Threads.nthreads(:interactive) > 0 ? :interactive : :default
+    @test all(d -> d.pool == expected, data)
+end
