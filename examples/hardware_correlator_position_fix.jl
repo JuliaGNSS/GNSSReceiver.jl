@@ -155,12 +155,13 @@ const XCORR_PRNS =
 const XCORR_EVERY = parse(Int, get(ENV, "HWFIX_XCORR_EVERY", "1"))
 const RAW_CHUNKS = Threads.Atomic{Int}(0)
 
-# Cap FFTW's own pthread pool: acquisition storms (initial + per-satellite
-# reacquisition backoff) otherwise oversubscribe the CPU and the OS preempts
-# the interactive-pool CSR poller — every preemption is a burst of missed
-# dumps, and a missed dump inside a subframe breaks its parity. Keep the total
-# OS-thread demand at least two cores short of the machine.
-FFTW.set_num_threads(4)
+# Keep FFTW single-threaded. `Acquisition` already parallelises a scan across
+# PRNs with Polyester, so FFTW threads inside each PRN's transforms only add
+# spinning barriers on an oversubscribed machine. Measured on the Orin with the
+# receiver's own plan (25 kHz coverage, 10 ms coherent, 5 rounds): 4 PRNs take
+# 0.48 s with one FFTW thread and 6.6 s with four; all 32 PRNs 1.7 s against
+# 38 s. The "55 s scans" of issue #107 were this setting, not the search.
+FFTW.set_num_threads(1)
 
 # ── 1. JIT warm-up ────────────────────────────────────────────────────────────
 # The warm-up must compile the SAME specializations the live call uses: the
