@@ -18,8 +18,14 @@ jobs:
         os:
           - ubuntu-latest
         include:
-          - os: windows-latest
-            version: '1'
+          # No Windows job: the receiver cannot even precompile there. `GNSSDecoder`'s
+          # Galileo E1B decoder builds an `Aff3ct.ConvViterbiDecoder`, and `aff3ct_jll`
+          # declares no `libaff3ct_jl` product for Windows, so the call fails with
+          # `UndefVarError: libaff3ct_jl not defined in Aff3ct.LibAFF3CT`. Since
+          # PositionVelocityTime 5.3 that construction happens inside *its* precompile
+          # workload, which makes it a load-time failure for every dependent rather than
+          # something a caller could avoid by not decoding Galileo. Restore the job once
+          # `aff3ct_jll` ships the wrapper for Windows.
           - os: macOS-latest
             version: '1'
     steps:
