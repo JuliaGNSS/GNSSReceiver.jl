@@ -855,4 +855,6 @@ function receive_and_gui(
     notify(close_stream_event)
 end
 
+include("precompile.jl")
+
 end
