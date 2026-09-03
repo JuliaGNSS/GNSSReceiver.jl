@@ -1,5 +1,13 @@
 # Changelog
 
+# [4.4.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.3.0...v4.4.0) (2026-09-03)
+
+
+### Features
+
+* precompile the multi-system and two-band receive shapes too ([47c70bf](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/47c70bfcf14f78321d18cd5f0d94d5409d5539b4))
+* precompile the receive pipeline ([816777b](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/816777b17b79a06cab50c6eac59fe1eeaff45345)), closes [#107](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/107)
+
 # [4.3.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.2.0...v4.3.0) (2026-08-20)
 
 
