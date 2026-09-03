@@ -7,12 +7,14 @@
 # Structure:
 #   1. JIT warm-up of the receive() path on synthetic samples.
 #   2. Raw stream: m2sdr_record → FIFO → SignalChannel (antenna 0 of the 2R2T
-#      words), with a producer-side sample count and a tap ring for the
-#      calibration acquisitions.
-#   3. Origin calibration: the bank's free-running sample counter is latched
-#      before streaming starts (it only counts samples DMA0 accepts, so that
-#      latch is exact up to dropped buffers); a code-phase sweep against one
-#      acquired satellite then verifies/corrects it modulo the code period.
+#      words), with a producer-side sample count and a tap ring for the opening
+#      scan.
+#   3. One 32-PRN scan to pick the receiver's PRN set. The host↔device sample
+#      axis needs no calibration: the bank's counter is latched immediately
+#      before streaming starts and only counts samples DMA0 accepts, so the
+#      latch is exact up to buffers dropped in between — measured at 0 or 1
+#      sample (≤0.25 chips) across 36 runs. `slip_watch` re-anchors it during
+#      the run, which is where the mapping really does drift.
 #   4. receive(sdr, …) with DMA-streamed dumps (dump_source = :dma,
 #      epoch_period = 50 → ~2.2 ms feedback transport) until the PVT solve
 #      returns a fix; it then rides RUN_AFTER_FIX seconds and stops.
@@ -107,9 +109,7 @@ const CHUNK = 8000                       # 2 ms
 const CSR_CSV = expanduser("~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch20_ant1/csr.csv")
 const FIFO = "/tmp/hwfix_raw.fifo"
 const FRAC = 24
-const SWEEP_MARGIN = 24_000              # samples ahead for sweep commits (6 ms)
 const ACQ_COVERAGE = 25_000.0Hz          # one-sided; LO offset ~14 kHz + Doppler
-const CN0_FLOOR_DBHZ = parse(Float64, get(ENV, "HWFIX_CAL_FLOOR", "38.0"))  # calibration satellite quality gate
 # Floor for the *receiver's* PRN search set, which is a different question from
 # the calibration gate above: calibration needs one satellite strong enough for
 # a code-phase sweep to show an unambiguous peak, while the receiver wants every
@@ -999,170 +999,11 @@ function acquire_prns(stream::RawStream, prns; noncoherent = 4)
     (results, host_end - length(signal))
 end
 
-# ── 3. Origin calibration ─────────────────────────────────────────────────────
-prompt_power(d) = abs2(d.correlator.accumulators[2])
 
-function collect_powers(sdr, ch, n; skip = 2)
-    powers = Float64[]
-    seen = 0
-    last_count = -1
-    deadline = time() + 0.002 * (n + skip) + 1.0
-    while length(powers) < n && time() < deadline
-        yield()
-        d = GNSSM2SDR._read_dump_csrs(sdr, ch, Val(1))
-        d === nothing && continue
-        d.count == last_count && continue
-        last_count = d.count
-        seen += 1
-        seen > skip && push!(powers, prompt_power(d))
-    end
-    powers
-end
 
-function sweep_measure(sdr, ch, S0, r, doppler0, phases, dumps_each)
-    out = Tuple{Float64,Float64}[]
-    for phi_base in phases
-        target = sample_count(sdr.bank) + SWEEP_MARGIN
-        phi = mod(phi_base + (target - S0) * r, CA_CODE_LENGTH)
-        schedule!(ch, target; carrier_hz = doppler0,
-                  code_doppler_hz = doppler0 * GPS_CA_CHIP_RATE / GPS_L1_HZ,
-                  code_phase_chips = phi)
-        t0 = time()
-        while apply_status(ch).armed && time() - t0 < 0.5
-            yield()
-        end
-        powers = collect_powers(sdr, ch, dumps_each)
-        isempty(powers) || push!(out, (Float64(phi_base), mean(powers)))
-    end
-    out
-end
 
-"""
-Sweep-calibrate against `acq_res`. Returns `delta` samples to add to
-`sdr.device_origin`, or `nothing` when no usable correlation peak was found.
-"""
-function calibrate_origin(sdr, stream, acq_res)
-    ch = sdr.bank.channels[1]
-    doppler0 = Float64(ustrip(Hz, acq_res.carrier_doppler))
-    code_step = code_word(ch, doppler0)
-    r = code_step / (1 << FRAC)               # chips per sample
-    sample_shift = max(1, round(Int, 0.5 * (1 << FRAC) / code_step))
-    load_code!(ch, acq_res.prn,
-               [get_code(gpsl1, i, acq_res.prn) > 0 ? 1 : 0 for i = 0:1022])
-    write(sdr.csr, ch.prefix * "spacing", spacing_word(ch, sample_shift, doppler0))
-    write(sdr.csr, ch.prefix * "carrier_freq", carrier_word(ch, doppler0))
-    write(sdr.csr, ch.prefix * "code_freq", code_step)
 
-    S0 = sample_count(sdr.bank)
-    coarse = sweep_measure(sdr, ch, S0, r, doppler0, 0:1022, 6)
-    isempty(coarse) && return nothing
-    best_coarse = coarse[argmax(last.(coarse))][1]
-    fine = sweep_measure(sdr, ch, S0, r, doppler0,
-                         [mod(best_coarse - 3 + 0.25i, 1023) for i = 0:24], 30)
-    isempty(fine) && return nothing
-    phi_fine = fine[argmax(last.(fine))][1]
-    floor_power = median(last.(fine))
-    recheck = sweep_measure(sdr, ch, S0, r, doppler0,
-                            [mod(phi_fine - 2 + 0.25i, 1023) for i = 0:16], 20)
-    isempty(recheck) && return nothing
-    phi_peak, peak_power = recheck[argmax(last.(recheck))]
-    ratio = peak_power / floor_power
-    @info @sprintf("PRN %d sweep peak %.2fx floor at %.2f chips",
-                   acq_res.prn, ratio, phi_peak)
-    ratio < 2.5 && return nothing
 
-    # Fresh acquisition right after the sweep keeps Doppler staleness tiny.
-    results, host_at_acq = acquire_prns(stream, [Int(acq_res.prn)])
-    fresh = results[argmax(map(x -> x.CN0, results))]
-    phi_acq = Float64(fresh.code_phase)
-    doppler = Float64(ustrip(Hz, fresh.carrier_doppler))
-    code_freq = GPS_CA_CHIP_RATE * (1.0 + doppler / GPS_L1_HZ)
-
-    predicted = mod(
-        phi_acq + code_freq * (S0 - (sdr.device_origin + host_at_acq)) / FS_HZ,
-        CA_CODE_LENGTH,
-    )
-    err_chips = rem(predicted - phi_peak, CA_CODE_LENGTH, RoundNearest)
-    delta = round(Int, err_chips * FS_HZ / code_freq)
-    @info @sprintf("origin correction %.3f chips = %+d samples (predicted %.2f, swept %.2f)",
-                   err_chips, delta, predicted, phi_peak)
-    delta
-end
-
-# One assign-style handover trial at a probe offset (chips) from the
-# acquisition-predicted phase; returns the mean prompt power.
-function handover_trial(sdr, acq, host_at_acq, offset_chips; dumps = 8)
-    GNSSReceiver.assign_channel!(
-        sdr, 1, acq.prn, acq.carrier_doppler,
-        acq.carrier_doppler * (GPS_CA_CHIP_RATE / GPS_L1_HZ),
-        mod(Float64(acq.code_phase) + offset_chips, 1023.0), host_at_acq;
-        el_sample_spacing = 2, signal = gpsl1)
-    # `assign_channel!` schedules and returns (it must not block the receiver's
-    # fold); the trial has to read dumps from *after* the commit, so wait for
-    # the staged handover to fire before measuring.
-    t0 = time()
-    while apply_status(sdr.bank.channels[1]).armed && time() - t0 < 0.5
-        yield()
-    end
-    powers = collect_powers(sdr, sdr.bank.channels[1], dumps)
-    isempty(powers) ? 0.0 : mean(powers)
-end
-
-"""
-Refine the origin with a *fresh-frame* mini-scan: the coarse sweep's peak is
-biased by Doppler staleness over its ~20 s (the trial phases propagate from a
-sweep-start anchor with the initial acquisition's Doppler, and the LO drifts),
-so it is only good to a couple of chips. Here every trial is a fresh
-assign-style handover — staleness per trial is milliseconds — so the peak
-offset *is* the residual origin error.
-"""
-function refine_origin!(sdr, stream, prn; halfspan = 3.0)
-    results, host_at_acq = acquire_prns(stream, [prn])
-    acq = results[argmax(map(x -> x.CN0, results))]
-    code_freq = GPS_CA_CHIP_RATE *
-                (1.0 + Float64(ustrip(Hz, acq.carrier_doppler)) / GPS_L1_HZ)
-    scan = [(off, handover_trial(sdr, acq, host_at_acq, off))
-            for off = -halfspan:0.25:halfspan]
-    powers = last.(scan)
-    best = argmax(powers)
-    ratio = powers[best] / median(powers)
-    offset = scan[best][1]
-    # The peak sitting at probe offset +o means the un-probed handover phase is
-    # too LOW by o; raising the phase means LOWERING the origin (the phase is
-    # propagated over `target - origin - host`).
-    delta = -round(Int, offset * FS_HZ / code_freq)
-    @info @sprintf("refine origin: peak %.1fx scan-floor at %+.2f chips → %+d samples",
-                   ratio, offset, delta)
-    (isnan(ratio) || ratio < 3) && return nothing
-    sdr.device_origin += delta
-    delta
-end
-
-# Program a handover exactly the way `assign_channel!` will during the run,
-# then compare prompt power on the predicted phase against a deliberately
-# wrong phase — the go/no-go for the corrected origin.
-function verify_origin(sdr, stream, prn)
-    results, host_at_acq = acquire_prns(stream, [prn])
-    acq = results[argmax(map(x -> x.CN0, results))]
-    doppler_hz = Float64(ustrip(Hz, acq.carrier_doppler))
-    GNSSReceiver.assign_channel!(
-        sdr, 1, acq.prn, acq.carrier_doppler,
-        acq.carrier_doppler * (GPS_CA_CHIP_RATE / GPS_L1_HZ),
-        Float64(acq.code_phase), host_at_acq;
-        el_sample_spacing = 2, signal = gpsl1)
-    sleep(0.05)
-    powers = collect_powers(sdr, sdr.bank.channels[1], 40)
-    isempty(powers) && return 0.0
-    target = sample_count(sdr.bank) + SWEEP_MARGIN
-    schedule!(sdr.bank.channels[1], target;
-              carrier_hz = doppler_hz,
-              code_doppler_hz = doppler_hz * GPS_CA_CHIP_RATE / GPS_L1_HZ,
-              code_phase_chips = mod(Float64(acq.code_phase) + 500.0, 1023.0))
-    sleep(0.05)
-    floor_powers = collect_powers(sdr, sdr.bank.channels[1], 40)
-    isempty(floor_powers) && return 0.0
-    mean(powers) / mean(floor_powers)
-end
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 function main()
@@ -1257,10 +1098,9 @@ function main()
     end
 
     # Armed only once calibration has finished rewriting `device_origin` — see
-    # `arm_slip_watch!` below. Everything before that (`refine_origin!`, the
-    # sweep's trial offsets, `+= consumed_before_receive`) moves the origin
-    # deliberately, and a baseline taken across those moves would read the
-    # deliberate part as creep and correct the calibration away.
+    # `arm_slip_watch!` below. The `+= consumed_before_receive` above moves the
+    # origin deliberately, and a baseline taken across that move would read the
+    # deliberate part as creep and correct it away.
     slip_baseline = Ref{Union{Nothing,Int64}}(nothing)
     let corrected = Ref{Int64}(0)
         global arm_slip_watch! = function ()
@@ -1332,64 +1172,28 @@ function main()
             error("raw stream did not fill the tap ring within 30 s — is m2sdr_record streaming?")
     end
     results, _ = acquire_prns(stream, collect(1:32); noncoherent = 10)
-    strong = sort(filter(r -> r.CN0 > CN0_FLOOR_DBHZ, results); by = r -> -r.CN0)
-    @info string(
-        "acquired ",
-        count(r -> r.CN0 > RX_FLOOR_DBHZ, results),
-        " satellites above ",
-        RX_FLOOR_DBHZ,
-        " dBHz, of which ",
-        length(strong),
-        " clear the ",
-        CN0_FLOOR_DBHZ,
-        " dBHz calibration gate:",
-    )
-    for r in sort(filter(r -> r.CN0 > RX_FLOOR_DBHZ, results); by = r -> -r.CN0)
-        @info @sprintf("  PRN %2d  CN0 %.1f dBHz  doppler %+7.0f Hz%s",
-                       r.prn, r.CN0, ustrip(Hz, r.carrier_doppler),
-                       r.CN0 > CN0_FLOOR_DBHZ ? "  (calibration candidate)" : "")
+    visible = sort(filter(r -> r.CN0 > RX_FLOOR_DBHZ, results); by = r -> -r.CN0)
+    @info "acquired $(length(visible)) satellites above $(RX_FLOOR_DBHZ) dBHz:"
+    for r in visible
+        @info @sprintf("  PRN %2d  CN0 %.1f dBHz  doppler %+7.0f Hz",
+                       r.prn, r.CN0, ustrip(Hz, r.carrier_doppler))
     end
-    isempty(strong) && error("no satellites acquired — check antenna/RF")
+    isempty(visible) && error("no satellites acquired — check antenna/RF")
 
-    calibrated = false
-    # Fast path: every calibration so far measured the pre-stream latch to be
-    # exact within ±9 samples (±2.3 chips) — inside a widened fresh-frame
-    # mini-scan. Try that first; it takes seconds and tolerates weaker
-    # satellites than a 6-minute sweep whose peak also smears with LO drift.
-    # The refine scan IS the verification: a ≥3× peak at the predicted phase
-    # demonstrates an assign-style handover landing on the satellite. A separate
-    # re-check trial minutes later just samples the fade statistics again.
-    for cand in strong[1:min(end, 3)]
-        refinement = refine_origin!(sdr, stream, Int(cand.prn); halfspan = 6.0)
-        if !isnothing(refinement)
-            calibrated = true
-            break
-        end
-    end
-    # Fallback: the full code-phase sweep (origin unknown beyond the code
-    # period, e.g. after a lossy stream start).
-    if !calibrated
-        for cand in strong[1:min(end, 3)]
-            delta = calibrate_origin(sdr, stream, cand)
-            isnothing(delta) && continue
-            sdr.device_origin += delta
-            refinement = refine_origin!(sdr, stream, Int(cand.prn))
-            if isnothing(refinement)
-                sdr.device_origin -= delta
-                continue
-            end
-            ratio = verify_origin(sdr, stream, Int(cand.prn))
-            @info @sprintf("handover verification: %.1fx floor", ratio)
-            if ratio > 3
-                calibrated = true
-                break
-            else
-                sdr.device_origin -= delta + refinement
-            end
-        end
-    end
-    GNSSReceiver.release_channel!(sdr, 1)   # also clears the poller's active mask
-    calibrated || error("origin calibration failed — no candidate verified")
+    # No origin calibration. `device_origin` is the bank's sample counter latched
+    # immediately before the stream started, and that latch is exact up to the
+    # samples DMA0 drops between the latch and the first delivered buffer.
+    #
+    # This used to be followed by a code-phase sweep that probed ±6 chips of
+    # handover offset and corrected the origin by the peak. Across 36 runs on
+    # this board every *accepted* peak (≥3× the scan floor) sat at 0.00 or
+    # ±0.25 chips — the sweep's own step size — so it only ever confirmed what
+    # the latch already had; the handful of multi-chip results all came from the
+    # one run whose peaks never cleared the acceptance gate, i.e. they were noise
+    # picks. Acquisition's code phase is good to well under a chip on its own,
+    # the residual is inside the DLL's pull-in, and the sweep cost ~2.9 s of the
+    # ~8 s start-up. The `slip_watch` timer below still re-anchors the origin
+    # during the run, which is where the mapping genuinely does drift.
 
     # Hand the stream to the receiver: stop draining, account for what we ate,
     # flush stale records.
