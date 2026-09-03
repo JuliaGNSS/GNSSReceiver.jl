@@ -1,5 +1,12 @@
 # Changelog
 
+# [4.5.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.4.0...v4.5.0) (2026-09-03)
+
+
+### Features
+
+* support GNSSSignals 4 ([3356c5e](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/3356c5ebd389736f61ae05ecee2c3ba15b0d541a))
+
 # [4.4.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.3.0...v4.4.0) (2026-09-03)
 
 
