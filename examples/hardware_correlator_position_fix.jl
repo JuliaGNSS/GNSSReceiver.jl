@@ -109,7 +109,7 @@ const FIFO = "/tmp/hwfix_raw.fifo"
 const FRAC = 24
 const SWEEP_MARGIN = 24_000              # samples ahead for sweep commits (6 ms)
 const ACQ_COVERAGE = 25_000.0Hz          # one-sided; LO offset ~14 kHz + Doppler
-const CN0_FLOOR_DBHZ = 38.0              # calibration satellite quality gate
+const CN0_FLOOR_DBHZ = parse(Float64, get(ENV, "HWFIX_CAL_FLOOR", "38.0"))  # calibration satellite quality gate
 # Floor for the *receiver's* PRN search set, which is a different question from
 # the calibration gate above: calibration needs one satellite strong enough for
 # a code-phase sweep to show an unambiguous peak, while the receiver wants every
@@ -135,6 +135,11 @@ const RUN_AFTER_FIX = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 30.0
 # altogether (`acquire_every = 300 s`).
 const ACQ_EVERY = parse(Float64, get(ENV, "HWFIX_ACQ_EVERY", "30")) * u"s"
 const ACQ_ASYNC = get(ENV, "HWFIX_ASYNC", "1") == "1"
+# Which thread pool the chunk-processing task runs on (`receive`'s
+# `processing_threadpool`). `:interactive` keeps the fold clear of the
+# acquisition worker's Polyester batches on the default pool; give Julia the
+# threads for it (`-t 6,3`: raw reader, DMA reader + NCO writer, and the fold).
+const PROC_POOL = Symbol(get(ENV, "HWFIX_PROC_POOL", "default"))
 
 const gpsl1 = GPSL1CA()
 # Bit-stream instrument (issue #107): unset means no logging, no cost.
@@ -589,6 +594,23 @@ mutable struct BitLogSource{L}
     # records the fold drained on the way out.
     const xcorr::Union{Nothing,CpuReference}
     chunks::Int
+    # Every hardware record the fold drained this chunk, as it came off the wire
+    # (`R` lines, in a separate file next to the bit log): the raw 1 ms
+    # accumulators, the device sample span and the replica code phase. The `P`
+    # prompts are what Tracking saw *after* the link coalesced a chunk's dumps
+    # into one record, so post-sync they are 2-8 ms long and unusable for
+    # anything that needs the 1 ms grid — bit-edge re-folds, false-lock
+    # signatures (a 500 Hz Costas alias flips the sign of every consecutive
+    # 1 ms prompt and is invisible at 2 ms), or the exact shape of a stream gap.
+    const records::Union{Nothing,IO}
+    # `drain_dumps!` leaves `drain_buffer` untouched when the ring was empty, so
+    # the newest sample index logged per channel is what tells a fresh drain
+    # from last chunk's buffer seen again.
+    const last_logged::Vector{Int64}
+    # The PRN each hardware channel held at the previous chunk, so a change is
+    # logged once (`A` lines) and a stream gap can be put beside the handover
+    # or re-arm that caused it.
+    const assigned::Vector{Int32}
 end
 
 function GNSSReceiver.advance_tracking!(
@@ -618,6 +640,44 @@ function GNSSReceiver.advance_tracking!(
     source.chunks += 1
     link = source.link
     boundary = link.next_epoch_boundary
+    # Channel table changes: handovers, releases and the noise channel's
+    # re-arms. The noise channel shows up as its decoy PRN changing.
+    for ch in eachindex(link.assignments)
+        assignment = link.assignments[ch]
+        prn_now = ch == link.noise_channel ? -link.noise_prn :
+                  isnothing(assignment) ? Int32(0) : Int32(assignment.prn)
+        if prn_now != source.assigned[ch]
+            println(io, "A ", ch, ' ', source.assigned[ch], ' ', prn_now, ' ', boundary,
+                    ' ', link.samples_consumed)
+            source.assigned[ch] = prn_now
+        end
+    end
+    records = source.records
+    new_dumps = 0
+    for dump in link.drain_buffer
+        GNSSReceiver.is_epoch_strobe(dump) && continue
+        ch = Int(dump.channel)
+        checkbounds(Bool, source.last_logged, ch) || continue
+        dump.output.sample_index <= source.last_logged[ch] && continue
+        source.last_logged[ch] = dump.output.sample_index
+        new_dumps += 1
+        isnothing(records) && continue
+        acc = Tracking.get_accumulators(dump.output.correlator)
+        println(records, "R ", ch, ' ', dump.prn, ' ', dump.output.sample_index,
+                ' ', dump.output.integrated_samples,
+                ' ', round(dump.code_phase; digits = 4),
+                ' ', round(Int, real(acc[1])), ' ', round(Int, imag(acc[1])),
+                ' ', round(Int, real(acc[2])), ' ', round(Int, imag(acc[2])),
+                ' ', round(Int, real(acc[3])), ' ', round(Int, imag(acc[3])))
+    end
+    # One line per chunk: wall clock (ns), the epoch boundary the fold reached,
+    # how many new dumps this chunk drained and the device's newest sample seen.
+    # A steady pipeline drains ~2 dumps per 2 ms chunk; a stall shows up as one
+    # chunk draining tens of dumps followed by a run of chunks draining none,
+    # and the wall clock says whether the stall was the raw stream or the fold.
+    println(io, "T ", time_ns(), ' ', boundary, ' ', new_dumps, ' ', link.latest_sample_index,
+            ' ', link.samples_consumed)
+    gk = GNSSReceiver.signal_group_key(gpsl1)
     for (prn, sat) in pairs(Tracking.get_sat_states(track_state))
         signal = Tracking.get_signals(sat)[1]
         soft_bits = signal.bit_buffer.soft_bits
@@ -647,11 +707,18 @@ function GNSSReceiver.advance_tracking!(
             acc = Tracking.get_accumulators(
                 Tracking.get_last_fully_integrated_correlator(signal),
             )
+            # Appended after the original fields (the analysis scripts read by
+            # position from the front): the C/N₀ the lock detector sees, and the
+            # bit buffer's polarity and pre-sync window length.
+            cn0 = Tracking.estimate_cn0(track_state, gk, prn, 1)
             println(io, "D ", prn, ' ', boundary,
                     ' ', abs(acc[1]), ' ', abs(acc[2]), ' ', abs(acc[3]),
                     ' ', Tracking.get_carrier_doppler(sat),
                     ' ', Tracking.get_code_doppler(sat),
-                    ' ', Tracking.get_code_phase(sat))
+                    ' ', Tracking.get_code_phase(sat),
+                    ' ', round(10log10(ustrip(Hz, Unitful.linear(cn0))); digits = 2),
+                    ' ', signal.bit_buffer.polarity,
+                    ' ', signal.bit_buffer.code_block_buffer_length)
         end
     end
     # ~1 s of chunks: the per-channel record-continuity counters. `lost` is in
@@ -685,6 +752,7 @@ function hw_receive(
     feedback_delay_epochs::Integer = 2,
     acquire_async::Bool = true,
     xcorr = nothing,
+    records = nothing,
     kwargs...,
 )
     link = GNSSReceiver.HardwareCorrelatorLink(
@@ -694,7 +762,11 @@ function hw_receive(
         doppler_update_interval,
         feedback_delay_epochs,
     )
-    source = BitLogSource(link, io, Dict{Int,IO}(), prompt_dir, xcorr, 0)
+    n_channels = GNSSReceiver.num_hardware_channels(sdr)
+    source = BitLogSource(
+        link, io, Dict{Int,IO}(), prompt_dir, xcorr, 0,
+        records, fill(typemin(Int64), n_channels), zeros(Int32, n_channels),
+    )
     BIT_LOG_SOURCE[] = source
     GNSSReceiver.receive(
         GNSSReceiver.raw_sample_channel(sdr),
@@ -776,6 +848,7 @@ function warm_up()
     data = hw_receive(
         sdr,
         BIT_LOG_WARM[];
+        records = BIT_LOG_WARM[],
         # The probe's own kernels are compiled by its constructor; this is for
         # the wrapper around them, which only exists when the probe does.
         xcorr = isempty(XCORR_LOG_NAME) ? nothing :
@@ -1023,6 +1096,13 @@ function handover_trial(sdr, acq, host_at_acq, offset_chips; dumps = 8)
         acq.carrier_doppler * (GPS_CA_CHIP_RATE / GPS_L1_HZ),
         mod(Float64(acq.code_phase) + offset_chips, 1023.0), host_at_acq;
         el_sample_spacing = 2, signal = gpsl1)
+    # `assign_channel!` schedules and returns (it must not block the receiver's
+    # fold); the trial has to read dumps from *after* the commit, so wait for
+    # the staged handover to fire before measuring.
+    t0 = time()
+    while apply_status(sdr.bank.channels[1]).armed && time() - t0 < 0.5
+        yield()
+    end
     powers = collect_powers(sdr, sdr.bank.channels[1], dumps)
     isempty(powers) ? 0.0 : mean(powers)
 end
@@ -1351,6 +1431,12 @@ function main()
               open(joinpath(dirname(@__FILE__), BIT_LOG_NAME), "w")
     isnothing(bit_log) ||
         @info "logging every soft bit and 1 ms prompt to $(BIT_LOG_NAME)"
+    # Every raw hardware record beside it (`R` lines, ~120 B per record: five
+    # satellites at 1 kHz write ~35 MB per minute).
+    records_log = isnothing(bit_log) ? nothing :
+                  open(joinpath(dirname(@__FILE__), BIT_LOG_NAME * ".records"), "w")
+    isnothing(records_log) ||
+        @info "logging every hardware record to $(BIT_LOG_NAME).records"
     # The probe's device axis is `sdr.device_origin` as it stands now — the
     # calibrated origin plus everything the pre-receiver drainer ate. It is
     # fixed for the rest of the run, which is exactly what makes a raw sample
@@ -1365,11 +1451,22 @@ function main()
         "FPGA-vs-CPU probe → ", XCORR_LOG_NAME, " (origin ", sdr.device_origin,
         ", PRNs ", isempty(XCORR_PRNS) ? "all" : join(sort!(collect(XCORR_PRNS)), ","),
         ", every ", XCORR_EVERY, " records)")
+    # GC pauses stop the CSR poller with the rest of the world; each pause is a
+    # burst of missed dumps = bit slips that scramble the decoders. With 55 GB
+    # free and this run capped at minutes, trading memory for a pause-free
+    # decode window is the right deal — with a valve, re-enabled if RAM runs low.
+    # The full collection runs BEFORE the receiver's processing task exists: on
+    # the heap the calibration scans leave behind it takes seconds, and measured
+    # after `hw_receive` it was the receiver's first stall (3.6 s of held NCO
+    # words on every channel, `T` lines in issue #107).
+    GC.gc(true)
+    GC.enable(false)
     data = hw_receive(
         sdr,
         bit_log,
         dirname(@__FILE__);
         xcorr = probe,
+        records = records_log,
         prns = strong_prns,
         acq_min_doppler_coverage = ACQ_COVERAGE,
         acq_coherent_integration_time = 10ms,
@@ -1406,15 +1503,10 @@ function main()
         # loops themselves let go — 24 dBHz is ~6 dB of fade margin on a 1 ms
         # discriminator, not an invitation to track noise.
         code_lock_cn0_threshold = 24.0u"dBHz",
+        processing_threadpool = PROC_POOL,
         extract = my_extract,
     )
 
-    # GC pauses stop the CSR poller with the rest of the world; each pause is a
-    # burst of missed dumps = bit slips that scramble the decoders. With 55 GB
-    # free and this run capped at minutes, trading memory for a pause-free
-    # decode window is the right deal — with a valve, re-enabled if RAM runs low.
-    GC.gc(true)
-    GC.enable(false)
     gc_off = true
 
 
@@ -1498,6 +1590,7 @@ function main()
         close(xcorr_log)
     end
     isnothing(bit_log) || close(bit_log)
+    isnothing(records_log) || close(records_log)
     foreach(close, values(BIT_LOG_SOURCE[].prompts))
     for (prn, v) in bits_log
         open(joinpath(homedir(), "hwfix/run", "bits_c93_prn$(prn).f32"), "w") do io

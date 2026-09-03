@@ -25,6 +25,22 @@ One text log (`$HWFIX_BITLOG`) plus one binary file per PRN
 | `D` | `prn boundary abs(late) abs(prompt) abs(early) carrier_doppler code_doppler code_phase` | the last fully integrated correlator and what the loops are steering with. |
 | `C` | `ch prn boundary lost overlap last_record_end` | per-channel record continuity, once a second. `lost` is in device samples of records the host never saw. |
 | `L` | `boundary gaps stale dropped skipped_epochs` | the link's own counters, once a second. |
+| `T` | `wall_ns boundary new_dumps latest_sample_index samples_consumed` | one per chunk: wall clock, the epoch boundary the fold reached, how many new dumps the chunk drained (~2 when the pipeline is steady) and the device's newest sample seen. Tens of dumps in one chunk followed by chunks draining none is a host stall, and the wall clock says whether the raw stream or the processing task stalled. |
+| `A` | `ch previous_prn new_prn boundary samples_consumed` | a hardware channel changed occupant: a handover, a release (`0`), or the noise channel re-arming onto its next decoy (negative PRN). |
+
+The `D` line carries three fields appended after the original eight: the C/N₀
+the lock detector sees (dBHz), the bit buffer's polarity and its pre-sync
+window length.
+
+A second file, `$HWFIX_BITLOG.records`, holds every hardware record the fold
+drained, as it came off the wire — i.e. on the true 1 ms grid, *before* the link
+coalesces a chunk's dumps into one 2-8 ms record for the loops:
+
+| line | fields | meaning |
+|---|---|---|
+| `R` | `ch prn sample_index integrated_samples code_phase re_L im_L re_P im_P re_E im_E` | one dump; the accumulators are the gateware's raw integer counts (127× a unit-replica prompt). |
+
+Five satellites at 1 kHz write ~35 MB of `R` lines per minute.
 
 `prompts_prn<N>.f32` is interleaved `Float32` real/imaginary parts of the 1 ms
 filtered prompts, contiguous in time (the receiver's `filtered_prompts` vector
@@ -55,6 +71,7 @@ than assuming it. Nothing else is normalised.
 | `word_errors.jl <log> <prn> <anchor-bit>` | Given one known subframe position, walk the whole stream on the 300-bit grid and report which of each subframe's ten words fail parity. Uniform sprinkling is thermal noise; bursts are discrete events in the ingest path. |
 | `walkoff.jl <log> [bin_seconds]` | Is the replica drifting off the correlation peak? Prints `|E|`, `|P|`, `|L|`, the early/late imbalance and both Dopplers, binned in time. A decaying prompt with the imbalance pinned at zero is *not* a code walk-off. |
 | `analyse_prompts.jl <dir>` | Per PRN: 20 ms phase coherence, residual carrier from the squared prompt, and a sweep of all 20 bit-edge hypotheses (raw and carrier-derotated) for a validating subframe. |
+| `records.jl <log> [prn…]` | **Signal, false lock or noise — and where do the bits go wrong?** Per PRN, from the raw 1 ms records: record lengths, every stream gap beside the channel-table event nearest it, `\|P\|` against the Early/Late taps (noise gives 1.0), and the phase step between consecutive 1 ms prompts — a locked carrier flips sign at ~2.5 % of pairs (the data transitions), a Costas alias 500 Hz off flips ~96 %, an unlocked one spreads the steps around the circle. Then re-folds the prompts into bits at the best edge and walks the word parity with slip re-search on both those bits and the soft bits Tracking handed `decode`. |
 | `weakbits.jl <prompts.f32>` | Finds the bits whose 20 ms accumulation nearly cancelled and prints the 20 individual 1 ms prompts inside them, so a mid-bit sign flip or amplitude collapse is visible directly. |
 
 The GPS parity implementation is IS-GPS-200 20.3.5.2 and is self-tested against
