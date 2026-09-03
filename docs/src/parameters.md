@@ -66,6 +66,7 @@ rate) at a fixed internal false-alarm probability — there is no acquisition CN
 | `acquire_every` | `10u"s"` | How often (in signal time) acquisition re-runs to look for new satellites. |
 | `prns` | `nothing` | Which PRNs to search for. `nothing` ⇒ each constellation's default range; a per-GNSS `NamedTuple`/`Dict` keyed by constellation; or a plain collection applied to every system. |
 | `acquire_async` | `false` | Run each band's search on its own task instead of inline (live receivers only — see below). |
+| `processing_threadpool` | `:default` (`:interactive` for the hardware-correlator method) | Thread pool of the chunk-processing task — see below. |
 
 ### Where the search runs (`acquire_async`)
 
@@ -87,6 +88,20 @@ stalled pipeline also delays the NCO feedback past the sample indices it was sch
 and costs every lock. Measured on a LiteX-M2SDR at 4 MS/s with a 30 s rescan cadence: the
 receiver stayed within 0.7 s of real time across ten background scans, where the same run
 with an inline search lost every lock at each scan (a ~13 s pipeline stall).
+
+A background scan still shares the machine with the chunk pipeline. `acquire!` runs its
+PRN search as a Polyester `@batch` over every default-pool thread, so a processing task
+that lives on that pool and yields (every chunk does, on `take!`) resumes only when the
+batch chunk holding its thread finishes — tens of milliseconds later. For the software
+receiver that is a late chunk and nothing more. For a hardware correlator it is a loop
+transient: the device holds each channel's last NCO word, a correction sized for a one- or
+two-millisecond epoch, for the whole stall, and the carrier phase slews by hundreds of
+degrees before the next update lands — measured on sky as navigation-word parity failures
+that appear only in words whose fold saw a stalled chunk (issue #107). The hardware
+method therefore runs the processing task on the *interactive* pool by default
+(`processing_threadpool = :interactive`), which Polyester never touches; start Julia with
+`-t N,M` so that pool exists (with no interactive threads Julia runs such tasks on the
+default pool, and the setting does nothing).
 
 ### Restricting the PRN search
 

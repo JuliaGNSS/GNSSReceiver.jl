@@ -504,6 +504,12 @@ function acquire_band_async(
         worker.in_flight = false
         worker.completed_scans += 1
         worker.last_scan_seconds = response.scan_seconds
+        # How long the worker computed for is what decides whether a scan can
+        # disturb tracking at all (a `@batch` inside `acquire!` occupies every
+        # default-pool thread while it runs); enable with
+        # `JULIA_DEBUG=GNSSReceiver` when a run's loops look stall-prone.
+        @debug "asynchronous acquisition scan merged" scan_seconds = response.scan_seconds completed_scans =
+            worker.completed_scans
         # `acquire!` returns one result per PRN *searched*, so count the ones
         # that actually passed the detector — "the scans found nothing" and "the
         # scans never ran" look identical otherwise.
