@@ -17,7 +17,7 @@ using Test,
 # Unexported PositionVelocityTime internals the vector-tracking tests exercise
 # directly (see "The Measurement-Model Surface" in that package's API docs).
 using PositionVelocityTime:
-    DOP, SPEED_OF_LIGHT, calc_DOP, calc_H, gpst_offset_available, time_scale_offset_to_gpst
+    DOP, SPEED_OF_LIGHT, calc_DOP, calc_H, time_offset_available, time_scale_offset_to_gpst
 
 using JLD2: load
 

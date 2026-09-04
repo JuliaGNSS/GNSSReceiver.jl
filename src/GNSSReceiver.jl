@@ -46,14 +46,18 @@ using PositionVelocityTime:
     calc_line_of_sight,
     calc_DOP,
     time_scale_offset_to_gpst,
-    gpst_offset_available,
-    calc_gpst_offset,
+    time_offset_available,
+    calc_steering_offset,
     get_week,
     system_start_epoch,
     day_of_year,
     select_ionospheric_correction,
     predict_atmospheric_delays,
     calc_course_over_ground
+
+# Length of a GNSS week in seconds — likewise unexported and bound at one site.
+# GNSSDecoder owns the definition; PositionVelocityTime reads the same one.
+using GNSSDecoder: SECONDS_PER_WEEK
 
 import Geodesy
 using Geodesy: ECEF
