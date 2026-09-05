@@ -412,9 +412,10 @@ struct ReceiverState{
     last_time_acquisition_ran::LT
     pvt::P
     # Reused across PVT cycles: `update_pvt` refills it in place instead of allocating a
-    # fresh `Vector{SatelliteState}` each cycle. Pooling every constellation and band
-    # makes its element type the abstract `SatelliteState` when more than one signal is
-    # tracked, but reuse still saves the per-cycle allocation.
+    # fresh vector each cycle. Its element type is named from the *configured* systems
+    # rather than left abstract (see `pvt_sat_state_union`): one concrete type for a
+    # single constellation, a small union — which Julia splits — when several are
+    # pooled into one solve.
     pvt_sat_state_buffer::PB
     # Vector-tracking runtime state, or `nothing` for a scalar-tracking receiver
     # (see `vector_tracking.jl`).
@@ -679,6 +680,34 @@ vt_config(vector_tracking::VectorTracking) = vector_tracking
 doppler_estimator_for(vector_tracking) =
     vt_enabled(vector_tracking) ? VectorPLLAndDLL() : ConventionalAssistedPLLAndDLL()
 
+# Element type of one system's entries in the PVT satellite buffer.
+#
+# `collect_pvt_sat_states!` builds every entry as
+# `SatelliteState(decoder, ranging_signal(system), tracked_sat)`, and all three
+# argument types are fixed at construction: the decoder state follows from the
+# system, the ranging signal is the system's, and the tracked-sat slot type is
+# the template the tracking group was built with. So the result type is known
+# without running anything, which is what `Base.promote_op` reads off.
+#
+# `SatelliteState` (abstract) if that fails — a receiver that cannot name its
+# own satellite type still works, it just pays what it paid before.
+function pvt_sat_state_type(system, sat_template)
+    T = Base.promote_op(
+        SatelliteState,
+        decoder_state_type(system),
+        typeof(ranging_signal(system)),
+        typeof(sat_template),
+    )
+    isconcretetype(T) ? T : SatelliteState
+end
+
+# The union over every configured system. A single constellation gives one
+# concrete type; a mix gives a small union, which Julia splits. If any system's
+# type could not be inferred the union collapses to `SatelliteState`, because
+# Julia simplifies a union of a type with its own supertype.
+pvt_sat_state_union(systems::Tuple, sat_templates::Tuple) =
+    Union{map(pvt_sat_state_type, systems, sat_templates)...}
+
 # Primary constructor: build one multi-band receiver state from the per-band
 # system tuples and pre-built per-band acquisition buffers (keyed by `band_key`).
 # All systems across all bands become tracking groups in a single `TrackState`,
@@ -703,9 +732,18 @@ function ReceiverState(
     # empty satellite dictionary is typed after a template built through
     # `create_tracked_sat` — the same constructor the acquisition handover uses — so
     # acquired sats merge without a slot-type mismatch (see `create_tracked_sat`).
-    groups = NamedTuple{group_keys}(map(systems) do system
+    sat_templates = map(systems) do system
+        create_tracked_sat(
+            tracking_signals(system),
+            0,
+            0.0,
+            0.0Hz,
+            num_ants,
+            doppler_estimator,
+        )
+    end
+    groups = NamedTuple{group_keys}(map(systems, sat_templates) do system, template
         sigs = tracking_signals(system)
-        template = create_tracked_sat(sigs, 0, 0.0, 0.0Hz, num_ants, doppler_estimator)
         sats = Dictionary{Int,typeof(template)}(Int[], typeof(template)[])
         SignalGroup(get_band(first(sigs)), sats, sigs, num_ants)
     end)
@@ -719,7 +757,19 @@ function ReceiverState(
     band_keys = keys(acquisition_buffers)
     last_time_acquisition_ran = NamedTuple{band_keys}(map(_ -> -Inf * 1.0s, band_keys))
     pvt = PVTSolution()
-    pvt_sat_state_buffer = SatelliteState[]
+    # The PVT satellite buffer, typed from the *configured* systems rather than
+    # left at the abstract `SatelliteState`.
+    #
+    # It has to pool constellations and bands — one `calc_pvt` resolves them
+    # together — so it cannot be one concrete type in general. But which types
+    # can appear is fixed here, at construction, and naming them is the whole
+    # difference: `Vector{SatelliteState}` makes `calc_pvt` a single
+    # specialisation shared by every receiver and inferable by none of them,
+    # while a union of the two or three types this receiver can actually produce
+    # is union-split, and collapses to one concrete element type for the common
+    # single-constellation case — which is the shape `PositionVelocityTime`
+    # precompiles for its own callers. See `pvt_sat_state_type`.
+    pvt_sat_state_buffer = Vector{pvt_sat_state_union(systems, sat_templates)}()
     # The vector-tracking clock/inter-frequency-bias layout is fixed here, from
     # the *configured* systems, so the navigation filter's state dimension
     # never changes mid-run. `vector_tracking` carries the filter's configuration

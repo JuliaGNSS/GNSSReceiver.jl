@@ -145,23 +145,20 @@ end
 # the originals. It is a workload, so it degrades to a no-op if those internals
 # are ever renamed — the receiver is slower to its first fix, nothing breaks.
 function _precompile_pvt_states()
-    states = PositionVelocityTime.SatelliteState[]
-    isdefined(PositionVelocityTime, :_precompile_states) || return states
-    isdefined(PositionVelocityTime, :_PRECOMPILE_GPS_L1CA_STATES) || return states
+    empty = PositionVelocityTime.SatelliteState[]
+    isdefined(PositionVelocityTime, :_precompile_states) || return empty
+    isdefined(PositionVelocityTime, :_PRECOMPILE_GPS_L1CA_STATES) || return empty
     try
-        append!(
-            states,
-            PositionVelocityTime._precompile_states(
-                GPSL1CA(),
-                PositionVelocityTime._PRECOMPILE_GPS_L1CA_STATES,
-                identity,
-                GPSL1CA(),
-            ),
+        # Concretely typed, exactly as a GPS-only receiver's buffer is.
+        PositionVelocityTime._precompile_states(
+            GPSL1CA(),
+            PositionVelocityTime._PRECOMPILE_GPS_L1CA_STATES,
+            identity,
+            GPSL1CA(),
         )
     catch
-        empty!(states)
+        empty
     end
-    states
 end
 
 function _precompile_noise_channel(T, num_samples, num_chunks)
@@ -175,20 +172,27 @@ end
 @setup_workload begin
     nav_symbols = _precompile_syncable_symbols()
     pvt_states = _precompile_pvt_states()
+    pvt_states_abstract = Vector{PositionVelocityTime.SatelliteState}(pvt_states)
     @compile_workload begin
-        # One real navigation solution, on exactly the vector the receiver
-        # builds (`ReceiverState`'s `pvt_sat_state_buffer`), cold and warm
-        # started, with and without the atmospheric corrections — the shapes
-        # `update_pvt` calls. See `_precompile_pvt_states`.
-        if !isempty(pvt_states)
-            pvt = calc_pvt(pvt_states; approximate_year = 2021)
-            calc_pvt(pvt_states, pvt; approximate_year = 2021)
-            calc_pvt(
-                pvt_states;
-                approximate_year = 2021,
-                enable_ionospheric_correction = false,
-                enable_tropospheric_correction = false,
-            )
+        # One real navigation solution, cold and warm started and with the
+        # atmospheric corrections both ways — the shapes `update_pvt` calls.
+        # Run on the *concrete* element type a single-constellation receiver's
+        # `pvt_sat_state_buffer` has and on the abstract `SatelliteState`
+        # fallback, because those are two specialisations and a receiver hits
+        # one or the other depending on whether its satellite type could be
+        # inferred (see `pvt_sat_state_type`). A multi-constellation receiver's
+        # union is a third, and is left to its own first solve.
+        for states in (pvt_states, pvt_states_abstract)
+            if !isempty(states)
+                pvt = calc_pvt(states; approximate_year = 2021)
+                calc_pvt(states, pvt; approximate_year = 2021)
+                calc_pvt(
+                    states;
+                    approximate_year = 2021,
+                    enable_ionospheric_correction = false,
+                    enable_tropospheric_correction = false,
+                )
+            end
         end
         # The decoder's sync path, driven directly: the receiver reaches it only
         # after 6 s of real navigation data, so no pipeline workload can.

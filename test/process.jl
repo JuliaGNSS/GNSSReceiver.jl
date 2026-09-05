@@ -413,6 +413,56 @@ end
     @test isempty(states)
 end
 
+@testset "The PVT buffer is typed from the configured systems" begin
+    # `pvt_sat_state_buffer` used to be a `Vector{SatelliteState}` — one
+    # specialisation of `calc_pvt` shared by every receiver and inferable by
+    # none. Naming the types the *configured* systems can produce collapses a
+    # single-constellation receiver's buffer to one concrete element type, which
+    # is the shape `PositionVelocityTime` precompiles for its own callers: the
+    # first solve then costs 0.006 s instead of 0.842 s, and it is not compiled
+    # inside the fold at the first fix (issue #107).
+    system = GPSL1CA()
+    key = get_signal_id(system)
+    receiver_state = GNSSReceiver.ReceiverState(
+        Complex{Int16},
+        system;
+        num_samples_for_acquisition = 4000,
+    )
+    buffer = receiver_state.pvt_sat_state_buffer
+    @test isconcretetype(eltype(buffer))
+
+    # And it has to be the type `collect_pvt_sat_states!` actually builds —
+    # inferring the wrong one would throw on the first `push!`, i.e. at the first
+    # fix, which is the worst possible moment to find out.
+    track_state = single_sat_track_state(system, 5)
+    ready = pvt_sat_state(
+        system,
+        5,
+        ranging_ready_code_detector(),
+        ranging_ready_carrier_detector(),
+    )
+    GNSSReceiver.collect_pvt_sat_states!(
+        buffer,
+        (system,),
+        (; key => Dictionary([5], [ready])),
+        track_state,
+        2u"s",
+    )
+    @test length(buffer) == 1
+    @test typeof(only(buffer)) === eltype(buffer)
+
+    # Two constellations pool into one solve, so no single concrete type serves —
+    # but the union is still known here, and Julia splits it.
+    multi = GNSSReceiver.ReceiverState(
+        Complex{Int16},
+        (GPSL1CA(), GalileoE1B());
+        num_samples_for_acquisition = 24552,
+    )
+    element = eltype(multi.pvt_sat_state_buffer)
+    @test element isa Union
+    @test all(isconcretetype, Base.uniontypes(element))
+end
+
 @testset "PVT waits for the satellites' loops to settle" begin
     # `time_in_lock_before_calculating_pvt` keeps a freshly locked satellite out of the
     # solve until its loops have settled: the pseudorange is built from the tracked code
