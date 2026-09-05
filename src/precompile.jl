@@ -93,32 +93,6 @@ function _precompile_drive_hardware_sdr(sdr, num_samples, num_chunks)
     end
 end
 
-# A GPS L1 C/A symbol stream that the navigation decoder will *synchronise* on.
-#
-# The pipeline workloads run `decode` on noise, which is what the receiver does
-# on every chunk — but the expensive branch is the one taken exactly once, when
-# the first subframe arrives: `try_sync` matching the TLM preamble, then
-# `read_tlm_and_how_words` and the four `can_decode_word` closures it drives.
-# Measured on an Orin, that was 1.0 s of compilation at the moment of the first
-# bit sync, inside the fold, with the hardware correlator's dump ring unattended
-# throughout (issue #107).
-#
-# Sync needs nothing but the preamble on the subframe grid: `10001011` at the
-# start of two consecutive 300-bit subframes (IS-GPS-200, both fixed for the
-# life of the signal). The words then fail parity, which is exactly as useful —
-# what this compiles is the path, not the result.
-function _precompile_syncable_symbols(num_subframes = 3)
-    preamble = Bool[1, 0, 0, 0, 1, 0, 1, 1]
-    bits = Bool[]
-    for _ = 1:num_subframes
-        append!(bits, preamble)
-        # Filler: anything but a constant, and deterministic so that what the
-        # package image contains never depends on a random draw.
-        append!(bits, [isodd(k >> 2) ⊻ isodd(k >> 5) for k = 1:(300-length(preamble))])
-    end
-    Float32[b ? 1.0f0 : -1.0f0 for b in bits]
-end
-
 # Satellites for one real PVT solve, or an empty vector when this cannot be
 # built.
 #
@@ -170,7 +144,6 @@ function _precompile_noise_channel(T, num_samples, num_chunks)
 end
 
 @setup_workload begin
-    nav_symbols = _precompile_syncable_symbols()
     pvt_states = _precompile_pvt_states()
     pvt_states_abstract = Vector{PositionVelocityTime.SatelliteState}(pvt_states)
     @compile_workload begin
@@ -194,9 +167,6 @@ end
                 )
             end
         end
-        # The decoder's sync path, driven directly: the receiver reaches it only
-        # after 6 s of real navigation data, so no pipeline workload can.
-        decode(GNSSDecoderState(GPSL1CA(), 1), nav_symbols, length(nav_symbols))
         # Integer front end: the common live case, with the Int16 backend
         # `max_meas` selects — one system, then the two default constellations
         # in one band (the multi-system tracking state, decoder and PVT paths).
