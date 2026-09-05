@@ -780,6 +780,80 @@ end
     @test typeof(a) === typeof(b)
 end
 
+@testset "A dump-stream gap freezes a satellite rather than decaying it" begin
+    # The device correlates whether or not the host is listening, and the dumps
+    # cross a DMA ring a late host overruns. On the board a 2.5 s hole in the
+    # record stream ended with the prompt still at its handover power — the
+    # FPGA had never lost the satellite — while the host had released all five
+    # and gone back to waiting for a rescan (issue #107). Missing records are a
+    # transport fault, so they must not be evidence against the signal.
+    system = GPSL1CA()
+    key = get_signal_id(system)
+    prn = 5
+    sdr = RecordingSDR(EPL, 2)
+    link = HardwareCorrelatorLink(
+        sdr;
+        sampling_freq = 4e6Hz,
+        reference_signal = GPSL1CA(),
+        max_dump_gap = 1u"s",
+    )
+    track_state = single_sat_track_state(system, prn)
+    assignment = GNSSReceiver.HardwareChannelAssignment(key, prn, 1)
+    link.assignments[1] = assignment
+    link.channel_of[assignment] = 1
+    # Handed over, nothing folded yet, and the host has consumed nothing.
+    link.last_record_at_samples[1] = 0
+
+    sat_states = (; key => Dictionary([prn], [GNSSReceiver.ReceiverSatState(system, prn)]))
+    before = sat_states[key][prn]
+    @test GNSSReceiver.is_in_lock(before)
+
+    # Two seconds of chunks with no records at all. Nothing was measured, so
+    # nothing about the satellite may change — not the detectors, not the dwell,
+    # not the time in lock.
+    for _ = 1:500
+        sat_states = GNSSReceiver.update_all_receiver_sat_states(
+            sat_states,
+            track_state,
+            (system,),
+            4u"ms",
+            link,
+        )
+    end
+    @test sat_states[key][prn].time_in_lock == before.time_in_lock
+    @test GNSSReceiver.is_in_lock(sat_states[key][prn])
+
+    # Past the budget the dump path is not late but broken, and the detectors
+    # are allowed to decay again so the satellite is eventually released.
+    link.samples_consumed = 8_000_000        # 2 s at 4 MHz since the last record
+    @test !GNSSReceiver.is_within_dump_gap_budget(link, key, prn)
+    # One chunk is enough to see the freeze lift: the detectors are updated and
+    # the clock the freeze had held now runs.
+    sat_states = GNSSReceiver.update_all_receiver_sat_states(
+        sat_states,
+        track_state,
+        (system,),
+        4u"ms",
+        link,
+    )
+    @test sat_states[key][prn].time_in_lock == 4u"ms"
+    for _ = 1:500
+        sat_states = GNSSReceiver.update_all_receiver_sat_states(
+            sat_states,
+            track_state,
+            (system,),
+            4u"ms",
+            link,
+        )
+    end
+    @test !GNSSReceiver.is_in_lock(sat_states[key][prn])
+    @test sat_states[key][prn].time_out_of_lock > 0u"s"
+
+    # A satellite the link holds no hardware channel for is not on this path at
+    # all, so nothing about it is ever a dump-stream gap.
+    @test !GNSSReceiver.is_within_dump_gap_budget(link, key, 99)
+end
+
 @testset "A normal one-or-two-epoch backlog is still folded, not skipped" begin
     band_systems = ((GPSL1CA(),),)
     sdr = RecordingSDR(EPL, 2)

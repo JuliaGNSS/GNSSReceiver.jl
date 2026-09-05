@@ -261,6 +261,7 @@ function process(
         track_state,
         all_systems,
         signal_duration,
+        correlator_source,
     )
 
     track_state = remove_lost_satellites(receiver_sat_states, track_state)
@@ -514,7 +515,16 @@ function update_pvt(
     )
 end
 
-function update_all_receiver_sat_states(receiver_sat_states, track_state, systems, signal_duration)
+function update_all_receiver_sat_states(
+    receiver_sat_states,
+    track_state,
+    systems,
+    signal_duration,
+    # Where this chunk's correlator outputs came from, so a satellite that
+    # received none of them can be told apart from one whose signal is gone —
+    # see [`is_observation_gap`](@ref GNSSReceiver.is_observation_gap).
+    correlator_source = nothing,
+)
     group_keys = keys(receiver_sat_states)
     # Map over `systems` (aligned with `group_keys`) so each group carries its own
     # ranging/data signal selectors: CN0 and carrier lock are read from the ranging
@@ -535,6 +545,13 @@ function update_all_receiver_sat_states(receiver_sat_states, track_state, system
             # its availability.
             if is_in_lock(receiver_sat_state) || receiver_sat_state.in_vt_loop
                 prn = receiver_sat_state.prn
+                # Nothing measured this chunk, for a reason that is about the
+                # transport and not about the signal: freeze the satellite
+                # rather than credit its detectors with evidence that never
+                # arrived. Only a hardware-correlator source ever says `true`.
+                if is_observation_gap(correlator_source, track_state, group_key, prn)
+                    return receiver_sat_state
+                end
                 ReceiverSatState(
                     prn,
                     decode(

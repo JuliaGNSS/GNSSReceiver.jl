@@ -389,6 +389,13 @@ Keywords:
     is held back until a second record corroborates the jump, and counted in
     `implausible_dumps`. One nonsense index is otherwise permanent: the clock
     only moves forward and the grid resynchronises onto it.
+  - `max_dump_gap` — how long a hardware channel's records may be missing before
+    the receiver stops protecting its satellite (default 5 s). Within it a
+    satellite that receives no record is *frozen* rather than decayed — a gap in
+    the dump stream is a host fault and says nothing about the signal, and the
+    device goes on tracking through it. Past it the dump path is broken rather
+    than late, and the lock detectors are allowed to release the satellite. See
+    [`is_observation_gap`](@ref).
 """
 mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     # Deliberately abstract, and the one field of this struct that is: the
@@ -530,6 +537,20 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     # Raw samples consumed from `raw_sample_channel` since the run began — the
     # time base `assign_channel!` hands over on.
     samples_consumed::Int
+    # ── Dump-stream gaps ──────────────────────────────────────────────────────
+    # `samples_consumed` when this hardware channel last contributed a record,
+    # i.e. how long its dumps have been missing measured on the host's own
+    # clock. A gap in the dump stream is a *host* fault — the device keeps
+    # correlating, and the board's own logs show a channel still on the peak
+    # after 2.5 s of missing records — so the receiver freezes the satellite's
+    # lock detectors rather than letting them decay through it
+    # (`is_within_dump_gap_budget`). `typemin` = nothing folded since the
+    # channel was assigned.
+    const last_record_at_samples::Vector{Int64}
+    # How long that freeze may last before the detectors are allowed to decay
+    # again, in raw samples. Without a bound a permanently dead dump path would
+    # hold every satellite in lock for ever.
+    const max_dump_gap_samples::Int64
     # Diagnostics.
     dropped_dumps::Int
     stale_dumps::Int
@@ -555,6 +576,7 @@ function HardwareCorrelatorLink(
     noise_source::Symbol = :channel,
     noise_rearm_interval = 1u"s",
     max_epoch_clock_advance = 1u"s",
+    max_dump_gap = 5u"s",
 )
     interval = something(
         doppler_update_interval,
@@ -599,6 +621,10 @@ function HardwareCorrelatorLink(
             "max_epoch_clock_advance $max_epoch_clock_advance is shorter than one epoch " *
             "at $sampling_freq",
         ),
+    )
+    max_dump_gap_samples = round(Int64, upreferred(max_dump_gap * sampling_freq))
+    max_dump_gap_samples >= 0 || throw(
+        ArgumentError("max_dump_gap must not be negative (got $max_dump_gap)"),
     )
 
     dumps = correlator_dump_channel(sdr)
@@ -651,6 +677,8 @@ function HardwareCorrelatorLink(
         max_index_advance,
         typemin(Int64),
         0,
+        fill(typemin(Int64), n),
+        max_dump_gap_samples,
         0,
         0,
         0,
@@ -738,6 +766,64 @@ function advance_tracking!(
     fold_closed_epochs!(link, track_state, band_measurements, band_systems)
 
     track_state
+end
+
+"""
+    is_observation_gap(correlator_source, track_state, group_key, prn) -> Bool
+
+Whether this chunk delivered **no measurement at all** for the satellite, in a
+way that says nothing about the signal — so the receiver should freeze its lock
+detectors rather than let them decay through it.
+
+`false` for a software correlator: there the chunk's samples *are* the
+measurement, and a chunk that produces no record produced none because the
+signal was not there.
+
+A hardware-correlator receiver is the opposite case. The device correlates
+whether or not the host is listening, and the dumps reach the host over a DMA
+ring that a late host overruns: a stall of a few hundred milliseconds — one JIT
+compilation is enough — costs every record produced during it. The board's own
+logs are unambiguous about what that gap is *not*: when the records resumed
+after 2.5 s of silence the prompt was still at its handover power with
+`|P|/|E,L| = 1.44`, i.e. the FPGA had held the satellite throughout on its last
+NCO word (issue #107). Decaying the detectors through such a gap released five
+satellites the device had never lost, and cost a rescan (two minutes) to get
+them back.
+
+So a hardware-tracked satellite that contributed no fully integrated record
+this chunk is frozen: its detectors, its dwell and its `time_in_lock` are left
+exactly as the last real measurement left them. The freeze is bounded by the
+link's `max_dump_gap` — past that the dump path is not late but broken, and the
+detectors are allowed to decay so the satellite is eventually released rather
+than held in a lock nothing is confirming.
+"""
+is_observation_gap(correlator_source, track_state, group_key, prn) = false
+
+function is_observation_gap(
+    link::HardwareCorrelatorLink,
+    track_state,
+    group_key,
+    prn,
+)
+    # Tracking clears `filtered_prompts` at the start of every chunk and pushes
+    # one per completed record, so "empty" is exactly "no record this chunk".
+    isempty(get_filtered_prompts(track_state, group_key, prn, RANGING_SIGNAL_INDEX)) &&
+        is_within_dump_gap_budget(link, group_key, prn)
+end
+
+# Whether the satellite's hardware channel has been silent for less than the
+# link's `max_dump_gap`. A satellite the link holds no channel for is not
+# hardware-tracked at all, so nothing about it is a dump-stream gap.
+function is_within_dump_gap_budget(link::HardwareCorrelatorLink, group_key, prn)
+    hw_channel = get(
+        link.channel_of,
+        HardwareChannelAssignment(group_key, prn, RANGING_SIGNAL_INDEX),
+        0,
+    )
+    hw_channel == 0 && return false
+    last_seen = link.last_record_at_samples[hw_channel]
+    last_seen == typemin(Int64) && return false
+    link.samples_consumed - last_seen <= link.max_dump_gap_samples
 end
 
 """
@@ -1123,6 +1209,10 @@ function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampl
     link.last_record_end[hw_channel] = typemin(Int64)
     link.lost_record_samples[hw_channel] = 0
     link.overlapping_record_samples[hw_channel] = 0
+    # The handover itself counts as the channel's last sign of life, so the
+    # dump-gap budget is spent from here rather than from whatever the previous
+    # occupant left behind.
+    link.last_record_at_samples[hw_channel] = link.samples_consumed
     _discard_partial!(link, hw_channel)
     link
 end
@@ -1516,6 +1606,8 @@ function _append_dump!(link, track_state, dump)
         dump.output,
     )
     _accumulate_dump!(link, track_state, assignment, sat_state, hw_channel, dump.output)
+    # The channel is alive: the dump-gap budget starts again from here.
+    link.last_record_at_samples[hw_channel] = link.samples_consumed
     # Collect the code-phase anchor for the phase bookkeeping. Only the
     # estimator-driver signal carries the sat-shared code phase; dumps are
     # appended in `sample_index` order, so the epoch's freshest anchor wins.
