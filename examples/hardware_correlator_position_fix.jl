@@ -84,7 +84,7 @@ using Statistics: mean, median, std
 using StaticArrays: SVector
 using Unitful
 using Unitful: Hz, ms, ustrip
-using Geodesy: LLAfromECEF, wgs84
+using Geodesy: LLAfromECEF, wgs84, ECEF
 
 using Acquisition: acquire
 using FFTW
@@ -800,6 +800,98 @@ my_extract(state) = (
     ],
 )
 
+# ── Status reporting ─────────────────────────────────────────────────────────
+# Every line the harness prints *while the receiver runs*, built here rather
+# than inline in the run loop, so that `warm_reporting` below can pay for their
+# compilation before the stream exists.
+#
+# This is not tidiness. `Printf.format` is compiled per format string on first
+# call, and a `@sprintf` sitting in the run loop is therefore first compiled
+# from inside the fold — where the receiver has a few milliseconds before the
+# device's dump ring overruns. Measured on the Orin (issue #107,
+# `--trace-compile-timing`): the first status line cost 743 ms of `Printf`
+# plus 368 + 153 ms for the two comprehensions that build it, and the
+# `slip_watch` timer another 383 ms on its first tick — 1.6 s of stalls that
+# emptied the ring and cost every satellite the records taken during them.
+# Nothing here is on a hot path; it runs at most a few times a second.
+
+sat_summary(sat_data) = join(
+    [@sprintf("%d:%.0f", k[2], 10log10(ustrip(Hz, Unitful.linear(v.cn0))))
+     for (k, v) in pairs(sat_data)],
+    " ",
+)
+
+decode_summary(decode) = join(
+    [@sprintf("%d:%db%s%s%d", e.prn, e.nbits, e.tow >= 0 ? "*" : "",
+              e.found ? "F" : "-", e.nsoft)
+     for e in decode],
+    " ",
+)
+
+position_summary(position) = let lla = LLAfromECEF(wgs84)(position)
+    @sprintf("%.6f°, %.6f°, %.0fm", lla.lat, lla.lon, lla.alt)
+end
+
+# lag = wall time minus receiver runtime: how far the processing is behind real
+# time. The NCO corrections apply `lag` late, so a growing lag silently opens
+# the loop delay — the PLL stops phase-locking long before anything else looks
+# wrong.
+status_line(t, runtime, sats, dec, pos, missed, free_bytes) = @sprintf(
+    "t=%5.1fs rt=%5.1fs cn0[%s] dec[%s] | %s | missed=%d free=%dG",
+    t, ustrip(u"s", runtime), sats, dec, pos, missed, free_bytes ÷ 2^30)
+
+first_fix_line(t, position, num_sats) = let lla = LLAfromECEF(wgs84)(position)
+    @sprintf(
+        "*** FIRST FIX after %.1f s: lat %.6f° lon %.6f° alt %.1f m (%d sats) ***",
+        t, lla.lat, lla.lon, lla.alt, num_sats)
+end
+
+slip_corrected_line(slip, total) = @sprintf(
+    "host axis slipped %+d samples (%.1f chips) — device_origin re-anchored, %+d total",
+    slip, slip * 0.2558, total)
+
+slip_implausible_line(slip) = @sprintf(
+    "host axis slip %+d samples is implausibly large — not correcting", slip)
+
+continuity_summary(link) = join(
+    [string(a.prn, "→ch", ch, " lost=", link.lost_record_samples[ch],
+            "smp overlap=", link.overlapping_record_samples[ch], "smp")
+     for (ch, a) in enumerate(link.assignments) if !isnothing(a)],
+    "  ",
+)
+
+link_summary(link) = string(
+    "link: gaps=", link.lost_record_gaps, " stale=", link.stale_dumps,
+    " dropped=", link.dropped_dumps, " skipped_epochs=", link.skipped_epochs)
+
+# Run every one of them once, into `devnull`, on values of exactly the types the
+# live loop will hand them. The dummies are built by hand rather than taken from
+# the warm-up's own payloads because those track nothing: an empty `sat_data`
+# never enters the comprehension body, so nothing inside it would compile.
+function warm_reporting()
+    # Exactly the container and element the receiver's own payload carries: the
+    # comprehensions above compile per container type, so a stand-in `Dict`
+    # would leave them to be compiled live after all. `Dictionaries` is
+    # GNSSReceiver's dependency, not the harness's, hence the qualified name.
+    sat_data = GNSSReceiver.Dictionary(
+        [(:GPSL1CA, 1)],
+        [GNSSReceiver.SatelliteDataOfInterest(45.0u"dBHz", 1.0 + 0.0im, true)],
+    )
+    decode = [(prn = 1, nbits = 300, tow = Int64(42), found = true, nsoft = 20,
+               soft = Float32[0.5])]
+    position = ECEF(4.0e6, 0.5e6, 4.6e6)
+    print(devnull, sat_summary(sat_data))
+    print(devnull, decode_summary(decode))
+    print(devnull, position_summary(position))
+    # `Sys.free_memory()` is a `UInt64`; `Printf` compiles per argument type, so
+    # the stand-in has to be one too.
+    print(devnull, status_line(1.0, 1.0u"s", "1:45", "1:0b-F0", "no fix", 0, UInt64(2)^31))
+    print(devnull, first_fix_line(1.0, position, 4))
+    print(devnull, slip_corrected_line(16, 16))
+    print(devnull, slip_implausible_line(1 << 20))
+    nothing
+end
+
 mutable struct WarmSDR{C} <: AbstractHardwareCorrelatorSDR
     const raw::SignalChannel{Complex{Int16},1}
     const dumps::PipeChannel{CorrelatorDump{C}}
@@ -870,6 +962,9 @@ function warm_up()
     for _ in data
     end
     wait(task)
+    # The harness's own reporting is part of the pipeline as far as the fold is
+    # concerned: it runs on the same task, between chunks.
+    warm_reporting()
     @info @sprintf("warm-up done in %.1f s", time() - t0)
 end
 
@@ -1103,12 +1198,12 @@ function main()
     # deliberate part as creep and correct it away.
     slip_baseline = Ref{Union{Nothing,Int64}}(nothing)
     let corrected = Ref{Int64}(0)
-        global arm_slip_watch! = function ()
-            samples = filter(!isnothing, [creep_now() for _ = 1:5])
-            slip_baseline[] = isempty(samples) ? nothing : minimum(samples)
-        end
-
-        global slip_watch = Timer(10; interval = 10) do _
+        # The tick, as a named function rather than the timer's own closure, so
+        # `arm_slip_watch!` can run it once while nothing depends on the fold.
+        # As a timer body it was first compiled on the ten-second tick — 383 ms
+        # of JIT on the receiver's task, with the device's dump ring unattended
+        # throughout (issue #107).
+        slip_tick = function ()
             try
                 isnothing(slip_baseline[]) && return
                 # A hand-over landing between the two reads shows up as one chunk
@@ -1128,16 +1223,25 @@ function main()
                 if 8 < slip < 4 * CHUNK
                     sdr.device_origin += slip
                     corrected[] += slip
-                    @info @sprintf(
-                        "host axis slipped %+d samples (%.1f chips) — device_origin re-anchored, %+d total",
-                        slip, slip * 0.2558, corrected[])
+                    @info slip_corrected_line(slip, corrected[])
                 elseif slip >= 4 * CHUNK
-                    @warn @sprintf(
-                        "host axis slip %+d samples is implausibly large — not correcting",
-                        slip)
+                    @warn slip_implausible_line(slip)
                 end
             catch
             end
+        end
+
+        global arm_slip_watch! = function ()
+            samples = filter(!isnothing, [creep_now() for _ = 1:5])
+            slip_baseline[] = isempty(samples) ? nothing : minimum(samples)
+            # Compiles the tick (and `creep_now`) here. The baseline was taken
+            # from the same reads, so this tick measures a slip of about zero
+            # and corrects nothing.
+            slip_tick()
+        end
+
+        global slip_watch = Timer(10; interval = 10) do _
+            slip_tick()
         end
     end
 
@@ -1333,36 +1437,20 @@ function main()
             if isnothing(first_fix)
                 first_fix = d.pvt
                 fix_time = t
-                lla = LLAfromECEF(wgs84)(d.pvt.position)
-                @info @sprintf(
-                    "*** FIRST FIX after %.1f s: lat %.6f° lon %.6f° alt %.1f m (%d sats) ***",
-                    t, lla.lat, lla.lon, lla.alt, length(d.pvt.sats))
+                @info first_fix_line(t, d.pvt.position, length(d.pvt.sats))
             end
         end
         if t - last_print >= 5.0
             last_print = t
-            sats = join(
-                [@sprintf("%d:%.0f", k[2], 10log10(ustrip(Hz, Unitful.linear(v.cn0))))
-                 for (k, v) in pairs(d.sat_data)],
-                " ")
-            dec = join(
-                [@sprintf("%d:%db%s%s%d", e.prn, e.nbits, e.tow >= 0 ? "*" : "",
-                          e.found ? "F" : "-", e.nsoft)
-                 for e in payload.decode],
-                " ")
-            pos = if has_fix
-                lla = LLAfromECEF(wgs84)(d.pvt.position)
-                @sprintf("%.6f°, %.6f°, %.0fm", lla.lat, lla.lon, lla.alt)
-            else
-                "no fix"
-            end
-            # lag = wall time minus receiver runtime: how far the processing
-            # is behind real time. The NCO corrections apply `lag` late, so a
-            # growing lag silently opens the loop delay — the PLL stops
-            # phase-locking long before anything else looks wrong.
-            @info @sprintf("t=%5.1fs rt=%5.1fs cn0[%s] dec[%s] | %s | missed=%d free=%dG",
-                           t, ustrip(u"s", d.runtime), sats, dec, pos,
-                           sdr.missed_csr_dumps, Sys.free_memory() ÷ 2^30)
+            @info status_line(
+                t,
+                d.runtime,
+                sat_summary(d.sat_data),
+                decode_summary(payload.decode),
+                has_fix ? position_summary(d.pvt.position) : "no fix",
+                sdr.missed_csr_dumps,
+                Sys.free_memory(),
+            )
             # Memory valve: a paused decode beats an OOM kill.
             if gc_off && Sys.free_memory() < 8 * 2^30
                 @warn "low memory — re-enabling GC"
@@ -1376,12 +1464,8 @@ function main()
 
     @info "stopping"
     let link = BIT_LOG_SOURCE[].link
-        @info "record continuity: " * join(
-            [string(a.prn, "→ch", ch, " lost=", link.lost_record_samples[ch],
-                    "smp overlap=", link.overlapping_record_samples[ch], "smp")
-             for (ch, a) in enumerate(link.assignments) if !isnothing(a)], "  ")
-        @info string("link: gaps=", link.lost_record_gaps, " stale=", link.stale_dumps,
-                     " dropped=", link.dropped_dumps, " skipped_epochs=", link.skipped_epochs)
+        @info "record continuity: " * continuity_summary(link)
+        @info link_summary(link)
     end
     if !isnothing(probe)
         @info string(

@@ -209,6 +209,14 @@ Optional:
     Defaults to `0`, i.e. "this device cannot tell"; implement it if it can,
     because a silently dropped dump is a silently corrupted loop.
 
+A vendor package needs no `PrecompileTools` workload of its own for the receive
+pipeline. Nothing GNSSReceiver compiles for a hardware receiver depends on the
+device's type — [`HardwareCorrelatorLink`](@ref) carries the correlator type
+only — and every call into this interface goes through `invokelatest`, so
+defining these methods does not invalidate the pipeline either. The package
+precompiles the whole hardware path against an internal stub device, and that is
+what a real device runs.
+
 Dumps and raw samples are deliberately *separate* streams rather than one fused
 element type: they have very different rates and lifecycles (tiny-continuous vs
 huge-periodic), and fusing them would force the full-rate raw stream to ride the
@@ -377,11 +385,32 @@ Keywords:
     [`coherent_integration_blocks`](@ref) for why this is not optional in
     practice.
 """
-mutable struct HardwareCorrelatorLink{
-    S<:AbstractHardwareCorrelatorSDR,
-    C<:Tracking.AbstractCorrelator,
-}
-    const sdr::S
+mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
+    # Deliberately abstract, and the one field of this struct that is: the
+    # device is *not* a type parameter, so every link over the same correlator
+    # type is the same type and the pipeline compiled for one device serves
+    # every other. That matters because the pipeline is large — `receive`'s
+    # processing closure alone costs 1.7 s to compile on an Orin — and it is
+    # specialised on the correlator source. With the device in the type, a
+    # warm-up against a stub SDR compiled a specialisation the live device
+    # could not use, and the whole pipeline recompiled *inside* the first live
+    # chunk: 1.7 s in which no dump is drained and the ring overflows (issue
+    # #107). Erasing it costs one dynamic dispatch per device call — see
+    # `_call_device` — and every one of those is per chunk
+    # (`dropped_dump_count!`) or rarer (`assign_channel!`, `release_channel!`);
+    # the two streams the ingest path really uses are cached below, so neither
+    # the drain nor the feedback push touches the device at all.
+    const sdr::AbstractHardwareCorrelatorSDR
+    # The device's two record streams, resolved once here rather than asked for
+    # per chunk. Caching them keeps the drain and the feedback push on concrete
+    # types — but the reason it matters is invalidation, not dispatch cost: code
+    # compiled against `correlator_dump_channel`'s method table is thrown away
+    # the moment a vendor package adds its own method to it, which is exactly
+    # when a hardware receiver starts, and the pipeline then recompiles inside
+    # the first live chunk. Reading the channels out of the link touches no
+    # generic function at all.
+    const dumps::PipeChannel{CorrelatorDump{C}}
+    const ncos::PipeChannel{NCOUpdate}
     # hw channel (1-based) → its occupant, or `nothing` when free.
     const assignments::Vector{Union{Nothing,HardwareChannelAssignment}}
     # Reverse index, so the per-chunk sync is a lookup rather than a scan.
@@ -541,17 +570,21 @@ function HardwareCorrelatorLink(
             ),
         )
 
-    dump_type = eltype(correlator_dump_channel(sdr))
+    dumps = correlator_dump_channel(sdr)
+    dump_type = eltype(dumps)
     dump_type <: CorrelatorDump || throw(
         ArgumentError(
             "correlator_dump_channel(::$(typeof(sdr))) must have eltype <: CorrelatorDump, " *
             "got $dump_type",
         ),
     )
+    ncos = nco_update_channel(sdr)
     n = num_hardware_channels(sdr)
 
-    HardwareCorrelatorLink{typeof(sdr),_correlator_type(dump_type)}(
+    HardwareCorrelatorLink{_correlator_type(dump_type)}(
         sdr,
+        dumps,
+        ncos,
         Union{Nothing,HardwareChannelAssignment}[nothing for _ = 1:n],
         Dict{HardwareChannelAssignment,Int}(),
         dump_type[],
@@ -602,6 +635,23 @@ The device behind a link.
 """
 get_sdr(link::HardwareCorrelatorLink) = link.sdr
 
+# Call one of the device interface's functions on the link's device.
+#
+# `invokelatest`, not a plain call, and that is the whole point of this helper.
+# `link.sdr` is abstract, so inference cannot resolve `dropped_dump_count!` on
+# it; what it does instead is record a backedge on the *method table*, so that
+# a package adding a method to it invalidates the caller. A vendor package
+# defining the interface for its device is precisely that, and it invalidates
+# everything the call is compiled into: the ingest path, `process`, and
+# `receive`'s processing closure. Which means the pipeline this package
+# precompiles would be recompiled anyway — inside the first live chunk, with the
+# device's dump ring unattended for as long as it takes (issue #107).
+# `invokelatest` resolves in the current world at run time and leaves no
+# backedge to invalidate. Every call through here is per chunk or rarer, so the
+# extra indirection is not measurable.
+_call_device(f::F, link::HardwareCorrelatorLink, args...; kwargs...) where {F} =
+    Base.invokelatest(f, link.sdr, args...; kwargs...)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The dispatch seam: how one chunk advances the tracking state
 # ─────────────────────────────────────────────────────────────────────────────
@@ -648,7 +698,7 @@ function advance_tracking!(
     # receiver has dropped give theirs back.
     sync_hardware_channels!(link, track_state, band_systems, band_measurements)
 
-    link.dropped_dumps += dropped_dump_count!(link.sdr)
+    link.dropped_dumps += _call_device(dropped_dump_count!, link)
 
     drain_dumps!(link)
     fold_closed_epochs!(link, track_state, band_measurements, band_systems)
@@ -854,8 +904,9 @@ function _arm_noise_channel!(link, signal, sampling_freq)
         sampling_freq,
         code_frequency,
     )
-    assign_channel!(
-        link.sdr,
+    _call_device(
+        assign_channel!,
+        link,
         link.noise_channel,
         Int(link.noise_prn),
         (rand() * 10_000 - 5_000) * Hz,   # carrier dither, ±5 kHz
@@ -941,7 +992,7 @@ function release_stale_channels!(link, track_state)
         assignment = link.assignments[hw_channel]
         isnothing(assignment) && continue
         _is_tracked(track_state, assignment) && continue
-        release_channel!(link.sdr, hw_channel)
+        _call_device(release_channel!, link, hw_channel)
         link.assignments[hw_channel] = nothing
         delete!(link.channel_of, assignment)
         link.phase_ref_sample[hw_channel] = typemin(Int64)
@@ -1013,8 +1064,9 @@ function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampl
     # `assign_channel!`.
     el_sample_spacing =
         Tracking.get_early_late_sample_spacing(correlator, sampling_freq, code_frequency)
-    assign_channel!(
-        link.sdr,
+    _call_device(
+        assign_channel!,
+        link,
         hw_channel,
         assignment.prn,
         get_carrier_doppler(sat_state),
@@ -1063,7 +1115,7 @@ which is the receiver's clock; the dump ring only has to be drained faster than
 the device fills it.
 """
 function drain_dumps!(link::HardwareCorrelatorLink)
-    channel = correlator_dump_channel(link.sdr)
+    channel = link.dumps
     available = min(Base.n_avail(channel), link.max_dumps_per_drain)
     available == 0 && return 0
     resize!(link.drain_buffer, available)
@@ -1685,7 +1737,7 @@ dropped rather than blocking the receiver, and counted in `link.dropped_dumps`'
 sibling diagnostics.
 """
 function push_nco_updates!(link::HardwareCorrelatorLink, track_state, boundary)
-    channel = nco_update_channel(link.sdr)
+    channel = link.ncos
     apply_at_sample =
         max(boundary, link.latest_sample_index) +
         link.feedback_delay_epochs * link.epoch_length

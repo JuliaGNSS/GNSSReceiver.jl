@@ -12,6 +12,113 @@
 # constellations in one band, and for two bands in lock-step.
 using PrecompileTools: @setup_workload, @compile_workload
 
+# ── A device to compile the hardware-correlator pipeline against ─────────────
+#
+# The hardware receiver is a second, separate pipeline: `process` takes its
+# correlator outputs from a [`HardwareCorrelatorLink`](@ref) rather than from a
+# `Tracking` backend, and every method from `receive`'s processing closure down
+# to the epoch fold is specialised on that source. Compiling it live costs 1.7 s
+# on an Orin — 1.7 s inside one chunk, during which nothing drains the device's
+# dump ring, so it overruns and every satellite's records for the next second
+# and a half are simply gone (issue #107).
+#
+# Nothing here talks to hardware: the three streams are ordinary channels the
+# workload fills itself, which is all the pipeline ever sees of a device. The
+# link erases the device's type (see `HardwareCorrelatorLink`), so what is
+# cached here is what a *real* vendor device runs — this stub and an M2SDR
+# produce the same `HardwareCorrelatorLink{EarlyPromptLateCorrelator{…}}` and
+# therefore the same specialisations.
+struct _PrecompileHardwareSDR{C<:Tracking.AbstractCorrelator} <:
+       AbstractHardwareCorrelatorSDR
+    raw::SignalChannel{Complex{Int16},1}
+    dumps::PipeChannel{CorrelatorDump{C}}
+    ncos::PipeChannel{NCOUpdate}
+end
+
+raw_sample_channel(sdr::_PrecompileHardwareSDR) = sdr.raw
+correlator_dump_channel(sdr::_PrecompileHardwareSDR) = sdr.dumps
+nco_update_channel(sdr::_PrecompileHardwareSDR) = sdr.ncos
+num_hardware_channels(::_PrecompileHardwareSDR) = 4
+assign_channel!(::_PrecompileHardwareSDR, args...; kwargs...) = nothing
+release_channel!(::_PrecompileHardwareSDR, hw_channel) = nothing
+
+# The correlator a single-antenna Early/Prompt/Late device dumps. Both the
+# element type and the tap count are part of the link's type parameter, so this
+# is what pins the cached specialisations to the ones a vendor package's device
+# will hit.
+_precompile_epl(early, prompt, late) =
+    EarlyPromptLateCorrelator(SVector{3,ComplexF64}(early, prompt, late), 1)
+
+const _PRECOMPILE_EPL = typeof(_precompile_epl(0, 0, 0))
+
+# Feed the stub device: one raw chunk and one epoch's worth of dumps per
+# iteration, on a sample axis that advances exactly as a real device's does, and
+# drain whatever NCO updates the receiver pushes back so the ring cannot fill.
+function _precompile_drive_hardware_sdr(sdr, num_samples, num_chunks)
+    Threads.@spawn begin
+        try
+            chunk = Complex{Int16}.(round.(randn(ComplexF32, num_samples, 1) .* 512))
+            for i = 1:num_chunks
+                base = i * num_samples
+                batch = CorrelatorDump{_PRECOMPILE_EPL}[]
+                for hw_channel = 1:2
+                    push!(
+                        batch,
+                        CorrelatorDump(
+                            hw_channel,
+                            hw_channel,
+                            CorrelatorOutput(
+                                _precompile_epl(400 + 0im, 1000 + 10im, 400 + 0im),
+                                num_samples,
+                                base + hw_channel,
+                            ),
+                            mod(0.001 * base, 1023.0),
+                        ),
+                    )
+                end
+                # The strobe is what closes an epoch on a device whose channels
+                # are momentarily silent, so the fold path that depends on it is
+                # compiled here too.
+                push!(batch, epoch_strobe(_precompile_epl(0, 0, 0), base))
+                put!(sdr.dumps, batch)
+                put!(sdr.raw, chunk)
+                while Base.n_avail(sdr.ncos) > 0
+                    take!(sdr.ncos)
+                end
+            end
+        finally
+            close(sdr.raw)
+            close(sdr.dumps)
+        end
+    end
+end
+
+# A GPS L1 C/A symbol stream that the navigation decoder will *synchronise* on.
+#
+# The pipeline workloads run `decode` on noise, which is what the receiver does
+# on every chunk — but the expensive branch is the one taken exactly once, when
+# the first subframe arrives: `try_sync` matching the TLM preamble, then
+# `read_tlm_and_how_words` and the four `can_decode_word` closures it drives.
+# Measured on an Orin, that was 1.0 s of compilation at the moment of the first
+# bit sync, inside the fold, with the hardware correlator's dump ring unattended
+# throughout (issue #107).
+#
+# Sync needs nothing but the preamble on the subframe grid: `10001011` at the
+# start of two consecutive 300-bit subframes (IS-GPS-200, both fixed for the
+# life of the signal). The words then fail parity, which is exactly as useful —
+# what this compiles is the path, not the result.
+function _precompile_syncable_symbols(num_subframes = 3)
+    preamble = Bool[1, 0, 0, 0, 1, 0, 1, 1]
+    bits = Bool[]
+    for _ = 1:num_subframes
+        append!(bits, preamble)
+        # Filler: anything but a constant, and deterministic so that what the
+        # package image contains never depends on a random draw.
+        append!(bits, [isodd(k >> 2) ⊻ isodd(k >> 5) for k = 1:(300-length(preamble))])
+    end
+    Float32[b ? 1.0f0 : -1.0f0 for b in bits]
+end
+
 function _precompile_noise_channel(T, num_samples, num_chunks)
     spawn_signal_channel_thread(; T, num_samples, num_antenna_channels = 1) do channel
         for _ = 1:num_chunks
@@ -21,7 +128,11 @@ function _precompile_noise_channel(T, num_samples, num_chunks)
 end
 
 @setup_workload begin
+    nav_symbols = _precompile_syncable_symbols()
     @compile_workload begin
+        # The decoder's sync path, driven directly: the receiver reaches it only
+        # after 6 s of real navigation data, so no pipeline workload can.
+        decode(GNSSDecoderState(GPSL1CA(), 1), nav_symbols, length(nav_symbols))
         # Integer front end: the common live case, with the Int16 backend
         # `max_meas` selects — one system, then the two default constellations
         # in one band (the multi-system tracking state, decoder and PVT paths).
@@ -64,5 +175,31 @@ end
             pvt_update_interval = 4u"ms",
         )
         collect_data(data)
+
+        # The hardware-correlator receiver: the same pipeline taking its
+        # correlator outputs off a device instead of computing them. Run with
+        # the live defaults — asynchronous acquisition on the interactive pool —
+        # so what is cached is the shape a hardware receiver actually runs,
+        # including the scan-merge path. The logger is silenced because
+        # `Pkg.precompile` runs single-threaded, where asynchronous acquisition
+        # rightly warns that it cannot overlap a scan with tracking.
+        Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+            sdr = _PrecompileHardwareSDR(
+                SignalChannel{Complex{Int16},1}(4000, 8),
+                PipeChannel{CorrelatorDump{_PRECOMPILE_EPL}}(1 << 12),
+                PipeChannel{NCOUpdate}(1 << 8),
+            )
+            driver = _precompile_drive_hardware_sdr(sdr, 4000, 12)
+            data = receive(
+                sdr,
+                GPSL1CA(),
+                4e6Hz;
+                max_meas = 2^11,
+                acquire_every = 4u"ms",
+                pvt_update_interval = 4u"ms",
+            )
+            collect_data(data)
+            wait(driver)
+        end
     end
 end

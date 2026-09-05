@@ -55,6 +55,26 @@ function RecordingSDR(::Type{C}, n_channels; capacity = 4096) where {C}
     )
 end
 
+# A second device, differing from `RecordingSDR` in nothing but its type. It
+# exists to pin the one property the hardware pipeline's compile latency rests
+# on: that a link over it is the *same type* as a link over any other device.
+struct SecondDeviceSDR{C} <: AbstractHardwareCorrelatorSDR
+    dumps::PipeChannel{CorrelatorDump{C}}
+    ncos::PipeChannel{NCOUpdate}
+    n_channels::Int
+end
+
+SecondDeviceSDR(::Type{C}, n_channels; capacity = 64) where {C} =
+    SecondDeviceSDR{C}(
+        PipeChannel{CorrelatorDump{C}}(capacity),
+        PipeChannel{NCOUpdate}(capacity),
+        n_channels,
+    )
+
+GNSSReceiver.correlator_dump_channel(sdr::SecondDeviceSDR) = sdr.dumps
+GNSSReceiver.nco_update_channel(sdr::SecondDeviceSDR) = sdr.ncos
+GNSSReceiver.num_hardware_channels(sdr::SecondDeviceSDR) = sdr.n_channels
+
 GNSSReceiver.correlator_dump_channel(sdr::RecordingSDR) = sdr.dumps
 GNSSReceiver.nco_update_channel(sdr::RecordingSDR) = sdr.ncos
 GNSSReceiver.num_hardware_channels(sdr::RecordingSDR) = sdr.n_channels
@@ -699,6 +719,25 @@ end
     # And the grid is back in step with the newest record, not a second behind.
     @test link.next_epoch_boundary > 4_000_000
     @test link.next_epoch_boundary <= 4_000_000 + link.epoch_length
+end
+
+@testset "The link's type does not depend on the device" begin
+    # `receive`'s processing closure, `process` and the whole dump-ingest path
+    # are specialised on the correlator source. With the device in the link's
+    # type each vendor would need its own copy of that compilation — and would
+    # pay for it live, inside the first chunk, with the dump ring unattended
+    # throughout: 1.7 s of it, measured on an Orin (issue #107).
+    a = HardwareCorrelatorLink(
+        RecordingSDR(EPL, 2);
+        sampling_freq = 4e6Hz,
+        reference_signal = GPSL1CA(),
+    )
+    b = HardwareCorrelatorLink(
+        SecondDeviceSDR(EPL, 2);
+        sampling_freq = 4e6Hz,
+        reference_signal = GPSL1CA(),
+    )
+    @test typeof(a) === typeof(b)
 end
 
 @testset "A normal one-or-two-epoch backlog is still folded, not skipped" begin
