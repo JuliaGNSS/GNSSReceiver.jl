@@ -1032,7 +1032,27 @@ function start_raw_stream(; tap_seconds = 0.6, capacity_chunks = 4000)
         read!(warm, Vector{UInt8}(undef, 65536))
         close(warm)
     end
-    recorder = open(`m2sdr_record -q - 0`, "r")
+    # Real-time priority for the recorder, if the host will grant it.
+    #
+    # The recorder is one process against a receiver that fills every
+    # default-pool thread with `@batch` acquisition work for seconds at a time,
+    # and it loses that race often enough to matter: the opening 32-PRN scan has
+    # been measured delivering 229.6 chunks/s against a nominal 500, and a
+    # coherent integration over a stream that fragmented like that read 6-13 dB
+    # low — 32.6/31.9/31.3 dBHz for satellites that were 38-45 dBHz twenty
+    # minutes earlier (issue #107). It is a scheduling coin toss, which is why
+    # some runs are unaffected. `SCHED_FIFO` at 50 takes the toss out of it and
+    # costs nothing while the host is idle. It needs `CAP_SYS_NICE`, so probe
+    # rather than assume, and say so when the answer is no.
+    rt_prefix = try
+        success(pipeline(`chrt -f 50 true`; stdout = devnull, stderr = devnull)) ?
+        `chrt -f 50` : ``
+    catch
+        ``
+    end
+    isempty(rt_prefix.exec) && @warn "recorder runs at normal priority (no chrt / no " *
+                                     "CAP_SYS_NICE): the opening scan may starve it"
+    recorder = open(`$rt_prefix m2sdr_record -q - 0`, "r")
 
     # 64 KiB of pipe = ~2 ms of slack at 32 MB/s; any longer reader stall backs
     # into the kernel ring (65 ms) and the driver drops whole buffers, slipping
