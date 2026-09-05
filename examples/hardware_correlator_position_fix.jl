@@ -1491,6 +1491,13 @@ function main()
     end
 
     @info "stopping"
+    # Both watchdogs measure a *running* receiver. Left armed through the
+    # shutdown below they report on a stream the harness has itself just torn
+    # down — the raw watchdog in particular then prints `recorder_alive = false`
+    # about a recorder this function killed two lines earlier, which reads
+    # exactly like a mid-run crash and cost real time to chase.
+    close(stream_watchdog)
+    close(slip_watch)
     let link = BIT_LOG_SOURCE[].link
         @info "record continuity: " * continuity_summary(link)
         @info link_summary(link)
