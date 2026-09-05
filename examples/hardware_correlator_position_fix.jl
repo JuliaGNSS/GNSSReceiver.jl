@@ -862,7 +862,8 @@ continuity_summary(link) = join(
 
 link_summary(link) = string(
     "link: gaps=", link.lost_record_gaps, " stale=", link.stale_dumps,
-    " dropped=", link.dropped_dumps, " skipped_epochs=", link.skipped_epochs)
+    " dropped=", link.dropped_dumps, " skipped_epochs=", link.skipped_epochs,
+    " implausible=", link.implausible_dumps)
 
 # Run every one of them once, into `devnull`, on values of exactly the types the
 # live loop will hand them. The dummies are built by hand rather than taken from

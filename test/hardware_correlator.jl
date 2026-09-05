@@ -721,6 +721,46 @@ end
     @test link.next_epoch_boundary <= 4_000_000 + link.epoch_length
 end
 
+@testset "One implausible sample index cannot move the epoch clock" begin
+    sdr = RecordingSDR(EPL, 2)
+    link = HardwareCorrelatorLink(
+        sdr;
+        sampling_freq = 4e6Hz,
+        reference_signal = GPSL1CA(),
+    )
+    put!(sdr.dumps, [dump_at(1, 1, 4000)])
+    drain_dumps!(link)
+    @test link.latest_sample_index == 4000
+
+    # The value that froze a whole run on the board: 717 259 801 450 on a device
+    # counter sitting at 29 × 10⁹, i.e. 49 hours ahead. The epoch clock only
+    # moves forward and the grid resynchronises onto it, so believing this once
+    # puts every genuine dump for the rest of the run in the past.
+    put!(sdr.dumps, [dump_at(1, 1, 717_259_801_450), dump_at(1, 1, 8000)])
+    @test drain_dumps!(link) == 1
+    @test link.implausible_dumps == 1
+    @test link.latest_sample_index == 8000
+end
+
+@testset "A jump a second record confirms is believed" begin
+    sdr = RecordingSDR(EPL, 2)
+    link = HardwareCorrelatorLink(
+        sdr;
+        sampling_freq = 4e6Hz,
+        reference_signal = GPSL1CA(),
+    )
+    put!(sdr.dumps, [dump_at(1, 1, 4000)])
+    drain_dumps!(link)
+
+    # A device whose counter really did restart carries the new axis on *every*
+    # subsequent record, so the next one corroborates the jump — which is what
+    # separates a restart from a torn read.
+    put!(sdr.dumps, [dump_at(1, 1, 900_000_000), dump_at(1, 1, 900_004_000)])
+    @test drain_dumps!(link) == 1
+    @test link.latest_sample_index == 900_004_000
+    @test link.implausible_dumps == 1
+end
+
 @testset "The link's type does not depend on the device" begin
     # `receive`'s processing closure, `process` and the whole dump-ingest path
     # are specialised on the correlator source. With the device in the link's

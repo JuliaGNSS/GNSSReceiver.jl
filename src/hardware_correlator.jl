@@ -384,6 +384,11 @@ Keywords:
     restores the old behaviour of folding every dump on its own. See
     [`coherent_integration_blocks`](@ref) for why this is not optional in
     practice.
+  - `max_epoch_clock_advance` — how far ahead of everything seen so far a
+    *single* record may place the epoch clock (default 1 s). A record beyond it
+    is held back until a second record corroborates the jump, and counted in
+    `implausible_dumps`. One nonsense index is otherwise permanent: the clock
+    only moves forward and the grid resynchronises onto it.
 """
 mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     # Deliberately abstract, and the one field of this struct that is: the
@@ -506,6 +511,22 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     # Highest `sample_index` seen so far; a record at or past the boundary is
     # what closes the open epoch.
     latest_sample_index::Int
+    # ── Epoch-clock plausibility ──────────────────────────────────────────────
+    # The furthest ahead of `latest_sample_index` a *single* record may place
+    # the epoch clock. The clock only ever moves forward, so one record
+    # carrying a nonsense index moves it somewhere no genuine record will ever
+    # reach again and every real dump is then "in the past" for the rest of the
+    # run — measured on the board as an index of 717 259 801 450 on a counter
+    # sitting at 29 × 10⁹, after which the grid resynchronised onto it and
+    # nothing was ever tracked again (issue #107). Beyond this bound the record
+    # is held back rather than trusted; a device that genuinely jumped (a
+    # restart, a re-armed counter) corroborates the jump with its very next
+    # record, which is what `implausible_index_candidate` waits for.
+    const max_index_advance::Int64
+    # The last rejected index, or `typemin` for none. Cleared by any plausible
+    # record, so only *consecutive* implausible records — a real jump — are
+    # ever accepted.
+    implausible_index_candidate::Int64
     # Raw samples consumed from `raw_sample_channel` since the run began — the
     # time base `assign_channel!` hands over on.
     samples_consumed::Int
@@ -514,6 +535,8 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     stale_dumps::Int
     unassignable_signals::Int
     skipped_epochs::Int
+    # Records refused by the epoch-clock plausibility bound above.
+    implausible_dumps::Int
     # Number of forward gaps seen across all channels (the *samples* they cost
     # are per channel, above).
     lost_record_gaps::Int
@@ -531,6 +554,7 @@ function HardwareCorrelatorLink(
     correlator_gain = nothing,
     noise_source::Symbol = :channel,
     noise_rearm_interval = 1u"s",
+    max_epoch_clock_advance = 1u"s",
 )
     interval = something(
         doppler_update_interval,
@@ -569,6 +593,13 @@ function HardwareCorrelatorLink(
                 "coherent_code_blocks must be at least 1 or nothing (got $coherent_code_blocks)",
             ),
         )
+    max_index_advance = round(Int64, upreferred(max_epoch_clock_advance * sampling_freq))
+    max_index_advance >= epoch_length || throw(
+        ArgumentError(
+            "max_epoch_clock_advance $max_epoch_clock_advance is shorter than one epoch " *
+            "at $sampling_freq",
+        ),
+    )
 
     dumps = correlator_dump_channel(sdr)
     dump_type = eltype(dumps)
@@ -617,6 +648,9 @@ function HardwareCorrelatorLink(
         0,
         typemin(Int),
         typemin(Int),
+        max_index_advance,
+        typemin(Int64),
+        0,
         0,
         0,
         0,
@@ -1106,7 +1140,8 @@ _band_sampling_frequency(band_measurements::NamedTuple, system) =
     drain_dumps!(link) -> Int
 
 Move every dump currently in the ring into `link.pending` and return how many
-were taken.
+were accepted (records the epoch-clock plausibility bound refuses are dropped
+and counted in `link.implausible_dumps`; see `_is_plausible_index!`).
 
 Non-blocking by construction: it takes exactly `n_avail` records (capped by
 `max_dumps_per_drain`), so a chunk that finds the ring empty does nothing rather
@@ -1120,15 +1155,48 @@ function drain_dumps!(link::HardwareCorrelatorLink)
     available == 0 && return 0
     resize!(link.drain_buffer, available)
     take!(channel, link.drain_buffer)
+    taken = 0
     for dump in link.drain_buffer
+        _is_plausible_index!(link, dump.output.sample_index) || continue
         push!(link.pending, dump)
         # The epoch clock advances on *any* record, strobe or not: that is what
         # lets a silent channel stall the loop only when the device also stops
         # strobing.
         link.latest_sample_index = max(link.latest_sample_index, dump.output.sample_index)
+        taken += 1
     end
     _anchor_epoch_grid!(link)
-    available
+    taken
+end
+
+# Whether a record's `sample_index` may be believed, i.e. whether it may move
+# the epoch clock. The clock is monotone and the grid resynchronises onto it
+# (`fold_closed_epochs!`), so a single nonsense index is not a transient: it
+# permanently strands the grid ahead of every genuine record. The rule is
+# therefore "one record cannot move the clock further than `max_index_advance`
+# on its own" — a jump that large has to be *corroborated* by a second record
+# landing near the first, which a device that really did restart its counter
+# supplies immediately while a torn CSR read or a framing slip does not.
+#
+# The first record of a run anchors the clock and is always believed: there is
+# nothing yet to be implausible against.
+function _is_plausible_index!(link::HardwareCorrelatorLink, sample_index)
+    if link.latest_sample_index == typemin(Int) ||
+       sample_index - link.latest_sample_index <= link.max_index_advance
+        # Any believable record clears a pending candidate: a genuine jump
+        # arrives as a *run* of records, so a candidate that the next record
+        # does not confirm was noise.
+        link.implausible_index_candidate = typemin(Int64)
+        return true
+    end
+    if link.implausible_index_candidate != typemin(Int64) &&
+       abs(sample_index - link.implausible_index_candidate) <= link.max_index_advance
+        link.implausible_index_candidate = typemin(Int64)
+        return true
+    end
+    link.implausible_index_candidate = sample_index
+    link.implausible_dumps += 1
+    false
 end
 
 # Anchor the epoch grid to the first record ever seen. The grid is defined on the
