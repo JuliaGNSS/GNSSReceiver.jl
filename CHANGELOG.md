@@ -1,5 +1,18 @@
 # Changelog
 
+# [4.6.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.5.0...v4.6.0) (2026-09-05)
+
+
+### Bug Fixes
+
+* **vt:** difference vector-loop times on the GPS Time count ([d93b200](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/d93b20030d7960bc32e47ba5ec21db428a4e9955))
+
+
+### Features
+
+* support the Galileo E5b/E6 and BeiDou signals ([5ac815a](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/5ac815a6cd9442045d985d305eecc554a2a9fb01))
+* **vt:** collapse onto any hub system, following PositionVelocityTime ([97524b6](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/97524b612a4cfb9426456e55a926e91f4fc191d9))
+
 # [4.5.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.4.0...v4.5.0) (2026-09-03)
 
 
