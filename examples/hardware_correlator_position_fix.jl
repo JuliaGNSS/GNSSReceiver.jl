@@ -614,6 +614,13 @@ mutable struct BitLogSource{L}
     const assigned::Vector{Int32}
 end
 
+# The instrument wraps the link, so `process` sees a `BitLogSource` where the
+# dump-gap protection dispatches on a `HardwareCorrelatorLink`. Without this
+# forward every instrumented run — which is every run this issue has measured —
+# silently loses the freeze and decays satellites through a host-side gap.
+GNSSReceiver.is_observation_gap(source::BitLogSource, track_state, group_key, prn) =
+    GNSSReceiver.is_observation_gap(source.link, track_state, group_key, prn)
+
 function GNSSReceiver.advance_tracking!(
     source::BitLogSource,
     band_measurements,

@@ -796,6 +796,17 @@ exactly as the last real measurement left them. The freeze is bounded by the
 link's `max_dump_gap` — past that the dump path is not late but broken, and the
 detectors are allowed to decay so the satellite is eventually released rather
 than held in a lock nothing is confirming.
+
+!!! warning "Wrappers must forward this"
+    A correlator source that *wraps* a link — an instrumented source that
+    forwards [`advance_tracking!`](@ref), say — matches the fallback below, not
+    the link's method, and its satellites silently lose the protection. Forward
+    it explicitly:
+
+    ```julia
+    GNSSReceiver.is_observation_gap(w::MyWrapper, track_state, group_key, prn) =
+        GNSSReceiver.is_observation_gap(w.link, track_state, group_key, prn)
+    ```
 """
 is_observation_gap(correlator_source, track_state, group_key, prn) = false
 
