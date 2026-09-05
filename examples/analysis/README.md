@@ -78,6 +78,23 @@ The GPS parity implementation is IS-GPS-200 20.3.5.2 and is self-tested against
 200 synthetically encoded words by `bit_shape.py`'s `selftest` in the issue
 thread; `subframes*.jl` share the same equations.
 
+### Without a board
+
+These need only a raw capture (`m2sdr_record -q cap.bin <bytes>`, sc16 2R2T) or
+nothing at all, and they exist to answer the question that comes before every
+other one: *is the receiver's problem in the signal, or in the receiver?*
+
+| script | question it answers |
+|---|---|
+| `offline_acq.jl <cap.bin> [offsets_s] [gps,gal]` | **Are the acquisitions real satellites?** Acquires every PRN on several independent segments of the capture and tabulates each one's C/N₀, Doppler and code phase across them. A real satellite holds its Doppler to a few Hz and walks its code phase at `doppler/1540` chips/s; noise picks a fresh random Doppler on every segment. This is what separated four real satellites from 28 noise peaks at a 26.6-27.7 dBHz floor (issue #107). |
+| `glitch_check.jl <ant0.bin> <prn> <step_ms> <dur_s>` | **Did the capture lose samples?** Acquires one PRN in a sliding window and checks the code phase against a straight line. Any drop in the recorder shows up as a step; 500 consecutive acquisitions staying inside 0.25 chips says the stream is intact and the fault is downstream. |
+| `direct_track.jl <ant0.bin> <prns> <if_hz>` | **Does *software* tracking hold this sky?** Acquisition → `Tracking` on the same samples, reporting C/N₀ and Doppler per second. The lesson it taught: pass the front end's LO offset as Doppler and `IF = 0`, because the offset comes off the same reference as the ADC clock and so is already in the code rate — hand it over as an intermediate frequency instead and the carrier aiding is wrong by 3.3 chips/s and nothing locks, while acquisition on the same file stays rock solid. |
+| `sw_receive.jl <cap.bin> [prns] [if_hz]` | The same capture through the whole software `receive` pipeline, for a like-for-like comparison against a hardware-correlator run. |
+| `synth_track.jl` | The control: synthetic GPS L1 C/A at 4 MHz through the same acquire→track path, with the answer known. Run it before believing either of the two above. |
+| `vis.py <tle-file> <lat> <lon> [utc]` | **Was that PRN even above the horizon?** Two-body + J2 propagation from celestrak TLEs (`curl -O https://celestrak.org/NORAD/elements/gps-ops.txt`), giving azimuth, elevation and predicted Doppler per satellite. Observed-minus-predicted Doppler agreeing on one common offset across every acquired PRN is what proves a scan found satellites rather than noise. No dependencies. |
+| `analyze_run.sh <bits.log>` | Summary of one instrumented run: the channel-assignment timeline, every fold gap above 80 ms with the compile and GC time inside it, and the handover's `\|P\|/\|E,L\|` per assignment. |
+| `stall_ctx.sh <bits.log> <min_gap_s>` | The chunk sequence either side of each stall — how many dumps each chunk folded and how far the device's sample index moved — which is what distinguishes a starved dump reader from a blocked fold. |
+
 ## Worked example
 
 ```bash
