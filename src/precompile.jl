@@ -119,6 +119,51 @@ function _precompile_syncable_symbols(num_subframes = 3)
     Float32[b ? 1.0f0 : -1.0f0 for b in bits]
 end
 
+# Satellites for one real PVT solve, or an empty vector when this cannot be
+# built.
+#
+# `PositionVelocityTime` precompiles `calc_pvt` itself, and for its own callers
+# that works — 0.006 s for a first solve. It does not survive reaching this
+# package. Two things break it, measured (x86, first `calc_pvt` on the states
+# below):
+#
+#   PVT alone                            0.006 s
+#   + Tracking (loads its PVT extension) 0.448 s
+#   + GNSSReceiver                       1.285 s
+#
+# The extension's methods are added *after* PVT precompiled, so they invalidate
+# the cached solve; and the receiver hands `calc_pvt` a `Vector{SatelliteState}`
+# with an abstract element type (it pools constellations), which is a different
+# specialisation from the concrete vectors PVT caches. On an Orin the two
+# together cost **2.6-2.8 s inside the fold at the first fix** — the largest
+# stall left in a live hardware run, and the one that still releases satellites
+# (issue #107). Only this package sees all the pieces at once, so this is where
+# the solve has to be cached.
+#
+# The satellites are PVT's own precompile fixtures rather than a copy of them:
+# duplicating thirty-five ephemeris fields per satellite here would rot against
+# the originals. It is a workload, so it degrades to a no-op if those internals
+# are ever renamed — the receiver is slower to its first fix, nothing breaks.
+function _precompile_pvt_states()
+    states = PositionVelocityTime.SatelliteState[]
+    isdefined(PositionVelocityTime, :_precompile_states) || return states
+    isdefined(PositionVelocityTime, :_PRECOMPILE_GPS_L1CA_STATES) || return states
+    try
+        append!(
+            states,
+            PositionVelocityTime._precompile_states(
+                GPSL1CA(),
+                PositionVelocityTime._PRECOMPILE_GPS_L1CA_STATES,
+                identity,
+                GPSL1CA(),
+            ),
+        )
+    catch
+        empty!(states)
+    end
+    states
+end
+
 function _precompile_noise_channel(T, num_samples, num_chunks)
     spawn_signal_channel_thread(; T, num_samples, num_antenna_channels = 1) do channel
         for _ = 1:num_chunks
@@ -129,7 +174,22 @@ end
 
 @setup_workload begin
     nav_symbols = _precompile_syncable_symbols()
+    pvt_states = _precompile_pvt_states()
     @compile_workload begin
+        # One real navigation solution, on exactly the vector the receiver
+        # builds (`ReceiverState`'s `pvt_sat_state_buffer`), cold and warm
+        # started, with and without the atmospheric corrections — the shapes
+        # `update_pvt` calls. See `_precompile_pvt_states`.
+        if !isempty(pvt_states)
+            pvt = calc_pvt(pvt_states; approximate_year = 2021)
+            calc_pvt(pvt_states, pvt; approximate_year = 2021)
+            calc_pvt(
+                pvt_states;
+                approximate_year = 2021,
+                enable_ionospheric_correction = false,
+                enable_tropospheric_correction = false,
+            )
+        end
         # The decoder's sync path, driven directly: the receiver reaches it only
         # after 6 s of real navigation data, so no pipeline workload can.
         decode(GNSSDecoderState(GPSL1CA(), 1), nav_symbols, length(nav_symbols))
