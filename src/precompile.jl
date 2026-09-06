@@ -98,21 +98,42 @@ end
 #
 # `PositionVelocityTime` precompiles `calc_pvt` itself, and for its own callers
 # that works — 0.006 s for a first solve. It does not survive reaching this
-# package. Two things break it, measured (x86, first `calc_pvt` on the states
-# below):
+# package, for two independent reasons, and neither of them is PVT's to fix.
 #
-#   PVT alone                            0.006 s
-#   + Tracking (loads its PVT extension) 0.448 s
-#   + GNSSReceiver                       1.285 s
+# **Invalidation, from `Tracking`'s dependencies.** Measured (x86, first
+# `calc_pvt` on the fixtures below, in a fresh session):
 #
-# The extension's methods are added *after* PVT precompiled, so they invalidate
-# the cached solve; and the receiver hands `calc_pvt` a `Vector{SatelliteState}`
-# with an abstract element type (it pools constellations), which is a different
-# specialisation from the concrete vectors PVT caches. On an Orin the two
-# together cost **2.6-2.8 s inside the fold at the first fix** — the largest
-# stall left in a live hardware run, and the one that still releases satellites
-# (issue #107). Only this package sees all the pieces at once, so this is where
-# the solve has to be cached.
+#   PVT alone                                  0.006 s
+#   + Static                                   0.626 s
+#   + Polyester                                0.452 s
+#   + Tracking                                 0.472 s
+#
+# `Static` alone accounts for all of it: `Tracking` reaches it through
+# `Polyester`'s `@batch`. `Static` and its siblings add methods to Base generics
+# for their static-integer types — `abs2(::Union{StaticBool,StaticFloat64,
+# StaticInt})`, `length(::Type{<:NDIndex})`, `(:)(::Integer, ::StaticInt)`,
+# `ifelse`, `IteratorSize` — and any precompiled code that called those
+# generically is discarded when they appear. `SnoopCompile`'s invalidation trees
+# attribute **74 PositionVelocityTime `MethodInstance`s to 7 such insertions**,
+# and the list is exactly what the board's `--trace-compile` named at the first
+# fix: `calc_pvt`, `user_position`, `decide_bias_layout`, `calc_H`,
+# `band_ifb_layout`, `calc_user_velocity_and_clock_drift`.
+#
+# **Specialisation.** The receiver hands `calc_pvt` its own
+# `pvt_sat_state_buffer`, whose element type is a union over the configured
+# systems (see `pvt_sat_state_type`) — not one of the concrete vectors PVT
+# caches for itself.
+#
+# On an Orin the two together cost **2.6-2.8 s inside the fold at the first
+# fix** — for a while the largest stall left in a live hardware run, and one
+# that released satellites every time (issue #107).
+#
+# This package is where it has to be fixed: the invalidation comes from
+# `Tracking`'s dependency tree rather than from PVT, so PVT cannot precompile
+# around it, and the buffer type is the receiver's own. By the time *this*
+# workload runs, `Static` and everything else is already loaded, so what it
+# caches is compiled in the world the receiver actually runs in and nothing
+# invalidates it afterwards.
 #
 # The satellites are PVT's own precompile fixtures rather than a copy of them:
 # duplicating thirty-five ephemeris fields per satellite here would rot against
