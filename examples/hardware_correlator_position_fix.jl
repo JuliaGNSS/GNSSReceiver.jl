@@ -6,7 +6,7 @@
 #
 # Structure:
 #   1. JIT warm-up of the receive() path on synthetic samples.
-#   2. Raw stream: m2sdr_record → FIFO → SignalChannel (antenna 0 of the 2R2T
+#   2. Raw stream: m2sdr_record → libuv pipe → SignalChannel (antenna 0 of the 2R2T
 #      words), with a producer-side sample count and a tap ring for the opening
 #      scan.
 #   3. One 32-PRN scan to pick the receiver's PRN set. The host↔device sample
@@ -107,7 +107,6 @@ const FS = 4e6Hz
 # batching coarsens (~+2 ms tau, fine at 8 Hz PLL).
 const CHUNK = 8000                       # 2 ms
 const CSR_CSV = expanduser("~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch20_ant1/csr.csv")
-const FIFO = "/tmp/hwfix_raw.fifo"
 const FRAC = 24
 const ACQ_COVERAGE = 25_000.0Hz          # one-sided; LO offset ~14 kHz + Doppler
 # Floor for the *receiver's* PRN search set, which is a different question from
