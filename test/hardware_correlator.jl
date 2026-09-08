@@ -971,6 +971,68 @@ end
     @test link.partial_blocks[1] == 0
 end
 
+@testset "A device re-arm is not counted as lost records" begin
+    # Two different faults used to share one counter. A record that never
+    # reached the host costs at least one whole epoch of span; a channel being
+    # re-armed costs *less* than one, because the hole is the remainder of the
+    # epoch the device stopped in — and it is followed by a short record running
+    # to the next boundary. On the board that made every handover read as
+    # dropped correlator output: the open-loop noise channel, re-armed once a
+    # second, produced 252 such holes in a 258 s run while nothing was lost at
+    # all (issue #107).
+    system = GPSL1CA()
+    prn = 9
+    sdr = RecordingSDR(EPL, 2)
+    link = HardwareCorrelatorLink(sdr; sampling_freq = 4e6Hz, reference_signal = system)
+    track_state = TrackState(system, [TrackedSat(system, prn, 0.0, 0.0Hz)])
+    link.assignments[1] = GNSSReceiver.HardwareChannelAssignment(:default, prn, 1)
+    link.channel_of[link.assignments[1]] = 1
+
+    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 4000))
+    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 8000))
+    @test link.lost_record_gaps == 0
+    @test link.rearm_gaps == 0
+
+    # The re-arm: 1539 samples in which the channel integrated nothing, then a
+    # 1149-sample record ending on the new epoch boundary. Exactly the shape the
+    # board produces (ch3/PRN 21, run 15).
+    GNSSReceiver._append_dump!(
+        link,
+        track_state,
+        dump_at(1, prn, 10_688; integrated_samples = 1149),
+    )
+    @test link.rearm_gaps == 1
+    @test link.rearm_dead_samples[1] == 1539
+    @test link.lost_record_gaps == 0        # nothing was lost in transit
+    @test link.lost_record_samples[1] == 0
+
+    # A hole of a whole epoch or more is a record that never arrived, and still
+    # lands on the other counter.
+    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 18_688))
+    @test link.lost_record_gaps == 1
+    @test link.lost_record_samples[1] == 4000
+    @test link.rearm_gaps == 1              # unchanged
+
+    # Both are elapsed signal time, so both reach the bit clock — the split is
+    # about attribution, not about what the loops are told.
+    blocks() =
+        Tracking.get_bit_buffer(
+            Tracking.get_signals(get_sat_state(track_state, prn))[1],
+        ).code_block_buffer_length
+    before = blocks()
+    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 26_688))
+    @test blocks() > before
+
+    # A fresh occupant clears both.
+    GNSSReceiver.release_stale_channels!(
+        link,
+        TrackState(system, [TrackedSat(system, prn + 1, 0.0, 0.0Hz)]),
+    )
+    @test link.lost_record_samples[1] == 0
+    @test link.rearm_dead_samples[1] == 0
+    @test link.last_record_samples[1] == typemin(Int64)
+end
+
 @testset "A hole in a channel's record stream is reported to the bit clock" begin
     system = GPSL1CA()
     prn = 7

@@ -471,9 +471,32 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     # record it — see `_account_record_continuity!` for why the bit clock, not
     # the loop filters, is what a lost record damages.
     const last_record_end::Vector{Int64}
-    # Device samples this channel's record stream is missing, i.e. summed
-    # forward gaps. Reset when the channel is (re)assigned.
+    # Length of the newest record folded on this channel, i.e. how long one of
+    # its records currently is. The device's record length is its *code* epoch,
+    # which need not equal the fold epoch, so this is what a hole is measured
+    # against. `typemin` = no record folded yet.
+    const last_record_samples::Vector{Int64}
+    # Device samples this channel's record stream is missing because whole
+    # records never reached the host — the ring overran, or a batch was dropped
+    # host-side. A missing record necessarily costs at least one whole epoch of
+    # span, which is exactly how these are told apart from the re-arm holes
+    # below. Reset when the channel is (re)assigned.
     const lost_record_samples::Vector{Int64}
+    # Device samples the channel did not integrate into any record at all,
+    # because it was being re-armed. Nothing was lost in transit: the device
+    # stops correlating while `assign_channel!`'s sample-exact phase load takes
+    # effect, then resumes on the new replica, so the hole is followed by a
+    # *short* first record running to the next epoch boundary. Such a hole is
+    # always less than one epoch — it is the remainder of one — which is the
+    # discriminator used below.
+    #
+    # Measured on the board (issue #107): the open-loop noise channel, re-armed
+    # once a second onto a fresh decoy, produced 252 short records in 259
+    # re-arms over a 258 s run, while every satellite channel produced exactly
+    # as many as it had assignments, and the two channels never re-armed
+    # produced none. Charging these as lost data made a clean run look like it
+    # was dropping correlator output.
+    const rearm_dead_samples::Vector{Int64}
     # How far this channel's records have overlapped (a record starting before
     # the previous one ended: a duplicate or a device counter step back).
     const overlapping_record_samples::Vector{Int64}
@@ -559,8 +582,9 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     # Records refused by the epoch-clock plausibility bound above.
     implausible_dumps::Int
     # Number of forward gaps seen across all channels (the *samples* they cost
-    # are per channel, above).
+    # are per channel, above), split the same way.
     lost_record_gaps::Int
+    rearm_gaps::Int
 end
 
 function HardwareCorrelatorLink(
@@ -656,6 +680,8 @@ function HardwareCorrelatorLink(
         fill(typemin(Int64), n),
         fill(NaN, n),
         fill(typemin(Int64), n),
+        fill(typemin(Int64), n),
+        zeros(Int64, n),
         zeros(Int64, n),
         zeros(Int64, n),
         Int(max_catchup_epochs),
@@ -679,6 +705,7 @@ function HardwareCorrelatorLink(
         0,
         fill(typemin(Int64), n),
         max_dump_gap_samples,
+        0,
         0,
         0,
         0,
@@ -1130,7 +1157,9 @@ function release_stale_channels!(link, track_state)
         link.anchor_sample[hw_channel] = typemin(Int64)
         link.anchor_code_phase[hw_channel] = NaN
         link.last_record_end[hw_channel] = typemin(Int64)
+        link.last_record_samples[hw_channel] = typemin(Int64)
         link.lost_record_samples[hw_channel] = 0
+        link.rearm_dead_samples[hw_channel] = 0
         link.overlapping_record_samples[hw_channel] = 0
         # A part-accumulated record belongs to the satellite that just left; it
         # can neither be finished nor handed to anyone else.
@@ -1218,7 +1247,9 @@ function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampl
     # A fresh occupant starts a fresh record stream: the previous satellite's
     # end sample says nothing about where this one's first record begins.
     link.last_record_end[hw_channel] = typemin(Int64)
+    link.last_record_samples[hw_channel] = typemin(Int64)
     link.lost_record_samples[hw_channel] = 0
+    link.rearm_dead_samples[hw_channel] = 0
     link.overlapping_record_samples[hw_channel] = 0
     # The handover itself counts as the channel's last sign of life, so the
     # dump-gap budget is spent from here rather than from whatever the previous
@@ -1548,8 +1579,23 @@ function _account_record_continuity!(
     if expected_start != typemin(Int64)
         gap = record_start - expected_start
         if gap > 0
-            link.lost_record_samples[hw_channel] += gap
-            link.lost_record_gaps += 1
+            # Two different faults, told apart by size. A record that never
+            # reached the host costs at least one whole epoch of span — you
+            # cannot lose a dump and lose less than the span it covered. A
+            # shorter hole is the device not integrating at all, which is what a
+            # channel re-arm looks like: `assign_channel!`'s phase load takes
+            # effect some milliseconds after the host issued it, the channel
+            # stops, and it resumes with a *short* record running to the next
+            # epoch boundary. The hole is the remainder of that epoch, so it is
+            # always under one. Charging the two together made every handover
+            # read as dropped correlator output (issue #107).
+            if gap < link.last_record_samples[hw_channel]
+                link.rearm_dead_samples[hw_channel] += gap
+                link.rearm_gaps += 1
+            else
+                link.lost_record_samples[hw_channel] += gap
+                link.lost_record_gaps += 1
+            end
             # Close the coherent accumulation *before* the hole: the records
             # after it are a different stretch of signal, and the gap record has
             # to reach the bit clock between the two. The partial comes out short
@@ -1585,6 +1631,7 @@ function _account_record_continuity!(
         end
     end
     link.last_record_end[hw_channel] = output.sample_index
+    link.last_record_samples[hw_channel] = output.integrated_samples
     link
 end
 

@@ -731,7 +731,9 @@ function GNSSReceiver.advance_tracking!(
     # ~1 s of chunks: the per-channel record-continuity counters. `lost` is in
     # device samples of records the host never saw — at 4000 samples per code
     # block that is directly the number of code blocks this satellite's
-    # navigation bit clock has slipped behind the sample axis.
+    # navigation bit clock has slipped behind the sample axis. The trailing
+    # field is `rearm`, the same unit for signal the device never integrated
+    # because the channel was re-armed: elapsed time, but nobody's fault.
     if source.chunks % 500 == 0
         for ch in eachindex(link.assignments)
             assignment = link.assignments[ch]
@@ -739,11 +741,12 @@ function GNSSReceiver.advance_tracking!(
             println(io, "C ", ch, ' ', assignment.prn, ' ', boundary,
                     ' ', link.lost_record_samples[ch],
                     ' ', link.overlapping_record_samples[ch],
-                    ' ', link.last_record_end[ch])
+                    ' ', link.last_record_end[ch],
+                    ' ', link.rearm_dead_samples[ch])
         end
         println(io, "L ", boundary, ' ', link.lost_record_gaps,
                 ' ', link.stale_dumps, ' ', link.dropped_dumps,
-                ' ', link.skipped_epochs)
+                ' ', link.skipped_epochs, ' ', link.rearm_gaps)
         flush(io)
     end
     track_state
@@ -859,15 +862,21 @@ slip_corrected_line(slip, total) = @sprintf(
 slip_implausible_line(slip) = @sprintf(
     "host axis slip %+d samples is implausibly large — not correcting", slip)
 
+# `lost` is records that never reached the host; `rearm` is signal time the
+# device did not integrate at all because the channel was being re-armed. They
+# were one counter until the board showed the open-loop noise channel, re-armed
+# once a second, reporting 252 "lost" holes in a run that lost nothing.
 continuity_summary(link) = join(
     [string(a.prn, "→ch", ch, " lost=", link.lost_record_samples[ch],
+            "smp rearm=", link.rearm_dead_samples[ch],
             "smp overlap=", link.overlapping_record_samples[ch], "smp")
      for (ch, a) in enumerate(link.assignments) if !isnothing(a)],
     "  ",
 )
 
 link_summary(link) = string(
-    "link: gaps=", link.lost_record_gaps, " stale=", link.stale_dumps,
+    "link: lost_gaps=", link.lost_record_gaps, " rearm_gaps=", link.rearm_gaps,
+    " stale=", link.stale_dumps,
     " dropped=", link.dropped_dumps, " skipped_epochs=", link.skipped_epochs,
     " implausible=", link.implausible_dumps)
 
