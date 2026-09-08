@@ -65,6 +65,38 @@ function idle_worker(acq_plan, group_key, ::Type{T}, interm_freq) where {T}
     )
 end
 
+@testset "A periodic scan skips satellites the receiver is already tracking" begin
+    # A scan's merge *replaces* the tracked state of any PRN it detects — a
+    # converged `TrackedSat` for a coarse acquisition seed. So which PRNs a scan
+    # searches is not just a cost question. Two must be excluded: one that is in
+    # lock, and one that is out of lock but held by the vector-tracking filter,
+    # which `remove_lost_satellites` deliberately keeps and which the filter is
+    # actively steering. The inline path has always excluded both; the async
+    # worker excluded only the first.
+    system = GPSL1CA()
+    group_key = get_signal_id(system)
+    acq_plan = GNSSReceiver.plan_band_acquisition(
+        (system,),
+        4e6Hz,
+        (500.0Hz,);
+        prns = [1, 2, 3, 4],
+    )[2][group_key]
+    worker = idle_worker(acq_plan, group_key, ComplexF64, 0.0Hz)
+
+    in_lock = GNSSReceiver.ReceiverSatState(system, 1)
+    out_of_lock = out_of_lock_sat_state(system, 2; time_out_of_lock = 100.0u"s")
+    coasting = @set out_of_lock_sat_state(system, 3; time_out_of_lock = 100.0u"s").in_vt_loop =
+        true
+    states = (; group_key => Dictionary([1, 2, 3], [in_lock, out_of_lock, coasting]))
+
+    scanned = GNSSReceiver._prns_to_scan(worker, states, true)[group_key]
+    @test !GNSSReceiver.is_in_lock(out_of_lock) && !GNSSReceiver.is_in_lock(coasting)
+    @test 4 in scanned            # never tracked at all
+    @test 2 in scanned            # tracked, out of lock, not in the loop
+    @test !(1 in scanned)         # in lock
+    @test !(3 in scanned)         # out of lock but the filter is steering it
+end
+
 @testset "A scan is dispatched once, and merged whenever it comes back" begin
     system = GPSL1CA()
     prn = 7

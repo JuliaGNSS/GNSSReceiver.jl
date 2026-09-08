@@ -607,7 +607,23 @@ function _prns_to_scan(
             periodic_due ?
             vcat(
                 filter(prn -> !haskey(sat_states, prn), avail),
-                collect(keys(filter(state -> !is_in_lock(state), sat_states))),
+                collect(
+                    keys(
+                        filter(
+                            # `!in_vt_loop` as well as `!is_in_lock`, matching
+                            # the inline path exactly. A vector-loop member is
+                            # deliberately kept out of lock — the navigation
+                            # filter steers it through the outage and
+                            # `remove_lost_satellites` refuses to drop it — and
+                            # a scan that re-detected it would have its merge
+                            # *replace* the filter-steered `TrackedSat` with a
+                            # coarse acquisition seed, throwing away the state
+                            # the loop was being carried by.
+                            state -> !is_in_lock(state) && !state.in_vt_loop,
+                            sat_states,
+                        ),
+                    ),
+                ),
             ) : collect(keys(filter(should_reacquire, sat_states)))
         end,
     )
