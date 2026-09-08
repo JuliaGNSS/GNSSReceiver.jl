@@ -267,6 +267,116 @@ end
     @test link.dropped_dumps == 17
 end
 
+@testset "Hardware bit sync anchors the integer code-period count" begin
+    system = GPSL1CA()
+    # The sync record can be followed by several more records in the same
+    # chunk. The decoder counts complete bits, the bit buffer counts the
+    # remaining complete periods, and phase supplies the remaining fraction.
+    for blocks in (0, 1, 3, 19),
+        elapsed_samples in (1000, 5000),
+        end_residual in (-0.1, 0.1)
+
+        link = HardwareCorrelatorLink(
+            RecordingSDR(EPL, 1);
+            sampling_freq = 4e6Hz,
+            reference_signal = system,
+        )
+        assignment = GNSSReceiver.HardwareChannelAssignment(:default, 7, 1)
+        link.assignments[1] = assignment
+        link.channel_of[assignment] = 1
+        boundary = 100_000
+        elapsed = elapsed_samples * 1023 / 4000
+        # Before sync the phase wraps at one period, losing the complete
+        # periods between the sync record and the end of this chunk.
+        phase = mod(end_residual + elapsed, 1023)
+        sat = TrackedSat(system, 7, phase, 0.0Hz)
+        signal = first(Tracking.get_signals(sat))
+        bb = Tracking.get_bit_buffer(signal)
+        synced = typeof(bb)(
+            bb.code_block_buffer,
+            bb.code_block_buffer_length,
+            true,
+            0,
+            Int8(1),
+            0.0 + 0.0im,
+            blocks,
+            bb.soft_bits,
+            bb.phase_acc,
+        )
+        sat = Tracking.TrackedSat(
+            sat;
+            signals = (Tracking.TrackedSignal(signal; bit_buffer = synced),),
+        )
+        state = TrackState(system, [sat])
+        link.phase_ref_sample[1] = boundary
+        link.last_record_end[1] = boundary - elapsed_samples
+        GNSSReceiver.anchor_bit_phases!(link, state, boundary)
+        @test get_code_phase(get_sat_state(state, 7)) ≈
+              blocks * 1023 + end_residual + elapsed
+        @test link.bit_phase_anchored[1]
+        # Anchoring is a transition, not a repeated snap of a running replica.
+        next_sat = Tracking.TrackedSat(
+            get_sat_state(state, 7);
+            code_phase = get_code_phase(get_sat_state(state, 7)) + 0.5,
+        )
+        Tracking.get_sat_states(state)[7] = next_sat
+        GNSSReceiver.anchor_bit_phases!(link, state, boundary)
+        @test get_code_phase(get_sat_state(state, 7)) == get_code_phase(next_sat)
+        GNSSReceiver.release_stale_channels!(
+            link,
+            TrackState(system, [TrackedSat(system, 8, 0.0, 0.0Hz)]),
+        )
+        @test !link.bit_phase_anchored[1]
+    end
+end
+
+@testset "Bit sync inside a hardware chunk preserves the reception time" begin
+    system = GPSL1CA()
+    link_sdr = RecordingSDR(EPL, 1)
+    link =
+        HardwareCorrelatorLink(link_sdr; sampling_freq = 4e6Hz, reference_signal = system)
+    assignment = GNSSReceiver.HardwareChannelAssignment(:default, 7, 1)
+    link.assignments[1] = assignment
+    link.channel_of[assignment] = 1
+    state = TrackState(system, [TrackedSat(system, 7, 0.0, 0.0Hz)])
+    found = false
+    # Three-record chunks do not divide the 20-record navigation symbol.
+    # Every dump is already aligned to the true code boundary; no RF model or
+    # guessed receiver position is involved in the expected phase below.
+    for chunk = 1:200
+        records = [
+            begin
+                sign = isodd((k - 1) ÷ 20) ? -1.0 : 1.0
+                dump_at(
+                    1,
+                    7,
+                    4000k;
+                    code_phase = 0.0,
+                    late = 400sign + 0im,
+                    prompt = 1000sign + 0im,
+                    early = 400sign + 0im,
+                )
+            end for k = (3chunk-2):3chunk
+        ]
+        put!(link_sdr.dumps, records)
+        GNSSReceiver.drain_dumps!(link)
+        GNSSReceiver.fold_closed_epochs!(link, state, (L1 = 4e6Hz,), ((system,),))
+        sat = get_sat_state(state, 7)
+        bb = Tracking.get_bit_buffer(first(Tracking.get_signals(sat)))
+        if bb.found
+            found = true
+            boundary = link.phase_ref_sample[1]
+            @test get_code_phase(sat) ≈ mod(boundary / 4000, 20) * 1023 atol = 1e-6
+        end
+        while Base.n_avail(link_sdr.ncos) > 0
+            take!(link_sdr.ncos)
+        end
+        # Mimic receive's chunk boundary: the decoder consumes all emitted bits.
+        empty!(bb.soft_bits)
+    end
+    @test found
+end
+
 @testset "Absolute code phase follows the device replica (pseudorange anchor)" begin
     system = GPSL1CA()
     prn = 7

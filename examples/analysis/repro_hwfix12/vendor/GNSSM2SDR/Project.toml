@@ -1,0 +1,31 @@
+name = "GNSSM2SDR"
+uuid = "8a4c37e1-6d2b-4f9a-b3c5-1e7d90f24aa8"
+version = "0.1.0"
+authors = ["Soeren Schoenbrod <soeren.schoenbrod@juliahub.com>"]
+
+[deps]
+Acquisition = "d4bbf60b-102b-5ffb-8f97-a7ea5817e69f"
+GNSSReceiver = "c84cffac-6943-4fe6-9449-f6d23817af8b"
+GNSSSignals = "52c80523-2a4e-5c38-8979-05588f836870"
+PipeChannels = "316ea068-b8d4-4418-b34f-158552ec34f5"
+SignalChannels = "59ec5e11-ed95-4167-ad38-35055440f478"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+Tracking = "10b2438b-ffd4-5096-aa58-44041d5c8f3b"
+Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
+
+[compat]
+Acquisition = "2.6.2"
+GNSSReceiver = "4.3"
+GNSSSignals = "3, 4"
+PipeChannels = "1"
+SignalChannels = "7"
+StaticArrays = "1"
+Tracking = "8"
+Unitful = "1"
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]

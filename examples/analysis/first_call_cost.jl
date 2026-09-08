@@ -54,6 +54,18 @@ end
 t = @elapsed decode(GNSSDecoderState(gpsl1, 7), synced, length(synced))
 println("first decode (bit sync) ", round(t; digits = 2), " s")
 
+# Exercise an actual solve after the receiver's complete dependency tree has
+# loaded. A decoder-only benchmark cannot detect invalidated PVT caches.
+pvt_states = GNSSReceiver._precompile_pvt_states()
+if isempty(pvt_states)
+    println("first PVT solve         unavailable: precompile fixtures missing")
+else
+    result = @timed calc_pvt(pvt_states; approximate_year = 2021)
+    @assert result.value.time !== nothing
+    println("first PVT solve         ", round(result.time; digits = 4),
+            " s (compile ", round(result.compile_time; digits = 4), " s)")
+end
+
 ch = GNSSReceiver.spawn_signal_channel_thread(; T = Complex{Int16}, num_samples = 4000, num_antenna_channels = 1) do c
     foreach(1:12) do _
         put!(c, Complex{Int16}.(round.(randn(ComplexF32, 4000, 1) .* 512)))

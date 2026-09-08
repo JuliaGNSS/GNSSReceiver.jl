@@ -1,0 +1,15 @@
+Precompiling packages...
+  57175.6 ms  ✓ GNSSDecoder
+  75545.3 ms  ✓ Tracking
+   4420.0 ms  ✓ Tracking → TrackingAcquisitionExt
+  38290.5 ms  ✓ PositionVelocityTime
+   5568.6 ms  ✓ PositionVelocityTime → PositionVelocityTimeTrackingExt
+  64831.8 ms  ✓ GNSSReceiver
+  6 dependencies successfully precompiled in 167 seconds. 254 already precompiled.
+Precompiling packages...
+  13564.7 ms  ✓ GNSSM2SDR
+  1 dependency successfully precompiled in 15 seconds. 260 already precompiled.
+GNSSReceiver 4.6.0 /home/orin/hwfix12/reproduce/GNSSReceiver/src/GNSSReceiver.jl
+GNSSDecoder 4.2.0 /home/orin/hwfix12/reproduce/GNSSReceiver/examples/analysis/repro_hwfix12/deps/GNSSDecoder/src/GNSSDecoder.jl
+Tracking 8.2.0 /home/orin/hwfix12/reproduce/GNSSReceiver/examples/analysis/repro_hwfix12/deps/Tracking/src/Tracking.jl
+GNSSM2SDR 0.1.0 /home/orin/hwfix12/reproduce/GNSSReceiver/examples/analysis/repro_hwfix12/vendor/GNSSM2SDR/src/GNSSM2SDR.jl

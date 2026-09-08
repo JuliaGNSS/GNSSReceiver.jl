@@ -462,6 +462,8 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     # sample = none).
     const anchor_sample::Vector{Int64}
     const anchor_code_phase::Vector{Float64}
+    # Whether the primary-code count has been tied to the decoded symbol grid.
+    const bit_phase_anchored::Vector{Bool}
     # ── Record continuity, per hardware channel ───────────────────────────────
     # A channel's records tile the sample axis: each one covers
     # `[sample_index - integrated_samples, sample_index)`, so the next one must
@@ -679,6 +681,7 @@ function HardwareCorrelatorLink(
         fill(typemin(Int64), n),
         fill(typemin(Int64), n),
         fill(NaN, n),
+        fill(false, n),
         fill(typemin(Int64), n),
         fill(typemin(Int64), n),
         zeros(Int64, n),
@@ -1156,6 +1159,7 @@ function release_stale_channels!(link, track_state)
         link.phase_ref_sample[hw_channel] = typemin(Int64)
         link.anchor_sample[hw_channel] = typemin(Int64)
         link.anchor_code_phase[hw_channel] = NaN
+        link.bit_phase_anchored[hw_channel] = false
         link.last_record_end[hw_channel] = typemin(Int64)
         link.last_record_samples[hw_channel] = typemin(Int64)
         link.lost_record_samples[hw_channel] = 0
@@ -1244,6 +1248,7 @@ function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampl
     link.phase_ref_sample[hw_channel] = typemin(Int64)
     link.anchor_sample[hw_channel] = typemin(Int64)
     link.anchor_code_phase[hw_channel] = NaN
+    link.bit_phase_anchored[hw_channel] = false
     # A fresh occupant starts a fresh record stream: the previous satellite's
     # end sample says nothing about where this one's first record begins.
     link.last_record_end[hw_channel] = typemin(Int64)
@@ -1418,6 +1423,7 @@ function fold_closed_epochs!(
     # runs, not after it.
     append_noise_observations!(link, track_state, band_systems, band_measurements)
     Tracking.estimate_dopplers_and_filter_prompt!(track_state, band_measurements)
+    anchor_bit_phases!(link, track_state, boundary)
     push_nco_updates!(link, track_state, boundary)
     folds
 end
@@ -1480,10 +1486,10 @@ dump seen) keep their acquisition seed: it lives on the host's raw-sample axis,
 which the link cannot place on the device counter, and the DLL pull-in doesn't
 need it to be moved.
 
-The whole-code-period count picked up while unanchored is arbitrary; that is
-fine, because the bit-sync phase snap (which runs *after* this in the same
-fold) re-windows `code_phase` from the bit buffer and preserves only the
-within-code-period part — exactly the part the anchor makes exact.
+The whole-code-period count picked up before bit sync is arbitrary.
+[`anchor_bit_phases!`](@ref) ties it to the bit buffer after the estimator
+first finds synchronization. Tracking's secondary-code snap does not perform
+this operation for signals without a secondary code, such as GPS L1 C/A.
 """
 function advance_code_phases!(link::HardwareCorrelatorLink, track_state, boundary)
     for hw_channel in eachindex(link.assignments)
@@ -1529,6 +1535,57 @@ function advance_code_phases!(link::HardwareCorrelatorLink, track_state, boundar
         code_phase = mod(code_phase, Tracking.current_code_wrap(signals))
         sat_states[assignment.prn] = Tracking.TrackedSat(sat_state; code_phase)
         link.phase_ref_sample[hw_channel] = boundary
+    end
+    link
+end
+
+"""
+    anchor_bit_phases!(link, track_state, boundary)
+
+Tie a newly synchronized data signal's integer code-period count to its bit
+buffer, retaining the replica phase at the common reception boundary. Applied
+once per channel assignment, after the estimator folds the chunk's records.
+"""
+# The hardware phase is referenced to the common fold boundary, whereas the
+# bit buffer counts completed records through this channel's last record end.
+# At first bit sync those two clocks must be joined explicitly: pre-sync phase
+# wraps every primary period, and a chunk can contain more records after the
+# one that found the bit edge. Losing that count introduces an integer-ms
+# pseudorange error even with perfectly continuous records and valid decoding.
+function anchor_bit_phases!(link::HardwareCorrelatorLink, track_state, boundary)
+    for ch in eachindex(link.assignments)
+        assignment = link.assignments[ch]
+        (isnothing(assignment) || assignment.signal_index != 1) && continue
+        link.bit_phase_anchored[ch] && continue
+        states = get_sat_states(track_state, assignment.group_key)
+        haskey(states, assignment.prn) || continue
+        sat = states[assignment.prn]
+        signals = Tracking.get_signals(sat)
+        signal = get_signal(first(signals))
+        bb = Tracking.get_bit_buffer(first(signals))
+        # Secondary-code signals have their own Tracking phase snap. This
+        # anchor is for a single data signal with a primary-only replica.
+        length(signals) == 1 || continue
+        get_secondary_code_length(signal) == 1 || continue
+        iszero(get_data_frequency(signal)) && continue
+        bb.found || continue
+        link.phase_ref_sample[ch] == boundary || continue
+        last = link.last_record_end[ch]
+        last == typemin(Int64) && continue
+        primary = get_code_length(signal)
+        rate =
+            (ustrip(Hz, get_code_frequency(signal)) + ustrip(Hz, get_code_doppler(sat))) /
+            link.sampling_freq_hz
+        elapsed = (boundary - last) * rate
+        # A dump may report the last sample before wrap (near `primary`) or
+        # the first after it (near zero). Recover its signed residual about
+        # the completed code boundary, then retain the full extrapolation to
+        # the common reception epoch, including any whole periods.
+        residual = rem(get_code_phase(sat) - elapsed, primary, RoundNearest)
+        code_phase =
+            bb.prompt_accumulator_integrated_code_blocks * primary + residual + elapsed
+        states[assignment.prn] = Tracking.TrackedSat(sat; code_phase)
+        link.bit_phase_anchored[ch] = true
     end
     link
 end

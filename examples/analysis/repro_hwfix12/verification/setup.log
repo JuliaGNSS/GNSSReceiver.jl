@@ -1,0 +1,8 @@
+Cloning into '/home/orin/hwfix12/reproduce/GNSSReceiver/examples/analysis/repro_hwfix12/deps/Tracking'...
+From https://github.com/JuliaGNSS/Tracking.jl
+ * branch            a2ff103b1c7657e6db8e177c59f4fe7f8d84c5ac -> FETCH_HEAD
+HEAD is now at a2ff103 feat(bit_buffer): say "time passed" without faking a measurement
+Cloning into '/home/orin/hwfix12/reproduce/GNSSReceiver/examples/analysis/repro_hwfix12/deps/GNSSDecoder'...
+From https://github.com/JuliaGNSS/GNSSDecoder.jl
+ * branch            28725906711265c341b59542bb4a5dabc99a9e87 -> FETCH_HEAD
+HEAD is now at 2872590 perf(gps-l1ca): avoid late recovery specialization

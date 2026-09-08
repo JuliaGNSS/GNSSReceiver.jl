@@ -1,0 +1,22 @@
+Read-only evidence archives on orin@orin2 (2026-09-08):
+
+/home/orin/hwfix12-repro-20260908.tar.gz
+SHA256 c3194b6b61c3d6602626019b4621ee8067bc15cf3e36702cb0c0b578cb5080b5
+Contains hwfix12 source copies, original run logs and records, replay/verification
+scripts, test logs, original board manifests, and repro_artifacts/hardware.
+Also contains the original hwfix9/GNSSM2SDR source directory. Temporary isolated
+reproduction checkouts and the in-progress load-check log are excluded.
+
+/home/orin/hwfix12-history-20260908.tar.gz
+SHA256 7503eb2c51ba93731e75bc84e78946cd79a83cc62af43d20b474405288ffb422
+Contains hwfix11/run/hc11f_bits.log, hc11k_bits.log, hc11n_bits.log, and
+hc11n_bits.log.records used for the historical before/after analysis.
+
+Both archives have adjacent .sha256 files. Retrieve with scp, verify SHA256,
+and extract into a fresh directory (archive members are relative paths).
+Original manifests record original board paths. For a portable runnable
+environment, use the committed Project.toml, Manifest.toml, and setup.sh here.
+The archives preserve intermediate experiments as well as final measurements;
+the source revision linked in issue 107 and this directory define the final
+reproducible software state. Re-running on sky does not reproduce the earlier
+satellite visibility or guarantee the same position accuracy.

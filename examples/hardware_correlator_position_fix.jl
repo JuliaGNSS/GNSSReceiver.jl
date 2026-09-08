@@ -9,7 +9,7 @@
 #   2. Raw stream: m2sdr_record → libuv pipe → SignalChannel (antenna 0 of the 2R2T
 #      words), with a producer-side sample count and a tap ring for the opening
 #      scan.
-#   3. One 32-PRN scan to pick the receiver's PRN set. The host↔device sample
+#   3. One 32-PRN scan to prioritize the receiver's search order. The host↔device sample
 #      axis needs no calibration: the bank's counter is latched immediately
 #      before streaming starts and only counts samples DMA0 accepts, so the
 #      latch is exact up to buffers dropped in between — measured at 0 or 1
@@ -109,21 +109,11 @@ const CHUNK = 8000                       # 2 ms
 const CSR_CSV = expanduser("~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch20_ant1/csr.csv")
 const FRAC = 24
 const ACQ_COVERAGE = 25_000.0Hz          # one-sided; LO offset ~14 kHz + Doppler
-# Floor for the *receiver's* PRN search set, which is a different question from
-# the calibration gate above: calibration needs one satellite strong enough for
-# a code-phase sweep to show an unambiguous peak, while the receiver wants every
-# satellite it might reach four of. `receive` applies its own CFAR detector
-# (`acq_pfa`) before any handover, so a PRN listed here that is not really there
-# costs a slice of one background scan and nothing else — whereas a PRN left out
-# can never be tracked, however good it gets later. Note the acquisition C/N₀
-# these are compared against reads ~7 dB optimistic at a 10 ms coherent
-# integration (measured against synthetic truth, issue #107), so 30 here is
-# nearer 23 dBHz in truth.
-# 30, not lower: this scan's own noise floor sits at ~27 dBHz (every
-# undetected PRN reports 26.7-27.3 with a Doppler pinned to a grid edge), so a
-# floor below that admits all 32 and spends channels on noise.
+# Diagnostic floor for the opening scan's visibility report. It does not limit
+# later acquisition: a satellite can become visible after startup, and every
+# periodic scan must remain able to discover it. CFAR in receive() decides
+# detection; the hardware link enforces channel capacity.
 const RX_FLOOR_DBHZ = 30.0
-const MAX_RX_PRNS = 8
 const MAX_SECONDS = length(ARGS) >= 1 ? parse(Float64, ARGS[1]) : 600.0
 const RUN_AFTER_FIX = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 30.0
 # Periodic rescan cadence. Acquisition now runs off the processing task
@@ -136,7 +126,7 @@ const ACQ_EVERY = parse(Float64, get(ENV, "HWFIX_ACQ_EVERY", "30")) * u"s"
 const ACQ_ASYNC = get(ENV, "HWFIX_ASYNC", "1") == "1"
 # Which thread pool the chunk-processing task runs on (`receive`'s
 # `processing_threadpool`). `:interactive` keeps the fold clear of the
-# acquisition worker's Polyester batches on the default pool; give Julia the
+# acquisition workers on the default pool; give Julia the
 # threads for it (`-t 6,3`: raw reader, DMA reader + NCO writer, and the fold).
 const PROC_POOL = Symbol(get(ENV, "HWFIX_PROC_POOL", "default"))
 
@@ -155,7 +145,7 @@ const XCORR_EVERY = parse(Int, get(ENV, "HWFIX_XCORR_EVERY", "1"))
 const RAW_CHUNKS = Threads.Atomic{Int}(0)
 
 # Keep FFTW single-threaded. `Acquisition` already parallelises a scan across
-# PRNs with Polyester, so FFTW threads inside each PRN's transforms only add
+# PRNs on Julia threads, so FFTW threads inside each PRN's transforms only add
 # spinning barriers on an oversubscribed machine. Measured on the Orin with the
 # receiver's own plan (25 kHz coverage, 10 ms coherent, 5 rounds): 4 PRNs take
 # 0.48 s with one FFTW thread and 6.6 s with four; all 32 PRNs 1.7 s against
@@ -642,6 +632,10 @@ function GNSSReceiver.advance_tracking!(
         band_systems,
     )
     isnothing(probe) || xcorr_process!(probe, source.link, track_state)
+    log_tracking!(source, track_state)
+end
+
+function log_tracking!(source::BitLogSource, track_state)
     io = source.io
     isnothing(io) && return track_state
     source.chunks += 1
@@ -683,7 +677,8 @@ function GNSSReceiver.advance_tracking!(
     # chunk draining tens of dumps followed by a run of chunks draining none,
     # and the wall clock says whether the stall was the raw stream or the fold.
     println(io, "T ", time_ns(), ' ', boundary, ' ', new_dumps, ' ', link.latest_sample_index,
-            ' ', link.samples_consumed)
+            ' ', link.samples_consumed, ' ', Base.cumulative_compile_time_ns()[1],
+            ' ', Base.gc_num().total_time)
     gk = GNSSReceiver.signal_group_key(gpsl1)
     for (prn, sat) in pairs(Tracking.get_sat_states(track_state))
         signal = Tracking.get_signals(sat)[1]
@@ -791,6 +786,19 @@ end
 const BIT_LOG_SOURCE = Ref{Any}(nothing)
 const BIT_LOG_WARM = Ref{Union{Nothing,IO}}(devnull)
 
+function append_soft_bits!(bits_log, decoded)
+    for e in decoded
+        isempty(e.soft) || append!(get!(bits_log, e.prn, Float32[]), e.soft)
+    end
+    bits_log
+end
+
+fresh_pvt(pvt, previous_time) =
+    !isnothing(pvt.time) && !isequal(pvt.time, previous_time)
+
+position_with_age(position, age) =
+    @sprintf("%s [age %.1f s]", position_summary(position), age)
+
 my_extract(state) = (
     data = GNSSReceiver.default_data_of_interest(state),
     decode = [
@@ -896,13 +904,17 @@ function warm_reporting()
     decode = [(prn = 1, nbits = 300, tow = Int64(42), found = true, nsoft = 20,
                soft = Float32[0.5])]
     position = ECEF(4.0e6, 0.5e6, 4.6e6)
-    print(devnull, sat_summary(sat_data))
-    print(devnull, decode_summary(decode))
-    print(devnull, position_summary(position))
+    # Invoke standalone methods: an inlined warm-up alone can leave the
+    # dynamically dispatched call in the live reporting loop uncompiled.
+    Base.invokelatest(sat_summary, sat_data)
+    Base.invokelatest(decode_summary, decode)
+    Base.invokelatest(position_summary, position)
+    Base.invokelatest(position_with_age, position, 1.0)
+    Base.invokelatest(append_soft_bits!, Dict{Int,Vector{Float32}}(), decode)
     # `Sys.free_memory()` is a `UInt64`; `Printf` compiles per argument type, so
     # the stand-in has to be one too.
-    print(devnull, status_line(1.0, 1.0u"s", "1:45", "1:0b-F0", "no fix", 0, UInt64(2)^31))
-    print(devnull, first_fix_line(1.0, position, 4))
+    Base.invokelatest(status_line, 1.0, 1.0u"s", "1:45", "1:0b-F0", "no fix", 0, UInt64(2)^31)
+    Base.invokelatest(first_fix_line, 1.0, position, 4)
     print(devnull, slip_corrected_line(16, 16))
     print(devnull, slip_implausible_line(1 << 20))
     nothing
@@ -921,6 +933,53 @@ GNSSReceiver.nco_update_channel(s::WarmSDR) = s.ncos
 GNSSReceiver.num_hardware_channels(s::WarmSDR) = 5
 GNSSReceiver.assign_channel!(s::WarmSDR, args...; kwargs...) = nothing
 GNSSReceiver.release_channel!(s::WarmSDR, ch) = nothing
+
+function warm_tracking_log!(sdr)
+    # Noise-only acquisition cannot exercise per-satellite logging or bit
+    # export. Use a populated state and real IOStreams, just like the run.
+    estimator = ConventionalAssistedPLLAndDLL(; carrier_loop_filter_bandwidth = 12.0Hz)
+    state = GNSSReceiver.ReceiverState(
+        ((gpsl1,),),
+        (L1 = GNSSReceiver.SampleBuffer(Complex{Int16}, CHUNK),);
+        doppler_estimator = estimator,
+    )
+    sat = GNSSReceiver.create_tracked_sat(
+        (gpsl1,), 1, 0.0, 0.0Hz, Tracking.NumAnts(1), estimator,
+    )
+    gk = GNSSReceiver.signal_group_key(gpsl1)
+    track_state = Base.invokelatest(Tracking.merge_sats, state.track_state, gk, [sat])
+    signal = first(Tracking.get_signals(sat))
+    push!(signal.bit_buffer.soft_bits, 0.5f0)
+    push!(Tracking.get_filtered_prompts(signal), 1000.0 + 10.0im)
+    link = GNSSReceiver.HardwareCorrelatorLink(sdr; sampling_freq = FS, reference_signal = gpsl1)
+    link.assignments[2] = GNSSReceiver.HardwareChannelAssignment(gk, 1, 1)
+    link.next_epoch_boundary = 8000
+    push!(link.drain_buffer, CorrelatorDump(2, 1,
+        CorrelatorOutput(warm_epl(400, 1000, 400), 4000, 4000), 0.0))
+    mktempdir() do dir
+        open(joinpath(dir, "warm.log"), "w") do io
+            source = BitLogSource(link, io, Dict{Int,IO}(), dir, nothing, 499,
+                io, fill(typemin(Int64), 5), zeros(Int32, 5))
+            try
+                Base.invokelatest(log_tracking!, source, track_state)
+            finally
+                foreach(close, values(source.prompts))
+            end
+        end
+    end
+    nothing
+end
+
+function warm_device_calls!(sdr)
+    # Compile the dynamically dispatched vendor methods without executing an
+    # assignment or changing a hardware channel during warm-up.
+    kw = (el_sample_spacing = 1, signal = gpsl1)
+    precompile(Core.kwcall, (typeof(kw), typeof(GNSSReceiver.assign_channel!),
+        typeof(sdr), Int, Int, typeof(FS), typeof(FS), Float64, Int))
+    precompile(GNSSReceiver.release_channel!, (typeof(sdr), Int))
+    precompile(GNSSReceiver.dropped_dump_count!, (typeof(sdr),))
+    nothing
+end
 
 function warm_up()
     @info "warming up receive() (hardware-path JIT)…"
@@ -965,22 +1024,41 @@ function warm_up()
         prns = [1, 2, 3, 4, 5, 7],
         acq_min_doppler_coverage = ACQ_COVERAGE,
         acq_coherent_integration_time = 10ms,
-        acq_noncoherent_rounds = 3,
+        acq_noncoherent_rounds = 5,
         max_meas = 2^11,
-        acquire_every = 50ms,
+        acquire_every = ACQ_EVERY,
         # Same scheduler as the live call, so its merge path is compiled here
         # and not during the decode window.
         acquire_async = ACQ_ASYNC,
         feedback_delay_epochs = 1,
-        doppler_estimator = ConventionalAssistedPLLAndDLL(),
+        doppler_estimator = ConventionalAssistedPLLAndDLL(;
+            carrier_loop_filter_bandwidth = 12.0Hz,
+        ),
+        code_lock_cn0_threshold = 24.0u"dBHz",
+        processing_threadpool = PROC_POOL,
         extract = my_extract,
     )
     for _ in data
     end
     wait(task)
+    warm_tracking_log!(sdr)
     # The harness's own reporting is part of the pipeline as far as the fold is
     # concerned: it runs on the same task, between chunks.
     warm_reporting()
+    # Exercise a successful position solve and the HOW recovery helper after
+    # the complete dependency tree has loaded, before feedback is live.
+    pvt_states = GNSSReceiver._precompile_pvt_states()
+    if !isempty(pvt_states)
+        pvt = Base.invokelatest(GNSSReceiver.calc_pvt, pvt_states; approximate_year = 2026)
+        Base.invokelatest(length, pvt.sats)
+        @assert Base.invokelatest(fresh_pvt, pvt, nothing)
+        @assert !Base.invokelatest(fresh_pvt, pvt, pvt.time)
+    end
+    Base.invokelatest(GNSSReceiver.GNSSDecoder.is_plausible_TOW,
+        UInt64(1), nothing, nothing, Int64(0))
+    # Dynamic signed/unsigned navigation-word arithmetic was the remaining
+    # small decoder specialization in the live trace.
+    Base.invokelatest(+, Int64(0), UInt64(0))
     @info @sprintf("warm-up done in %.1f s", time() - t0)
 end
 
@@ -1049,24 +1127,17 @@ function start_raw_stream(; tap_seconds = 0.6, capacity_chunks = 4000)
     end
     # Real-time priority for the recorder, if the host will grant it.
     #
-    # The recorder is one process against a receiver that fills every
-    # default-pool thread with `@batch` acquisition work for seconds at a time,
-    # and it loses that race often enough to matter: the opening 32-PRN scan has
-    # been measured delivering 229.6 chunks/s against a nominal 500, and a
-    # coherent integration over a stream that fragmented like that read 6-13 dB
-    # low — 32.6/31.9/31.3 dBHz for satellites that were 38-45 dBHz twenty
-    # minutes earlier (issue #107). It is a scheduling coin toss, which is why
-    # some runs are unaffected. `SCHED_FIFO` at 50 takes the toss out of it and
-    # costs nothing while the host is idle. It needs `CAP_SYS_NICE`, so probe
-    # rather than assume, and say so when the answer is no.
+    # Acquisition >= 2.8 respects Julia's thread pools, removing the former
+    # Polyester opening-scan starvation. Real-time scheduling remains optional
+    # protection against unrelated host load; normal priority is a supported
+    # configuration and is what the on-sky tests use on orin2.
     rt_prefix = try
         success(pipeline(`chrt -f 50 true`; stdout = devnull, stderr = devnull)) ?
         `chrt -f 50` : ``
     catch
         ``
     end
-    isempty(rt_prefix.exec) && @warn "recorder runs at normal priority (no chrt / no " *
-                                     "CAP_SYS_NICE): the opening scan may starve it"
+    isempty(rt_prefix.exec) && @info "recorder runs at normal scheduling priority"
     recorder = open(`$rt_prefix m2sdr_record -q - 0`, "r")
 
     # 64 KiB of pipe = ~2 ms of slack at 32 MB/s; any longer reader stall backs
@@ -1138,6 +1209,9 @@ end
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 function main()
+    # Include compilation and GC counters in the T records so latency can be
+    # measured without locally patching the harness before each hardware run.
+    Base.cumulative_compile_timing(true)
     # Redirected stderr is fully buffered; flush it so the log is observable
     # live. A Timer callback that throws kills the timer silently — never let
     # that happen to the only thing making the log visible.
@@ -1177,6 +1251,7 @@ function main()
     # whether assigned or not (there is no per-channel enable), so the CSR
     # poller's ioctl load scales with the bank size — and 8 is plenty for a fix.
     sdr = M2SDRCorrelator(CSR_CSV, stream.channel; fs = FS, n_channels = 8)
+    warm_device_calls!(sdr)
     @info "gateware exposes $(GNSSReceiver.num_hardware_channels(sdr)) channels"
 
     # Poll dumps over CSR (the doc'd bring-up path: DMA1's IRQ cadence is far
@@ -1276,7 +1351,9 @@ function main()
             slip_tick()
         end
 
-        global slip_watch = Timer(10; interval = 10) do _
+        # Compile the Timer wrapper immediately, while the baseline is unset
+        # and before acquisition hands any satellites to the tracking loops.
+        global slip_watch = Timer(0; interval = 10) do _
             slip_tick()
         end
     end
@@ -1318,7 +1395,6 @@ function main()
         @info @sprintf("  PRN %2d  CN0 %.1f dBHz  doppler %+7.0f Hz",
                        r.prn, r.CN0, ustrip(Hz, r.carrier_doppler))
     end
-    isempty(visible) && error("no satellites acquired — check antenna/RF")
 
     # No origin calibration. `device_origin` is the bank's sample counter latched
     # immediately before the stream started, and that latch is exact up to the
@@ -1362,16 +1438,14 @@ function main()
     # `found`/`nsoft` expose Tracking's bit-buffer state: whether bit sync ever
     # happened and how many soft bits this chunk carried to the decoder.
 
-    # A fix needs four satellites tracked *at the same time*, so the search set
-    # is everything the scan saw above `RX_FLOOR_DBHZ` — not just the handful
-    # that cleared the calibration gate — capped at what the bank can hold.
-    strong_prns = [
-        Int(r.prn) for r in sort(
-            filter(r -> r.CN0 > RX_FLOOR_DBHZ, results);
-            by = r -> -r.CN0,
-        )[1:min(end, min(MAX_RX_PRNS, GNSSReceiver.num_hardware_channels(sdr)))]
-    ]
-    @info "receiver PRN set: $strong_prns"
+    # Search the whole constellation on periodic scans. Restricting the plan
+    # to the opening scan's detections permanently excluded satellites hidden
+    # by a temporary fade (and capped a two-satellite start at two forever).
+    # Try the initial detections first, strongest first, then the remaining
+    # PRNs; CFAR still gates every handover and the link limits channel use.
+    receiver_prns = [Int(r.prn) for r in visible]
+    append!(receiver_prns, setdiff(1:32, receiver_prns))
+    @info "receiver PRN search order: $receiver_prns"
     bit_log = isempty(BIT_LOG_NAME) ? nothing :
               open(joinpath(dirname(@__FILE__), BIT_LOG_NAME), "w")
     isnothing(bit_log) ||
@@ -1412,7 +1486,7 @@ function main()
         dirname(@__FILE__);
         xcorr = probe,
         records = records_log,
-        prns = strong_prns,
+        prns = receiver_prns,
         acq_min_doppler_coverage = ACQ_COVERAGE,
         acq_coherent_integration_time = 10ms,
         # Five rounds rather than three: the satellites that decide whether
@@ -1432,16 +1506,17 @@ function main()
         # τ ≈ 4-5 ms sits in the delay-instability zone (BL·τ ≈ 0.08): power
         # and frequency hold, phase never locks, no bits decode. Cut both
         # knobs: 1-epoch apply (a late commit just applies immediately) and an
-        # 8 Hz PLL (BL·τ ≈ 0.02).
+        # retuned PLL below. Runtime compilation must also be warmed: a
+        # buffered dump stream does not protect the loop's feedback deadline.
         feedback_delay_epochs = 1,
         doppler_estimator = ConventionalAssistedPLLAndDLL(;
             carrier_loop_filter_bandwidth = 12.0Hz,
         ),
         # Hold a satellite through a fade rather than dropping it at the
-        # default 30 dBHz. Losing lock is not free here: reacquisition builds a
-        # fresh `GNSSDecoderState`, so the ~30 s of consecutive error-free
-        # subframes an ephemeris needs starts over, and a fix needs four
-        # satellites to finish that run *at the same time*. Measured on sky: the
+        # default 30 dBHz. Losing lock is not free here: reacquisition resets
+        # symbol timing and TOW. Cached ephemeris fields can shorten recovery,
+        # but a fix still needs four satellites with valid timing at once.
+        # Measured on sky: the
         # 31-40 dBHz satellites breathe several dB either side of the threshold
         # and cycle in and out every few tens of seconds, which is exactly long
         # enough to never finish. The floor still has to sit above where the
@@ -1460,15 +1535,17 @@ function main()
     first_fix = nothing
     fix_time = 0.0
     n_solutions = 0
+    previous_pvt_time = nothing
+    last_fresh_fix = 0.0
     bits_log = Dict{Int,Vector{Float32}}()
     for payload in data
         d = payload.data
-        for e in payload.decode
-            isempty(e.soft) || append!(get!(bits_log, e.prn, Float32[]), e.soft)
-        end
+        append_soft_bits!(bits_log, payload.decode)
         t = time() - t0
         has_fix = d.pvt.time !== nothing
-        if has_fix
+        if fresh_pvt(d.pvt, previous_pvt_time)
+            previous_pvt_time = d.pvt.time
+            last_fresh_fix = t
             n_solutions += 1
             if isnothing(first_fix)
                 first_fix = d.pvt
@@ -1483,7 +1560,7 @@ function main()
                 d.runtime,
                 sat_summary(d.sat_data),
                 decode_summary(payload.decode),
-                has_fix ? position_summary(d.pvt.position) : "no fix",
+                has_fix ? position_with_age(d.pvt.position, t - last_fresh_fix) : "no fix",
                 sdr.missed_csr_dumps,
                 Sys.free_memory(),
             )
@@ -1506,6 +1583,16 @@ function main()
     # exactly like a mid-run crash and cost real time to chase.
     close(stream_watchdog)
     close(slip_watch)
+    # Closing the output asks receive() to stop; its finally block joins the
+    # acquisition workers and closes the sample channel. Keep log sinks and
+    # the FPGA services alive until that processing task has stopped writing.
+    close(data)
+    wait(stream.reader)
+    process_running(stream.recorder) && kill(stream.recorder)
+    wait(stream.recorder)
+    stop!(sdr)
+    isnothing(sdr.reader) || wait(sdr.reader)
+    isnothing(sdr.writer) || wait(sdr.writer)
     let link = BIT_LOG_SOURCE[].link
         @info "record continuity: " * continuity_summary(link)
         @info link_summary(link)
@@ -1525,15 +1612,12 @@ function main()
     isnothing(records_log) || close(records_log)
     foreach(close, values(BIT_LOG_SOURCE[].prompts))
     for (prn, v) in bits_log
-        open(joinpath(homedir(), "hwfix/run", "bits_c93_prn$(prn).f32"), "w") do io
+        open(joinpath(dirname(@__FILE__), "bits_prn$(prn).f32"), "w") do io
             write(io, v)
         end
     end
     @info "soft-bit totals: " * join(["$k:$(length(v))" for (k, v) in bits_log], " ")
     gc_off && GC.enable(true)
-    stop!(sdr)
-    close(stream.channel)
-    process_running(stream.recorder) && kill(stream.recorder)
 
     if isnothing(first_fix)
         @error "no position fix obtained"
@@ -1543,7 +1627,7 @@ function main()
         exit(1)
     end
     lla = LLAfromECEF(wgs84)(first_fix.position)
-    @info @sprintf("SUCCESS: first fix at t=%.1fs → %.6f° %.6f° %.1f m; %d solutions total",
+    @info @sprintf("PVT returned: first solution at t=%.1fs → %.6f° %.6f° %.1f m; %d fresh timestamp updates (accuracy not validated)",
                    fix_time, lla.lat, lla.lon, lla.alt, n_solutions)
 end
 

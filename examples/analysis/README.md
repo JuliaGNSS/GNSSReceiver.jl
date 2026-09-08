@@ -25,7 +25,7 @@ One text log (`$HWFIX_BITLOG`) plus one binary file per PRN
 | `D` | `prn boundary abs(late) abs(prompt) abs(early) carrier_doppler code_doppler code_phase` | the last fully integrated correlator and what the loops are steering with. |
 | `C` | `ch prn boundary lost overlap last_record_end` | per-channel record continuity, once a second. `lost` is in device samples of records the host never saw. |
 | `L` | `boundary gaps stale dropped skipped_epochs` | the link's own counters, once a second. |
-| `T` | `wall_ns boundary new_dumps latest_sample_index samples_consumed` | one per chunk: wall clock, the epoch boundary the fold reached, how many new dumps the chunk drained (~2 when the pipeline is steady) and the device's newest sample seen. Tens of dumps in one chunk followed by chunks draining none is a host stall, and the wall clock says whether the raw stream or the processing task stalled. |
+| `T` | `wall_ns boundary new_dumps latest_sample_index samples_consumed compile_ns gc_ns` | one per chunk: wall clock, the epoch boundary the fold reached, how many new dumps the chunk drained (~2 when the pipeline is steady) and the device's newest sample seen. Tens of dumps in one chunk followed by chunks draining none is a host stall, and the wall clock says whether the raw stream or the processing task stalled. The final two fields are cumulative compilation and GC times in nanoseconds. |
 | `A` | `ch previous_prn new_prn boundary samples_consumed` | a hardware channel changed occupant: a handover, a release (`0`), or the noise channel re-arming onto its next decoy (negative PRN). |
 
 The `D` line carries three fields appended after the original eight: the C/N₀
@@ -92,6 +92,8 @@ other one: *is the receiver's problem in the signal, or in the receiver?*
 | `sw_receive.jl <cap.bin> [prns] [if_hz]` | The same capture through the whole software `receive` pipeline, for a like-for-like comparison against a hardware-correlator run. |
 | `synth_track.jl` | The control: synthetic GPS L1 C/A at 4 MHz through the same acquire→track path, with the answer known. Run it before believing either of the two above. |
 | `vis.py <tle-file> <lat> <lon> [utc]` | **Was that PRN even above the horizon?** Two-body + J2 propagation from celestrak TLEs (`curl -O https://celestrak.org/NORAD/elements/gps-ops.txt`), giving azimuth, elevation and predicted Doppler per satellite. Observed-minus-predicted Doppler agreeing on one common offset across every acquired PRN is what proves a scan found satellites rather than noise. No dependencies. |
+| `decoder_latency.jl <bits.log>` | Measure compilation inside each decode call while replaying recorded soft bits. Use a fresh process with `--trace-compile=trace.jl --trace-compile-timing` to identify late recovery-path specializations. |
+| `replay_pvt.jl <bits.log> <lat> <lon> <height>` | Re-decode recorded soft bits and compare original PVT positions with the integer code-period correction diagnosed in [hardware_fix_12.md](hardware_fix_12.md). This is a diagnostic replay, not a tracking replay or an integrity check. |
 | `analyze_run.sh <bits.log>` | Summary of one instrumented run: the channel-assignment timeline, every fold gap above 80 ms with the compile and GC time inside it, and the handover's `\|P\|/\|E,L\|` per assignment. |
 | `stall_ctx.sh <bits.log> <min_gap_s>` | The chunk sequence either side of each stall — how many dumps each chunk folded and how far the device's sample index moved — which is what distinguishes a starved dump reader from a blocked fold. |
 
