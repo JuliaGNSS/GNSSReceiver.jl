@@ -314,3 +314,39 @@ end
     @test detect_num_channels(regs(1:4)) == 0     # no ch0: not a gnss build
     @test detect_num_channels(Dict{String,Tuple{UInt32,Int}}()) == 0
 end
+
+struct TestApplyChannel
+    status::NamedTuple{(:armed, :late),Tuple{Bool,Bool}}
+end
+GNSSM2SDR.apply_status(ch::TestApplyChannel) = ch.status
+
+@testset "Assignment becomes visible only after an on-time arm" begin
+    h = GNSSM2SDR.PendingHandover(Int32(9), 0.0, 0.0, 0.0, 0, 10000, 3)
+    function device(status; active = true, prn = Int32(9))
+        (
+            bank = (channels = [TestApplyChannel(status)],),
+            pending = Union{Nothing,GNSSM2SDR.PendingHandover}[h],
+            active = [active],
+            assigned_prns = [prn],
+            assignment_start = [Threads.Atomic{Int64}(typemax(Int64))],
+            handover_margin = 1000,
+        )
+    end
+    sdr = device((armed = false, late = false))
+    @test GNSSM2SDR._verify_handover!(sdr, 1, 10000) == 0
+    @test sdr.assignment_start[1][] == typemax(Int64)
+    @test GNSSM2SDR._verify_handover!(sdr, 1, 10500) == 0
+    @test sdr.assignment_start[1][] == 10000
+    @test isnothing(sdr.pending[1])
+    for status in ((armed = true, late = false), (armed = false, late = true))
+        failed = device(status)
+        @test_logs (:warn, r"handover failed") GNSSM2SDR._verify_handover!(failed, 1, 10500)
+        @test failed.assignment_start[1][] == typemax(Int64)
+        @test isnothing(failed.pending[1])
+    end
+    for stale in (device((armed = false, late = false); active = false),
+                  device((armed = false, late = false); prn = Int32(10)))
+        @test GNSSM2SDR._verify_handover!(stale, 1, 10500) == 0
+        @test stale.assignment_start[1][] == typemax(Int64)
+    end
+end

@@ -42,6 +42,7 @@ mutable struct RecordingSDR{C} <: AbstractHardwareCorrelatorSDR
     const assigned::Vector{Any}
     const released::Vector{Int}
     dropped::Int
+    assignment_start::Vector{Int64}
 end
 
 function RecordingSDR(::Type{C}, n_channels; capacity = 4096) where {C}
@@ -52,6 +53,7 @@ function RecordingSDR(::Type{C}, n_channels; capacity = 4096) where {C}
         Any[],
         Int[],
         0,
+        fill(typemin(Int64), n_channels),
     )
 end
 
@@ -75,6 +77,7 @@ GNSSReceiver.correlator_dump_channel(sdr::SecondDeviceSDR) = sdr.dumps
 GNSSReceiver.nco_update_channel(sdr::SecondDeviceSDR) = sdr.ncos
 GNSSReceiver.num_hardware_channels(sdr::SecondDeviceSDR) = sdr.n_channels
 
+GNSSReceiver.assignment_start_sample(sdr::RecordingSDR, ch) = sdr.assignment_start[ch]
 GNSSReceiver.correlator_dump_channel(sdr::RecordingSDR) = sdr.dumps
 GNSSReceiver.nco_update_channel(sdr::RecordingSDR) = sdr.ncos
 GNSSReceiver.num_hardware_channels(sdr::RecordingSDR) = sdr.n_channels
@@ -1214,4 +1217,40 @@ end
     )
     @test link.last_record_end[1] == typemin(Int64)
     @test link.lost_record_samples[1] == 0
+end
+
+@testset "Only confirmed assignment integrations reach a fresh satellite" begin
+    system = GPSL1CA()
+    prn = 9
+    sdr = RecordingSDR(EPL, 2)
+    link = HardwareCorrelatorLink(sdr; sampling_freq = 4e6Hz, reference_signal = system)
+    assignment = GNSSReceiver.HardwareChannelAssignment(:default, prn, 1)
+    for target in (9539, 49539) # first arm, then reacquisition of the same PRN
+        track_state = TrackState(system, [TrackedSat(system, prn, 0.0, 0.0Hz)])
+        sat = get_sat_state(track_state, prn)
+        GNSSReceiver._assign!(link, 1, assignment, sat, first(Tracking.get_signals(sat)), 4e6Hz)
+        sdr.assignment_start[1] = typemax(Int64)
+        # Matching PRN is insufficient while the scheduled phase load is pending.
+        GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, target - 1539))
+        @test link.last_record_end[1] == typemin(Int64)
+        @test link.partial_blocks[1] == 0
+        @test link.anchor_sample[1] == typemin(Int64)
+
+        sdr.assignment_start[1] = target
+        # Buffered old records and integrations crossing the boundary stay invalid.
+        GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, target - 1539))
+        GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, target + 1))
+        @test link.last_record_end[1] == typemin(Int64)
+        @test link.partial_blocks[1] == 0
+        # The short first integration starts exactly at the applied phase load.
+        GNSSReceiver._append_dump!(link, track_state,
+            dump_at(1, prn, target + 1149; integrated_samples = 1149))
+        @test link.last_record_end[1] == target + 1149
+        output = only(Tracking.get_correlator_outputs(sat, 1))
+        @test output.integrated_samples == 1149
+        @test output.sample_index == target + 1149
+        @test link.lost_record_gaps == 0
+        @test link.rearm_gaps == 0
+        @test Tracking.get_bit_buffer(track_state, prn).code_block_buffer_length == 0
+    end
 end

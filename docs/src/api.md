@@ -44,6 +44,7 @@ nco_update_channel
 num_hardware_channels
 assign_channel!
 release_channel!
+assignment_start_sample
 dropped_dump_count!
 correlator_gain
 epoch_strobe

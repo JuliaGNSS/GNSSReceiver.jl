@@ -9,10 +9,13 @@ versions and tree hashes. Its four local package paths are relative:
 | GNSSReceiver | This checkout, three directories above |
 | GNSSDecoder | `28725906711265c341b59542bb4a5dabc99a9e87` |
 | Tracking | `a2ff103b1c7657e6db8e177c59f4fe7f8d84c5ac` |
-| GNSSM2SDR | Exact board source copied into `vendor/GNSSM2SDR`, including its MIT license |
+| GNSSM2SDR | Board source vendored in `vendor/GNSSM2SDR`, with the confirmed-arm boundary fix and its MIT license |
 
 The vendor package on the board had no Git metadata. Its source snapshot is
-intentional: replacing it with another version would not reproduce these tests.
+intentional. This checkout additionally patches that adapter to publish a channel's
+confirmed effective arm sample. Earlier measurements in `hardware_fix_12.md`
+used the original snapshot; the first-arm retest is documented separately in
+`first_arm.md`. Replacing the vendor directory would omit this fix.
 Setup fetches the two pinned Git revisions and instantiates the manifest; it
 does not update dependencies or reconfigure the FPGA/RF hardware.
 

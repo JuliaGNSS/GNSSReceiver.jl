@@ -340,6 +340,18 @@ absorbs, so declare it rather than leaving it at the default.
 """
 correlator_gain(::AbstractHardwareCorrelatorSDR) = 1
 
+"""
+    assignment_start_sample(sdr, hw_channel) -> Int64
+
+Earliest device sample belonging to the channel's confirmed current assignment.
+Return `typemax(Int64)` while an asynchronous arm is pending or failed, and
+publish its effective sample only after confirming it applied. Revoke the
+previous boundary before starting any new assignment, including the same PRN.
+The Receiver rejects integrations starting before this boundary, including
+already queued dumps. Synchronous producers default to no additional cutoff.
+"""
+assignment_start_sample(::AbstractHardwareCorrelatorSDR, hw_channel) = typemin(Int64)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Host-side ingest state
 # ─────────────────────────────────────────────────────────────────────────────
@@ -739,8 +751,8 @@ get_sdr(link::HardwareCorrelatorLink) = link.sdr
 # precompiles would be recompiled anyway — inside the first live chunk, with the
 # device's dump ring unattended for as long as it takes (issue #107).
 # `invokelatest` resolves in the current world at run time and leaves no
-# backedge to invalidate. Every call through here is per chunk or rarer, so the
-# extra indirection is not measurable.
+# backedge to invalidate. Assignment-boundary reads also use this barrier
+# when consuming records, so loading a vendor cannot invalidate the fold.
 _call_device(f::F, link::HardwareCorrelatorLink, args...; kwargs...) where {F} =
     Base.invokelatest(f, link.sdr, args...; kwargs...)
 
@@ -1695,6 +1707,12 @@ end
 function _append_dump!(link, track_state, dump)
     hw_channel = Int(dump.channel)
     checkbounds(Bool, link.assignments, hw_channel) || (link.stale_dumps += 1; return link)
+    start = _call_device(assignment_start_sample, link, hw_channel)::Int64
+    if start == typemax(Int64) ||
+       dump.output.sample_index - dump.output.integrated_samples < start
+        link.stale_dumps += 1
+        return link
+    end
     if hw_channel == link.noise_channel
         # A dump still carrying the previous decoy PRN was produced before the
         # re-arm took effect; pooling it would credit the window a look at a

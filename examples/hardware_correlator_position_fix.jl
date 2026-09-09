@@ -978,6 +978,7 @@ function warm_device_calls!(sdr)
         typeof(sdr), Int, Int, typeof(FS), typeof(FS), Float64, Int))
     precompile(GNSSReceiver.release_channel!, (typeof(sdr), Int))
     precompile(GNSSReceiver.dropped_dump_count!, (typeof(sdr),))
+    precompile(GNSSReceiver.assignment_start_sample, (typeof(sdr), Int))
     nothing
 end
 
@@ -1038,7 +1039,11 @@ function warm_up()
         processing_threadpool = PROC_POOL,
         extract = my_extract,
     )
-    for _ in data
+    for payload in data
+        # The live reporting loop receives a dynamically typed payload. Compile
+        # its standalone property reads too; inlined warm-up does not cover them.
+        snapshot = Base.invokelatest(getproperty, payload, :data)
+        Base.invokelatest(getproperty, snapshot, :sat_data)
     end
     wait(task)
     warm_tracking_log!(sdr)

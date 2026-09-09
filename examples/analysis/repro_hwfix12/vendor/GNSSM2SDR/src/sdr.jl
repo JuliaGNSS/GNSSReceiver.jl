@@ -61,6 +61,9 @@ mutable struct M2SDRCorrelator{N,C} <: GNSSReceiver.AbstractHardwareCorrelatorSD
     # on the receiver's chunk-processing task, and every millisecond it blocks
     # there is a millisecond every *other* channel holds a stale NCO word.
     const pending::Vector{Union{Nothing,PendingHandover}}
+    # Published by the verifier and read by the Receiver on another thread.
+    const assignment_start::Vector{Threads.Atomic{Int64}}
+    const assignment_locks::Vector{ReentrantLock}
 end
 
 """
@@ -137,6 +140,8 @@ function M2SDRCorrelator(
         fill(false, resolved_channels),
         zeros(Int32, resolved_channels),
         Union{Nothing,PendingHandover}[nothing for _ = 1:resolved_channels],
+        [Threads.Atomic{Int64}(typemax(Int64)) for _ = 1:resolved_channels],
+        [ReentrantLock() for _ = 1:resolved_channels],
     )
 end
 
@@ -163,7 +168,14 @@ function GNSSReceiver.dropped_dump_count!(sdr::M2SDRCorrelator)
     count_ones(bits)
 end
 
-function GNSSReceiver.release_channel!(sdr::M2SDRCorrelator, hw_channel)
+GNSSReceiver.assignment_start_sample(sdr::M2SDRCorrelator, hw_channel) =
+    sdr.assignment_start[hw_channel][]
+
+GNSSReceiver.release_channel!(sdr::M2SDRCorrelator, hw_channel) =
+    lock(() -> _release_channel!(sdr, hw_channel), sdr.assignment_locks[hw_channel])
+
+function _release_channel!(sdr::M2SDRCorrelator, hw_channel)
+    sdr.assignment_start[hw_channel][] = typemax(Int64)
     sdr.active[hw_channel] = false
     ch = sdr.bank.channels[hw_channel]
     write(sdr.csr, ch.prefix * "control", 0)
@@ -181,6 +193,28 @@ function GNSSReceiver.assign_channel!(
     el_sample_spacing,
     signal,
 )
+    lock(sdr.assignment_locks[hw_channel])
+    try
+        _assign_channel!(sdr, hw_channel, prn, carrier_doppler, code_doppler,
+                         code_phase, valid_at_sample; el_sample_spacing, signal)
+    finally
+        unlock(sdr.assignment_locks[hw_channel])
+    end
+end
+
+function _assign_channel!(
+    sdr::M2SDRCorrelator,
+    hw_channel,
+    prn,
+    carrier_doppler,
+    code_doppler,
+    code_phase,
+    valid_at_sample;
+    el_sample_spacing,
+    signal,
+)
+    # Invalidate queued dumps before changing PRN metadata or code RAM.
+    sdr.assignment_start[hw_channel][] = typemax(Int64)
     ch = sdr.bank.channels[hw_channel]
     carrier_hz = Float64(ustrip(uconvert(Hz, carrier_doppler)))
     code_doppler_hz = Float64(ustrip(uconvert(Hz, code_doppler)))
@@ -246,34 +280,37 @@ Called from the NCO writer / CSR poller task every pass, so the receiver's
 processing task never waits on a commit.
 """
 function verify_handovers!(sdr::M2SDRCorrelator)
-    any(!isnothing, sdr.pending) || return 0
-    now = sample_count(sdr.bank)
     rescheduled = 0
     for hw_channel in eachindex(sdr.pending)
-        h = sdr.pending[hw_channel]
-        isnothing(h) && continue
-        # `late` is only meaningful once the commit fired; give it half a margin.
-        now >= h.target + sdr.handover_margin ÷ 2 || continue
-        if !sdr.active[hw_channel] || sdr.assigned_prns[hw_channel] != h.prn
-            sdr.pending[hw_channel] = nothing
-            continue
-        end
-        status = apply_status(sdr.bank.channels[hw_channel])
-        if !status.armed && !status.late
-            sdr.pending[hw_channel] = nothing
-        elseif h.attempt >= 3
-            @warn(
-                "handover for PRN $(h.prn) on channel $hw_channel kept committing late — " *
-                "increase handover_margin (currently $(sdr.handover_margin) samples)"
-            )
-            sdr.pending[hw_channel] = nothing
-        else
-            _schedule_handover!(sdr, hw_channel, h.prn, h.carrier_hz, h.code_doppler_hz,
-                                h.code_phase, h.valid_at_sample, h.attempt + 1)
-            rescheduled += 1
+        rescheduled += lock(sdr.assignment_locks[hw_channel]) do
+            isnothing(sdr.pending[hw_channel]) && return 0
+            _verify_handover!(sdr, hw_channel, sample_count(sdr.bank))
         end
     end
     rescheduled
+end
+
+function _verify_handover!(sdr, hw_channel, now)
+    h = sdr.pending[hw_channel]
+    isnothing(h) && return 0
+    now >= h.target + sdr.handover_margin ÷ 2 || return 0
+    if !sdr.active[hw_channel] || sdr.assigned_prns[hw_channel] != h.prn
+        sdr.pending[hw_channel] = nothing
+        return 0
+    end
+    status = apply_status(sdr.bank.channels[hw_channel])
+    if !status.armed && !status.late
+        sdr.assignment_start[hw_channel][] = h.target
+        sdr.pending[hw_channel] = nothing
+    elseif h.attempt >= 3
+        @warn "handover failed; channel remains unconfirmed" hw_channel prn=h.prn
+        sdr.pending[hw_channel] = nothing
+    else
+        _schedule_handover!(sdr, hw_channel, h.prn, h.carrier_hz, h.code_doppler_hz,
+                            h.code_phase, h.valid_at_sample, h.attempt + 1)
+        return 1
+    end
+    0
 end
 
 # Host raw-sample count → the bank's free-running counter. Both count the same
@@ -634,6 +671,10 @@ function _drain_ncos!(
     for _ = 1:n
         update = take!(sdr.ncos)
         update.apply_at_sample < now - max_stale && continue
+        start = sdr.assignment_start[update.channel][]
+        start == typemax(Int64) && continue
+        update.prn == sdr.assigned_prns[update.channel] || continue
+        update.apply_at_sample < start && continue
         ch = sdr.bank.channels[update.channel]
         # An update that quantizes to the NCO words the channel already runs
         # is a no-op on the device; committing it anyway costs ~6 serialized

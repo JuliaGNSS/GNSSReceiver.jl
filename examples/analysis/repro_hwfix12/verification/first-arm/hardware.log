@@ -1,0 +1,46 @@
+Run directory: /home/orin/first-arm-WYp5Hn/examples/analysis/repro_hwfix12/runs/run-OR2FNL
+Precompiling packages...
+  13600.9 ms  ✓ GNSSM2SDR
+  1 dependency successfully precompiled in 14 seconds. 260 already precompiled.
+[ Info: warming up receive() (hardware-path JIT)…
+[ Info: warm-up done in 6.0 s
+[ Info: pre-stream device counter: 53100210485
+[ Info: recorder runs at normal scheduling priority
+[ Info: recorder pipe capacity: 32 MiB
+[ Info: raw stream started
+[ Info: gateware exposes 8 channels
+[ Info: acquired 5 satellites above 30.0 dBHz:
+[ Info:   PRN  4  CN0 38.6 dBHz  doppler   -3200 Hz
+[ Info:   PRN 19  CN0 38.5 dBHz  doppler   -4700 Hz
+[ Info:   PRN  1  CN0 34.9 dBHz  doppler   -8000 Hz
+[ Info:   PRN  9  CN0 32.3 dBHz  doppler   -1400 Hz
+[ Info:   PRN  2  CN0 30.5 dBHz  doppler   -8100 Hz
+[ Info: starting receiver (20184000 samples consumed pre-receive)
+[ Info: receiver PRN search order: [4, 19, 1, 9, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+[ Info: logging every soft bit and 1 ms prompt to bits.log
+[ Info: logging every hardware record to bits.log.records
+[ Info: t=  5.1s rt=  5.7s cn0[4:41 19:40 1:39 2:33] dec[4:-1bF0 19:-1bF0 1:-1b-0 9:-1b--1 2:-1b-0 28:-1b--1] | no fix | missed=0 free=57G
+[ Info: t= 10.1s rt= 10.7s cn0[4:42 19:41 1:40 2:30] dec[4:-1bF0 19:-1bF1 1:-1bF0 9:-1b--1 2:-1b-0 28:-1b--1] | no fix | missed=0 free=57G
+[ Info: t= 15.2s rt= 15.8s cn0[4:42 19:39 1:42] dec[4:-1bF0 19:-1bF0 1:-1bF0 9:-1b--1 2:-1b--1 28:-1b--1] | no fix | missed=0 free=57G
+[ Info: t= 20.3s rt= 20.9s cn0[4:44 19:38 1:42] dec[4:-1bF0 19:-1bF0 1:-1bF0 9:-1b--1 2:-1b--1 28:-1b--1] | no fix | missed=0 free=57G
+[ Info: t= 25.4s rt= 26.0s cn0[4:44 19:35 1:42] dec[4:-1bF0 19:-1bF0 1:-1bF0 9:-1b--1 2:-1b--1 28:-1b--1] | no fix | missed=0 free=57G
+[ Info: t= 30.5s rt= 31.1s cn0[4:45 19:29 1:44] dec[4:13b*F0 19:13b*F0 1:13b*F0 9:-1b--1 2:-1b--1 28:-1b--1] | no fix | missed=0 free=57G
+[ Info: t= 35.5s rt= 36.1s cn0[4:44 19:34 1:44] dec[4:264b*F0 19:264b*F0 1:264b*F0 9:-1b--1 2:-1b--1 28:-1b--1] | no fix | missed=0 free=56G
+[ Info: t= 40.5s rt= 41.1s cn0[4:45 19:36 1:45] dec[4:214b*F0 19:214b*F0 1:214b*F0 9:-1b--1 2:-1b--1 28:-1b--1] | no fix | missed=0 free=56G
+[ Info: t= 45.6s rt= 46.2s cn0[4:45 19:35 1:45] dec[4:169b*F0 19:169b*F0 1:169b*F0 9:-1b--1 2:-1b--1 28:-1b--1] | no fix | missed=0 free=56G
+[ Info: t= 50.7s rt= 51.3s cn0[4:45 19:39 1:44] dec[4:124b*F0 19:124b*F0 1:124b*F0 9:-1b--1 2:-1b--1 28:-1b--1] | no fix | missed=0 free=56G
+[ Info: t= 55.7s rt= 56.3s cn0[4:45 19:42 1:44] dec[4:74b*F0 19:74b*F0 1:74b*F0 9:-1b--1 2:-1b--1 28:-1b--1] | no fix | missed=0 free=56G
+[ Info: t= 60.8s rt= 61.4s cn0[4:46 19:42 1:45] dec[4:29b*F0 19:29b*F0 1:29b*F0 9:-1b--1 2:-1b--1 28:-1b--1] | no fix | missed=0 free=56G
+[ Info: t= 65.9s rt= 66.5s cn0[4:46 19:43 1:44 6:34 17:33] dec[4:282b*F0 19:282b*F0 1:281b*F0 9:-1b--1 2:-1b--1 28:-1b--1 6:-1b-0 17:-1b-0] | no fix | missed=0 free=56G
+[ Info: t= 71.0s rt= 71.6s cn0[4:46 19:42 1:44 6:34 17:35] dec[4:237b*F0 19:237b*F0 1:236b*F0 9:-1b--1 2:-1b--1 28:-1b--1 6:-1bF0 17:-1b-0] | no fix | missed=0 free=56G
+[ Info: t= 76.1s rt= 76.7s cn0[4:46 19:43 1:44 6:32 17:36] dec[4:192b*F0 19:192b*F0 1:191b*F0 9:-1b--1 2:-1b--1 28:-1b--1 6:-1bF0 17:-1bF0] | no fix | missed=0 free=56G
+[ Info: t= 81.2s rt= 81.8s cn0[4:47 19:41 1:44 17:35] dec[4:147b*F0 19:147b*F1 1:146b*F0 9:-1b--1 2:-1b--1 28:-1b--1 6:-1b--1 17:-1bF0] | no fix | missed=0 free=55G
+[ Info: t= 86.3s rt= 86.9s cn0[4:46 19:37 1:43 17:34] dec[4:102b*F0 19:102b*F1 1:101b*F0 9:-1b--1 2:-1b--1 28:-1b--1 6:-1b--1 17:-1bF0] | no fix | missed=0 free=55G
+[ Info: *** FIRST FIX after 90.5 s: lat 50.769119° lon 6.073063° alt 244.5 m (4 sats) ***
+[ Info: t= 91.4s rt= 92.0s cn0[4:48 19:34 1:44 17:34] dec[4:57b*F0 19:57b*F1 1:56b*F0 9:-1b--1 2:-1b--1 28:-1b--1 6:-1b--1 17:56b*F0] | 50.769096°, 6.073054°, 252m [age 0.0 s] | missed=0 free=55G
+[ Info: t= 96.5s rt= 97.1s cn0[4:48 19:30 1:43 17:33] dec[4:12b*F0 19:312b*F1 1:11b*F0 9:-1b--1 2:-1b--1 28:-1b--1 6:-1b--1 17:11b*F0] | 50.769910°, 6.073150°, 209m [age 0.0 s] | missed=0 free=55G
+[ Info: stopping
+[ Info: record continuity: 4→ch2 lost=0smp rearm=0smp overlap=0smp  1→ch4 lost=0smp rearm=0smp overlap=0smp  17→ch6 lost=0smp rearm=0smp overlap=0smp
+[ Info: link: lost_gaps=0 rearm_gaps=0 stale=339175 dropped=0 skipped_epochs=345 implausible=0
+[ Info: soft-bit totals: 4:63 6:13 17:26 1:47 19:116
+[ Info: PVT returned: first solution at t=90.5s → 50.769119° 6.073063° 244.5 m; 92 fresh timestamp updates (accuracy not validated)
