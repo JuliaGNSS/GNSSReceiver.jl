@@ -727,7 +727,12 @@ end
         sdr,
         system,
         sampling_freq;
-        # Acquire early and often enough that the 400 ms run has a handover.
+        # Keep this synthetic finite stream deterministic even when the test
+        # runner has only one Julia thread. An asynchronous acquisition cannot
+        # overlap there and may finish after the producer has already closed
+        # its 1.4 s stream, leaving no opportunity to merge the handover.
+        acquire_async = false,
+        # Acquire early and often enough that the run has a handover.
         acquire_every = 20ms,
         prns = [prn],
         # A synthetic signal carries no real navigation data, so PVT can never

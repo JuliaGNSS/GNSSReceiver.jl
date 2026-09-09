@@ -30,6 +30,30 @@ The lower-level `write_to_file` (write raw samples straight to disk) is re-expor
 [SignalChannels](https://github.com/JuliaGNSS/SignalChannels.jl); see that package for its
 documentation.
 
+## Hardware correlators
+
+```@docs
+AbstractHardwareCorrelatorSDR
+HardwareCorrelatorLink
+CorrelatorDump
+NCOUpdate
+EPOCH_STROBE_CHANNEL
+raw_sample_channel
+correlator_dump_channel
+nco_update_channel
+num_hardware_channels
+assign_channel!
+release_channel!
+dropped_dump_count!
+correlator_gain
+epoch_strobe
+is_epoch_strobe
+is_observation_gap
+coherent_integration_blocks
+advance_tracking!
+flush_partial_records!
+```
+
 ## Consuming the results
 
 ```@docs

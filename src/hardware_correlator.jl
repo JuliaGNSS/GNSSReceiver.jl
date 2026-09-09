@@ -27,8 +27,8 @@
 """
     CorrelatorDump{C}
 
-One correlator dump streamed from a hardware correlator: `Tracking`'s
-[`CorrelatorOutput`](@extref Tracking.CorrelatorOutput) plus the routing needed
+One correlator dump streamed from a hardware correlator: Tracking's
+`CorrelatorOutput` plus the routing needed
 to get it back to the right satellite.
 
   - `channel` — the hardware channel that produced it (1-based), or
