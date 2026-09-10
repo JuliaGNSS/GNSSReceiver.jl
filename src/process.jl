@@ -138,67 +138,6 @@ end
     )
 end
 
-# Run `_acquire_all_bands` only when it can change something — a periodic scan
-# is due on some band, or a satellite qualifies for reacquisition — since on a
-# steady-state frame its per-band buffer resets and NamedTuple merges would
-# allocate for a no-op. When skipping, any buffer still holding samples is
-# emptied so the next scan's coherent window stays gap-free. Returns the same
-# four values (`track_state`, per-group satellite states, per-band acquisition
-# buffers and timers), same types, on both paths.
-function acquire_if_due(
-    receiver_state,
-    band_keys,
-    band_systems,
-    meas,
-    interm_freqs,
-    acq_plans,
-    runtime;
-    num_ants,
-    acquire_every,
-    acq_pfa,
-    code_lock_cn0_threshold,
-    subsample_interpolation,
-)
-    acq_due = any(
-        t -> runtime - t >= acquire_every,
-        values(receiver_state.last_time_acquisition_ran),
-    )
-    reacq_due =
-        any(d -> any(should_reacquire, d), values(receiver_state.receiver_sat_states))
-    if acq_due || reacq_due
-        _acquire_all_bands(
-            receiver_state.track_state,
-            receiver_state.receiver_sat_states,
-            receiver_state.acquisition_buffers,
-            receiver_state.last_time_acquisition_ran,
-            band_keys,
-            band_systems,
-            meas,
-            interm_freqs,
-            acq_plans,
-            (
-                runtime,
-                num_ants,
-                acquire_every,
-                acq_pfa,
-                code_lock_cn0_threshold,
-                subsample_interpolation,
-            ),
-        )
-    else
-        buffers =
-            all(b -> b.current_length == 0, values(receiver_state.acquisition_buffers)) ?
-            receiver_state.acquisition_buffers :
-            map(SampleBuffers.reset, receiver_state.acquisition_buffers)
-        (
-            receiver_state.track_state,
-            receiver_state.receiver_sat_states,
-            buffers,
-            receiver_state.last_time_acquisition_ran,
-        )
-    end
-end
-
 """
     process(receiver_state, acq_plans, measurements, band_systems, sampling_freq,
             interm_freqs = map(_ -> 0.0Hz, band_systems); kwargs...)
@@ -211,8 +150,9 @@ A single chunk runs the whole per-cycle pipeline: it (re)acquires satellites per
 fire), tracks every band's satellites from one `TrackState`, updates their lock detectors
 and, once enough have been locked for `time_in_lock_before_calculating_pvt`, recomputes
 the fused multi-GNSS PVT solution every `pvt_update_interval`.
-Satellites that drop out of lock are removed and reacquired
-with a bounded quadratic back-off. `measurements`, `band_systems` and `interm_freqs` are
+Satellites that drop out of lock are removed and picked up again by the periodic scan
+(the fast reacquisition path of `should_reacquire` is off by default — see there).
+`measurements`, `band_systems` and `interm_freqs` are
 tuples aligned band-by-band (`interm_freqs` defaults to `0 Hz` for every band), and
 `acq_plans` is one `NamedTuple` keyed by group key across all bands. This is the function
 [`receive`](@ref) calls for each chunk; see it for the remaining keyword arguments.
@@ -225,6 +165,16 @@ function process(
     sampling_freq,
     interm_freqs::Tuple = map(_ -> 0.0Hz, band_systems);
     downconvert_and_correlator = CPUThreadedDownconvertAndCorrelator(),
+    # Where this chunk's correlator outputs come from. `nothing` ⇒ correlate the
+    # raw samples on the CPU with `downconvert_and_correlator`. Pass a
+    # [`HardwareCorrelatorLink`](@ref) to take them from an FPGA correlator
+    # instead; the raw samples then still drive acquisition, decoding and PVT.
+    correlator_source = nothing,
+    # Where acquisition runs. [`InlineAcquisition`](@ref) searches on this task,
+    # inside this call; an [`AsyncAcquisition`](@ref) hands the window to a
+    # worker task instead and merges its results on a later chunk, so a scan
+    # never stalls tracking. `receive` builds the latter for `acquire_async`.
+    acquisition = InlineAcquisition(),
     num_ants::NumAnts{N} = NumAnts(1),
     acquire_every = 10s,
     acq_pfa = DEFAULT_ACQ_PFA,
@@ -250,21 +200,26 @@ function process(
     # share one runtime and signal duration.
     signal_duration = size(first(meas), 1) / sampling_freq
 
-    # (Re)acquire per band, but only when a scan is actually due — see `acquire_if_due`.
+    # (Re)acquire — on this task or on an acquisition worker, depending on the
+    # scheduler; see `advance_acquisition`.
     track_state, receiver_sat_states, acquisition_buffers, last_time_acquisition_ran =
-        acquire_if_due(
+        advance_acquisition(
+            acquisition,
             receiver_state,
             band_keys,
             band_systems,
             meas,
             interm_freqs,
             acq_plans,
-            runtime;
-            num_ants,
-            acquire_every,
-            acq_pfa,
-            code_lock_cn0_threshold,
-            subsample_interpolation,
+            sampling_freq,
+            (
+                runtime,
+                num_ants,
+                acquire_every,
+                acq_pfa,
+                code_lock_cn0_threshold,
+                subsample_interpolation,
+            ),
         )
 
     # Single multi-band tracking pass: one `BandMeasurement` per band, keyed by
@@ -284,16 +239,30 @@ function process(
             interm_freqs,
         ),
     )
-    # Advance every band's satellites by one tracking pass over the shared
-    # `TrackState`, mutating it in place (`track!`): the receiver discards the
-    # previous `ReceiverState` each chunk, so this is safe and allocation-free.
-    track_state = track!(band_measurements, track_state; downconvert_and_correlator)
+    # In-place `track!` rather than the immutable `track`: the latter detaches
+    # (copies) each group's satellite slot vectors and rebuilds the TrackedSat
+    # wrappers every call. The receiver discards the previous `ReceiverState` each
+    # chunk and reuses one hoisted correlator, so mutating in place is safe and is
+    # Tracking's documented allocation-free real-time pattern.
+    #
+    # Which correlator produced this chunk's outputs is the one thing a
+    # hardware-correlator receiver changes, and it changes it by dispatch: the
+    # default source is the software backend and calls `track!` as above, while a
+    # `HardwareCorrelatorLink` ingests the FPGA's dumps instead. See
+    # [`advance_tracking!`](@ref).
+    track_state = advance_tracking!(
+        something(correlator_source, downconvert_and_correlator),
+        band_measurements,
+        track_state,
+        band_systems,
+    )
 
     receiver_sat_states = update_all_receiver_sat_states(
         receiver_sat_states,
         track_state,
         all_systems,
         signal_duration,
+        correlator_source,
     )
 
     track_state = remove_lost_satellites(receiver_sat_states, track_state)
@@ -547,7 +516,16 @@ function update_pvt(
     )
 end
 
-function update_all_receiver_sat_states(receiver_sat_states, track_state, systems, signal_duration)
+function update_all_receiver_sat_states(
+    receiver_sat_states,
+    track_state,
+    systems,
+    signal_duration,
+    # Where this chunk's correlator outputs came from, so a satellite that
+    # received none of them can be told apart from one whose signal is gone —
+    # see [`is_observation_gap`](@ref GNSSReceiver.is_observation_gap).
+    correlator_source = nothing,
+)
     group_keys = keys(receiver_sat_states)
     # Map over `systems` (aligned with `group_keys`) so each group carries its own
     # ranging/data signal selectors: CN0 and carrier lock are read from the ranging
@@ -568,10 +546,26 @@ function update_all_receiver_sat_states(receiver_sat_states, track_state, system
             # its availability.
             if is_in_lock(receiver_sat_state) || receiver_sat_state.in_vt_loop
                 prn = receiver_sat_state.prn
+                # Nothing measured this chunk, for a reason that is about the
+                # transport and not about the signal: freeze the satellite
+                # rather than credit its detectors with evidence that never
+                # arrived. Only a hardware-correlator source ever says `true`.
+                if is_observation_gap(correlator_source, track_state, group_key, prn)
+                    return receiver_sat_state
+                end
+                # A source that had to restart the satellite's bit clock has cut
+                # the bit stream this decoder was synchronised to; restart the
+                # decoder with it (keeping what it already knows about the
+                # satellite), so it re-synchronises on the next preamble
+                # instead of ranging on a bit count that is off by the cut.
+                decoder =
+                    take_bit_clock_restart!(correlator_source, group_key, prn) ?
+                    reset_decoder_state(receiver_sat_state.decoder) :
+                    receiver_sat_state.decoder
                 ReceiverSatState(
                     prn,
                     decode(
-                        receiver_sat_state.decoder,
+                        decoder,
                         get_soft_bits(track_state, group_key, prn, data_idx),
                         get_num_bits(track_state, group_key, prn, data_idx),
                     ),
@@ -662,8 +656,18 @@ function update_states_from_acquisition_results(
     )
 
     # CFAR alone decides detection: a result is accepted when its peak-to-noise ratio
-    # clears the CFAR threshold for the configured false-alarm probability.
-    acq_res_valids = filter(res -> is_detected(res; pfa = acq_pfa), acquisition_results)
+    # clears the CFAR threshold for the configured false-alarm probability. Guard the
+    # estimates too: a non-finite Doppler or code phase (a degenerate interpolation on
+    # a marginal peak) would seed a tracked satellite whose NaN poisons the replica
+    # parameters — an `InexactError` deep in the correlate phase that kills the whole
+    # processing task.
+    acq_res_valids = filter(
+        res ->
+            is_detected(res; pfa = acq_pfa) &&
+            isfinite(res.carrier_doppler) &&
+            isfinite(res.code_phase),
+        acquisition_results,
+    )
     acquired_prns = map(res -> res.prn, acq_res_valids)
     isempty(acq_res_valids) && return track_state, receiver_sat_states, acquired_prns
 
@@ -862,7 +866,17 @@ end
 # in seconds it grows with the code period exactly as the tracking loops do.
 # `reacquire_backoff` sets the base step; `max_reacquire_attempts` caps total
 # attempts before falling back to the periodic full scan (`acquire_every`).
-function should_reacquire(state; reacquire_backoff = 200ms, max_reacquire_attempts = 5)
+# The base back-off must respect the cost of one attempt: each is a full
+# FM-DBZP acquisition over the buffered window, ~seconds of CPU on an embedded
+# host. At a 200 ms base, a handful of satellites bouncing in and out of lock
+# queue acquisitions faster than the processing task can run them — it falls
+# behind real time, every NCO correction applies late, the loops open, more
+# satellites drop, and the receiver death-spirals. With `max_reacquire_attempts`
+# at its default of 0 the fast path never fires and a lost satellite waits for
+# the periodic full scan (`acquire_every`); a caller that wants the fast path
+# passes a positive cap, and with the 10 s base the attempts then land at
+# ~10/40/90 s. Neither knob is exposed by `receive` yet.
+function should_reacquire(state; reacquire_backoff = 10_000ms, max_reacquire_attempts = 0)
     n = state.num_unsuccessful_reacquisition
     # Never reacquire a satellite in the vector loop — it is still tracked,
     # with its NCOs driven by the navigation filter.
