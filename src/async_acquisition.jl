@@ -738,8 +738,13 @@ function merge_scan_results(
     track_state, receiver_sat_states
 end
 
+# The same filter the dispatch applied (`_prns_to_scan`), re-evaluated at merge
+# time: a satellite that locked — or joined the vector loop — while the scan
+# was in flight keeps its tracked state rather than being replaced by the
+# scan's coarse seed.
 _is_locked_now(receiver_sat_states, prn) =
-    haskey(receiver_sat_states, prn) && is_in_lock(receiver_sat_states[prn])
+    haskey(receiver_sat_states, prn) &&
+    (is_in_lock(receiver_sat_states[prn]) || receiver_sat_states[prn].in_vt_loop)
 
 # Advance the reacquisition back-off of every satellite the dispatched scan is
 # a reacquisition attempt for.

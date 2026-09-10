@@ -233,8 +233,9 @@ end
 
         # The hardware-correlator receiver: the same pipeline taking its
         # correlator outputs off a device instead of computing them. Run with
-        # the live defaults — asynchronous acquisition on the interactive pool —
-        # so what is cached is the shape a hardware receiver actually runs,
+        # the live defaults — asynchronous acquisition, the processing task on
+        # the interactive pool — so what is cached is the shape a hardware
+        # receiver actually runs,
         # including the scan-merge path. The logger is silenced because
         # `Pkg.precompile` runs single-threaded, where asynchronous acquisition
         # rightly warns that it cannot overlap a scan with tracking.
