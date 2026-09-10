@@ -70,13 +70,6 @@ function main()
     sleep(0.3)
     stream = start_raw_stream(; chunk = CHUNK)
     sdr = M2SDRCorrelator(CSR_CSV, stream.channel; fs = FS, n_channels = N_HW_CHANNELS)
-    # 80 kHz epoch strobes (`epoch_period` in samples): the litepcie driver only
-    # completes whole 8 KiB DMA buffers, so the strobe rate is what bounds the
-    # dump latency the loop sees (~0.75 ms here). It is also what fills the
-    # driver's 256-buffer ring in ~190 ms — a host that stops draining the ring
-    # for longer than half of that loses records.
-    start!(sdr; dump_source = :dma, epoch_period = 50)
-    sdr.device_origin = origin
     @info "gateware exposes $(num_hardware_channels(sdr)) channels; driving $N_HW_CHANNELS"
 
     # Built here rather than through `receive(sdr, …)` only so its counters can
@@ -113,6 +106,17 @@ function main()
         # symbol timing and TOW.
         code_lock_cn0_threshold = 24.0dBHz,
     )
+    # Enable the device only now, with the pipeline built and its processing
+    # task running: the first records then meet a consumer, instead of piling
+    # up in the dump ring while `receive` is still being compiled.
+    #
+    # 80 kHz epoch strobes (`epoch_period` in samples): the litepcie driver only
+    # completes whole 8 KiB DMA buffers, so the strobe rate is what bounds the
+    # dump latency the loop sees (~0.75 ms here). It is also what fills the
+    # driver's 256-buffer ring in ~190 ms — a host that stops draining the ring
+    # for longer than half of that loses records.
+    start!(sdr; dump_source = :dma, epoch_period = 50)
+    sdr.device_origin = origin
 
     t0 = time()
     first_fix_at = nothing
