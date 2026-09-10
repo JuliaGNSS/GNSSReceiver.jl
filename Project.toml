@@ -27,10 +27,6 @@ UnicodeMaps = "93404ded-f489-4c96-9f3f-351522718b35"
 UnicodePlots = "b8865327-cd53-5732-bb35-84acbb429228"
 Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
 
-[sources]
-# Remove this pin after JuliaGNSS/Tracking.jl#235 is merged and released.
-Tracking = {url = "https://github.com/JuliaGNSS/Tracking.jl", rev = "a2ff103b1c7657e6db8e177c59f4fe7f8d84c5ac"}
-
 [compat]
 Accessors = "0.1.42"
 Acquisition = "2.8"

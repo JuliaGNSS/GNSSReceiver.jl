@@ -150,8 +150,9 @@ A single chunk runs the whole per-cycle pipeline: it (re)acquires satellites per
 fire), tracks every band's satellites from one `TrackState`, updates their lock detectors
 and, once enough have been locked for `time_in_lock_before_calculating_pvt`, recomputes
 the fused multi-GNSS PVT solution every `pvt_update_interval`.
-Satellites that drop out of lock are removed and reacquired
-with a bounded quadratic back-off. `measurements`, `band_systems` and `interm_freqs` are
+Satellites that drop out of lock are removed and picked up again by the periodic scan
+(the fast reacquisition path of `should_reacquire` is off by default — see there).
+`measurements`, `band_systems` and `interm_freqs` are
 tuples aligned band-by-band (`interm_freqs` defaults to `0 Hz` for every band), and
 `acq_plans` is one `NamedTuple` keyed by group key across all bands. This is the function
 [`receive`](@ref) calls for each chunk; see it for the remaining keyword arguments.
@@ -552,10 +553,19 @@ function update_all_receiver_sat_states(
                 if is_observation_gap(correlator_source, track_state, group_key, prn)
                     return receiver_sat_state
                 end
+                # A source that had to restart the satellite's bit clock has cut
+                # the bit stream this decoder was synchronised to; restart the
+                # decoder with it (keeping what it already knows about the
+                # satellite), so it re-synchronises on the next preamble
+                # instead of ranging on a bit count that is off by the cut.
+                decoder =
+                    take_bit_clock_restart!(correlator_source, group_key, prn) ?
+                    reset_decoder_state(receiver_sat_state.decoder) :
+                    receiver_sat_state.decoder
                 ReceiverSatState(
                     prn,
                     decode(
-                        receiver_sat_state.decoder,
+                        decoder,
                         get_soft_bits(track_state, group_key, prn, data_idx),
                         get_num_bits(track_state, group_key, prn, data_idx),
                     ),
@@ -861,8 +871,11 @@ end
 # host. At a 200 ms base, a handful of satellites bouncing in and out of lock
 # queue acquisitions faster than the processing task can run them — it falls
 # behind real time, every NCO correction applies late, the loops open, more
-# satellites drop, and the receiver death-spirals. Attempts at ~10/40/90 s
-# keep reacquisition cheaper than the periodic full scan it falls back to.
+# satellites drop, and the receiver death-spirals. With `max_reacquire_attempts`
+# at its default of 0 the fast path never fires and a lost satellite waits for
+# the periodic full scan (`acquire_every`); a caller that wants the fast path
+# passes a positive cap, and with the 10 s base the attempts then land at
+# ~10/40/90 s. Neither knob is exposed by `receive` yet.
 function should_reacquire(state; reacquire_backoff = 10_000ms, max_reacquire_attempts = 0)
     n = state.num_unsuccessful_reacquisition
     # Never reacquire a satellite in the vector loop — it is still tracked,

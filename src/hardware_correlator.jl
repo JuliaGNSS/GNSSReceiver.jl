@@ -530,6 +530,24 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     const partial_samples::Vector{Int64}
     const partial_blocks::Vector{Int}
     const partial_end::Vector{Int64}
+    # Primary-code blocks handed to the estimator since it last ran, per channel.
+    # `coherent_integration_blocks` sizes a record against the bit buffer's
+    # progress through the current symbol, but the bit buffer only advances when
+    # the estimator consumes the records — once per chunk. Records emitted
+    # earlier in the same chunk are invisible to it, so without this count a
+    # host that fell a symbol behind sized every record from the same stale
+    # block count, the third one straddled a bit edge, and every later one sat
+    # off the grid — the bit stream stalled while bit sync stayed "found".
+    const pending_blocks::Vector{Int}
+    # Whether the channel's record stream lost records since the estimator last
+    # ran (see `_account_record_continuity!`). Consumed by
+    # `restart_lost_bit_clocks!` after the estimator, so the bit buffer that
+    # counted blocks up to the hole finishes the records it was given before it
+    # is replaced.
+    const bit_clock_lost::Vector{Bool}
+    # Satellites whose bit clock was just restarted, waiting for the receiver to
+    # restart the matching decoder (`take_bit_clock_restart!`).
+    const bit_clock_restarts::Vector{HardwareChannelAssignment}
     # ── Noise reference ───────────────────────────────────────────────────────
     # Where the C/N₀ estimator's noise density comes from: `:channel` spends a
     # hardware channel on an open-loop despread (the documented FPGA recipe),
@@ -705,6 +723,9 @@ function HardwareCorrelatorLink(
         zeros(Int64, n),
         zeros(Int, n),
         fill(typemin(Int64), n),
+        zeros(Int, n),
+        fill(false, n),
+        HardwareChannelAssignment[],
         noise_source,
         0,
         Int32(0),
@@ -1177,6 +1198,9 @@ function release_stale_channels!(link, track_state)
         link.lost_record_samples[hw_channel] = 0
         link.rearm_dead_samples[hw_channel] = 0
         link.overlapping_record_samples[hw_channel] = 0
+        link.pending_blocks[hw_channel] = 0
+        link.bit_clock_lost[hw_channel] = false
+        filter!(!=(assignment), link.bit_clock_restarts)
         # A part-accumulated record belongs to the satellite that just left; it
         # can neither be finished nor handed to anyone else.
         _discard_partial!(link, hw_channel)
@@ -1268,6 +1292,8 @@ function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampl
     link.lost_record_samples[hw_channel] = 0
     link.rearm_dead_samples[hw_channel] = 0
     link.overlapping_record_samples[hw_channel] = 0
+    link.pending_blocks[hw_channel] = 0
+    link.bit_clock_lost[hw_channel] = false
     # The handover itself counts as the channel's last sign of life, so the
     # dump-gap budget is spent from here rather than from whatever the previous
     # occupant left behind.
@@ -1435,9 +1461,78 @@ function fold_closed_epochs!(
     # runs, not after it.
     append_noise_observations!(link, track_state, band_systems, band_measurements)
     Tracking.estimate_dopplers_and_filter_prompt!(track_state, band_measurements)
+    # The estimator consumed every record emitted this chunk, so the bit buffers
+    # are current again and nothing is pending against them.
+    fill!(link.pending_blocks, 0)
     anchor_bit_phases!(link, track_state, boundary)
+    restart_lost_bit_clocks!(link, track_state)
     push_nco_updates!(link, track_state, boundary)
     folds
+end
+
+"""
+    restart_lost_bit_clocks!(link, track_state) -> link
+
+Give every satellite whose hardware channel lost records this chunk a fresh,
+unsynchronised bit buffer, and queue it for the receiver to restart its decoder
+(see [`take_bit_clock_restart!`](@ref)).
+
+A lost record is a hole in the block count the navigation bit clock is built on:
+tracking, C/N₀ and bit sync all look healthy afterwards while every bit sits off
+its grid and the pseudorange's bit count is wrong by the hole. Nothing about the
+hole can be measured — the records are gone — so the state that depended on
+continuity is thrown away and rebuilt from the signal: bit sync is found again
+within a second or two, and the decoder re-synchronises on the next preamble.
+The tracking loops, which need no continuity, keep running on the device
+throughout. Runs after the estimator, so the records folded up to the hole have
+been credited to the buffer that was counting them.
+
+The absolute code phase is left alone: [`advance_code_phases!`](@ref)
+dead-reckons it across the hole and re-anchors it to the device replica on the
+next dump. Only its integer code-period count is re-tied to the bit grid, by
+[`anchor_bit_phases!`](@ref), once bit sync is back.
+"""
+function restart_lost_bit_clocks!(link::HardwareCorrelatorLink, track_state)
+    for hw_channel in eachindex(link.assignments)
+        link.bit_clock_lost[hw_channel] || continue
+        link.bit_clock_lost[hw_channel] = false
+        assignment = link.assignments[hw_channel]
+        isnothing(assignment) && continue
+        sat_states = get_sat_states(track_state, assignment.group_key)
+        haskey(sat_states, assignment.prn) || continue
+        sat_state = sat_states[assignment.prn]
+        signals = Tracking.get_signals(sat_state)
+        tracked = signals[assignment.signal_index]
+        restarted = Tracking.TrackedSignal(
+            tracked;
+            bit_buffer = typeof(Tracking.get_bit_buffer(tracked))(),
+        )
+        sat_states[assignment.prn] = Tracking.TrackedSat(
+            sat_state;
+            signals = Base.setindex(signals, restarted, assignment.signal_index),
+        )
+        link.bit_phase_anchored[hw_channel] = false
+        assignment in link.bit_clock_restarts || push!(link.bit_clock_restarts, assignment)
+    end
+    link
+end
+
+"""
+    take_bit_clock_restart!(correlator_source, group_key, prn) -> Bool
+
+Whether the source restarted this satellite's bit clock since the receiver last
+asked, clearing the flag. The receiver restarts the satellite's decoder in
+response, because the bit stream it was decoding has been cut. `false` for every
+source but a [`HardwareCorrelatorLink`](@ref) that lost records — see
+[`restart_lost_bit_clocks!`](@ref).
+"""
+take_bit_clock_restart!(correlator_source, group_key, prn) = false
+
+function take_bit_clock_restart!(link::HardwareCorrelatorLink, group_key, prn)
+    isempty(link.bit_clock_restarts) && return false
+    before = length(link.bit_clock_restarts)
+    filter!(a -> !(a.group_key == group_key && a.prn == prn), link.bit_clock_restarts)
+    length(link.bit_clock_restarts) < before
 end
 
 """
@@ -1632,9 +1727,12 @@ end
 # `num_code_blocks_that_form_a_bit`), so a record the host never sees moves that
 # satellite's bit boundary permanently by the record's length. Tracking, C/N0
 # and bit sync all stay healthy while the bit stream sits off its 20 ms grid;
-# only the decoder notices, and only as "a valid preamble never appears again".
-# `Tracking.advance_bit_clock` is what puts the clock back, and the gap record
-# appended below is how this path asks for it.
+# only the decoder notices, and only as "a valid preamble never appears again" —
+# and until it does, the bit count its pseudorange is built on is wrong by the
+# hole. So a hole is not compensated for, it is declared: the satellite's bit
+# clock and decoder are restarted (`restart_lost_bit_clocks!`), and the host
+# fault that caused it is what has to be fixed. A dump stream that is drained
+# without stalls loses nothing.
 function _account_record_continuity!(
     link,
     track_state,
@@ -1658,43 +1756,22 @@ function _account_record_continuity!(
             # epoch boundary. The hole is the remainder of that epoch, so it is
             # always under one. Charging the two together made every handover
             # read as dropped correlator output (issue #107).
+            # Either way the records after the hole are a different stretch of
+            # signal: close the coherent accumulation before it.
+            _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
             if gap < link.last_record_samples[hw_channel]
                 link.rearm_dead_samples[hw_channel] += gap
                 link.rearm_gaps += 1
             else
                 link.lost_record_samples[hw_channel] += gap
                 link.lost_record_gaps += 1
+                # From here on the channel's records are folded one code block
+                # at a time, as for a fresh satellite, until the bit clock has
+                # been restarted after this chunk's estimator pass.
+                link.bit_clock_lost[hw_channel] = true
+                @warn "hardware correlator records lost; restarting the satellite's bit sync and decoder" prn =
+                    assignment.prn hw_channel lost_samples = gap
             end
-            # Close the coherent accumulation *before* the hole: the records
-            # after it are a different stretch of signal, and the gap record has
-            # to reach the bit clock between the two. The partial comes out short
-            # (weak, like the bit straddling the gap) and the next accumulation
-            # re-aligns to the symbol boundary, which is exactly what
-            # `coherent_integration_blocks` measures against the bit buffer.
-            _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
-            # Tell the fold that this much signal time passed and nothing is
-            # known about it. This used to append a record spanning the gap with
-            # a *zeroed* correlator, which was a lie the consumer was expected to
-            # see through: a zero correlator is a measurement of nothing, so
-            # every discriminator computes 0/0, the NaN leaves the loop filter
-            # as a NaN Doppler, and a later correlate iteration dies converting
-            # it to a sample count. Guarding the discriminators against that
-            # would only make it quiet — 0 is what a discriminator returns for a
-            # *perfectly tracked* signal, so "no measurement" would enter the
-            # loop filter as "no error", plus a zero prompt through the prompt
-            # filter and a zero-power record in the C/N0 average.
-            # `advance_bit_clock!` says the one thing that is actually true and
-            # moves nothing else.
-            #
-            # The bit straddling the gap still comes out weak, and every bit
-            # after it stays on the 20 ms grid — which is the whole point.
-            Tracking.advance_bit_clock!(
-                track_state,
-                _gap_code_blocks(link, sat_state, assignment.signal_index, gap),
-                assignment.group_key,
-                assignment.prn,
-                assignment.signal_index,
-            )
         elseif gap < 0
             link.overlapping_record_samples[hw_channel] -= gap
         end
@@ -1755,7 +1832,7 @@ function _append_dump!(link, track_state, dump)
 end
 
 """
-    coherent_integration_blocks(link, sat_state, signal_index) -> Int
+    coherent_integration_blocks(link, sat_state, signal_index, hw_channel) -> Int
 
 How many primary-code blocks the link should sum into one record for this
 signal, right now.
@@ -1820,16 +1897,26 @@ measured in the closed-loop reproduction to false-lock and diverge by ~1000 Hz.
 A chunk-length record (2 ms ⇒ ±125 Hz) is comfortably inside; anything longer
 needs the length to be ramped up as the loop settles, which this does not yet do.
 
-The count is measured against the bit buffer's own progress through the current
-symbol, so a partial record — one truncated by a stream gap — lands the *next*
-one back on the symbol boundary instead of straddling it for the rest of the lock.
+The count is measured against the bit buffer's progress through the current
+symbol — its own block count plus the blocks of the records emitted since the
+estimator last advanced it (`pending_blocks`) — so a record truncated by the
+chunk boundary lands the *next* one back on the symbol edge, and a chunk that
+holds several symbols' worth of dumps is cut on every edge rather than at one
+stale offset.
 """
-function coherent_integration_blocks(link::HardwareCorrelatorLink, sat_state, signal_index)
+function coherent_integration_blocks(
+    link::HardwareCorrelatorLink,
+    sat_state,
+    signal_index,
+    hw_channel,
+)
     tracked_signal = Tracking.get_signals(sat_state)[signal_index]
     bit_buffer = Tracking.get_bit_buffer(tracked_signal)
     # Pre-sync the detectors need one prompt per code block, and Tracking
-    # enforces it.
+    # enforces it. A channel whose bit clock is about to be restarted is folded
+    # the same way: its records will meet a fresh, unsynchronised bit buffer.
     has_bit_or_secondary_code_been_found(bit_buffer) || return 1
+    link.bit_clock_lost[hw_channel] && return 1
     signal = get_signal(tracked_signal)
     # A device replica reproduces the primary code only — nothing in
     # `assign_channel!` asks it to wipe off a secondary/overlay code — so
@@ -1845,9 +1932,10 @@ function coherent_integration_blocks(link::HardwareCorrelatorLink, sat_state, si
         min(link.coherent_code_blocks, blocks_per_symbol)
     # Land on the symbol boundary the bit buffer is counting toward, so a
     # truncated record is absorbed once instead of shifting every later one.
-    remaining =
-        blocks_per_symbol -
-        mod(bit_buffer.prompt_accumulator_integrated_code_blocks, blocks_per_symbol)
+    counted =
+        bit_buffer.prompt_accumulator_integrated_code_blocks +
+        link.pending_blocks[hw_channel]
+    remaining = blocks_per_symbol - mod(counted, blocks_per_symbol)
     max(1, min(requested, remaining))
 end
 
@@ -1877,7 +1965,7 @@ end
 # the FLL divides by, and the bit clock's block credit all follow from those two
 # numbers.
 function _accumulate_dump!(link, track_state, assignment, sat_state, hw_channel, output)
-    target = coherent_integration_blocks(link, sat_state, assignment.signal_index)
+    target = coherent_integration_blocks(link, sat_state, assignment.signal_index, hw_channel)
     blocks = _record_code_blocks(link, sat_state, assignment.signal_index, output)
     if link.partial_blocks[hw_channel] == 0
         link.partial_correlator[hw_channel] = output.correlator
@@ -1895,19 +1983,6 @@ function _accumulate_dump!(link, track_state, assignment, sat_state, hw_channel,
     link.partial_blocks[hw_channel] >= target &&
         _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
     link
-end
-
-# Whole primary-code blocks a *gap* spans. Same arithmetic as
-# `_record_code_blocks` but without its `max(1, …)` floor: a gap shorter than one
-# code block rounds to zero blocks and must credit nothing, where a record always
-# represents at least the block it was integrated over.
-function _gap_code_blocks(link, sat_state, signal_index, gap_samples)
-    signal = get_signal(Tracking.get_signals(sat_state)[signal_index])
-    round(
-        Int,
-        gap_samples * ustrip(Hz, get_code_frequency(signal)) /
-        (get_code_length(signal) * link.sampling_freq_hz),
-    )
 end
 
 # Whole primary-code blocks a record spans, recovered from its sample count the
@@ -1944,6 +2019,7 @@ function _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
         assignment.prn,
         assignment.signal_index,
     )
+    link.pending_blocks[hw_channel] += link.partial_blocks[hw_channel]
     link.partial_samples[hw_channel] = 0
     link.partial_blocks[hw_channel] = 0
     link.partial_end[hw_channel] = typemin(Int64)

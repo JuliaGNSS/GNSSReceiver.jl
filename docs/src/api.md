@@ -50,6 +50,8 @@ correlator_gain
 epoch_strobe
 is_epoch_strobe
 is_observation_gap
+restart_lost_bit_clocks!
+take_bit_clock_restart!
 coherent_integration_blocks
 advance_tracking!
 flush_partial_records!

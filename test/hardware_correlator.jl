@@ -1020,13 +1020,14 @@ end
     # Before bit sync the length is pinned to one block: the sync detectors take
     # exactly one prompt per code block and `Tracking` errors on anything else.
     @test GNSSReceiver.coherent_integration_blocks(
-        link, get_sat_state(track_state, prn), 1) == 1
+        link, get_sat_state(track_state, prn), 1, 1) == 1
     for k = 1:4
         GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 4000k))
     end
     @test length(outputs()) == 4
     @test all(o -> o.integrated_samples == 4000, outputs())
-    empty!(outputs())
+    empty!(outputs())          # the estimator consumed them…
+    fill!(link.pending_blocks, 0)  # …so the fold clears what was pending against the bit buffer
 
     # Post-sync the ceiling is a whole navigation bit, but the per-chunk flush is
     # what decides the actual length.
@@ -1038,7 +1039,7 @@ end
         get_sat_state(track_state, prn);
         signals = (Tracking.TrackedSignal(signal(); bit_buffer = synced),))
     @test GNSSReceiver.coherent_integration_blocks(
-        link, get_sat_state(track_state, prn), 1) == 20
+        link, get_sat_state(track_state, prn), 1, 1) == 20
 
     # Two dumps arrive (a 2 ms chunk keeping up). Neither reaches the estimator on
     # its own; the flush hands over their coherent sum, tagged with the summed
@@ -1058,7 +1059,8 @@ end
           Tracking.get_early_late_sample_spacing(
         get_correlator(get_sat_state(track_state, prn), 1), 4e6Hz,
         get_code_frequency(system))
-    empty!(outputs())
+    empty!(outputs())          # the estimator consumed them…
+    fill!(link.pending_blocks, 0)  # …so the fold clears what was pending against the bit buffer
 
     # A catch-up burst is where this matters: 20 dumps in one chunk become one
     # 20 ms record, so the loop's Δt — and with it Tracking's 1/n bandwidth
@@ -1073,7 +1075,8 @@ end
     burst = only(outputs())
     @test burst.integrated_samples == 80_000
     @test Tracking.get_prompt(burst.correlator) ≈ 20 + 0im
-    empty!(outputs())
+    empty!(outputs())          # the estimator consumed them…
+    fill!(link.pending_blocks, 0)  # …so the fold clears what was pending against the bit buffer
 
     # Nothing accumulated ⇒ the flush is a no-op rather than a zero record, which
     # `Tracking` would read as a gap and credit to the bit clock.
@@ -1082,7 +1085,7 @@ end
 
     # A channel that changes occupant must not carry its predecessor's partial
     # into the newcomer's fold.
-    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 200_000))
+    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 188_000))
     @test link.partial_blocks[1] == 1
     GNSSReceiver.release_stale_channels!(
         link, TrackState(system, [TrackedSat(system, prn + 1, 0.0, 0.0Hz)]))
@@ -1131,15 +1134,19 @@ end
     @test link.lost_record_samples[1] == 4000
     @test link.rearm_gaps == 1              # unchanged
 
-    # Both are elapsed signal time, so both reach the bit clock — the split is
-    # about attribution, not about what the loops are told.
-    blocks() =
-        Tracking.get_bit_buffer(
-            Tracking.get_signals(get_sat_state(track_state, prn))[1],
-        ).code_block_buffer_length
-    before = blocks()
-    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 26_688))
-    @test blocks() > before
+    # The split decides what happens next: a re-arm hole is the device's own
+    # doing and the bit clock is intact, a lost record has cut the bit clock and
+    # the satellite's bit sync has to be restarted.
+    @test link.bit_clock_lost[1]
+    link.bit_clock_lost[1] = false
+    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 22_688))
+    GNSSReceiver._append_dump!(
+        link,
+        track_state,
+        dump_at(1, prn, 25_000; integrated_samples = 1000),
+    )
+    @test link.rearm_gaps == 2
+    @test !link.bit_clock_lost[1]
 
     # A fresh occupant clears both.
     GNSSReceiver.release_stale_channels!(
@@ -1151,7 +1158,7 @@ end
     @test link.last_record_samples[1] == typemin(Int64)
 end
 
-@testset "A hole in a channel's record stream is reported to the bit clock" begin
+@testset "A hole in a channel's record stream restarts the satellite's bit clock" begin
     system = GPSL1CA()
     prn = 7
     sdr = RecordingSDR(EPL, 2)
@@ -1159,64 +1166,124 @@ end
     track_state = TrackState(system, [TrackedSat(system, prn, 0.0, 0.0Hz)])
     link.assignments[1] = GNSSReceiver.HardwareChannelAssignment(:default, prn, 1)
     link.channel_of[link.assignments[1]] = 1
-
     outputs() = Tracking.get_correlator_outputs(get_sat_state(track_state, prn), 1)
-    # Blocks the bit clock has been told about. Pre-sync that is the length of
-    # the hard-decision search window, which advances one per code period of
-    # signal time — whether or not a prompt was measured for it.
-    blocks() =
-        Tracking.get_bit_buffer(
-            Tracking.get_signals(get_sat_state(track_state, prn))[1],
-        ).code_block_buffer_length
+    signal() = Tracking.get_signals(get_sat_state(track_state, prn))[1]
 
-    # The first record on a fresh channel has nothing to be continuous with.
+    # In bit sync, 13 of the open bit's 20 blocks counted, integer code-period
+    # count anchored: the state a hole has to invalidate.
+    bit_buffer = Tracking.get_bit_buffer(signal())
+    synced = typeof(bit_buffer)(
+        bit_buffer.code_block_buffer, 40, true, 0, Int8(1), complex(0.0, 0.0), 13,
+        bit_buffer.soft_bits, bit_buffer.phase_acc)
+    Tracking.get_sat_states(track_state)[prn] = Tracking.TrackedSat(
+        get_sat_state(track_state, prn);
+        signals = (Tracking.TrackedSignal(signal(); bit_buffer = synced),))
+    link.bit_phase_anchored[1] = true
+
+    # Two continuous records accumulate towards the bit edge 7 blocks away.
     GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 4000))
-    @test link.lost_record_gaps == 0
-    @test link.lost_record_samples[1] == 0
-    @test length(outputs()) == 1
-
-    # A record that starts exactly where the last one ended is continuous.
     GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 8000))
     @test link.lost_record_gaps == 0
-    @test length(outputs()) == 2
+    @test link.partial_blocks[1] == 2
+    @test isempty(outputs())
 
-    # Three records lost: the next one starts 12000 samples late. The gap is
-    # accounted and the three code periods it spans are credited to the bit
-    # clock, so the satellite's navigation bit boundary does not move for the
-    # rest of its lock.
-    #
-    # It is credited as *elapsed time*, not as a measurement. This used to
-    # append a record spanning the hole with a zeroed correlator, which every
-    # discriminator then read as 0/0 — so what is pinned here is that the bit
-    # clock moved by exactly the hole and that nothing was put into the
-    # correlator outputs to move it.
-    before = blocks()
-    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 24_000))
+    # Three records lost: the next one starts 12000 samples late. Nothing about
+    # the hole is compensated — no record is invented for it and the bit clock
+    # is not credited — the accumulation before it is closed, the hole is
+    # accounted, and the channel is marked for a bit-clock restart.
+    @test_logs (:warn, r"records lost") GNSSReceiver._append_dump!(
+        link, track_state, dump_at(1, prn, 24_000))
     @test link.lost_record_gaps == 1
     @test link.lost_record_samples[1] == 12_000
-    @test blocks() - before == 3      # 12000 samples = 3 GPS L1 C/A code periods
-    @test length(outputs()) == 3      # the three real records, and nothing else
+    @test link.bit_clock_lost[1]
+    @test length(outputs()) == 2
+    @test outputs()[1].integrated_samples == 8000     # the pre-hole partial, closed
+    @test outputs()[1].sample_index == 8000
+    @test outputs()[2].integrated_samples == 4000     # the post-hole record, alone
+    @test outputs()[2].sample_index == 24_000
     @test all(o -> !iszero(Tracking.get_prompt(o.correlator)), outputs())
-    @test outputs()[3].sample_index == 24_000
+    @test Tracking.get_bit_buffer(signal()).prompt_accumulator_integrated_code_blocks == 13
+    # Until the restart the channel folds one block at a time, like a fresh
+    # satellite: its records will meet an unsynchronised bit buffer.
+    @test GNSSReceiver.coherent_integration_blocks(
+        link, get_sat_state(track_state, prn), 1, 1) == 1
+
+    # After the estimator pass the bit buffer is replaced by a fresh one, the
+    # integer code-period anchor is dropped with it, and the receiver is told
+    # exactly once to restart the decoder.
+    GNSSReceiver.restart_lost_bit_clocks!(link, track_state)
+    restarted = Tracking.get_bit_buffer(signal())
+    @test !restarted.found
+    @test restarted.code_block_buffer_length == 0
+    @test restarted.prompt_accumulator_integrated_code_blocks == 0
+    @test !link.bit_clock_lost[1]
+    @test !link.bit_phase_anchored[1]
+    @test GNSSReceiver.take_bit_clock_restart!(link, :default, prn)
+    @test !GNSSReceiver.take_bit_clock_restart!(link, :default, prn)
+    @test !GNSSReceiver.take_bit_clock_restart!(link, :default, prn + 1)
+    # A software correlator source never asks for one.
+    @test !GNSSReceiver.take_bit_clock_restart!(nothing, :default, prn)
 
     # A record that starts before the previous one ended is an overlap, not a
-    # hole — a duplicate or a device counter step back. Counted, never credited.
-    overlap_before = blocks()
+    # hole — a duplicate or a device counter step back. Counted, nothing more.
     GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 26_000))
     @test link.overlapping_record_samples[1] == 2000
     @test link.lost_record_gaps == 1
-    @test blocks() == overlap_before  # an overlap is not elapsed time
-    @test length(outputs()) == 4
+    @test !link.bit_clock_lost[1]
 
     # Reassigning the channel starts a fresh record stream: the old occupant's
-    # end sample says nothing about where the new one's first record begins.
-    empty!(sdr.released)
+    # end sample says nothing about where the new one's first record begins, and
+    # a restart still queued for the old occupant is forgotten with it.
+    link.bit_clock_lost[1] = true
+    push!(link.bit_clock_restarts, link.assignments[1])
     GNSSReceiver.release_stale_channels!(
         link,
         TrackState(system, [TrackedSat(system, prn + 1, 0.0, 0.0Hz)]),
     )
     @test link.last_record_end[1] == typemin(Int64)
     @test link.lost_record_samples[1] == 0
+    @test !link.bit_clock_lost[1]
+    @test isempty(link.bit_clock_restarts)
+end
+
+@testset "A chunk holding several symbols is cut on every bit edge" begin
+    # The estimator advances the bit buffer once per chunk, so a record sized
+    # against the buffer alone is sized against a count that ignores every
+    # record already emitted this chunk. A 30-dump backlog then came out as
+    # 7 + 7 + 7 + 7 + 2 blocks: the third record straddles a bit edge and
+    # every later one sits off the grid, and `Tracking.buffer`'s equality test
+    # never fires again — bit sync stays "found" while the bit stream stops.
+    system = GPSL1CA()
+    prn = 3
+    sdr = RecordingSDR(EPL, 1)
+    link = HardwareCorrelatorLink(sdr; sampling_freq = 4e6Hz, reference_signal = system)
+    track_state = TrackState(system, [TrackedSat(system, prn, 0.0, 0.0Hz)])
+    link.assignments[1] = GNSSReceiver.HardwareChannelAssignment(:default, prn, 1)
+    link.channel_of[link.assignments[1]] = 1
+    outputs() = Tracking.get_correlator_outputs(get_sat_state(track_state, prn), 1)
+    signal() = Tracking.get_signals(get_sat_state(track_state, prn))[1]
+    bit_buffer = Tracking.get_bit_buffer(signal())
+    synced = typeof(bit_buffer)(
+        bit_buffer.code_block_buffer, 40, true, 0, Int8(1), complex(0.0, 0.0), 13,
+        bit_buffer.soft_bits, bit_buffer.phase_acc)
+    Tracking.get_sat_states(track_state)[prn] = Tracking.TrackedSat(
+        get_sat_state(track_state, prn);
+        signals = (Tracking.TrackedSignal(signal(); bit_buffer = synced),))
+
+    for k = 1:30
+        GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 4000k))
+    end
+    GNSSReceiver.flush_partial_records!(link, track_state)
+    @test [o.integrated_samples ÷ 4000 for o in outputs()] == [7, 20, 3]
+    @test [o.sample_index for o in outputs()] == [7 * 4000, 27 * 4000, 30 * 4000]
+    @test Tracking.get_prompt(outputs()[2].correlator) ≈ 20 + 0im
+    # The blocks the estimator has not seen yet are what the sizing added in.
+    @test link.pending_blocks[1] == 30
+    # Once it has, the count is cleared and the next chunk starts from the
+    # buffer's own progress again.
+    fill!(link.pending_blocks, 0)
+    @test GNSSReceiver.coherent_integration_blocks(
+        link, get_sat_state(track_state, prn), 1, 1) == 7
 end
 
 @testset "Only confirmed assignment integrations reach a fresh satellite" begin
