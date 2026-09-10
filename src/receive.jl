@@ -556,11 +556,15 @@ a long enough scan costs every lock. Pass `acquire_async = false` to override
 (e.g. for a deterministic test against a simulated device).
 
 For the same reason the chunk-processing task runs on the *interactive* thread
-pool here (`processing_threadpool = :interactive`): an asynchronous scan's
-`@batch` fills every default-pool thread, and a fold parked behind it resumes
-tens of milliseconds late while the device holds a one-epoch correction — which
-is what turns a strong, phase-locked satellite's bits into parity errors. Start
-Julia with `-t N,M` so the pool exists.
+pool here (`processing_threadpool = :interactive`): an asynchronous scan spawns
+one chunk task per default-pool thread, each of which runs several PRNs through
+the whole scan without yielding — seconds on an embedded host — and a fold
+queued behind them waits for a chunk to finish while the device holds a
+one-epoch correction, which is what turns a strong, phase-locked satellite's
+bits into parity errors. Start Julia with `-t N,M` so the pool exists, and size
+`M` for everything that lives there: Julia puts the main thread in the
+interactive pool, and a vendor package's device-service tasks usually keep a
+thread each (see the LiteX-M2SDR example).
 """
 function receive(
     sdr::AbstractHardwareCorrelatorSDR,
@@ -669,13 +673,14 @@ function receive(
     # Thread pool the chunk-processing task runs on. `:default` is right for the
     # software receiver, whose correlate phase is itself threaded across the
     # default pool. A hardware-correlator receiver wants `:interactive`: its
-    # per-chunk work is light, and `acquire!`'s `@batch` occupies every
-    # default-pool thread for the length of a scan — a processing task parked
-    # there resumes only when a batch chunk finishes, tens of ms later, during
-    # which the device holds each channel's last NCO word (a correction sized
-    # for one epoch) and the carrier phase slews by hundreds of degrees (issue
-    # #107). Start Julia with interactive threads (`-t N,M`) for it to take
-    # effect; without any, Julia runs `:interactive` tasks on the default pool.
+    # per-chunk work is light, and an asynchronous `acquire!` spawns one
+    # non-yielding chunk task per default-pool thread for the length of a scan
+    # — a processing task queued there resumes only when a chunk finishes,
+    # seconds later on an embedded host, during which the device holds each
+    # channel's last NCO word (a correction sized for one epoch) and the
+    # carrier phase slews by hundreds of degrees (issue #107). Start Julia with
+    # interactive threads (`-t N,M`) for it to take effect; without any, Julia
+    # runs `:interactive` tasks on the default pool.
     processing_threadpool::Symbol = :default,
 ) where {N}
     processing_threadpool in (:default, :interactive) || throw(

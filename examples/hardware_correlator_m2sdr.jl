@@ -14,18 +14,22 @@
 #   - GNSSM2SDR.jl, the vendor half of the `AbstractHardwareCorrelatorSDR`
 #     interface for this board (https://github.com/JuliaGNSS/GNSSM2SDR.jl), in
 #     the active project;
-#   - Julia started with interactive threads, e.g. `julia -t 6,3`: the chunk
-#     pipeline runs on the interactive pool so an acquisition scan on the default
-#     pool cannot park it while the device holds a stale NCO word.
+#   - Julia started with four interactive threads, e.g. `julia -t 6,4`. The
+#     interactive pool holds four occupants: this script's main task (Julia
+#     puts the main thread in the interactive pool when one exists), the
+#     raw-stream reader and the DMA1 service task (each keeps a thread and waits
+#     in the kernel rather than on Julia's event loop), and GNSSReceiver's chunk
+#     pipeline. Fewer threads and a busy main task — a compilation, say — takes
+#     the pipeline's thread away; an acquisition scan's chunk tasks stay on the
+#     default pool and cannot.
 #
-# Usage: julia -t 6,3 --project=. hardware_correlator_m2sdr.jl [MAX_SECONDS] [SECONDS_AFTER_FIX]
+# Usage: julia -t 6,4 --project=. hardware_correlator_m2sdr.jl [MAX_SECONDS] [SECONDS_AFTER_FIX]
 
 using Printf
 using Unitful
 using Unitful: Hz, ms, s, dBHz, ustrip
 using Geodesy: LLAfromECEF, wgs84
 using GNSSSignals: GPSL1CA
-using SignalChannels: SignalChannel
 using Tracking: ConventionalAssistedPLLAndDLL
 using GNSSReceiver
 using GNSSM2SDR
@@ -37,52 +41,6 @@ const CSR_CSV = expanduser("~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch20_ant1/csr.cs
 const MAX_SECONDS = length(ARGS) >= 1 ? parse(Float64, ARGS[1]) : 300.0
 const SECONDS_AFTER_FIX = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 60.0
 const gpsl1 = GPSL1CA()
-
-# ── Raw sample stream ─────────────────────────────────────────────────────────
-# `m2sdr_record` drains DMA0 into a pipe; a task turns antenna 0 of the 2R2T
-# sc16 stream into chunks on a `SignalChannel`. The pipe is grown to 32 MiB
-# (~1 s at 32 MB/s) so a late reader backs into the pipe rather than into the
-# driver's ring, where a dropped buffer would silently shift the host's sample
-# count against the device's.
-function start_raw_stream(; capacity_chunks = 4000)
-    run(ignorestatus(`pkill -x m2sdr_record`))
-    sleep(0.3)
-    recorder = open(`m2sdr_record -q - 0`, "r")
-    let want = 32 * 1024 * 1024, got = -1
-        while want >= 1024 * 1024
-            got = ccall(:fcntl, Cint, (Cint, Cint, Cint), Base._fd(recorder.out), 1031, want)
-            got > 0 && break
-            want >>= 1
-        end
-        got > 0 || @warn "could not grow the recorder pipe; a reader stall may drop raw samples"
-    end
-    channel = SignalChannel{Complex{Int16},1}(CHUNK, capacity_chunks)
-    reader = Threads.@spawn :interactive begin
-        nbuf = capacity_chunks + 2
-        pool = [Matrix{Complex{Int16}}(undef, CHUNK, 1) for _ = 1:nbuf]
-        raw = Vector{UInt8}(undef, CHUNK * 8)
-        idx = 1
-        try
-            while isopen(channel)
-                read!(recorder, raw)
-                words = reinterpret(Int16, raw)          # 4 × Int16 per sample (2R2T)
-                buf = pool[idx]
-                @inbounds for k = 1:CHUNK
-                    buf[k, 1] = Complex(words[4k-3], words[4k-2])   # antenna 0
-                end
-                put!(channel, buf)
-                idx = mod1(idx + 1, nbuf)
-            end
-        catch e
-            e isa EOFError || e isa InvalidStateException || rethrow()
-        finally
-            close(channel)
-            close(recorder)
-        end
-    end
-    Base.errormonitor(reader)
-    (; channel, recorder, reader)
-end
 
 # ── Reporting ─────────────────────────────────────────────────────────────────
 cn0_db(cn0) = 10 * log10(Unitful.linear(cn0) / Hz)
@@ -97,6 +55,7 @@ function position_summary(pvt)
 end
 
 function main()
+    Base.cumulative_compile_timing(true)
     # The bank's sample counter only advances on samples DMA0 accepts, so its
     # value just before the stream starts is the device index of the stream's
     # first sample — the constant that maps the host's sample count onto the
@@ -107,7 +66,9 @@ function main()
         count
     end
 
-    stream = start_raw_stream()
+    run(ignorestatus(`pkill -x m2sdr_record`))
+    sleep(0.3)
+    stream = start_raw_stream(; chunk = CHUNK)
     sdr = M2SDRCorrelator(CSR_CSV, stream.channel; fs = FS, n_channels = N_HW_CHANNELS)
     # 80 kHz epoch strobes (`epoch_period` in samples): the litepcie driver only
     # completes whole 8 KiB DMA buffers, so the strobe rate is what bounds the
@@ -170,8 +131,12 @@ function main()
         end
         if t - last_print >= 5
             last_print = t
-            @info @sprintf("t=%6.1f s  runtime=%6.1f s  cn0[%s]  %s", t, ustrip(s, d.runtime),
-                           sat_summary(d.sat_data),
+            # Cumulative GC and compilation time: a stall in the loop is one or
+            # the other far more often than it is anything in the receiver.
+            gc_s = Base.gc_time_ns() / 1e9
+            jit_s = Base.cumulative_compile_time_ns()[1] / 1e9
+            @info @sprintf("t=%6.1f s  runtime=%6.1f s  gc=%5.2f s  jit=%5.2f s  cn0[%s]  %s", t,
+                           ustrip(s, d.runtime), gc_s, jit_s, sat_summary(d.sat_data),
                            isnothing(d.pvt.time) ? "no fix" : position_summary(d.pvt))
         end
         (!isnothing(first_fix_at) && t - first_fix_at > SECONDS_AFTER_FIX) && break
@@ -181,8 +146,7 @@ function main()
     # Closing the output stops `receive`; its processing task closes the sample
     # channel, which ends the raw reader. Only then take the device down.
     close(data)
-    wait(stream.reader)
-    process_running(stream.recorder) && kill(stream.recorder)
+    close(stream)
     stop!(sdr)
     isnothing(sdr.reader) || wait(sdr.reader)
     isnothing(sdr.writer) || wait(sdr.writer)

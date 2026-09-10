@@ -89,19 +89,23 @@ and costs every lock. Measured on a LiteX-M2SDR at 4 MS/s with a 30 s rescan cad
 receiver stayed within 0.7 s of real time across ten background scans, where the same run
 with an inline search lost every lock at each scan (a ~13 s pipeline stall).
 
-A background scan still shares the machine with the chunk pipeline. `acquire!` runs its
-PRN search as a Polyester `@batch` over every default-pool thread, so a processing task
-that lives on that pool and yields (every chunk does, on `take!`) resumes only when the
-batch chunk holding its thread finishes — tens of milliseconds later. For the software
-receiver that is a late chunk and nothing more. For a hardware correlator it is a loop
-transient: the device holds each channel's last NCO word, a correction sized for a one- or
-two-millisecond epoch, for the whole stall, and the carrier phase slews by hundreds of
-degrees before the next update lands — measured on sky as navigation-word parity failures
-that appear only in words whose fold saw a stalled chunk (issue #107). The hardware
-method therefore runs the processing task on the *interactive* pool by default
-(`processing_threadpool = :interactive`), which Polyester never touches; start Julia with
-`-t N,M` so that pool exists (with no interactive threads Julia runs such tasks on the
-default pool, and the setting does nothing).
+A background scan still shares the machine with the chunk pipeline. `acquire!` spawns one
+chunk task per default-pool thread, and each runs its share of the PRNs through the whole
+scan without yielding — on a Jetson Orin at 4 MS/s with 10 ms coherent and five noncoherent
+rounds, about 1.6 s. Julia's scheduler is cooperative, so a processing task that lives on
+that pool and yields (every chunk does, on `take!`) resumes only when one of those chunk
+tasks finishes. For the software receiver that is a late chunk and nothing more. For a
+hardware correlator it is a loop transient: the device holds each channel's last NCO word,
+a correction sized for a one- or two-millisecond epoch, for the whole stall, and the carrier
+phase slews by hundreds of degrees before the next update lands — measured on sky as
+navigation-word parity failures that appear only in words whose fold saw a stalled chunk
+(issue #107). The hardware method therefore runs the processing task on the *interactive*
+pool by default (`processing_threadpool = :interactive`), which the scan's chunk tasks never
+enter. Start Julia with `-t N,M` so that pool exists (with no interactive threads Julia runs
+such tasks on the default pool, and the setting does nothing), and count its occupants when
+choosing `M`: Julia places the main thread in the interactive pool, so the main task and
+anything it compiles live there too, and a vendor package's device-service tasks typically
+keep a thread each. The LiteX-M2SDR example needs `-t N,4`.
 
 ### Restricting the PRN search
 
