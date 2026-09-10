@@ -197,7 +197,13 @@ function _spawn_band_worker(
         0,
         NaN,
     )
-    task = Threads.@spawn while true
+    # `:default` explicitly. A bare `@spawn` inherits the *calling* task's pool,
+    # and `receive` is normally called from the main task — which, when Julia
+    # has interactive threads at all, lives on the interactive pool. The scan
+    # and the chunk tasks `acquire!` spawns from it would then run on the very
+    # pool the processing task was moved to in order to escape them (measured:
+    # a 60 s scan starving the fold for seconds, GNSSReceiver.jl#107).
+    task = Threads.@spawn :default while true
         request = try
             take!(requests)
         catch e
@@ -284,7 +290,7 @@ channel ends a worker's loop; the inline scheduler has nothing to release.
 
 This **waits** (up to `timeout` seconds per band) for a scan that is still
 running to finish, rather than just closing the channels and returning. A search
-is seconds of compute inside `Acquisition`/Polyester, and leaving one in flight
+is seconds of compute inside `Acquisition`, and leaving one in flight
 while the caller tears the process down — `exit`, or simply the end of `main` —
 faults the runtime out from under it (observed as a `SIGBUS` in
 `_accumulate_prn_step_tiled!` at the end of an otherwise complete hardware run).
@@ -505,8 +511,8 @@ function acquire_band_async(
         worker.completed_scans += 1
         worker.last_scan_seconds = response.scan_seconds
         # How long the worker computed for is what decides whether a scan can
-        # disturb tracking at all (a `@batch` inside `acquire!` occupies every
-        # default-pool thread while it runs); enable with
+        # disturb tracking at all (`acquire!`'s chunk tasks occupy every
+        # default-pool thread for the length of the scan); enable with
         # `JULIA_DEBUG=GNSSReceiver` when a run's loops look stall-prone.
         @debug "asynchronous acquisition scan merged" scan_seconds = response.scan_seconds completed_scans =
             worker.completed_scans
