@@ -112,9 +112,11 @@ function main()
     #
     # 80 kHz epoch strobes (`epoch_period` in samples): the litepcie driver only
     # completes whole 8 KiB DMA buffers, so the strobe rate is what bounds the
-    # dump latency the loop sees (~0.75 ms here). It is also what fills the
-    # driver's 256-buffer ring in ~190 ms — a host that stops draining the ring
-    # for longer than half of that loses records.
+    # dump latency the loop sees (~0.75 ms here). It also fills the driver's
+    # 256-buffer ring in ~190 ms, and the driver discards once a reader lags
+    # half of that — which is why GNSSM2SDR drains DMA1 with a recorder process
+    # into a 32 MiB pipe (its default `dump_transport`), like the raw stream:
+    # a GC pause or a compilation in this process then only delays the reader.
     start!(sdr; dump_source = :dma, epoch_period = 50)
     sdr.device_origin = origin
 
