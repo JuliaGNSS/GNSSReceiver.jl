@@ -101,6 +101,45 @@ _galileo_inav_data(; kwargs...) = GNSSDecoder.GalileoINAVData(;
     kwargs...,
 )
 
+# A BeiDou D1 navigation data set carrying every field a record needs, with a real BDS-3
+# MEO orbit (semi-major axis ~27 900 km, inclined ~55°). BeiDou counts its weeks from
+# 2006-01-01, so its week 730 begins on 2019-12-29 and second 345600 — four days in — is
+# 2020-01-02, which is what the record's epoch line has to say.
+const _BDT_WEEK = 730
+const _BDT_SOW = 4 * 86400
+_beidou_dnav_data(; kwargs...) = GNSSDecoder.BeiDouDNAVData(;
+    last_subframe_id = 3,
+    SOW = _BDT_SOW + 65,
+    WN = _BDT_WEEK,
+    URAI = 0,
+    SatH1 = false,
+    AODE = 1,
+    AODC = 1,
+    t_0c = _BDT_SOW,
+    t_0e = _BDT_SOW,
+    a_f0 = -2.229036763310e-4,
+    a_f1 = 1.396483990392e-11,
+    a_f2 = 0.0,
+    T_GD1 = -1.100000000000e-8,
+    T_GD2 = -1.170000000000e-8,
+    sqrt_A = 5.282622100830e3,
+    e = 6.324013043195e-4,
+    ω = -2.936387939148,
+    Δn = 1.281847459404e-9,
+    M_0 = -1.573072741952,
+    Ω_0 = -2.204464371371,
+    Ω_dot = -2.157608862158e-9,
+    i_0 = 9.626440735042e-1,
+    i_dot = -3.239297798064e-10,
+    C_uc = -1.019053161144e-5,
+    C_us = 6.938725709915e-6,
+    C_rc = 1.755781250000e2,
+    C_rs = -3.128125000000e2,
+    C_ic = 1.769512891769e-7,
+    C_is = -1.303851604462e-7,
+    kwargs...,
+)
+
 # A decoder state holding `data` as validated navigation data. A freshly constructed decoder
 # reports no bit count until it has synchronised; zero puts the transmit time exactly on the
 # decoded time of week, which is what makes the expected pseudoranges below exact.
@@ -154,30 +193,60 @@ end
 @testset "Every trackable signal has a RINEX observation code" begin
     # `rinex_layout` refuses to write a file it cannot label correctly, so the mapping has
     # to cover every signal this receiver can range on — otherwise enabling RINEX output
-    # would fail at run time for a perfectly trackable configuration.
-    for signal in (
-        GPSL1CA(),
-        GPSL1C_D(),
-        GPSL1C_P(),
-        GPSL2CM(),
-        GPSL2CL(),
-        GPSL5I(),
-        GPSL5Q(),
-        GalileoE1B(),
-        GalileoE1B_BOC11(),
-        GalileoE1C(),
-        GalileoE1C_BOC11(),
-        GalileoE5aI(),
-        GalileoE5aQ(),
-    )
+    # would fail at run time for a perfectly trackable configuration. Enumerated from
+    # GNSSSignals rather than listed here, so a signal added upstream forces the decision
+    # instead of quietly going uncovered.
+    leaves(T) = isabstracttype(T) ? vcat(map(leaves, subtypes(T))...) : [T]
+    signals = filter(!isnothing, map(leaves(AbstractGNSSSignal)) do T
+        try
+            T()
+        catch
+            nothing
+        end
+    end)
+    # The receiver tracks more than a handful, so an empty or tiny enumeration would make
+    # the loop below vacuous.
+    @test length(signals) >= 20
+
+    for signal in signals
         signal_id = get_signal_id(signal)
+        if haskey(GNSSReceiver.RINEX_UNCODED_SIGNALS, signal_id)
+            # A signal the format itself cannot name: excluded on purpose, and it says so.
+            @test !haskey(GNSSReceiver.RINEX_SIGNAL_CODES, signal_id)
+            continue
+        end
         @test haskey(GNSSReceiver.RINEX_SIGNAL_CODES, signal_id)
-        @test GNSSReceiver.rinex_system_char(signal) in ('G', 'E')
+        @test GNSSReceiver.rinex_system_char(signal) in ('G', 'E', 'C')
         # A RINEX 3.05 observation code is a band digit plus a signal-attribute letter.
         code = GNSSReceiver.RINEX_SIGNAL_CODES[signal_id]
         @test length(code) == 2
         @test isdigit(code[1]) && isuppercase(code[2])
     end
+
+    # The codes of the constellation code tables (14, 16 and 19), spot-checked where the
+    # band digit is not the obvious one: BeiDou B1I is `2I`, not the `1I` RINEX 3.02 used,
+    # and B2b shares band 7 with Galileo's E5b while B3 shares band 6 with E6.
+    @test GNSSReceiver.RINEX_SIGNAL_CODES[:BeiDouB1I] == "2I"
+    @test GNSSReceiver.RINEX_SIGNAL_CODES[:BeiDouB3I] == "6I"
+    @test GNSSReceiver.RINEX_SIGNAL_CODES[:BeiDouB1C_D] == "1D"
+    @test GNSSReceiver.RINEX_SIGNAL_CODES[:BeiDouB1C_P] == "1P"
+    @test GNSSReceiver.RINEX_SIGNAL_CODES[:BeiDouB2aI] == "5D"
+    @test GNSSReceiver.RINEX_SIGNAL_CODES[:BeiDouB2aQ] == "5P"
+    @test GNSSReceiver.RINEX_SIGNAL_CODES[:BeiDouB2bI] == "7D"
+    @test GNSSReceiver.RINEX_SIGNAL_CODES[:GalileoE5bI] == "7I"
+    @test GNSSReceiver.RINEX_SIGNAL_CODES[:GalileoE5bQ] == "7Q"
+    @test GNSSReceiver.RINEX_SIGNAL_CODES[:GalileoE6B] == "6B"
+    @test GNSSReceiver.RINEX_SIGNAL_CODES[:GalileoE6C] == "6C"
+
+    # E5a-QP postdates RINEX 3.05, so asking for it says that rather than looking like an
+    # omission in this table.
+    error = try
+        GNSSReceiver.rinex_layout(((GalileoE5aQP(),),), (0.0Hz,))
+    catch exception
+        exception
+    end
+    @test error isa ArgumentError
+    @test occursin("OS SIS ICD Issue 2.2", sprint(showerror, error))
 end
 
 @testset "Continuous carrier phase" begin
@@ -391,6 +460,127 @@ end
     @test GNSSReceiver.sisa_metres(nothing) == -1.0
 end
 
+@testset "BeiDou D1 ephemeris record" begin
+    decoder = _decoder_with(BeiDouB1I(), 21, _beidou_dnav_data())
+    eph = GNSSReceiver.rinex_ephemeris(decoder; approximate_year = 2020)
+    @test eph isa BeiDouEphemeris
+    @test eph.prn == 21
+
+    # BeiDou counts its own weeks from its own origin, so the record's week is the
+    # broadcast one as it stands, and the epoch it makes is BDT — not the GPS-aligned
+    # clock the GPS and Galileo records share. Reading it as a GPS week would date the
+    # record in 2033 instead.
+    @test eph.week == _BDT_WEEK
+    @test eph.toc == DateTime(2020, 1, 2)
+    @test GNSSReceiver.week_seconds_to_datetime(_BDT_WEEK, _BDT_SOW) != eph.toc
+    @test eph.toe == Float64(_BDT_SOW)
+
+    # The Keplerian set, straight through in the units RINEX asks for.
+    @test eph.sqrt_a ≈ 5.282622100830e3
+    @test eph.e ≈ 6.324013043195e-4
+    @test eph.i0 ≈ 9.626440735042e-1
+    @test eph.omegadot ≈ -2.157608862158e-9
+    @test eph.crs ≈ -3.128125000000e2
+
+    # The two group delays and the age counters land in their own fields, and the health
+    # flag is the number the record writes.
+    @test eph.tgd1_b1_b3 ≈ -1.1e-8
+    @test eph.tgd2_b2_b3 ≈ -1.17e-8
+    @test (eph.aode, eph.aodc) == (1.0, 1.0)
+    @test eph.sath1 == 0.0
+
+    # URAI 0 is 2.0 m by the same two segments as GPS, but the top of the BDS range means
+    # "use at own risk" and is 8192 m, not the negative accuracy GPS and Galileo report
+    # for an accuracy that was never predicted.
+    @test eph.sv_accuracy == 2.0
+    @test GNSSReceiver.bds_accuracy_metres(6) == 16.0
+    @test GNSSReceiver.bds_accuracy_metres(7) == 32.0
+    @test GNSSReceiver.bds_accuracy_metres(14) == 4096.0
+    @test GNSSReceiver.bds_accuracy_metres(15) == 8192.0
+    @test GNSSReceiver.bds_accuracy_metres(nothing) == 8192.0
+
+    # The transmission time refers to the record's own week: a subframe received just
+    # after the week rolled over is folded back onto it rather than reading a week early.
+    @test eph.transmission_time == Float64(_BDT_SOW + 65)
+    rolled = GNSSReceiver.rinex_ephemeris(
+        _decoder_with(BeiDouB1I(), 21, _beidou_dnav_data(; SOW = 30, t_0e = 604000));
+        approximate_year = 2020,
+    )
+    @test rolled.transmission_time == 30 + 604800
+
+    # B-CNAV is a different message, and RINEX 3.05 has no record for it.
+    @test isnothing(
+        GNSSReceiver.rinex_ephemeris(
+            _decoder_with(BeiDouB1C_D(), 21, GNSSDecoder.BeiDouB1CData());
+            approximate_year = 2020,
+        ),
+    )
+end
+
+@testset "BeiDou navigation-header records" begin
+    data = _beidou_dnav_data(;
+        α_0 = 1.0244548321e-8,
+        α_1 = 2.2351741791e-8,
+        α_2 = -5.9604644775e-8,
+        α_3 = -1.1920928955e-7,
+        β_0 = 8.8064e4,
+        β_1 = 4.9152e4,
+        β_2 = -6.5536e4,
+        β_3 = -1.9661e5,
+        A_0UTC = -9.3132257462e-10,
+        A_1UTC = -7.1054273576e-15,
+        Δt_LS = 4,
+    )
+    iono = GNSSReceiver.nav_ionospheric_corrections!(IonosphericCorrection[], data, 21)
+    @test [c.type for c in iono] == ["BDSA", "BDSB"]
+    @test first(iono).parameters[1] ≈ 1.0244548321e-8
+
+    time_corrections =
+        GNSSReceiver.nav_time_system_corrections!(TimeSystemCorrection[], data)
+    @test only(time_corrections).type == "BDUT"
+    @test only(time_corrections).reference_week == _BDT_WEEK
+
+    # BeiDou's broadcast leap seconds are BDT - UTC, 14 fewer than the GPS - UTC a blank
+    # identifier is read as, and its week and day count from the BDT epoch. Naming the
+    # time system is what makes those numbers mean what they say.
+    leap = GNSSReceiver.nav_leap_seconds(data)
+    @test leap.count == 4
+    @test leap.time_system == "BDT"
+    # A message that has not sent the whole event yet still reports the count it has.
+    @test isnothing(leap.future_count)
+    @test isnothing(GNSSReceiver.nav_leap_seconds(_beidou_dnav_data()))
+
+    # The BDS ionosphere records carry the transmission the coefficients arrived on, which
+    # RINEX makes mandatory for BeiDou alone: the satellite, and the hour of the day as a
+    # letter. Second 345665 of a BDT week is 00h-01h of its fifth day, so `A`.
+    @test all(c -> c.sv_id == 21, iono)
+    @test all(c -> c.time_mark == 'A', iono)
+    @test GNSSReceiver.ionosphere_time_mark(0) == 'A'
+    @test GNSSReceiver.ionosphere_time_mark(23 * 3600) == 'X'
+    @test GNSSReceiver.ionosphere_time_mark(4 * 86400 + 12 * 3600) == 'M'
+    # Without a second of week there is no mark to give, so no record is claimed.
+    @test isempty(
+        GNSSReceiver.nav_ionospheric_corrections!(
+            IonosphericCorrection[],
+            _beidou_dnav_data(; SOW = nothing, α_0 = 1.0e-8),
+            21,
+        ),
+    )
+end
+
+@testset "BeiDou observations are differenced on one time scale" begin
+    # BDT runs 14 s behind GPS Time, and PositionVelocityTime leaves every transmit time
+    # on its own constellation's scale. Differencing them as they come would put 14 s —
+    # 4.2 million metres — into a BeiDou pseudorange.
+    @test GNSSReceiver.time_scale_offset(GNSSSignals.GPST(), GNSSSignals.BDT()) == 14.0
+    @test GNSSReceiver.time_scale_offset(GNSSSignals.BDT(), GNSSSignals.GPST()) == -14.0
+    # GPS and Galileo both count TAI - 19 s, which is why a receiver of those two alone
+    # never had to correct anything.
+    @test GNSSReceiver.time_scale_offset(GNSSSignals.GPST(), GNSSSignals.GST()) == 0.0
+    # A solution that names no reference system moves nothing.
+    @test GNSSReceiver.time_scale_offset(nothing, GNSSSignals.BDT()) == 0.0
+end
+
 @testset "RINEX 3.05 has no record for the GPS CNAV messages" begin
     # GPS L5 and L2C broadcast a quasi-Keplerian ephemeris RINEX 3.05 cannot express, so
     # those decoders yield no record — which must be reported as such rather than written
@@ -425,7 +615,7 @@ end
             DN = 7,
         ),
     )
-    iono = GNSSReceiver.nav_ionospheric_corrections!(IonosphericCorrection[], gps.data)
+    iono = GNSSReceiver.nav_ionospheric_corrections!(IonosphericCorrection[], gps.data, 13)
     @test length(iono) == 2
     @test iono[1].type == "GPSA"
     @test iono[1].parameters ==
@@ -437,12 +627,17 @@ end
     @test utc[1].a0 == -9.3132257462e-10
     @test utc[1].reference_week == 76
     # The four-field leap-second record, which some parsers require.
-    @test GNSSReceiver.nav_leap_seconds(gps.data) == (18, 18, 137, 7)
+    leap = GNSSReceiver.nav_leap_seconds(gps.data)
+    @test (leap.count, leap.future_count, leap.week, leap.day) == (18, 18, 137, 7)
+    # GPS and Galileo count against the epoch a blank identifier is read as, so they leave
+    # the field blank rather than claiming a system.
+    @test leap.time_system == ""
     # A satellite that has not sent the record yet contributes nothing.
     @test isempty(
         GNSSReceiver.nav_ionospheric_corrections!(
             IonosphericCorrection[],
             _gps_lnav_data(),
+            13,
         ),
     )
     @test isnothing(GNSSReceiver.nav_leap_seconds(_gps_lnav_data()))
@@ -466,7 +661,8 @@ end
             WN_0G = 12,
         ),
     )
-    iono = GNSSReceiver.nav_ionospheric_corrections!(IonosphericCorrection[], galileo.data)
+    iono =
+        GNSSReceiver.nav_ionospheric_corrections!(IonosphericCorrection[], galileo.data, 24)
     @test length(iono) == 1
     @test iono[1].type == "GAL"
     @test iono[1].parameters == (4.5e1, 1.5625e-2, -3.0517578125e-3, 0.0)

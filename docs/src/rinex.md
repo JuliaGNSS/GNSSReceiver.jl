@@ -85,7 +85,8 @@ receiver measures:
 | `D…`  | Doppler (Hz)                 | carrier Doppler of the tracking loops                         |
 | `S…`  | Signal strength (dB-Hz)      | `estimate_cn0`                                                |
 
-The observation codes follow RINEX 3.05 Table A2 and name the signal the receiver actually
+The observation codes come from the constellation code tables of RINEX 3.05 — Table 14
+(GPS), 16 (Galileo) and 19 (BDS) — and name the signal the receiver actually
 ranges on — for a [`CombinedSignal`](@ref) that is the pilot, so
 `CombinedSignal(GalileoE1C(), GalileoE1B())` is written as `C1C`/`L1C`/`D1C`/`S1C` under
 system `E`. A satellite tracked on several signals or bands appears once per epoch, with
@@ -97,12 +98,43 @@ leap-second header records as satellites broadcast them.
 
 !!! note "Which navigation messages can be written"
 
-    RINEX 3.05 defines broadcast-ephemeris records for **GPS LNAV** (L1 C/A) and for
-    **Galileo I/NAV** (E1B) and **F/NAV** (E5a). The GPS CNAV and CNAV-2 messages (L5, L2C,
-    L1C) broadcast a quasi-Keplerian ephemeris that RINEX only gained a record for in
-    version 4, so those satellites are logged with a warning and contribute observations but
-    no ephemerides. Their *observations* are unaffected, and an external navigation file can
-    supply the orbits.
+    RINEX 3.05 defines broadcast-ephemeris records for **GPS LNAV** (L1 C/A), for **Galileo
+    I/NAV** (E1B, E5b) and **F/NAV** (E5a), and for **BeiDou D1/D2** (B1I, B3I). The GPS
+    CNAV and CNAV-2 messages (L5, L2C, L1C), the BeiDou B-CNAV messages (B1C, B2a, B2b) and
+    Galileo's E6 C/NAV broadcast a quasi-Keplerian ephemeris that RINEX only gained a record
+    for in version 4, so those satellites are logged with a warning and contribute
+    observations but no ephemerides. Their *observations* are unaffected, and an external
+    navigation file can supply the orbits.
+
+!!! note "The one signal that cannot be written at all"
+
+    Galileo **E5a-QP** is new in OS SIS ICD Issue 2.2, published after RINEX 3.05, whose
+    Galileo codes cover only E5a I, Q and I+Q. There is no observation code to write it
+    under, so enabling RINEX output for a run that ranges on it is an error rather than a
+    guess at a code that means a different signal.
+
+## BeiDou and the BDT time scale
+
+BeiDou keeps its own clock: **BDT runs 14 s behind GPS Time**, because it started at zero on
+2006-01-01 aligned with UTC, by which point GPS had accrued 14 leap seconds. Two consequences
+are handled here rather than left to the reader of the file:
+
+  - `PositionVelocityTime` reports every satellite's transmit time on *its own*
+    constellation's scale — it has to, since the satellite position is propagated from that
+    same time against an ephemeris on that same scale. Pseudoranges are differences of
+    transmit times, so this receiver applies the identical correction the PVT solve does
+    before differencing them. Left out, a BeiDou pseudorange would be wrong by 14 s of
+    light travel: 4.2 million metres.
+  - A BeiDou navigation record is stamped in BDT throughout — its week is the broadcast BDT
+    week, not aligned onto the GPS week as Galileo's is, and its `toc` is the calendar time
+    that week and second make on BeiDou's own origin.
+
+The same care runs through the header records. BeiDou's broadcast leap seconds are BDT −
+UTC, 14 fewer than the GPS − UTC a blank time-system field is read as, and its event week
+and day count from the BDT epoch — so the `LEAP SECONDS` record names `BDT`, without which
+its numbers would be read as GPS ones. And a BDS ionosphere record carries the satellite and
+the hour of the day it was broadcast on, which RINEX makes mandatory for BeiDou alone: it
+transmits several parameter sets a day, and nothing else tells them apart.
 
 ## Epoch times, pseudoranges and the receiver clock
 

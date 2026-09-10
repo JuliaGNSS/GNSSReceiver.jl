@@ -81,9 +81,11 @@ using RINEXParser:
     RinexNavWriter,
     GPSEphemeris,
     GalileoEphemeris,
+    BeiDouEphemeris,
     galileo_data_sources,
     galileo_sv_health,
     IonosphericCorrection,
+    LeapSeconds,
     TimeSystemCorrection,
     write_ephemeris!
 

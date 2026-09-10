@@ -32,8 +32,9 @@ defaults below.
     into the station, monument, receiver and country of the name, while any other marker
     name yields the station alone.
   - `leap_seconds`: current GPS-UTC leap-second count for the `LEAP SECONDS` header
-    record. Left `nothing` it is filled from the navigation message *if* a satellite has
-    broadcast it by the time the header is written (GPS sends it on subframe 4 page 18,
+    record, as a count or a `RINEXParser.LeapSeconds` naming the event and the time system
+    it counts in. Left `nothing` it is filled from the navigation message *if* a satellite
+    has broadcast it by the time the header is written (GPS sends it on subframe 4 page 18,
     only every 12.5 min, so usually it has not).
 
 # Derived file names
@@ -60,7 +61,7 @@ Base.@kwdef struct RinexConfig
     receiver_type::String = "GNSSReceiver.jl"
     antenna_number::String = ""
     antenna_type::String = "UNKNOWN"
-    leap_seconds::Union{Nothing,Int} = nothing
+    leap_seconds::Union{Nothing,Int,LeapSeconds} = nothing
 end
 
 # `write_rinex = false` / `true` / `RinexConfig(...)`: normalise the flag form to either
@@ -126,6 +127,10 @@ rinex_path(config::RinexConfig, ::Symbol, header, start_time) = joinpath(
 # from GNSSDecoder.
 const GPS_EPOCH = DateTime(1980, 1, 6)
 
+# BeiDou's time-scale origin, 2006-01-01, where BDT started at zero aligned with UTC — by
+# which time GPS Time had already accrued the 14 leap seconds that separate the two counts.
+const BDT_EPOCH = DateTime(2006, 1, 1)
+
 # Galileo's system time starts at the beginning of GPS week 1024, so a GST week number
 # becomes the continuous, GPS-aligned week RINEX asks for by adding this offset. The two
 # time scales are within nanoseconds of each other, so a Galileo time of week is directly
@@ -143,11 +148,12 @@ gps_time_origin() = from_utc(get_system_start_time(GPSL1CA()); scale = TAI)
 const RINEX_SYSTEM_CHARS =
     Dict(:GPS => 'G', :Galileo => 'E', :GLONASS => 'R', :BeiDou => 'C')
 
-# RINEX 3.05 observation-code suffix (Table A2: band digit plus signal attribute) of every
-# signal this receiver can range on, keyed by `get_signal_id`. The four observables of a
-# signal are "C"/"L"/"D"/"S" prefixed onto its suffix. The BOC(1,1)-approximation Galileo
-# E1 variants are the same broadcast signal as the full-CBOC ones — the modulation
-# approximation is a tracking-internal detail — so they share their codes.
+# RINEX 3.05 observation-code suffix (band digit plus signal attribute) of every signal this
+# receiver can range on, keyed by `get_signal_id`, from the per-constellation code tables:
+# Table 14 (GPS), 16 (Galileo) and 19 (BDS). The four observables of a signal are
+# "C"/"L"/"D"/"S" prefixed onto its suffix. The BOC(1,1)-approximation Galileo E1 variants
+# are the same broadcast signal as the full-CBOC ones — the modulation approximation is a
+# tracking-internal detail — so they share their codes.
 const RINEX_SIGNAL_CODES = Dict(
     :GPSL1CA => "1C",
     :GPSL1C_D => "1S",
@@ -162,6 +168,30 @@ const RINEX_SIGNAL_CODES = Dict(
     :GalileoE1C_BOC11 => "1C",
     :GalileoE5aI => "5I",
     :GalileoE5aQ => "5Q",
+    :GalileoE5bI => "7I",
+    :GalileoE5bQ => "7Q",
+    :GalileoE6B => "6B",
+    :GalileoE6C => "6C",
+    # BeiDou. B1I is `2I` rather than the `1I` of RINEX 3.02, which 3.05 keeps only as a
+    # form to accept when *reading* (Table 19 note). The BDS-3 signals are named by
+    # component: data `D`, pilot `P`, which is what GNSSSignals' I/Q suffixes are for B2a
+    # and B2b.
+    :BeiDouB1I => "2I",
+    :BeiDouB3I => "6I",
+    :BeiDouB1C_D => "1D",
+    :BeiDouB1C_P => "1P",
+    :BeiDouB2aI => "5D",
+    :BeiDouB2aQ => "5P",
+    :BeiDouB2bI => "7D",
+)
+
+# Signals RINEX 3.05 has no observation code for at all, with the reason, so that being
+# unable to name one reads as a property of the format rather than as an omission here.
+const RINEX_UNCODED_SIGNALS = Dict(
+    :GalileoE5aQP =>
+        "Galileo E5a-QP is new in OS SIS ICD Issue 2.2, published after " *
+        "RINEX 3.05, whose Galileo codes (Table 16) cover only E5a I, Q " *
+        "and I+Q",
 )
 
 # The four RINEX observables this receiver produces per signal, in header order:
@@ -221,6 +251,10 @@ function rinex_layout(band_systems::Tuple, interm_freqs::Tuple)
             signal_id = get_signal_id(signal)
             haskey(RINEX_SIGNAL_CODES, signal_id) || throw(
                 ArgumentError(
+                    haskey(RINEX_UNCODED_SIGNALS, signal_id) ?
+                    "Signal $signal_id cannot be written to a RINEX 3.05 file: " *
+                    "$(RINEX_UNCODED_SIGNALS[signal_id]). Track it without RINEX " *
+                    "output, or range on a signal the format names." :
                     "Signal $signal_id has no RINEX 3.05 observation code in this " *
                     "receiver; add it to `GNSSReceiver.RINEX_SIGNAL_CODES` or disable " *
                     "RINEX output.",
@@ -369,6 +403,11 @@ rinex_week(
     };
     approximate_year,
 ) = decoder.data.WN + GALILEO_WEEK_OFFSET
+# BeiDou counts its own weeks, which a BDS record reports as they are rather than aligned
+# onto the GPS week. The broadcast field is 13 bits and rolls over after 8191 weeks — the
+# first roll-over falls in 2163, so the broadcast number is still the continuous one.
+rinex_week(decoder::GNSSDecoderState{<:GNSSDecoder.BeiDouDNAVData}; approximate_year) =
+    decoder.data.WN
 
 # Calendar time of a navigation-record reference epoch from its GPS-aligned week and
 # seconds of week. Galileo's system time shares the GPS week alignment, so one conversion
@@ -376,16 +415,22 @@ rinex_week(
 week_seconds_to_datetime(week::Integer, seconds) =
     GPS_EPOCH + Week(week) + Millisecond(round(Int, seconds * 1000))
 
+# The same for BeiDou, which counts its own weeks from its own origin: a BDS record's epoch
+# line is BDT, not the GPS-aligned clock the other constellations' records share.
+bdt_week_seconds_to_datetime(week::Integer, seconds) =
+    BDT_EPOCH + Week(week) + Millisecond(round(Int, seconds * 1000))
+
 """
     rinex_ephemeris(decoder; approximate_year)
 
 Convert one satellite's decoded navigation message into the RINEX 3.05 broadcast ephemeris
 record RINEXParser writes, or `nothing` when RINEX 3.05 cannot express that message.
 
-Records exist for GPS LNAV (L1 C/A) and for Galileo I/NAV (E1B) and F/NAV (E5a). The GPS
-CNAV and CNAV-2 messages (L5, L2C, L1C) broadcast a quasi-Keplerian ephemeris that RINEX
-3.05 has no record layout for — it arrived with RINEX 4 — so those decoders yield `nothing`
-even though they position perfectly well.
+Records exist for GPS LNAV (L1 C/A), for Galileo I/NAV (E1B, E5b) and F/NAV (E5a), and for
+BeiDou D1/D2 (B1I, B3I). The GPS CNAV and CNAV-2 messages (L5, L2C, L1C), the BeiDou
+B-CNAV messages (B1C, B2a, B2b) and Galileo's E6 C/NAV broadcast a quasi-Keplerian
+ephemeris that RINEX 3.05 has no record layout for — it arrived with RINEX 4 — so those
+decoders yield `nothing` even though they position perfectly well.
 """
 rinex_ephemeris(decoder; approximate_year) = nothing
 
@@ -536,6 +581,62 @@ function rinex_ephemeris(
     )
 end
 
+# BeiDou user range accuracy: the broadcast URAI index maps onto metres by the same two
+# geometric segments as GPS's URA (RINEX 3.05 Table A14, from BDS-SIS-ICD section 5.2.4),
+# but the top of the range means something else — index 15 is "use at own risk" and is
+# reported as 8192 m rather than as the negative accuracy GPS and Galileo use for an
+# accuracy that was not predicted at all.
+function bds_accuracy_metres(index::Integer)
+    index <= 6 && return 2.0^(1 + index / 2)
+    index <= 14 && return 2.0^(index - 2)
+    8192.0
+end
+bds_accuracy_metres(::Nothing) = 8192.0
+
+function rinex_ephemeris(
+    decoder::GNSSDecoderState{<:GNSSDecoder.BeiDouDNAVData};
+    approximate_year,
+)
+    data = decoder.data
+    week = rinex_week(decoder; approximate_year)
+    BeiDouEphemeris(;
+        prn = decoder.prn,
+        # Every time of a BDS record is BeiDou time: seconds of the BDT week, and the
+        # calendar epoch they make with `week` is BDT's too, not the GPS-aligned one the
+        # other constellations' records carry.
+        toc = bdt_week_seconds_to_datetime(week, data.t_0c),
+        af0 = data.a_f0,
+        af1 = data.a_f1,
+        af2 = data.a_f2,
+        aode = data.AODE,
+        crs = data.C_rs,
+        deltan = data.Δn,
+        m0 = data.M_0,
+        cuc = data.C_uc,
+        e = data.e,
+        cus = data.C_us,
+        sqrt_a = data.sqrt_A,
+        toe = data.t_0e,
+        cic = data.C_ic,
+        omega0 = data.Ω_0,
+        cis = data.C_is,
+        i0 = data.i_0,
+        crc = data.C_rc,
+        omega = data.ω,
+        omegadot = data.Ω_dot,
+        idot = data.i_dot,
+        week = week,
+        sv_accuracy = bds_accuracy_metres(data.URAI),
+        sath1 = data.SatH1,
+        tgd1_b1_b3 = data.T_GD1,
+        tgd2_b2_b3 = data.T_GD2,
+        # The record's transmission time refers to its own `week`, so a message received
+        # after the week rolled over is folded back onto it (Table A14 footnote ****).
+        transmission_time = data.t_0e + fold_week_crossover(data.SOW - data.t_0e),
+        aodc = data.AODC,
+    )
+end
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Navigation-file header
 #
@@ -546,8 +647,13 @@ end
 
 # Klobuchar (GPS) and NeQuick (Galileo) ionosphere coefficients of one decoder, appended to
 # `corrections` when the satellite has broadcast them.
-nav_ionospheric_corrections!(corrections, data) = corrections
-function nav_ionospheric_corrections!(corrections, data::GNSSDecoder.GPSL1CAData)
+# The hour of the day a message was broadcast, as the letter RINEX marks an ionospheric
+# correction with: 'A' for 00h-01h through 'X' for 23h-24h.
+ionosphere_time_mark(seconds_of_week) =
+    'A' + (mod(floor(Int, seconds_of_week), 86400) ÷ 3600)
+
+nav_ionospheric_corrections!(corrections, data, prn) = corrections
+function nav_ionospheric_corrections!(corrections, data::GNSSDecoder.GPSL1CAData, prn)
     isnothing(data.α_0) || push!(
         corrections,
         IonosphericCorrection("GPSA", (data.α_0, data.α_1, data.α_2, data.α_3)),
@@ -558,7 +664,39 @@ function nav_ionospheric_corrections!(corrections, data::GNSSDecoder.GPSL1CAData
     )
     corrections
 end
-function nav_ionospheric_corrections!(corrections, data::GNSSDecoder.AbstractGalileoData)
+function nav_ionospheric_corrections!(corrections, data::GNSSDecoder.BeiDouDNAVData, prn)
+    # RINEX 3.05 Table A5 makes the time mark and the satellite number mandatory for BDS,
+    # which broadcasts several parameter sets a day: without them a reader cannot tell one
+    # set from the next. Both describe the transmission the coefficients arrived on, so a
+    # message that has not reported its second of week yet cannot carry them — and a BDS
+    # record without them would be rejected rather than written incomplete.
+    isnothing(data.SOW) && return corrections
+    time_mark = ionosphere_time_mark(data.SOW)
+    isnothing(data.α_0) || push!(
+        corrections,
+        IonosphericCorrection(
+            "BDSA",
+            (data.α_0, data.α_1, data.α_2, data.α_3);
+            time_mark,
+            sv_id = prn,
+        ),
+    )
+    isnothing(data.β_0) || push!(
+        corrections,
+        IonosphericCorrection(
+            "BDSB",
+            (data.β_0, data.β_1, data.β_2, data.β_3);
+            time_mark,
+            sv_id = prn,
+        ),
+    )
+    corrections
+end
+function nav_ionospheric_corrections!(
+    corrections,
+    data::GNSSDecoder.AbstractGalileoData,
+    prn,
+)
     # Galileo's NeQuick coefficients occupy a Klobuchar-shaped record whose fourth slot is
     # unused.
     isnothing(data.a_i0) || push!(
@@ -590,16 +728,51 @@ function nav_time_system_corrections!(corrections, data::GNSSDecoder.AbstractGal
     corrections
 end
 
-# Broadcast leap-second count, as the four-field form RINEX prefers (current count, count
-# after the next event, and the week and day the event falls on) whenever the satellite
-# sent the whole record. GPS and Galileo name these fields alike.
+function nav_time_system_corrections!(corrections, data::GNSSDecoder.BeiDouDNAVData)
+    isnothing(data.A_0UTC) || push!(
+        corrections,
+        # BDT counts seconds of its own week, so the record's reference time and week are
+        # BDT's, not the GPS-aligned pair the other constellations report.
+        TimeSystemCorrection("BDUT", data.A_0UTC, data.A_1UTC, 0, Int(data.WN)),
+    )
+    corrections
+end
+
+# Broadcast leap-second count, as the full record RINEX prefers (current count, count after
+# the next event, and the week and day the event falls on) whenever the satellite sent the
+# whole thing. GPS and Galileo name these fields alike and count them against the same
+# epoch, so either may supply the record and it needs no time system to be read correctly.
+#
+# BeiDou counts differently in both halves: its leap seconds are those of *BDT* − UTC, 14
+# fewer than the GPS − UTC a blank identifier is read as, and its week and day count from
+# the BDT epoch with days 0-6 rather than 1-7. Naming `"BDT"` is what makes those numbers
+# mean what they say — without the identifier they would be read as GPS ones, which is why
+# this used not to be written at all.
 nav_leap_seconds(data) = nothing
 function nav_leap_seconds(
     data::Union{GNSSDecoder.GPSL1CAData,GNSSDecoder.AbstractGalileoData},
 )
     isnothing(data.Δt_LS) && return nothing
-    any(isnothing, (data.Δt_LSF, data.WN_LSF, data.DN)) && return Int(data.Δt_LS)
-    (Int(data.Δt_LS), Int(data.Δt_LSF), Int(data.WN_LSF), Int(data.DN))
+    any(isnothing, (data.Δt_LSF, data.WN_LSF, data.DN)) &&
+        return LeapSeconds(Int(data.Δt_LS))
+    LeapSeconds(
+        Int(data.Δt_LS);
+        future_count = Int(data.Δt_LSF),
+        week = Int(data.WN_LSF),
+        day = Int(data.DN),
+    )
+end
+function nav_leap_seconds(data::GNSSDecoder.BeiDouDNAVData)
+    isnothing(data.Δt_LS) && return nothing
+    any(isnothing, (data.Δt_LSF, data.WN_LSF, data.DN)) &&
+        return LeapSeconds(Int(data.Δt_LS); time_system = "BDT")
+    LeapSeconds(
+        Int(data.Δt_LS);
+        future_count = Int(data.Δt_LSF),
+        week = Int(data.WN_LSF),
+        day = Int(data.DN),
+        time_system = "BDT",
+    )
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -611,7 +784,7 @@ end
 # task owns it outright while the tracking loop moves on.
 struct RinexRecord
     epoch::Union{Nothing,ObsEpoch}
-    ephemerides::Vector{Union{GPSEphemeris,GalileoEphemeris}}
+    ephemerides::Vector{Union{GPSEphemeris,GalileoEphemeris,BeiDouEphemeris}}
     nav_header::RinexNavHeader
     approx_position::NTuple{3,Float64}
     leap_seconds::Union{Nothing,Int,NTuple{4,Int}}
@@ -889,10 +1062,38 @@ subtract the broadcast clock correction a second time, biasing every satellite b
 clock error: tens of kilometres, differing satellite to satellite, so the fix collapses
 rather than merely shifting.
 """
-uncorrected_transmit_time(decoder, signal, sat_state) =
+uncorrected_transmit_time(decoder, signal, sat_state, reference_system) =
     PositionVelocityTime.calc_uncorrected_time(
         PositionVelocityTime.SatelliteState(decoder, signal, sat_state),
-    )
+    ) + time_scale_offset(reference_system, get_time_system(signal))
+
+"""
+    time_scale_offset(reference_system, time_system) -> Float64
+
+Seconds to add to a satellite's transmit time to express it in the count the PVT solution
+reports its epoch, clock offset and reference time in.
+
+`PositionVelocityTime` keeps every transmit time on its own constellation's scale — the
+satellite position is propagated from that same time against an ephemeris on that same
+scale, so shifting it would move the offset into the orbit — and applies the conversion
+only where pseudoranges are *differenced* (`calc_time_scale_offsets`). RINEX differences
+them too, against the epoch's reference time, so it needs the identical correction.
+
+It is `0.0` for GPS and Galileo, which both count `TAI − 19 s`, which is why a receiver of
+those two alone never had to think about it. BDT is `TAI − 33 s`, so a BeiDou second of
+week reads 14 s lower than the GPS time of week of the same instant: left out of the
+difference, that is 4.2 million metres of pseudorange.
+"""
+time_scale_offset(::Nothing, time_system) = 0.0
+time_scale_offset(reference_system, time_system) =
+    time_scale_offset_to_gpst(reference_system) - time_scale_offset_to_gpst(time_system)
+
+# The time system a tracked group's satellites count in, for the offset above. A group the
+# layout does not know cannot contribute an observation either, so it counts as the
+# reference system and moves nothing.
+sat_time_system(logger::RinexLogger, group_key::Symbol, reference_system) =
+    haskey(logger.layouts, group_key) ? get_time_system(logger.layouts[group_key].signal) :
+    reference_system
 
 # RINEX signal-strength indicator: the carrier-to-noise density ratio mapped onto the
 # spec's 1-9 scale in 6 dB-Hz steps (1 for 12 dB-Hz or worse, 9 for 54 dB-Hz or better).
@@ -996,7 +1197,14 @@ function obs_epoch_timing(logger::RinexLogger, receiver_state)
     # The solution's own reference: the latest transmit time it saw, and the clock bias it
     # solved for. Together they give the measurement instant as a time of week, which is
     # exactly how `calc_pvt` derived the epoch it reports.
-    reference_time = maximum(info.time for info in pvt.sats)
+    # Every satellite's transmit time on the count the solution reports, so that the
+    # latest of them — and every pseudorange differenced against it below — is one scale.
+    reference_time = maximum(
+        info.time + time_scale_offset(
+            pvt.reference_system,
+            sat_time_system(logger, first(key), pvt.reference_system),
+        ) for (key, info) in pairs(pvt.sats)
+    )
     clock_offset = ustrip(m, pvt.time_correction) / SPEED_OF_LIGHT
     receive_time = reference_time - clock_offset
 
@@ -1107,7 +1315,12 @@ function build_obs_epoch(logger::RinexLogger, receiver_state, timing::ObsEpochTi
         # week and the (small) clock offset, never as a difference of absolute seconds — the
         # cancellation there would quantize the range to tens of metres. The range rate is
         # `-λ·f_d`, which carries the range from the measurement instant to the nominal one.
-        transmit_time = uncorrected_transmit_time(decoder, layout.signal, sat_state)
+        transmit_time = uncorrected_transmit_time(
+            decoder,
+            layout.signal,
+            sat_state,
+            receiver_state.pvt.reference_system,
+        )
         travel_time =
             week_difference(timing.reference_time, transmit_time) - timing.clock_offset
         range = travel_time * SPEED_OF_LIGHT
@@ -1153,7 +1366,7 @@ end
 # RINEXParser deduplicates the ephemerides, so offering all of them every time is the
 # documented way to write each one exactly once.
 function build_nav_records(logger::RinexLogger, receiver_state)
-    ephemerides = Vector{Union{GPSEphemeris,GalileoEphemeris}}()
+    ephemerides = Vector{Union{GPSEphemeris,GalileoEphemeris,BeiDouEphemeris}}()
     ionospheric_corrections = IonosphericCorrection[]
     time_system_corrections = TimeSystemCorrection[]
     leap_seconds = nothing
@@ -1171,7 +1384,11 @@ function build_nav_records(logger::RinexLogger, receiver_state)
                     continue
                 end
                 push!(ephemerides, ephemeris)
-                nav_ionospheric_corrections!(ionospheric_corrections, decoder.data)
+                nav_ionospheric_corrections!(
+                    ionospheric_corrections,
+                    decoder.data,
+                    decoder.prn,
+                )
                 nav_time_system_corrections!(time_system_corrections, decoder.data)
                 leap_seconds =
                     something(leap_seconds, nav_leap_seconds(decoder.data), Some(nothing))

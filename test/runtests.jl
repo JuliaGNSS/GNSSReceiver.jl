@@ -22,6 +22,7 @@ using Test,
 using PositionVelocityTime:
     DOP, SPEED_OF_LIGHT, calc_DOP, calc_H, time_offset_available, time_scale_offset_to_gpst
 
+using InteractiveUtils: subtypes
 using JLD2: load
 
 # The navigation-filter configuration (also accepted by `receive`'s `vector_tracking`
