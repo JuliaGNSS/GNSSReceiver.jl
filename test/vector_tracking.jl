@@ -44,11 +44,18 @@ function _test_member(;
     cn0 = 10^4.5, # 45 dB-Hz
     early_late_spacing = 1.0,
     coherent_integration_time = nothing,
+    # The filter interval the variances are referred to. A `VTMember` now carries its
+    # measurements and their variances already fused across the satellite's signals
+    # (`fuse_vt_signal_measurements`), so the interval enters here rather than at
+    # `vt_measurement_noise_covariance`.
+    integration_time = 0.1u"s",
     decoder = test_decoder_state(signal, prn),
 )
     c = SPEED_OF_LIGHT
     code_frequency = ustrip(u"Hz", get_code_frequency(signal))
     tcoh = something(coherent_integration_time, get_code_length(signal) / code_frequency)
+    chip_length = c / code_frequency
+    wavelength = c / ustrip(u"Hz", get_center_frequency(signal))
     sat_state = SatelliteState(;
         decoder,
         system = signal,
@@ -74,12 +81,25 @@ function _test_member(;
         sat_clock_drift,
         pseudorange,
         pseudorange_rate,
-        code_discriminator,
-        carrier_discriminator,
-        cn0,
-        early_late_spacing,
-        tcoh,
+        code_discriminator * chip_length,
+        carrier_discriminator * wavelength,
+        _range_var(cn0, early_late_spacing, tcoh, chip_length, ustrip(u"s", integration_time)),
+        _rate_var(cn0, tcoh, wavelength, ustrip(u"s", integration_time)),
     )
+end
+
+# The measurement-noise model, written out independently of the implementation so the
+# assertions below test it rather than restate it.
+#
+# Averaged noncoherent DLL variance d/(4·C/N0·T)·(1 + 2/((2−d)·C/N0·T_coh)), in metres².
+_range_var(cn0, d, tcoh, chip_length, T) =
+    d / (4 * T * cn0) * (1 + 2 / ((2 - d) * cn0 * tcoh)) * chip_length^2
+# Mean-FLL variance 2·σ_φ²/(2π·T)² with σ_φ² = 1/(2·C/N0·T_coh)(1+1/(2·C/N0·T_coh)),
+# expressed as a rate (λ²). No inflation factor: the derived single-cycle variance is the
+# right one for this estimator, and the lag-1 correlation the telescoping creates makes a
+# white-noise filter pessimistic rather than overconfident.
+_rate_var(cn0, tcoh, wavelength, T) = let ct = cn0 * tcoh
+    wavelength^2 * (1 / (2 * ct) * (1 + 1 / (2 * ct))) / (2 * π^2 * T^2)
 end
 
 @testset "Vector-loop times difference on the GPS Time count" begin
@@ -409,13 +429,17 @@ end
 end
 
 @testset "Measurement noise and innovation gates" begin
+    Tf = 0.1
     members = [
         _test_member(; prn = 1),
         _test_member(; prn = 2, signal = GPSL5I(), group_key = :GPSL5I),
     ]
-    R = GNSSReceiver.vt_measurement_noise_covariance(members, 100.0u"ms")
+    R = GNSSReceiver.vt_measurement_noise_covariance(members)
     @test size(R) == (4, 4)
     @test isdiag(R)
+    # `vt_measurement_noise_covariance` only places what each member already carries.
+    @test R[1, 1] == members[1].range_variance
+    @test R[4, 4] == members[2].rate_variance
     # The DLL thermal noise scales with the squared chip length: GPS L5's chips
     # are 10× shorter than L1 C/A's, so its thermal variance is 100× smaller.
     # (L1 C/A and L5I share a 1 ms coherent dump, so the squaring loss cancels here.)
@@ -428,27 +452,11 @@ end
     # the ATAN FLL phase noise, the range through the noncoherent DLL squaring loss.
     ca = _test_member(; prn = 1, signal = GPSL1CA(), group_key = :GPSL1CA)
     e1b = _test_member(; prn = 1, signal = GalileoE1B(), group_key = :GalileoE1B)
-    @test ca.coherent_integration_time ≈ 1e-3
-    @test e1b.coherent_integration_time ≈ 4e-3
-    Tf = 0.1
-    Rte = GNSSReceiver.vt_measurement_noise_covariance([ca, e1b], Tf * u"s")
-    # Averaged noncoherent DLL variance d/(4·C/N0·T)·(1 + 2/((2−d)·C/N0·T_coh)), in metres².
-    function range_var(m, T = Tf)
-        d = m.early_late_spacing
-        squaring_loss = 1 + 2 / ((2 - d) * m.cn0 * m.coherent_integration_time)
-        d / (4 * T * m.cn0) * squaring_loss * m.chip_length^2
-    end
-    # Mean-FLL variance 2·σ_φ²/(2π·T)² with σ_φ² = 1/(2·C/N0·T_coh)(1+1/(2·C/N0·T_coh)),
-    # expressed as a rate (λ²). No inflation factor: the derived single-cycle variance is the
-    # right one for this estimator, and the lag-1 correlation the telescoping creates makes a
-    # white-noise filter pessimistic rather than overconfident.
-    rate_var(m) = let ct = m.cn0 * m.coherent_integration_time
-        m.wavelength^2 * (1 / (2 * ct) * (1 + 1 / (2 * ct))) / (2 * π^2 * Tf^2)
-    end
-    @test Rte[1, 1] ≈ range_var(ca)
-    @test Rte[2, 2] ≈ range_var(e1b)
-    @test Rte[3, 3] ≈ rate_var(ca)
-    @test Rte[4, 4] ≈ rate_var(e1b)
+    Rte = GNSSReceiver.vt_measurement_noise_covariance([ca, e1b])
+    @test Rte[1, 1] ≈ _range_var(10^4.5, 1.0, 1e-3, ca.chip_length, Tf)
+    @test Rte[2, 2] ≈ _range_var(10^4.5, 1.0, 4e-3, e1b.chip_length, Tf)
+    @test Rte[3, 3] ≈ _rate_var(10^4.5, 1e-3, ca.wavelength, Tf)
+    @test Rte[4, 4] ≈ _rate_var(10^4.5, 4e-3, e1b.wavelength, Tf)
     @test Rte[3, 3] > Rte[4, 4]   # shorter-T_coh C/A is the noisier rate measurement
     # E1B's chips are 293 m against C/A's 293 m, so at equal C/N0 and spacing the only
     # difference in the range rows is the squaring loss — C/A's shorter dump costs it more.
@@ -458,24 +466,22 @@ end
     # The squaring loss is pinned to the coherent dump, not the filter interval: lengthening
     # the filter interval averages the thermal term down but cannot buy back the loss, so the
     # variance falls more slowly than 1/T.
-    R_short = GNSSReceiver.vt_measurement_noise_covariance([ca], 0.1u"s")
-    R_long = GNSSReceiver.vt_measurement_noise_covariance([ca], 1.0u"s")
-    @test R_short[1, 1] / R_long[1, 1] ≈ 10.0
+    short = _test_member(; integration_time = 0.1u"s")
+    long = _test_member(; integration_time = 1.0u"s")
+    @test short.range_variance / long.range_variance ≈ 10.0
     # A weak-signal member is dominated by the squaring loss, which no filter interval fixes.
     weak = _test_member(; cn0 = 10^2.0) # 20 dB-Hz
-    R_weak = GNSSReceiver.vt_measurement_noise_covariance([weak], 0.1u"s")
-    weak_loss = 1 + 2 / ((2 - weak.early_late_spacing) * weak.cn0 * weak.coherent_integration_time)
+    weak_loss = 1 + 2 / ((2 - 1.0) * 10^2.0 * 1e-3)
     @test weak_loss > 10
-    @test R_weak[1, 1] ≈ range_var(weak, 0.1)
+    @test weak.range_variance ≈ _range_var(10^2.0, 1.0, 1e-3, weak.chip_length, Tf)
 
     # The model is evaluated at each member's configured spacing as given: it assumes the early
     # and late taps bracket the correlation peak (`d < 2` chips), which every real correlator
     # does — Tracking's own default is 0.5. Narrowing the correlator at equal C/N0 lowers the
     # thermal term proportionally, which is the whole point of a narrow spacing.
     narrow = _test_member(; early_late_spacing = 0.5)
-    R_narrow = GNSSReceiver.vt_measurement_noise_covariance([narrow], 0.1u"s")
-    @test R_narrow[1, 1] ≈ range_var(narrow, 0.1)
-    @test R_narrow[1, 1] < range_var(ca, 0.1)   # same C/N0 and dump, wider spacing
+    @test narrow.range_variance ≈ _range_var(10^4.5, 0.5, 1e-3, narrow.chip_length, Tf)
+    @test narrow.range_variance < ca.range_variance   # same C/N0 and dump, wider spacing
 
     # With a confident filter the gate is the physical two-chip bracket; with
     # a large prior uncertainty (e.g. an unobserved clock bias) it widens to
@@ -493,7 +499,7 @@ end
         stack([member.sat_position]),
         bias_columns,
     )
-    R1 = GNSSReceiver.vt_measurement_noise_covariance([member], 100.0u"ms")
+    R1 = GNSSReceiver.vt_measurement_noise_covariance([member])
     P_confident = Matrix(1.0I, 8, 8)
     gates = GNSSReceiver.innovation_gates([member], J[1:1, :], P_confident, R1[1:1, 1:1])
     @test gates[1] ≈ 2 * member.chip_length
@@ -1092,43 +1098,138 @@ end
         NumAnts(1),
         VectorPLLAndDLL(),
     )
-    base = Tracking.get_doppler_estimator_state(sat)
+    # One accumulator slot per signal, so a single-signal satellite's is a 1-tuple.
     # Mean = sum / count: (2, 6 Hz) → +3 Hz, (1, −4 Hz) → −4 Hz.
-    pos = SatVectorPLLAndDLL(base; carrier_discr_acc = (2, 6.0u"Hz"))
-    neg = SatVectorPLLAndDLL(base; carrier_discr_acc = (1, -4.0u"Hz"))
-    empty_acc = SatVectorPLLAndDLL(base; carrier_discr_acc = (0, 0.0u"Hz"))
-    @test GNSSReceiver.accumulated_carrier_discriminator(pos) ≈ 3.0
-    @test GNSSReceiver.accumulated_carrier_discriminator(neg) ≈ -4.0
-    @test GNSSReceiver.accumulated_carrier_discriminator(empty_acc) == 0.0
+    with_acc(acc) = Accessors.@set sat.doppler_estimator_state =
+        SatVectorPLLAndDLL(Tracking.get_doppler_estimator_state(sat); carrier_discr_acc = acc)
+    @test GNSSReceiver.signal_carrier_discriminator(with_acc(((2, 6.0u"Hz"),)), 1) ≈ 3.0
+    @test GNSSReceiver.signal_carrier_discriminator(with_acc(((1, -4.0u"Hz"),)), 1) ≈ -4.0
+    # Nothing accumulated is `nothing`, not a zero the filter would weigh in full.
+    @test GNSSReceiver.signal_carrier_discriminator(with_acc(((0, 0.0u"Hz"),)), 1) === nothing
 end
 
 @testset "A cycle without an accumulated discriminator withholds the member" begin
-    # The `accumulated_*` helpers substitute a zero when nothing was accumulated, which the
-    # navigation filter cannot distinguish from a genuine zero residual measured at full
-    # weight. `has_accumulated_discriminators` is the guard that keeps such a member out of
-    # the measurement set.
+    # A member that accumulated nothing must be withheld rather than entered with a zero
+    # residual, which the navigation filter cannot distinguish from a genuine zero
+    # measured at full weight. `fuse_vt_signal_measurements` reports that as
+    # `has_code` / `has_rate`, and `collect_vt_members!` turns it into `available`.
     sat = GNSSReceiver.create_tracked_sat(
         GNSSReceiver.tracking_signals(GPSL1CA()),
         1,
         0.0,
         20.0u"Hz",
         NumAnts(1),
-        VectorPLLAndDLL(),
+        VectorPLLAndDLL(; signal_combining = true),
     )
     base = Tracking.get_doppler_estimator_state(sat)
-    accumulated = SatVectorPLLAndDLL(
-        base;
-        code_discr_acc = (3, 0.06),
-        carrier_discr_acc = (3, 6.0u"Hz"),
+    with(acc_code, acc_carrier) = Accessors.@set sat.doppler_estimator_state =
+        SatVectorPLLAndDLL(base; code_discr_acc = acc_code, carrier_discr_acc = acc_carrier)
+    wavelength = SPEED_OF_LIGHT / ustrip(u"Hz", get_center_frequency(GPSL1CA()))
+
+    accumulated = with(((3, 0.06),), ((3, 6.0u"Hz"),))
+    _, _, _, _, has_code, has_rate = GNSSReceiver.fuse_vt_signal_measurements(
+        accumulated,
+        wavelength,
+        100.0u"ms",
+        5e6u"Hz",
     )
-    nothing_accumulated =
-        SatVectorPLLAndDLL(base; code_discr_acc = (0, 0.0), carrier_discr_acc = (0, 0.0u"Hz"))
-    @test GNSSReceiver.has_accumulated_discriminators(accumulated)
-    @test !GNSSReceiver.has_accumulated_discriminators(nothing_accumulated)
-    # The zero the helpers would otherwise hand to the filter is indistinguishable from a
-    # measured zero — which is exactly why the guard is needed rather than the fallback.
-    @test GNSSReceiver.accumulated_carrier_discriminator(nothing_accumulated) == 0.0
-    @test GNSSReceiver.accumulated_code_discriminator(nothing_accumulated, 100.0u"ms") == 0.0
+    @test has_code && has_rate
+
+    empty_acc = with(((0, 0.0),), ((0, 0.0u"Hz"),))
+    code, rate, range_variance, rate_variance, has_code, has_rate =
+        GNSSReceiver.fuse_vt_signal_measurements(empty_acc, wavelength, 100.0u"ms", 5e6u"Hz")
+    @test !has_code && !has_rate
+    # The withheld measurement reads as an infinite variance, so a stray consumer sees no
+    # confident zero.
+    @test code == 0.0 && rate == 0.0
+    @test isinf(range_variance) && isinf(rate_variance)
+end
+
+# One vector-tracked satellite of `system`, with the per-signal accumulators and (for a
+# combined group) the data component's differential group delay set through the public
+# `TrackState` path.
+function _vt_sat(system, code_acc, carrier_acc, delay)
+    receiver_state = GNSSReceiver.ReceiverState(
+        ComplexF64,
+        system;
+        num_samples_for_acquisition = 20000,
+        vector_tracking = true,
+    )
+    key = GNSSReceiver.signal_group_key(system)
+    track_state = merge_sats(
+        receiver_state.track_state,
+        key,
+        [GNSSReceiver.create_tracked_sat(
+            GNSSReceiver.tracking_signals(system),
+            1,
+            0.0,
+            20.0u"Hz",
+            NumAnts(1),
+            receiver_state.track_state.doppler_estimator,
+        )],
+    )
+    data_idx = GNSSReceiver.data_signal_index(system)
+    data_idx == 1 ||
+        set_differential_group_delay!(track_state, key, 1, data_idx, delay)
+    sat = get_sat_state(track_state, key, 1)
+    Accessors.@set sat.doppler_estimator_state = SatVectorPLLAndDLL(
+        Tracking.get_doppler_estimator_state(sat);
+        code_discr_acc = code_acc,
+        carrier_discr_acc = carrier_acc,
+    )
+end
+
+@testset "A satellite's signals fuse inverse-variance into one measurement" begin
+    # A `CombinedSignal` group hands the filter one accumulator per component. Both
+    # measure the same line of sight, so they combine — the code ones only after each
+    # passenger is referred to the driver's code phase by its differential group delay.
+    system = GNSSReceiver.CombinedSignal(GPSL5Q(), GPSL5I())
+    sampling_freq = 25e6u"Hz"
+    T = 100.0u"ms"
+    wavelength = SPEED_OF_LIGHT / ustrip(u"Hz", get_center_frequency(GPSL5Q()))
+    fuse(sat) = GNSSReceiver.fuse_vt_signal_measurements(sat, wavelength, T, sampling_freq)
+
+    # Same count and sum on both components, so with equal variances the fused value is
+    # that common value and the fused variance is half of one signal's. The pilot is the
+    # driver (delay 0 by definition); the data component is told its own.
+    both = _vt_sat(system, ((2, 0.04), (2, 0.04)), ((2, 6.0u"Hz"), (2, 6.0u"Hz")), 0.0u"s")
+    driver_only =
+        _vt_sat(system, ((2, 0.04), (0, 0.0)), ((2, 6.0u"Hz"), (0, 0.0u"Hz")), 0.0u"s")
+
+    code_both, rate_both, range_var_both, rate_var_both, _, _ = fuse(both)
+    code_one, rate_one, range_var_one, rate_var_one, _, _ = fuse(driver_only)
+
+    # Equal measurements fuse to the same value...
+    @test code_both ≈ code_one
+    @test rate_both ≈ rate_one
+    # ...and two independent measurements of it halve the variance.
+    @test range_var_both ≈ range_var_one / 2
+    @test rate_var_both ≈ rate_var_one / 2
+
+    # A passenger whose differential group delay is unknown is withheld from the CODE
+    # fusion — it cannot be referred to the driver's code phase — but still contributes to
+    # the rate one, which needs no such referral: every signal of a group rides one
+    # carrier.
+    unknown =
+        _vt_sat(system, ((2, 0.04), (2, 0.04)), ((2, 6.0u"Hz"), (2, 6.0u"Hz")), nothing)
+    code_u, rate_u, range_var_u, rate_var_u, has_code, has_rate = fuse(unknown)
+    @test has_code && has_rate
+    @test range_var_u ≈ range_var_one
+    @test rate_var_u ≈ rate_var_both
+    @test code_u ≈ code_one
+    @test rate_u ≈ rate_both
+
+    # A non-zero differential group delay shifts the passenger's code measurement by
+    # exactly the chips it corresponds to, and the fused value by half of that (two
+    # equally weighted contributors). `signal_code_discriminator` negates, so subtracting
+    # the offset from the raw discriminator ADDS to the correction.
+    biased =
+        _vt_sat(system, ((2, 0.04), (2, 0.04)), ((2, 6.0u"Hz"), (2, 6.0u"Hz")), 4.0e-9u"s")
+    code_b, _, _, _, _, _ = fuse(biased)
+    code_frequency = get_code_doppler(both) + get_code_frequency(GPSL5I())
+    offset_chips = uconvert(NoUnits, 4.0e-9u"s" * code_frequency)
+    chip_length = SPEED_OF_LIGHT / ustrip(u"Hz", get_code_frequency(GPSL5I()))
+    @test code_b ≈ code_both + offset_chips * chip_length / 2
 end
 
 @testset "Pseudorange differencing across a GNSS week rollover" begin

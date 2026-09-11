@@ -26,8 +26,8 @@ using Aqua
         #
         # Skipped, not run: `has_persistent_tasks` resolves the package from the
         # registry into a fresh project, which cannot succeed while this branch
-        # requires the not-yet-released GNSSDecoder 4 and PositionVelocityTime 5.3.
-        # Flip back to `@test` with those releases.
+        # requires the not-yet-released Tracking 9 (multi-signal discriminator
+        # combining). Flip back to `@test` with that release.
         @test_skip any(_ -> !Aqua.has_persistent_tasks(package; tmax = 60), 1:3)
     end
 end

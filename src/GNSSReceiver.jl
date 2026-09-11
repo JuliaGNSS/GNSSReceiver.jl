@@ -574,6 +574,115 @@ tracking_signals(system::CombinedSignal) = (system.pilot, system.data)
 const RANGING_SIGNAL_INDEX = 1
 data_signal_index(system) = length(tracking_signals(system))
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Differential group delay
+#
+# `Tracking`'s multi-signal discriminator combining folds the data component's
+# DLL discriminator into the pilot-driven code loop, but only once it has been
+# told how far apart the two components' code phases sit — the satellite's
+# differential payload group delay. `Tracking` deliberately keeps no table of
+# it: deriving the value means knowing which constellation broadcasts which
+# correction, on what datum and with which sign, and then parsing a navigation
+# message. That is this receiver's job, and it is the same place that has to
+# stay consistent with the *downstream* correction, which
+# `PositionVelocityTime`'s `correct_by_group_delay` applies from the ranging
+# (pilot) signal we hand it.
+#
+# The quantity `set_differential_group_delay!` wants is the *driver's* payload
+# group delay minus this signal's, positive when this signal leaves the
+# satellite through the shorter path — so for our groups it is always
+# `delay(pilot) − delay(data)`, stored on the data component.
+#
+# For GPS that reduces to a difference of two broadcast inter-signal
+# corrections. The receiver corrects a range generated on signal `X` by
+# `−T_GD + ISC_X` (IS-GPS-705J §20.3.3.3.1.2, IS-GPS-800J §3.5.4.1 — exactly
+# what `correct_by_group_delay` applies), so `X`'s payload delay is
+# `T_GD − ISC_X`; `T_GD` is one per-SV term shared by every signal and cancels,
+# leaving
+#
+#     delay(pilot) − delay(data) = ISC_data − ISC_pilot
+#
+# already in `Tracking`'s convention and independent of the datum `T_GD` is
+# referenced to. Where a pair shares one broadcast ISC (L2 CM/CL) or leaves the
+# satellite as one composite (every Galileo pair) the difference is a hard zero.
+#
+# An unknown value stays `nothing`, never a guessed `0.0s`: `Tracking` then
+# holds the data component out of the *code* loop only and still takes its
+# carrier contribution, whereas a wrong zero would put a moving sub-metre bias
+# straight into the shared code phase.
+
+# A data-only system tracks a single signal, which *is* the estimator driver —
+# there is nothing to state a differential against.
+differential_group_delay(::AbstractGNSSSignal, ::GNSSDecoderState) = nothing
+
+differential_group_delay(system::CombinedSignal, decoder::GNSSDecoderState) =
+    _differential_group_delay(system.pilot, system.data, decoder)
+
+# Both components of a Galileo pair are generated in one payload chain and
+# transmitted as a single constant-envelope composite, so there is no intra-band
+# differential to correct — which is also why `correct_by_group_delay` picks
+# Galileo's BGD by band alone and never by component.
+_differential_group_delay(
+    ::AbstractGalileoSignal,
+    ::AbstractGalileoSignal,
+    ::GNSSDecoderState,
+) = 0.0s
+
+# GPS L5, from CNAV (message type 30): I5 and Q5 each have their own ISC.
+_differential_group_delay(
+    ::GPSL5Q,
+    ::GPSL5I,
+    decoder::GNSSDecoderState{<:GNSSDecoder.GPSCNAVData},
+) = _isc_difference(decoder.data.ISC_L5I5, decoder.data.ISC_L5Q5)
+
+# GPS L1C, from CNAV-2 (subframe 3 page 1).
+_differential_group_delay(
+    ::GPSL1C_P,
+    ::GPSL1C_D,
+    decoder::GNSSDecoderState{<:GNSSDecoder.GPSL1C_DData},
+) = _isc_difference(decoder.data.ISC_L1CD, decoder.data.ISC_L1CP)
+
+# GPS L2C: IS-GPS-200N §30.3.3.3.1.1 defines one `ISC_L2C` for the L2C signal,
+# covering CM and CL alike, so the two components' difference is zero by
+# construction — the same reading `correct_by_group_delay` takes.
+_differential_group_delay(::GPSL2CL, ::GPSL2CM, ::GNSSDecoderState) = 0.0s
+
+# Any other pair: unknown, which costs the data component's code contribution
+# and nothing else.
+_differential_group_delay(
+    ::AbstractGNSSSignal,
+    ::AbstractGNSSSignal,
+    ::GNSSDecoderState,
+) = nothing
+
+# The ISC fields are `nothing` until the message carrying them has been decoded —
+# a satellite can have a complete ephemeris and clock long before that (CNAV
+# broadcasts them in MT30 only). Missing either end means the differential is
+# unknown, not zero. `s` because `set_differential_group_delay!` refuses a bare
+# number: at these magnitudes an assumed unit is a metre.
+_isc_difference(_, _) = nothing
+_isc_difference(data_isc::Real, pilot_isc::Real) = (data_isc - pilot_isc) * 1.0s
+
+# Whether this system's group satisfies multi-signal discriminator combining's one
+# precondition: the estimator-driver signal — `tracking_signals`' first entry, the
+# pilot — must be the group's longest-*integrating* signal. `Tracking` cannot check it
+# (the ordering is a property of the tuple its caller assembled, not of the
+# `TrackState`), and violating it is not an error but a loss: the accumulator is
+# consumed at every driver record, so a component reporting `k` times per driver record
+# reaches the loop in one update out of `k`, throwing away most of the gain.
+#
+# The coherent integration length is one primary code period per signal, because this
+# receiver never raises any signal's `preferred_num_code_blocks_to_integrate` above
+# Tracking's default of 1 (see `CodeLockDetector`). So the check reduces to comparing
+# primary code periods — which holds for every intra-band pilot/data pair GNSSSignals
+# defines, all of whose components share one. It is checked rather than assumed because
+# a `CombinedSignal` is the caller's to construct, and a pair that violates it costs
+# silently: nothing downstream reads differently, the satellite just tracks noisier.
+combines_signals(system) = _combines_signals(tracking_signals(system))
+_combines_signals(signals::Tuple{AbstractGNSSSignal}) = true
+_combines_signals(signals::Tuple) =
+    all(s -> primary_code_period(s) <= primary_code_period(first(signals)), signals)
+
 # Tracking-group key / `sat_data` key for a system: the id of the signal the loops
 # range on — the pilot for a `CombinedSignal`, and the signal itself (its data
 # component) for a plain signal. This is exactly what PVT keys `pvt.sats` by (we hand
@@ -662,8 +771,51 @@ vt_config(vector_tracking::VectorTracking) = vector_tracking
 # applies the navigation filter's NCO corrections), the conventional
 # FLL-assisted PLL/DLL for scalar tracking. Not user-selectable — the mode alone
 # determines it.
+#
+# Both estimators combine the signals' discriminators (`signal_combining`), so a
+# `CombinedSignal` group closes the loops `Tracking` still owns on the pilot *and*
+# the data component rather than on the pilot alone. `Tracking` leaves this off by
+# default because only the caller assembling a group can check its one
+# precondition — the estimator-driver signal must be the longest-integrating of the
+# group. This receiver is that caller, so it checks (`combines_signals`) rather than
+# assuming, and seeds the estimator with combining on: it holds for every pair
+# GNSSSignals defines, and a group that violates it has the flag cleared per
+# satellite at handoff (`set_signal_combining!`, see
+# `update_states_from_acquisition_results`). A data-only group is a single-signal
+# satellite, which `Tracking` leaves bit-identical either way.
+#
+# The code half of the combination additionally waits on each data component's
+# differential group delay (see `differential_group_delay`); until that is known
+# the data component aids the carrier loops only.
+#
+# Under `VectorPLLAndDLL` the flag's reach follows `vt_on`: all three loops while a
+# satellite is still running its scalar fallback (so it pulls in with the full
+# combining gain rather than acquiring it only once the navigation filter takes
+# over), and the carrier phase loop alone once the filter owns the other two. The
+# code and carrier frequency measurements then reach the filter as one accumulator
+# per signal, and this receiver fuses them itself — see
+# `fuse_vt_signal_measurements`, which is better placed to weigh them than a
+# nominal ICD power split is.
 doppler_estimator_for(vector_tracking) =
-    vt_enabled(vector_tracking) ? VectorPLLAndDLL() : ConventionalAssistedPLLAndDLL()
+    vt_enabled(vector_tracking) ? VectorPLLAndDLL(; signal_combining = true) :
+    ConventionalAssistedPLLAndDLL(; signal_combining = true)
+
+# Say so once, at construction, when a group's driver is not its longest-integrating
+# signal. `apply_signal_combining!` handles it — such a group simply tracks without
+# combining — but the cost is invisible from the outside: nothing errors, no measurement
+# is wrong, the satellite is just noisier than the pair it was given could have been.
+# Silent degradation is worth one line.
+function warn_about_uncombinable_systems(systems)
+    for system in systems
+        combines_signals(system) && continue
+        sigs = tracking_signals(system)
+        @warn "Signal pair tracks without discriminator combining: the ranging (first) " *
+              "signal must have the longest primary code period of the group, so that " *
+              "it drives the loop at least as often as every other component" ranging =
+            get_signal_name(first(sigs)) others = map(get_signal_name, Base.tail(sigs))
+    end
+    nothing
+end
 
 # Primary constructor: build one multi-band receiver state from the per-band
 # system tuples and pre-built per-band acquisition buffers (keyed by `band_key`).
@@ -678,6 +830,7 @@ function ReceiverState(
     doppler_estimator = doppler_estimator_for(vector_tracking)
     systems = _flatten_systems(band_systems)
     assert_decodable(systems)
+    warn_about_uncombinable_systems(systems)
     group_keys = map(signal_group_key, systems)
     # One tracking group per system: a plain signal alone, a `CombinedSignal` as its
     # pilot (ranging driver) + data component (see `tracking_signals`). Each group

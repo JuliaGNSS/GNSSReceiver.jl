@@ -298,6 +298,11 @@ function process(
 
     track_state = remove_lost_satellites(receiver_sat_states, track_state)
 
+    # Feed each combined group's data component the differential group delay its
+    # decoder has by now recovered, so `Tracking`'s discriminator combining can
+    # take the component's code measurement too (see `differential_group_delay`).
+    update_differential_group_delays!(track_state, receiver_sat_states, all_systems)
+
     # Run a navigation cycle once a full `pvt_update_interval` of signal time has
     # accumulated, otherwise carry the previous solution forward. The elapsed
     # time is the filter's integration interval; gating the cadence here lets the
@@ -458,6 +463,41 @@ function remove_lost_satellites(receiver_sat_states, track_state)
                receiver_sat_state.prn in tracked_prns
                 track_state = remove_satellite(track_state; prn = receiver_sat_state.prn, group = group_key)
             end
+        end
+    end
+    track_state
+end
+
+# Keep every combined group's data component's differential group delay in step
+# with what its decoder has recovered (see `differential_group_delay`). Runs once
+# per chunk, but writes only on a *change*: `set_differential_group_delay!`
+# rebuilds the `TrackedSat`, and the value it carries is constant per satellite
+# once the message that holds it has been decoded — so in the steady state this
+# is a read and a comparison per satellite.
+#
+# Single-signal (data-only) groups are skipped outright: their only signal is the
+# estimator driver, whose differential is 0 by definition and which
+# `set_differential_group_delay!` refuses a non-zero value for.
+#
+# Mutates `track_state` in place and returns it.
+function update_differential_group_delays!(track_state, receiver_sat_states, systems)
+    for system in systems
+        data_idx = data_signal_index(system)
+        data_idx == RANGING_SIGNAL_INDEX && continue
+        group_key = signal_group_key(system)
+        tracked_prns = keys(get_sat_states(track_state, group_key))
+        for receiver_sat_state in receiver_sat_states[group_key]
+            prn = receiver_sat_state.prn
+            # A satellite `remove_lost_satellites` has just dropped still has a
+            # `ReceiverSatState` (it is the reacquisition book-keeping) but no
+            # slot in the tracking state to address.
+            prn in tracked_prns || continue
+            delay = differential_group_delay(system, receiver_sat_state.decoder)
+            isequal(
+                delay,
+                get_differential_group_delay(track_state, group_key, prn, data_idx),
+            ) && continue
+            set_differential_group_delay!(track_state, group_key, prn, data_idx, delay)
         end
     end
     track_state
@@ -640,6 +680,23 @@ tracked_sat_from_acq(
     doppler_estimator,
 )
 
+# Multi-signal discriminator combining is seeded on for every satellite by the shared
+# estimator (see `doppler_estimator_for`). Clear it again for the satellites of a group
+# whose driver is not its longest-integrating signal (`combines_signals`): combining
+# would then reach the loop in one update out of `k` and cost most of its gain rather
+# than buy any. Per satellite because that is how `Tracking` owns the flag — the
+# ordering is a property of this group's signal tuple, not of the `TrackState` — and
+# because the flag is a `Bool` field, so clearing it changes no slot type.
+#
+# Mutates `track_state` in place and returns it.
+function apply_signal_combining!(track_state, group_key, system, prns)
+    combines_signals(system) && return track_state
+    for prn in prns
+        set_signal_combining!(track_state, group_key, prn, false)
+    end
+    track_state
+end
+
 # Returns `(track_state, receiver_sat_states, acquired_prns)`. `acquired_prns`
 # lists the PRNs that passed the CFAR detector and were merged; the reacquisition
 # path uses it to distinguish a real re-lock from a detection that was rejected.
@@ -685,6 +742,9 @@ function update_states_from_acquisition_results(
     ]
 
     new_track_state = merge_sats(track_state, group_key, new_sat_states)
+
+    new_track_state =
+        apply_signal_combining!(new_track_state, group_key, system, acquired_prns)
 
     new_receiver_sat_states_dictionary = merge(
         receiver_sat_states,

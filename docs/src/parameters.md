@@ -51,6 +51,26 @@ list lives in the [`receive` docstring](@ref receive) at the bottom of the page.
 A [`CombinedSignal`](@ref)`(pilot, data)` tracks the dataless pilot (which the loops range
 on) and the data component (whose navigation message is decoded) together in one group.
 
+Both components then feed the loops. Under scalar tracking the receiver enables
+`Tracking`'s multi-signal discriminator combining, which folds the data component's
+PLL/FLL/DLL discriminators into the pilot-driven loop update as a minimum-variance
+weighted mean — the pilot still sets the loop cadence, the bandwidths and the carrier
+phase reference. The **carrier** loops take that contribution from the first integration;
+the **code** loop waits until the satellite's differential payload group delay is known,
+which for a GPS pair means the inter-signal corrections have been decoded (`ISC_L5I5` /
+`ISC_L5Q5` from CNAV, `ISC_L1CD` / `ISC_L1CP` from CNAV-2) and for a Galileo pair is
+immediate, both components leaving the satellite in one payload chain. Nothing is
+configurable here and nothing is assumed: an undecoded correction leaves the data
+component aiding the carrier loops only, rather than being guessed as zero.
+
+Vector tracking (`vector_tracking = true`) closes the code and carrier frequency loops
+through the navigation filter instead, and both components reach it there too: each
+supplies its own discriminator dump, and the receiver fuses the two inverse-variance from
+what each actually measured — its own C/N₀, correlator spacing and integration length —
+which is a better weighting than the nominal power split the loops use. Combining still
+applies to the carrier phase loop, which stays with the tracking channel, and to all three
+while a satellite is pulling in on its scalar fallback before the filter takes it over.
+
 ## Acquisition
 
 Acquisition is the search that finds which satellites are visible and gives a first

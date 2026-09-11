@@ -590,32 +590,88 @@ struct VTMember
     sat_clock_drift::Float64 # s/s
     pseudorange::Float64     # measured, atmosphere-corrected (m)
     pseudorange_rate::Float64 # measured λ·doppler (m/s)
-    code_discriminator::Float64    # accumulated DLL output (chips)
-    carrier_discriminator::Float64 # accumulated FLL output (Hz, sign-flipped)
-    cn0::Float64             # linear carrier-to-noise density (Hz)
-    early_late_spacing::Float64 # chips
-    coherent_integration_time::Float64 # s, per coherent correlator dump (sets DLL/FLL noise)
+    # This cycle's tracking-loop measurements, already fused across every signal the
+    # satellite is tracked on and already in the filter's units — see
+    # `fuse_vt_signal_measurements`, which is where the per-signal accumulators,
+    # their noise models and the differential group delay are resolved.
+    code_correction::Float64 # m, added to `pseudorange`
+    rate_correction::Float64 # m/s, added to `pseudorange_rate`
+    # Variances of those two, likewise fused; `vt_measurement_noise_covariance` only
+    # places them on `R`'s diagonal.
+    range_variance::Float64  # m²
+    rate_variance::Float64   # m²/s²
 end
 
-# Mean DLL discriminator (chips) over the last filter interval, corrected by
-# half the NCO code-frequency correction applied over it (the discriminator
-# measures the average error while the NCO was already steering it out).
-# `mean_code_discr` returns `nothing` when nothing was accumulated.
-function accumulated_code_discriminator(estimator_state, integration_time)
-    mean = mean_code_discr(estimator_state)
-    isnothing(mean) ? 0.0 :
-    -mean + ustrip(Hz, estimator_state.code_freq_update) * ustrip(s, integration_time) / 2
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-signal tracking-loop measurements
+#
+# Under vector closure `Tracking` accumulates a satellite's DLL and FLL
+# discriminators per *signal* and fuses none of them: it holds only the nominal
+# ICD power split, while this filter holds each signal's measured C/N₀, tap
+# spacing and coherent integration length — the quantities the variances below
+# are built from — so weighting belongs here. A `CombinedSignal` group therefore
+# hands the filter both the pilot's and the data component's measurement of the
+# same line of sight, and the two are combined inverse-variance.
+#
+# What that buys is thermal only. Several measurements from one satellite lie
+# along one line of sight, so their orbit, clock and atmospheric errors are
+# common-mode and survive the fusion untouched; only the receiver noise averages
+# down. The fused variance below is written for exactly that and claims nothing
+# more.
+
+# Mean DLL discriminator of one signal (chips) over the last filter interval,
+# corrected by half the NCO code-frequency correction applied over it (the
+# discriminator measures the average error while the NCO was already steering it
+# out), and referred to the satellite's shared code phase — the driver signal's,
+# which is what `pseudorange` was formed from.
+#
+# `Tracking` deliberately leaves that referral to us under vector closure: a
+# passenger's code phase sits at the driver's plus the satellite's differential
+# payload group delay (`differential_group_delay`), so its raw discriminator
+# measures the driver's error plus that offset. A passenger whose delay is still
+# unknown is therefore withheld from the code measurement entirely rather than
+# fused on the wrong datum — `nothing`, not a guessed zero, exactly as in the
+# scalar loops.
+#
+# Returns `nothing` when this signal has no usable code measurement this cycle:
+# `mean_code_discr` returns `nothing` while its accumulator count is zero, and an
+# unreferable passenger is treated the same way.
+function signal_code_discriminator(tracked_sat, signal_index, code_frequency, integration_time)
+    mean = mean_code_discr(tracked_sat, signal_index)
+    isnothing(mean) && return nothing
+    # The driver's code phase *is* the shared one, so its differential is 0 by
+    # definition — `Tracking` refuses to store a non-zero one there and leaves the field
+    # at `nothing`, which here means the same thing as `0.0s` and must not be read as
+    # "unknown". Only a passenger's `nothing` withholds a measurement.
+    delay = signal_index == RANGING_SIGNAL_INDEX ? 0.0s :
+            get_differential_group_delay(tracked_sat, signal_index)
+    isnothing(delay) && return nothing
+    # The driver's own delay is 0 by definition, so this is a no-op for it.
+    offset_chips = uconvert(NoUnits, delay * code_frequency)
+    # The NCO correction is the satellite's, not this signal's: one `code_freq_update`
+    # steers the shared code phase. Reading it as this signal's chips is exact wherever
+    # the group's components share a chip rate, which every pilot/data pair this receiver
+    # tracks does (`tracking_signals` never pairs signals across chip rates).
+    estimator_state = get_doppler_estimator_state(tracked_sat)
+    -(mean - offset_chips) +
+    ustrip(Hz, estimator_state.code_freq_update) * ustrip(s, integration_time) / 2
 end
 
-# Mean FLL discriminator (Hz) over the last filter interval. Tracking's `fll_disc`
-# measures f_incoming − f_replica, so the true carrier Doppler is the replica
-# Doppler plus this residual; the pseudorange-rate measurement is therefore
-# `λ · carrier_doppler + λ · mean_fll` — the discriminator enters with its own
-# sign. (The code discriminator carries the opposite sign because `dll_disc`'s
-# sense is reversed relative to its own observable.)
+# Mean FLL discriminator of one signal (Hz) over the last filter interval.
+# Tracking's `fll_disc` measures f_incoming − f_replica, so the true carrier
+# Doppler is the replica Doppler plus this residual; the pseudorange-rate
+# measurement is therefore `λ · carrier_doppler + λ · mean_fll` — the
+# discriminator enters with its own sign. (The code discriminator carries the
+# opposite sign because `dll_disc`'s sense is reversed relative to its own
+# observable.)
+#
+# Every signal of a group rides one carrier, so unlike the code measurement this
+# needs no per-signal referral: each component measures the same residual on the
+# same shared `carrier_doppler`, and a passenger contributes from its first
+# integration whether or not its group delay is known.
 #
 # Deliberately NOT corrected by half the NCO frequency correction, unlike
-# `accumulated_code_discriminator` — the asymmetry is load-bearing, not an oversight.
+# `signal_code_discriminator` — the asymmetry is load-bearing, not an oversight.
 # The code observable is a *delay* read at the end of the cycle combined with the *mean*
 # delay error over it, so the two refer to epochs `T/2` apart and the mean has to be
 # advanced to the end. The rate observable has no such gap: `get_carrier_doppler` is the
@@ -632,27 +688,203 @@ end
 # navigation filter correcting its own past error — leaves a residue of ≈1% of the applied
 # correction, whose sign follows the carrier loop's transient rather than the correction, so
 # it does not accumulate across cycles.
-function accumulated_carrier_discriminator(estimator_state)
-    mean = mean_carrier_discr(estimator_state)
-    isnothing(mean) ? 0.0 : ustrip(Hz, mean)
+function signal_carrier_discriminator(tracked_sat, signal_index)
+    mean = mean_carrier_discr(tracked_sat, signal_index)
+    isnothing(mean) ? nothing : ustrip(Hz, mean)
 end
 
-# Whether a member accumulated any discriminator at all this cycle. Tracking's
-# `mean_code_discr` / `mean_carrier_discr` return `nothing` while their accumulator count is
-# zero, which is what a cycle without a single fully integrated correlator dump for this
-# satellite looks like (a member admitted at the very end of a cycle, or one whose samples
-# were starved). The `accumulated_*` helpers substitute a zero there, and a zero
-# discriminator is not a missing measurement to the navigation filter — it is a *confidently
-# zero* residual carrying the full measurement weight of `R`, which would pull the state
-# towards the current NCO instead of leaving it to coast. Members without an accumulation are
-# therefore withheld from the measurement set; they stay in the vector loop and keep getting
-# NCO corrections, exactly like a member out of code lock.
+# Per-dump DLL and FLL discriminator variances of one signal, propagated through the
+# averaging of the `N = T/T_coh` dumps the filter's measurement is a mean of. Returned in
+# the measurement's own units — m² for the range row, m²/s² for the rate row — so the
+# fusion below weights and the covariance places, and neither has to know the model.
 #
-# Both accumulators are incremented in the same branch of Tracking's fold, so the two counts
-# never disagree; the carrier one is checked as well so this stays true if that changes.
-has_accumulated_discriminators(estimator_state) =
-    !isnothing(mean_code_discr(estimator_state)) &&
-    !isnothing(mean_carrier_discr(estimator_state))
+# Code. Tracking's `dll_disc` is the *noncoherent* envelope-normalized early-minus-late
+# discriminator, whose per-dump jitter carries a squaring loss set by the coherent
+# integration time (Kaplan & Hegarty, "Understanding GPS: Principles and Applications",
+# 2nd ed., Artech House 2006, §5.5.2, noncoherent early-late DLL tracking jitter; derived in
+# general form by Betz & Kolodziejski, "Generalized Theory of Code Tracking with an
+# Early-Late Discriminator, Part II: Noncoherent Processing and Numerical Results", IEEE
+# Trans. Aerospace and Electronic Systems 45(4), 2009, pp. 1557-1564):
+#     σ_τ,dump² = d/(4·C/N0·T_coh) · (1 + 2/((2 − d)·C/N0·T_coh))   [chips²],
+# the first factor being the coherent early-late variance (the reference formulas carry a
+# loop noise bandwidth `B_n`; a single dump is the open-loop case `B_n = 1/(2·T_coh)`) and
+# the bracket the squaring loss from multiplying two noisy envelopes. The filter's code
+# measurement is `mean_code_discr`, the mean of the `N` per-dump discriminators, whose
+# noise is white across dumps (successive dumps share no samples), so
+#     var(mean) = σ_τ,dump²/N = d/(4·C/N0·T) · (1 + 2/((2 − d)·C/N0·T_coh))   [chips²],
+# i.e. the thermal term averages down over the whole filter interval `T` while the squaring
+# loss stays pinned to `T_coh` — a short coherent dump inflates the code variance no matter
+# how long the filter interval is. The pseudorange variance is `chip_length²` times that.
+# For the BOC VEML correlator `d` is the inner early-late pair's spacing, so the model is
+# the EPL approximation of it: the extra very-early/very-late taps average a little more
+# noise away, making the model mildly conservative there.
+#
+# Rate. A coherent dump of length `T_coh` estimates carrier phase with the ATAN
+# discriminator jitter
+#     σ_φ² = 1/(2·C/N0·T_coh)·(1 + 1/(2·C/N0·T_coh))   [rad²].
+# The filter's rate measurement is `mean_carrier_discr`, the mean of the `N` per-dump
+# discriminators in `carrier_discr_acc`. Each dump is a frequency — a phase difference over
+# one `T_coh`, `(θ_k − θ_{k-1})/(2π·T_coh)` — so the mean reduces to `(θ_N − θ_0)/(2π·T)`:
+# the interior phases cancel, leaving only the two endpoint phase estimates, giving
+#     var(mean) = 2·σ_φ² / (2π·T)²   [Hz²],
+# and the pseudorange-rate variance is λ² times that.
+#
+# The rate rows carry no inflation factor, deliberately. Consecutive cycles are not
+# independent: Tracking chains the FLL's `previous_prompt` across cycles (each chunk's first
+# record reads the carried-over `last_fully_integrated_filtered_prompt`) while
+# `reset_carrier_discr_acc!` fires every cycle, so cycle `i` measures `(θ_N − θ_0)/(2π·T)`
+# and cycle `i+1` measures `(θ_2N − θ_N)/(2π·T)`. They share the boundary phase estimate
+# with opposite signs, giving
+#     cov = −σ_φ²/(2π·T)²,   var = 2·σ_φ²/(2π·T)²   ⇒   ρ(lag 1) = −1/2,
+# which a Kalman update cannot represent. Two consequences, neither of them a reason to
+# inflate the variance:
+#
+#  - The correlation is *negative*, so noise averages out faster across cycles than a
+#    white-noise filter credits. The filter is therefore already pessimistic about the rate
+#    channel, not overconfident — inflating it moves further in the direction it already
+#    errs, and widens the pseudorange innovation gates as a side effect. What the
+#    correlation does cost is a pessimistic reported velocity / clock-drift uncertainty,
+#    which only measurement differencing (Bryson-Henrikson) or carrying the boundary phase
+#    as a state would fix.
+#  - The rate residuals carry a ≈ −0.5 lag-1 autocorrelation *by construction*. That is the
+#    telescoping, not a tracking fault, and it must not be tuned against.
+#
+# Note also that the derived variance is not conservative by accident: treating all `N`
+# per-dump discriminators as independent would give `N` times this value, and it is exactly
+# the −1/2 adjacency correlation making the interior phases telescope away that earns the
+# tighter figure. It is the right variance for the estimator `mean_carrier_discr` actually
+# is.
+function signal_measurement_variances(
+    tracked_sat,
+    signal_index,
+    early_late_spacing,
+    chip_length,
+    wavelength,
+    integration_time,
+)
+    T = ustrip(s, integration_time)
+    cn0 = linear_cn0_floor(ustrip(estimate_cn0(tracked_sat, signal_index)))
+    # Actual coherent integration time of this signal's last correlator dump
+    # (num_code_blocks · code period, from Tracking) — one code period per dump at the
+    # default integration length (GPS L1 C/A 1 ms, Galileo E1B 4 ms), but this reads
+    # whatever Tracking used. It sets the per-dump phase-noise variance and the DLL
+    # squaring loss, so both the range and the range-rate variance scale with it.
+    #
+    # Note this is the *last* dump's length, taken as representative of all `N` dumps in
+    # the cycle. Tracking times each record individually
+    # (`output.integrated_samples / sampling_frequency`), so a cycle in which the coherent
+    # length changes — bit or secondary-code sync promoting 1 ms to 4/20 ms — is modelled
+    # with the post-change length for every dump. That also breaks the telescoping the rate
+    # measurement relies on (`mean_carrier_discr` divides each dump's phase difference by
+    # its *own* `T_coh`, so the interior phases only cancel when every `T_coh` is equal),
+    # leaving both the rate measurement's gain and its variance approximate for that one
+    # cycle. Accepted: it is a single-cycle transient at sync, long before which the
+    # cadence is settled for the rest of the run.
+    t_coh = ustrip(s, get_last_fully_integrated_integration_time(tracked_sat, signal_index))
+    cn0_tcoh = cn0 * t_coh
+    # The noise model assumes the early and late taps still sit inside the correlation
+    # triangle, i.e. `d < 2` chips — which every real correlator configuration is well
+    # under (Tracking's own default is 0.5).
+    d = early_late_spacing
+    squaring_loss = 1 + 2 / ((2 - d) * cn0_tcoh)
+    range_variance = d / (4 * T * cn0) * squaring_loss * chip_length^2
+    sigma_phi2 = 1 / (2 * cn0_tcoh) * (1 + 1 / (2 * cn0_tcoh))
+    rate_variance = wavelength^2 * sigma_phi2 / (2 * π^2 * T^2)
+    (range_variance, rate_variance)
+end
+
+# Early-late spacing of one signal in chips at its current code rate — the `d` of the
+# noise model above, read off the correlator Tracking actually used for that signal.
+function signal_early_late_spacing(tracked_sat, signal_index, sampling_freq)
+    signal = get_signal(tracked_sat, signal_index)
+    upreferred(
+        get_early_late_sample_spacing(
+            get_last_fully_integrated_correlator(tracked_sat, signal_index),
+            sampling_freq,
+            get_code_frequency(signal),
+        ) / sampling_freq * (get_code_doppler(tracked_sat) + get_code_frequency(signal)),
+    )
+end
+
+# Inverse-variance fusion of one satellite's per-signal measurements into the pair the
+# navigation filter consumes: `(code_correction, rate_correction, range_variance,
+# rate_variance, has_code, has_rate)`.
+#
+# A signal that contributed nothing this cycle is left out rather than entered as a zero:
+# `mean_code_discr` / `mean_carrier_discr` return `nothing` while their accumulator count
+# is zero — a cycle without a single fully integrated dump for that signal (a member
+# admitted at the very end of a cycle, or one whose samples were starved) — and a zero
+# discriminator is not a missing measurement to the filter but a *confidently zero*
+# residual carrying full weight, which would pull the state towards the current NCO
+# instead of leaving it to coast. The two flags say whether anything was left; a member
+# with either one false is not `available` and so is withheld from the measurement set
+# (see `collect_vt_members!`), while staying in the loop and keeping its NCO corrections.
+#
+# The two are tracked separately because a passenger can be missing from the code fusion
+# while contributing to the rate one (an unknown differential group delay), so the counts
+# genuinely can disagree — unlike before, when both came from one signal and one branch of
+# Tracking's fold.
+#
+# `ntuple(…, Val(N))` rather than a loop over `get_signals`: the signal tuple is
+# heterogeneous, so only a compile-time-unrolled walk keeps each signal's accessors
+# concretely typed.
+function fuse_vt_signal_measurements(
+    tracked_sat,
+    wavelength,
+    integration_time,
+    sampling_freq,
+)
+    signals = get_signals(tracked_sat)
+    contributions = ntuple(Val(length(signals))) do i
+        signal = get_signal(tracked_sat, i)
+        code_frequency = get_code_doppler(tracked_sat) + get_code_frequency(signal)
+        chip_length = SPEED_OF_LIGHT / ustrip(Hz, get_code_frequency(signal))
+        d = signal_early_late_spacing(tracked_sat, i, sampling_freq)
+        range_variance, rate_variance = signal_measurement_variances(
+            tracked_sat,
+            i,
+            d,
+            chip_length,
+            wavelength,
+            integration_time,
+        )
+        code = signal_code_discriminator(tracked_sat, i, code_frequency, integration_time)
+        rate = signal_carrier_discriminator(tracked_sat, i)
+        (
+            code = isnothing(code) ? nothing : code * chip_length,
+            code_variance = range_variance,
+            rate = isnothing(rate) ? nothing : rate * wavelength,
+            rate_variance = rate_variance,
+        )
+    end
+    code_correction, range_variance, has_code =
+        _inverse_variance_mean(contributions, c -> c.code, c -> c.code_variance)
+    rate_correction, rate_variance, has_rate =
+        _inverse_variance_mean(contributions, c -> c.rate, c -> c.rate_variance)
+    (code_correction, rate_correction, range_variance, rate_variance, has_code, has_rate)
+end
+
+# Inverse-variance mean of the contributions whose value is not `nothing`, as
+# `(mean, variance, any_contributed)`. With none, the variance is left at `Inf` and the
+# mean at zero — the caller withholds such a member, so neither value is ever used, but
+# `Inf` keeps a stray consumer from reading a confident zero.
+#
+# One signal reduces to that signal's own value and variance exactly, so a data-only
+# group's numbers are unchanged by the fusion existing.
+function _inverse_variance_mean(contributions::Tuple, value_of, variance_of)
+    weight_sum = 0.0
+    weighted = 0.0
+    for contribution in contributions
+        value = value_of(contribution)
+        isnothing(value) && continue
+        variance = variance_of(contribution)
+        (isfinite(variance) && variance > 0) || continue
+        weight = inv(variance)
+        weight_sum += weight
+        weighted += weight * value
+    end
+    iszero(weight_sum) ? (0.0, Inf, false) : (weighted / weight_sum, inv(weight_sum), true)
+end
 
 # Linear carrier-to-noise density (Hz) floored to 1, from a CN0 estimate in
 # dB-Hz. The floor keeps a starved estimator from producing a degenerate
@@ -677,9 +909,9 @@ pseudorange_from_tows(receive_tow, transmit_tow) =
 # positions come from their ephemerides). `available_prns` are the members
 # currently usable as measurements (in code lock); a member not in it stays in
 # the loop and keeps getting NCO corrections, but its discriminators are
-# withheld from the navigation filter this cycle. A member that accumulated no
-# discriminator at all this cycle is withheld the same way — see
-# `has_accumulated_discriminators`.
+# withheld from the navigation filter this cycle. A member none of whose signals
+# accumulated a usable discriminator this cycle is withheld the same way — see
+# `fuse_vt_signal_measurements`.
 function collect_vt_members!(
     members::Vector{VTMember},
     track_state,
@@ -709,40 +941,23 @@ function collect_vt_members!(
     ifb_index = layout.ifb_index_by_group[group_key]
     for prn in prns
         tracked_sat = get_sat_state(track_state, group_key, prn)
-        estimator_state = get_doppler_estimator_state(tracked_sat)
-        # Actual coherent integration time of the last correlator dump (num_code_blocks ·
-        # code period, from Tracking) — one code period per dump at the default integration
-        # length (GPS L1 C/A 1 ms, Galileo E1B 4 ms), but this reads whatever Tracking used.
-        # It sets the per-dump phase-noise variance and the DLL squaring loss, so both the
-        # range and the range-rate measurement noise scale with it.
-        #
-        # Note this is the *last* dump's length, taken as representative of all `N` dumps in
-        # the cycle. Tracking times each record individually
-        # (`output.integrated_samples / sampling_frequency`), so a cycle in which the coherent
-        # length changes — bit or secondary-code sync promoting 1 ms to 4/20 ms — is modelled
-        # with the post-change length for every dump. That also breaks the telescoping the rate
-        # measurement relies on (`mean_carrier_discr` divides each dump's phase difference by
-        # its *own* `T_coh`, so the interior phases only cancel when every `T_coh` is equal),
-        # leaving both the rate measurement's gain and its variance approximate for that one
-        # cycle. Accepted: it is a single-cycle transient at sync, long before which the
-        # cadence is settled for the rest of the run.
-        coherent_integration_time =
-            ustrip(s, get_last_fully_integrated_integration_time(tracked_sat, RANGING_SIGNAL_INDEX))
         sat_state =
             SatelliteState(receiver_group_states[prn].decoder, ranging, tracked_sat)
         time = calc_corrected_time(sat_state)
         time_gpst_count = time - scale_offset
         sat_pv = calc_satellite_position_and_velocity(sat_state.decoder, time)
         pseudorange = pseudorange_from_tows(ustrip(s, reference_time), time_gpst_count)
+        # The satellite's shared `carrier_doppler`, so the ranging signal's wavelength is
+        # the whole group's — as it must be, every signal of a group riding one carrier.
         pseudorange_rate = wavelength * ustrip(Hz, get_carrier_doppler(tracked_sat))
-        # Early-late spacing in chips at the current code rate (measurement
-        # noise model input).
-        early_late_spacing = upreferred(
-            get_early_late_sample_spacing(
-                get_last_fully_integrated_correlator(tracked_sat, RANGING_SIGNAL_INDEX),
-                sampling_freq,
-                get_code_frequency(ranging),
-            ) / sampling_freq * (get_code_doppler(tracked_sat) + get_code_frequency(ranging)),
+        # Both tracking-loop measurements and their variances, fused over every signal
+        # this satellite is tracked on.
+        code_correction, rate_correction, range_variance, rate_variance, has_code,
+        has_rate = fuse_vt_signal_measurements(
+            tracked_sat,
+            wavelength,
+            integration_time,
+            sampling_freq,
         )
         push!(
             members,
@@ -754,7 +969,7 @@ function collect_vt_members!(
                 chip_length,
                 wavelength,
                 code_frequency,
-                prn in available_prns && has_accumulated_discriminators(estimator_state),
+                prn in available_prns && has_code && has_rate,
                 sat_state,
                 time,
                 time_gpst_count,
@@ -763,11 +978,10 @@ function collect_vt_members!(
                 calc_satellite_clock_drift(sat_state.decoder, time),
                 pseudorange,
                 pseudorange_rate,
-                accumulated_code_discriminator(estimator_state, integration_time),
-                accumulated_carrier_discriminator(estimator_state),
-                linear_cn0_floor(ustrip(estimate_cn0(tracked_sat, RANGING_SIGNAL_INDEX))),
-                early_late_spacing,
-                coherent_integration_time,
+                code_correction,
+                rate_correction,
+                range_variance,
+                rate_variance,
             ),
         )
     end
@@ -923,85 +1137,17 @@ function nav_filter_jacobian(
     J
 end
 
-# The rate rows are the derived single-cycle variance, deliberately carrying no inflation
-# factor. Consecutive cycles are not independent: Tracking chains the FLL's `previous_prompt`
-# across cycles (each chunk's first record reads the carried-over
-# `last_fully_integrated_filtered_prompt`) while `reset_carrier_discr_acc!` fires every cycle,
-# so cycle `i` measures `(θ_N − θ_0)/(2π·T)` and cycle `i+1` measures `(θ_2N − θ_N)/(2π·T)`.
-# They share the boundary phase estimate with opposite signs, giving
-#     cov = −σ_φ²/(2π·T)²,   var = 2·σ_φ²/(2π·T)²   ⇒   ρ(lag 1) = −1/2,
-# which a Kalman update cannot represent. Two consequences, neither of them a reason to inflate
-# `R`:
-#
-#  - The correlation is *negative*, so noise averages out faster across cycles than a
-#    white-noise filter credits. The filter is therefore already pessimistic about the rate
-#    channel, not overconfident — inflating `R` moves further in the direction it already errs,
-#    and widens the pseudorange innovation gates as a side effect. What the correlation does
-#    cost is a pessimistic reported velocity / clock-drift uncertainty, which only measurement
-#    differencing (Bryson-Henrikson) or carrying the boundary phase as a state would fix.
-#  - The rate residuals carry a ≈ −0.5 lag-1 autocorrelation *by construction*. That is the
-#    telescoping, not a tracking fault, and it must not be tuned against.
-#
-# Note also that the derived variance is not conservative by accident: treating all `N`
-# per-dump discriminators as independent would give `N` times this value, and it is exactly the
-# −1/2 adjacency correlation making the interior phases telescope away that earns the tighter
-# figure. It is the right variance for the estimator `mean_carrier_discr` actually is.
-
-# Measurement-noise covariance: CN0-driven DLL thermal-noise variance for the pseudoranges,
-# and the pseudorange-rate variance for the ATAN frequency-lock discriminator used in Tracking
-# (`atan(cross/dot)/(2π·T_coh)`; see Tracking's `fll_disc`).
-#
-# Both rows are built the same way: the per-dump discriminator variance for a coherent
-# integration time `T_coh` (`member.coherent_integration_time`), propagated through the
-# averaging of the `N = T/T_coh` dumps that the filter's measurement is a mean of.
-#
-# Code. Tracking's `dll_disc` is the *noncoherent* envelope-normalized early-minus-late
-# discriminator, whose per-dump jitter carries a squaring loss set by the coherent
-# integration time (Kaplan & Hegarty, "Understanding GPS: Principles and Applications",
-# 2nd ed., Artech House 2006, §5.5.2, noncoherent early-late DLL tracking jitter; derived in
-# general form by Betz & Kolodziejski, "Generalized Theory of Code Tracking with an
-# Early-Late Discriminator, Part II: Noncoherent Processing and Numerical Results", IEEE
-# Trans. Aerospace and Electronic Systems 45(4), 2009, pp. 1557-1564):
-#     σ_τ,dump² = d/(4·C/N0·T_coh) · (1 + 2/((2 − d)·C/N0·T_coh))   [chips²],
-# the first factor being the coherent early-late variance (the reference formulas carry a
-# loop noise bandwidth `B_n`; a single dump is the open-loop case `B_n = 1/(2·T_coh)`) and
-# the bracket the squaring loss from multiplying two noisy envelopes. The filter's code
-# measurement is `mean_code_discr`, the mean of the `N` per-dump discriminators, whose
-# noise is white across dumps (successive dumps share no samples), so
-#     var(mean) = σ_τ,dump²/N = d/(4·C/N0·T) · (1 + 2/((2 − d)·C/N0·T_coh))   [chips²],
-# i.e. the thermal term averages down over the whole filter interval `T` while the squaring
-# loss stays pinned to `T_coh` — a short coherent dump inflates the code variance no matter
-# how long the filter interval is. The pseudorange variance is `chip_length²` times that.
-# For the BOC VEML correlator `d` is the inner early-late pair's spacing, so the model is
-# the EPL approximation of it: the extra very-early/very-late taps average a little more
-# noise away, making the model mildly conservative there.
-#
-# Rate. A coherent dump of length `T_coh` estimates carrier phase with the ATAN
-# discriminator jitter
-#     σ_φ² = 1/(2·C/N0·T_coh)·(1 + 1/(2·C/N0·T_coh))   [rad²].
-# The filter's rate measurement is `mean_carrier_discr`, the mean of the `N` per-dump
-# discriminators in `carrier_discr_acc`. Each dump is a frequency — a phase difference over
-# one `T_coh`, `(θ_k − θ_{k-1})/(2π·T_coh)` — so the mean reduces to `(θ_N − θ_0)/(2π·T)`:
-# the interior phases cancel, leaving only the two endpoint phase estimates, giving
-#     var(mean) = 2·σ_φ² / (2π·T)²   [Hz²],
-# and the pseudorange-rate variance is λ² times that.
-function vt_measurement_noise_covariance(
-    members::AbstractVector{VTMember},
-    integration_time,
-)
-    T = ustrip(s, integration_time)
+# Measurement-noise covariance. Every variance was derived per signal and fused per
+# satellite while the members were gathered (`signal_measurement_variances`,
+# `fuse_vt_signal_measurements`), where each signal's own measured C/N₀, tap spacing and
+# coherent integration length are at hand; all that is left here is to place them on the
+# diagonal — pseudorange rows first, pseudorange-rate rows second, in member order.
+function vt_measurement_noise_covariance(members::AbstractVector{VTMember})
     num_sats = length(members)
     R = zeros(2 * num_sats, 2 * num_sats)
     for (j, member) in enumerate(members)
-        cn0_tcoh = member.cn0 * member.coherent_integration_time
-        # The noise model assumes the early and late taps still sit inside the correlation
-        # triangle, i.e. `d < 2` chips — which every real correlator configuration is well
-        # under (Tracking's own default is 0.5).
-        d = member.early_late_spacing
-        squaring_loss = 1 + 2 / ((2 - d) * cn0_tcoh)
-        R[j, j] = d / (4 * T * member.cn0) * squaring_loss * member.chip_length^2
-        sigma_phi2 = 1 / (2 * cn0_tcoh) * (1 + 1 / (2 * cn0_tcoh))
-        R[num_sats + j, num_sats + j] = member.wavelength^2 * sigma_phi2 / (2 * π^2 * T^2)
+        R[j, j] = member.range_variance
+        R[num_sats + j, num_sats + j] = member.rate_variance
     end
     R
 end
@@ -1285,8 +1431,8 @@ end
 #
 # Because the vector loop steers every replica onto the navigation solution, a
 # well-tracked member's residuals reduce to its own discriminators — the code residual
-# to `+code_discriminator · chip_length`, the rate residual to
-# `-carrier_discriminator · wavelength` — while a member the solution predicts poorly
+# to `+code_correction`, the rate residual to `-rate_correction` — while a member the
+# solution predicts poorly
 # (one diverging, or one out of lock and coasting) keeps a large residual. That is
 # what makes them worth reporting for members outside the update too: such a member
 # is monitored rather than dropped as a missing satellite.
@@ -1305,15 +1451,14 @@ function vt_post_fit_residuals(
 )
     residuals = [
         (
-            measured_pseudoranges[j] +
-            members[j].code_discriminator * members[j].chip_length -
+            measured_pseudoranges[j] + members[j].code_correction -
             predicted_pseudoranges[j]
         ) * m for j in eachindex(members)
     ]
     rate_residuals = [
         (
             predicted_pseudorange_rates[j] - members[j].pseudorange_rate -
-            members[j].carrier_discriminator * members[j].wavelength
+            members[j].rate_correction
         ) * (m / s) for j in eachindex(members)
     ]
     residuals, rate_residuals
@@ -1856,7 +2001,7 @@ function run_vt_iteration(
     bias_columns = vt_bias_columns(members, vt.layout)
     sat_positions_mat =
         isempty(members) ? zeros(3, 0) : stack(member.sat_position for member in members)
-    R = vt_measurement_noise_covariance(members, integration_time)
+    R = vt_measurement_noise_covariance(members)
 
     # Measurement candidates: members whose signal is currently available (the
     # discriminators of an obscured satellite carry no information).
@@ -1871,8 +2016,7 @@ function run_vt_iteration(
     observability = BiasObservability(4, 4, 0, Tuple{Int,Int,Float64}[])
     if !isempty(candidate_indices)
         z_pseudoranges = [
-            measured_pseudoranges[j] +
-            members[j].code_discriminator * members[j].chip_length for
+            measured_pseudoranges[j] + members[j].code_correction for
             j in candidate_indices
         ]
         # Innovation gate disabled for now: the observability watchdog
@@ -1920,8 +2064,7 @@ function run_vt_iteration(
                 vcat(
                     z_pseudoranges,
                     [
-                        members[j].pseudorange_rate +
-                        members[j].carrier_discriminator * members[j].wavelength
+                        members[j].pseudorange_rate + members[j].rate_correction
                         for j in candidate_indices
                     ],
                 )
