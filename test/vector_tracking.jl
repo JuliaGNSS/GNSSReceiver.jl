@@ -1240,6 +1240,18 @@ end
         code_b, _, _, _, _, _ = fuse(delayed)
         @test code_b ≈ code_both - offset_m / 2
     end
+
+    # A group that does not combine (`signal_combining = false`) fuses the driver alone,
+    # although Tracking accumulated the passenger's measurements too: with both
+    # components' accumulators populated it reads exactly like the driver-only satellite.
+    uncombined = GNSSReceiver.fuse_vt_signal_measurements(
+        both,
+        wavelength,
+        T,
+        sampling_freq;
+        combining = false,
+    )
+    @test collect(uncombined) ≈ collect(fuse(driver_only))
 end
 
 @testset "Pseudorange differencing across a GNSS week rollover" begin

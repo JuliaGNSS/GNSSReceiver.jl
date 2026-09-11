@@ -70,6 +70,8 @@ what each actually measured — its own C/N₀, correlator spacing and integrati
 which is a better weighting than the nominal power split the loops use. Combining still
 applies to the carrier phase loop, which stays with the tracking channel, and to all three
 while a satellite is pulling in on its scalar fallback before the filter takes it over.
+With `signal_combining = false` both halves are off: the loops close on the ranging
+signal and the filter takes its measurements alone.
 
 ## Acquisition
 
