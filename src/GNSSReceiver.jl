@@ -599,8 +599,9 @@ data_signal_index(system) = length(tracking_signals(system))
 # `−T_GD + ISC_X` (IS-GPS-705J §20.3.3.3.1.2, IS-GPS-800J §3.5.4.1 — exactly
 # what `correct_by_group_delay` applies), so `X`'s payload delay is
 # `T_GD − ISC_X`. `T_GD` is one per-SV term shared by every signal, so it is
-# dropped as the common datum, leaving `−ISC_X` on each component. Where a pair
-# shares one broadcast ISC (L2 CM/CL)
+# dropped as the common datum, leaving `−ISC_X` on each component. BeiDou
+# references its corrections the other way round (see below), which is why the
+# two families' signs differ. Where a pair shares one broadcast ISC (L2 CM/CL)
 # or leaves the satellite as one composite (every Galileo pair) both components
 # get a hard zero.
 #
@@ -642,6 +643,28 @@ _group_delays(
 # the same reading `correct_by_group_delay` takes.
 _group_delays(::GPSL2CL, ::GPSL2CM, ::GNSSDecoderState) = (0.0s, 0.0s)
 
+# BeiDou B1C (from B-CNAV1 subframe 2) and B2a (from B-CNAV2 message type 30).
+#
+# BeiDou states the intra-pair difference *directly* rather than one correction per
+# component: the clock polynomial is referred to B3I, the band's pilot carries the group
+# delay from there (`T_GD_B1Cp`, `T_GD_B2ap`), and the data component carries that same
+# delay plus one inter-signal correction (`ISC_B1Cd`, `ISC_B2ad`). Reading the corrections
+# `correct_by_group_delay` applies — `t − T_GD` on the pilot, `t − T_GD − ISC` on the data
+# component — the payload delays are `T_GD` and `T_GD + ISC`. Dropping the band's `T_GD`
+# as the common datum, just as GPS's is, leaves `0.0s` on the pilot and `+ISC` on the data
+# component: the opposite sign to GPS, and the pilot's value known from the start.
+_group_delays(
+    ::BeiDouB1C_P,
+    ::BeiDouB1C_D,
+    decoder::GNSSDecoderState{<:GNSSDecoder.BeiDouB1CData},
+) = (0.0s, _isc(decoder.data.ISC_B1Cd))
+
+_group_delays(
+    ::BeiDouB2aQ,
+    ::BeiDouB2aI,
+    decoder::GNSSDecoderState{<:GNSSDecoder.BeiDouB2aData},
+) = (0.0s, _isc(decoder.data.ISC_B2ad))
+
 # Any other pair: unknown, which costs the data component's code contribution
 # and nothing else.
 _group_delays(::AbstractGNSSSignal, ::AbstractGNSSSignal, ::GNSSDecoderState) =
@@ -653,6 +676,13 @@ _group_delays(::AbstractGNSSSignal, ::AbstractGNSSSignal, ::GNSSDecoderState) =
 # number: at these magnitudes an assumed unit is a metre.
 _negated_isc(_) = nothing
 _negated_isc(isc::Real) = -isc * 1.0s
+
+# Same contract for the BeiDou form, taken as it comes. An absent value is ordinary
+# here, not a decoder fault: `ISC_B2ad` rides in B-CNAV2 message type 30, which a B2a
+# satellite can go a long time without sending — GNSSDecoder deliberately does not
+# require it for positioning.
+_isc(_) = nothing
+_isc(isc::Real) = isc * 1.0s
 
 # Whether this system's group satisfies multi-signal discriminator combining's one
 # precondition: the estimator-driver signal — `tracking_signals`' first entry, the
