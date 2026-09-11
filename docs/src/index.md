@@ -23,7 +23,8 @@ a terminal GUI, persist to disk, or post-process in Julia.
   biases and per-band inter-frequency biases.
 - Pilot + data **combined tracking** via [`CombinedSignal`](@ref): range on the dataless
   pilot, decode the navigation message from the data component (e.g. Galileo E1B/E1C,
-  GPS L5I/L5Q, BeiDou B1C-D/B1C-P).
+  GPS L5I/L5Q, BeiDou B1C-D/B1C-P), and close the carrier and code loops on both
+  components' discriminators rather than the pilot's alone.
 - Live reception from any **SoapySDR** device (RTL-SDR, LimeSDR, BladeRF, USRP, …).
 - Offline **replay from files**, including raw 8-bit offset-binary I/Q recordings.
 - **Multi-antenna** processing with eigen-beamforming.
