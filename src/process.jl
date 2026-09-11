@@ -298,6 +298,11 @@ function process(
 
     track_state = remove_lost_satellites(receiver_sat_states, track_state)
 
+    # Feed each combined group's components the group delays their decoder has by
+    # now recovered, so `Tracking`'s discriminator combining can take the data
+    # component's code measurement too (see `group_delays`).
+    update_group_delays!(track_state, receiver_sat_states, all_systems)
+
     # Run a navigation cycle once a full `pvt_update_interval` of signal time has
     # accumulated, otherwise carry the previous solution forward. The elapsed
     # time is the filter's integration interval; gating the cadence here lets the
@@ -457,6 +462,39 @@ function remove_lost_satellites(receiver_sat_states, track_state)
                !receiver_sat_state.in_vt_loop &&
                receiver_sat_state.prn in tracked_prns
                 track_state = remove_satellite(track_state; prn = receiver_sat_state.prn, group = group_key)
+            end
+        end
+    end
+    track_state
+end
+
+# Keep every combined group's per-signal group delays in step with what its decoder
+# has recovered (see `group_delays`). Runs once per chunk, but writes only on a
+# *change*: `set_group_delay!` rebuilds the `TrackedSat` (and drops its pending
+# combining sums), and the values it carries are constant per satellite once the
+# message that holds them has been decoded — so in the steady state this is a read
+# and a comparison per signal and satellite.
+#
+# Single-signal (data-only) groups are skipped outright: their only signal has no
+# other to be differenced against, so `Tracking` would store a value and never read it.
+#
+# Mutates `track_state` in place and returns it.
+function update_group_delays!(track_state, receiver_sat_states, systems)
+    for system in systems
+        data_signal_index(system) == RANGING_SIGNAL_INDEX && continue
+        group_key = signal_group_key(system)
+        tracked_prns = keys(get_sat_states(track_state, group_key))
+        for receiver_sat_state in receiver_sat_states[group_key]
+            prn = receiver_sat_state.prn
+            # A satellite `remove_lost_satellites` has just dropped still has a
+            # `ReceiverSatState` (it is the reacquisition book-keeping) but no
+            # slot in the tracking state to address.
+            prn in tracked_prns || continue
+            delays = group_delays(system, receiver_sat_state.decoder)
+            for (signal_index, delay) in enumerate(delays)
+                isequal(delay, get_group_delay(track_state, group_key, prn, signal_index)) &&
+                    continue
+                set_group_delay!(track_state, group_key, prn, signal_index, delay)
             end
         end
     end
