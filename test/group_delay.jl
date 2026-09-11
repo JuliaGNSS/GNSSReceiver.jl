@@ -164,6 +164,15 @@ end
             vector_tracking,
         )
         @test receiver_state.track_state.groups[key].discriminator_combining
+        # The switch that makes a combined run comparable turns it off again.
+        uncombined = GNSSReceiver.ReceiverState(
+            ComplexF64,
+            system;
+            num_samples_for_acquisition = 20000,
+            vector_tracking,
+            signal_combining = false,
+        )
+        @test !uncombined.track_state.groups[key].discriminator_combining
     end
 end
 

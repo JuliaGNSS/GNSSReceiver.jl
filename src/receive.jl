@@ -482,6 +482,16 @@ the defaults assume vehicular dynamics and a TCXO-grade oscillator, and both the
 the filter weighs its prediction against the measurements. Each payload then reports what the
 filter is doing through its [`VTStatus`](@ref).
 
+A [`CombinedSignal`](@ref) group's loops are closed on both of its components by default,
+combining their discriminators. Under vector tracking that holds for every loop too: the
+carrier phase loop, which stays with the tracking channel, combines the components'
+discriminators, and the navigation filter fuses both components' code and carrier
+frequency measurements, weighted by what each actually measured. Pass
+`signal_combining = false` to use the ranging signal alone throughout — the same
+satellites, samples and loop bandwidths, tracking the pilot only (and, under vector
+tracking, feeding the navigation filter the pilot's measurements only), which is the
+comparison a combined run is measured against.
+
 The downconvert-and-correlator backend is auto-selected from the sample element type:
 `Complex{Int16}` inputs use Tracking's fast integer backend when `max_meas` (the front-end
 full-scale, e.g. `2^11` for a 12-bit ADC) is given, and otherwise fall back to the float
@@ -536,6 +546,10 @@ function receive(
     # A `VectorTracking` enables it and configures the filter (platform dynamics,
     # oscillator stability, when to give up).
     vector_tracking::Union{Bool,VectorTracking} = false,
+    # Multi-signal discriminator combining. `true` (the default) closes each group's loops
+    # on every component of its signal pair; `false` closes them on the ranging signal
+    # alone, which is what a combined run has to be compared against.
+    signal_combining::Bool = true,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
     pvt_approximate_year::Integer = year(now(UTC)),
@@ -606,7 +620,8 @@ function receive(
         # buffer is sized in scalar samples, so unwrap to the scalar element type `T`.
         map((ch, s) -> SampleBuffer(eltype(eltype(ch)), s[3]), measurement_channels, setups),
     )
-    initial_state = ReceiverState(band_systems, buffers; num_ants, vector_tracking)
+    initial_state =
+        ReceiverState(band_systems, buffers; num_ants, vector_tracking, signal_combining)
 
     # The channel carries whatever `extract` returns. Infer that type without running
     # user code where possible (`promote_op`); for the default this is a concrete

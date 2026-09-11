@@ -764,8 +764,8 @@ vt_config(vector_tracking::VectorTracking) = vector_tracking
 # The tracking loops' Doppler estimator for the given mode: `Tracking`'s
 # `VectorPLLAndDLL` under vector tracking (it accumulates the discriminators and
 # applies the navigation filter's NCO corrections), the conventional
-# FLL-assisted PLL/DLL for scalar tracking. Not user-selectable — the mode alone
-# determines it.
+# FLL-assisted PLL/DLL for scalar tracking. Which of the two is not user-selectable —
+# the mode alone determines it.
 doppler_estimator_for(vector_tracking) =
     vt_enabled(vector_tracking) ? VectorPLLAndDLL() : ConventionalAssistedPLLAndDLL()
 
@@ -781,15 +781,22 @@ doppler_estimator_for(vector_tracking) =
 # (see `group_delays`); until both are known the data component aids the carrier loops
 # only.
 #
-# Under `VectorPLLAndDLL` the flag's reach follows `vt_on`: all three loops while a
-# satellite is still running its scalar fallback (so it pulls in with the full
-# combining gain rather than acquiring it only once the navigation filter takes
-# over), and the carrier phase loop alone once the filter owns the other two. The
-# code and carrier frequency measurements then reach the filter as one accumulator
-# per signal, and this receiver fuses them itself — see
-# `fuse_vt_signal_measurements`, which is better placed to weigh them than a
-# nominal ICD power split is.
-discriminator_combining(system) = combines_signals(system)
+# Under `VectorPLLAndDLL` the flag's reach in `Tracking` follows `vt_on`: all three
+# loops while a satellite is still running its scalar fallback (so it pulls in with the
+# full combining gain rather than acquiring it only once the navigation filter takes
+# over), and the carrier phase loop alone once the filter owns the other two. The code
+# and carrier frequency measurements then reach the filter as one accumulator per
+# signal — whatever the flag says — and this receiver fuses them itself, being better
+# placed to weigh them than a nominal ICD power split is. It reads the same flag there:
+# a group that does not combine hands the filter its ranging signal's measurements
+# alone (see `fuse_vt_signal_measurements`).
+#
+# `signal_combining = false` turns the combination off across the whole receiver, leaving
+# every group's loops closed on its ranging signal alone. That is not a tuning knob but a
+# measurement one: it is what makes a combined run comparable against the same signals,
+# satellites and samples tracked without the combination.
+discriminator_combining(system, signal_combining::Bool) =
+    signal_combining && combines_signals(system)
 
 # Say so once, at construction, when a group's driver is not its longest-integrating
 # signal. Such a group is built with combining off and simply tracks without it, but the
@@ -817,11 +824,12 @@ function ReceiverState(
     acquisition_buffers::NamedTuple;
     num_ants::NumAnts = NumAnts(1),
     vector_tracking::Union{Bool,VectorTracking} = false,
+    signal_combining::Bool = true,
 )
     doppler_estimator = doppler_estimator_for(vector_tracking)
     systems = _flatten_systems(band_systems)
     assert_decodable(systems)
-    warn_about_uncombinable_systems(systems)
+    signal_combining && warn_about_uncombinable_systems(systems)
     group_keys = map(signal_group_key, systems)
     # One tracking group per system: a plain signal alone, a `CombinedSignal` as its
     # pilot (ranging driver) + data component (see `tracking_signals`). Each group
@@ -835,7 +843,7 @@ function ReceiverState(
         sigs = tracking_signals(system)
         template = create_tracked_sat(sigs, 0, 0.0, 0.0Hz, num_ants, doppler_estimator)
         sats = Dictionary{Int,typeof(template)}(Int[], typeof(template)[])
-        combining = discriminator_combining(system)
+        combining = discriminator_combining(system, signal_combining)
         SignalGroup(get_band(first(sigs)), sats, sigs, num_ants, combining)
     end)
     track_state =
@@ -883,9 +891,11 @@ sample buffer, and `num_ants` selects single- versus multi-antenna processing.
 of per-satellite loop filters (the tracking-loop estimator follows from this: the
 conventional FLL-assisted PLL/DLL for scalar, `VectorPLLAndDLL` for vector tracking); pass
 a [`VectorTracking`](@ref) instead of `true` to describe the platform's dynamics and the
-receiver's oscillator to that filter. One `ReceiverState` spans every band; pass the
-per-band system tuples and pre-built acquisition buffers to the primary constructor for the
-multi-band case.
+receiver's oscillator to that filter. `signal_combining = false` closes each group's loops
+on its ranging signal alone instead of combining its components' discriminators, and under
+vector tracking feeds the navigation filter that signal's measurements alone. One
+`ReceiverState` spans every band; pass the per-band system tuples and pre-built acquisition
+buffers to the primary constructor for the multi-band case.
 """
 function ReceiverState(
     ::Type{T}, # Must be the same type as the incoming signal
@@ -893,11 +903,12 @@ function ReceiverState(
     num_samples_for_acquisition,
     num_ants::NumAnts = NumAnts(1),
     vector_tracking::Union{Bool,VectorTracking} = false,
+    signal_combining::Bool = true,
 ) where {T}
     systems = as_systems(systems)
     band_key = get_band_id(system_band(first(systems)))
     buffers = NamedTuple{(band_key,)}((SampleBuffer(T, num_samples_for_acquisition),))
-    ReceiverState((systems,), buffers; num_ants, vector_tracking)
+    ReceiverState((systems,), buffers; num_ants, vector_tracking, signal_combining)
 end
 
 include("read_file.jl")

@@ -828,6 +828,14 @@ end
 # while contributing to the rate one (an unknown group delay, see
 # `signal_code_discriminator`), so the counts genuinely can disagree.
 #
+# `combining = false` fuses the driver's measurements alone. It is the group's
+# `discriminator_combining` flag, and it has to be applied here: `Tracking` accumulates
+# every signal's discriminators for the navigation filter whatever that flag says, so a
+# group that does not combine would otherwise still close the two loops the filter owns
+# on both of its components — and differ from a combining one only in the carrier phase
+# loop. With it, a group that does not combine is tracked on its ranging signal alone in
+# either mode, which is what `signal_combining = false` promises.
+#
 # `ntuple(…, Val(N))` rather than a loop over `get_signals`: the signal tuple is
 # heterogeneous, so only a compile-time-unrolled walk keeps each signal's accessors
 # concretely typed.
@@ -835,10 +843,14 @@ function fuse_vt_signal_measurements(
     tracked_sat,
     wavelength,
     integration_time,
-    sampling_freq,
+    sampling_freq;
+    combining::Bool = true,
 )
     signals = get_signals(tracked_sat)
     contributions = ntuple(Val(length(signals))) do i
+        if !combining && i != RANGING_SIGNAL_INDEX
+            return (code = nothing, code_variance = Inf, rate = nothing, rate_variance = Inf)
+        end
         signal = get_signal(tracked_sat, i)
         chip_length = SPEED_OF_LIGHT / ustrip(Hz, get_code_frequency(signal))
         d = signal_early_late_spacing(tracked_sat, i, sampling_freq)
@@ -941,6 +953,7 @@ function collect_vt_members!(
         SPEED_OF_LIGHT / ustrip(Hz, get_center_frequency(ranging))
     clock_bias_index = layout.clock_bias_index_by_group[group_key]
     ifb_index = layout.ifb_index_by_group[group_key]
+    combining = track_state.groups[group_key].discriminator_combining
     for prn in prns
         tracked_sat = get_sat_state(track_state, group_key, prn)
         sat_state =
@@ -953,13 +966,15 @@ function collect_vt_members!(
         # the whole group's — as it must be, every signal of a group riding one carrier.
         pseudorange_rate = wavelength * ustrip(Hz, get_carrier_doppler(tracked_sat))
         # Both tracking-loop measurements and their variances, fused over every signal
-        # this satellite is tracked on.
+        # this satellite is tracked on — or the ranging signal's alone, for a group that
+        # does not combine.
         code_correction, rate_correction, range_variance, rate_variance, has_code,
         has_rate = fuse_vt_signal_measurements(
             tracked_sat,
             wavelength,
             integration_time,
-            sampling_freq,
+            sampling_freq;
+            combining,
         )
         push!(
             members,
