@@ -53,6 +53,28 @@ _delay_difference((pilot, data)) =
     l1c_decoder = @set l1c_decoder.data.ISC_L1CP = -1.0e-9
     @test _delay_difference(GNSSReceiver.group_delays(l1c, l1c_decoder)) ≈ 2.0e-9u"s"
 
+    # BeiDou puts the band's pilot delay on both components and the ISC on the data one
+    # alone, so the pilot's value is known from the start and the data component's is
+    # `+ISC` — note the sign, opposite to the GPS pairs above, where each component's own
+    # ISC enters negated.
+    b1c = GNSSReceiver.CombinedSignal(BeiDouB1C_P(), BeiDouB1C_D())
+    b1c_decoder = GNSSDecoderState(BeiDouB1C_D(), 19)
+    @test GNSSReceiver.group_delays(b1c, b1c_decoder) === (0.0u"s", nothing)
+    # `T_GD_B1Cp` is the pilot's delay from the B3I-referenced clock. It is shared by
+    # both components, so it must not reach the difference.
+    b1c_decoder = @set b1c_decoder.data.T_GD_B1Cp = 7.0e-9
+    @test GNSSReceiver.group_delays(b1c, b1c_decoder) === (0.0u"s", nothing)
+    b1c_decoder = @set b1c_decoder.data.ISC_B1Cd = 3.0e-9
+    @test GNSSReceiver.group_delays(b1c, b1c_decoder) === (0.0u"s", 3.0e-9u"s")
+    @test _delay_difference(GNSSReceiver.group_delays(b1c, b1c_decoder)) ≈ -3.0e-9u"s"
+
+    b2a = GNSSReceiver.CombinedSignal(BeiDouB2aQ(), BeiDouB2aI())
+    b2a_decoder = GNSSDecoderState(BeiDouB2aI(), 19)
+    @test GNSSReceiver.group_delays(b2a, b2a_decoder) === (0.0u"s", nothing)
+    b2a_decoder = @set b2a_decoder.data.T_GD_B2ap = -4.0e-9
+    @test GNSSReceiver.group_delays(b2a, b2a_decoder) === (0.0u"s", nothing)
+    b2a_decoder = @set b2a_decoder.data.ISC_B2ad = -1.5e-9
+    @test _delay_difference(GNSSReceiver.group_delays(b2a, b2a_decoder)) ≈ 1.5e-9u"s"
 end
 
 @testset "update_group_delays! writes only what changed" begin
