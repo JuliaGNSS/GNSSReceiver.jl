@@ -686,7 +686,11 @@ end
     # at a 200 ms base — never once per frame — and stop after
     # `max_reacquire_attempts`.
     system = GPSL1CA()
+    # The knobs are applied through a helper rather than splatted inside `@test`:
+    # `@test f(x; knobs...)` trips a `BoundsError` in Test.jl on Julia 1.13 when
+    # the splatted values are Unitful quantities.
     knobs = (; reacquire_backoff = 200u"ms", max_reacquire_attempts = 3)
+    due_now(s) = GNSSReceiver.should_reacquire(s; knobs...)
     state(n, t) = GNSSReceiver.ReceiverSatState(
         5,
         GNSSDecoderState(system, 5),
@@ -698,16 +702,13 @@ end
         false,
     )
     for (n, due) in enumerate((0.2u"s", 0.8u"s", 1.8u"s"))
-        @test !GNSSReceiver.should_reacquire(state(n - 1, due - 1u"ms"); knobs...)
-        @test GNSSReceiver.should_reacquire(state(n - 1, due); knobs...)
+        @test !due_now(state(n - 1, due - 1u"ms"))
+        @test due_now(state(n - 1, due))
     end
     # Attempts are capped, however long the satellite stays out of lock.
-    @test !GNSSReceiver.should_reacquire(state(3, 60u"s"); knobs...)
+    @test !due_now(state(3, 60u"s"))
     # And a satellite that is in lock is never a candidate.
-    @test !GNSSReceiver.should_reacquire(
-        GNSSReceiver.ReceiverSatState(system, 5);
-        knobs...,
-    )
+    @test !due_now(GNSSReceiver.ReceiverSatState(system, 5))
 end
 
 @testset "A counted failed reacquisition advances the back-off" begin
@@ -716,8 +717,9 @@ end
     s1 = GNSSReceiver.increment_num_unsuccessful_reacquisition(s0)
     @test s1.num_unsuccessful_reacquisition == 1
     knobs = (; reacquire_backoff = 200u"ms", max_reacquire_attempts = 3)
+    due_now(s) = GNSSReceiver.should_reacquire(s; knobs...)
     # The first attempt was due at 0.2 s; having spent it, the same satellite
     # has to wait until 0.8 s for the next one.
-    @test GNSSReceiver.should_reacquire(s0; knobs...)
-    @test !GNSSReceiver.should_reacquire(s1; knobs...)
+    @test due_now(s0)
+    @test !due_now(s1)
 end
