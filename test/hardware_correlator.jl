@@ -656,19 +656,25 @@ function _correlate_chunk!(sdr::SimulatedFPGA{C}, samples) where {C}
     out
 end
 
-@testset "Closed loop through a simulated hardware correlator" begin
+# Two chunk lengths. 4000 samples is one code period at 4 MS/s, and it hides a
+# whole class of handover errors: anything off by a whole number of chunks
+# vanishes modulo the code length. 3000 samples (0.75 ms, 767.25 chips) does not
+# — a handover declared valid at the wrong end of the chunk lands 256 chips off
+# the peak and the loop never closes (regression: `advance_tracking!` used to
+# count the chunk before handing over its acquisitions).
+@testset "Closed loop through a simulated hardware correlator ($chunk-sample chunks)" for chunk in (4000, 3000)
     system = GPSL1CA()
     prn = 11
     sampling_freq = 4e6Hz
     fs = 4e6
-    chunk = 4000                      # 1 ms
+    epoch = 4000                      # the link's fold epoch: one code period
     # 1.4 s of signal. The link pushes one NCO update per *chunk* (see
     # `push_nco_updates!`) rather than one per folded epoch, because that is how
     # often a correction can actually reach a device; a device like this one,
     # which honours `apply_at_sample` strictly, used to receive a whole per-epoch
     # sequence during a catch-up and could replay it, so it pulled in within
     # 700 ms. Same convergence, more signal to get there.
-    num_chunks = 1400
+    num_chunks = cld(1400 * 4000, chunk)
     true_doppler = 1200.0             # Hz
     initial_code_phase = 137.4        # chips
     amplitude = 0.126                 # ≈ 45 dBHz against unit-variance noise
@@ -794,11 +800,13 @@ end
     @test abs(code_error) < 0.5 * handover_code_phase_error
 
     # 5. Updates are scheduled on the epoch grid, a fixed number of epochs
-    #    ahead — that is what makes the loop delay deterministic.
+    #    ahead — that is what makes the loop delay deterministic. Checked where
+    #    the chunk *is* the epoch; otherwise the newest record the schedule is
+    #    anchored to (`push_nco_updates!`) legitimately sits off the grid.
     applied_samples = unique(u -> u.apply_at_sample, sdr.applied)
-    if length(applied_samples) >= 3
+    if chunk == epoch && length(applied_samples) >= 3
         deltas = diff([u.apply_at_sample for u in applied_samples])
-        @test all(d -> d % chunk == 0, deltas)
+        @test all(d -> d % epoch == 0, deltas)
     end
 end
 

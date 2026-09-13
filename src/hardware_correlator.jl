@@ -813,15 +813,18 @@ function advance_tracking!(
     # re-feeds the whole accumulated history to `decode` as "new" bits.
     Tracking.reset_start_sample_and_bit_buffer!(track_state)
 
-    # The raw stream is still the receiver's clock: count what this chunk
-    # delivered so the handover time base stays aligned with it.
-    link.samples_consumed += _chunk_num_samples(band_measurements)
-
     # A dump only makes sense for a satellite the device is actually
     # correlating, so reconcile the channel table with the tracking state first:
     # this chunk's acquisitions get hardware channels, and satellites the
-    # receiver has dropped give theirs back.
+    # receiver has dropped give theirs back. This runs *before* the chunk is
+    # counted: an acquired satellite's code phase refers to the first sample of
+    # the chunk being processed (see `correct_code_phases` / `merge_scan`), so
+    # that is the sample the handover has to be declared valid at.
     sync_hardware_channels!(link, track_state, band_systems, band_measurements)
+
+    # The raw stream is still the receiver's clock: count what this chunk
+    # delivered so the handover time base stays aligned with it.
+    link.samples_consumed += _chunk_num_samples(band_measurements)
 
     link.dropped_dumps += _call_device(dropped_dump_count!, link)
 
@@ -1646,6 +1649,12 @@ function advance_code_phases!(link::HardwareCorrelatorLink, track_state, boundar
     link
 end
 
+# The hardware phase is referenced to the common fold boundary, whereas the
+# bit buffer counts completed records through this channel's last record end.
+# At first bit sync those two clocks must be joined explicitly: pre-sync phase
+# wraps every primary period, and a chunk can contain more records after the
+# one that found the bit edge. Losing that count introduces an integer-ms
+# pseudorange error even with perfectly continuous records and valid decoding.
 """
     anchor_bit_phases!(link, track_state, boundary)
 
@@ -1653,12 +1662,6 @@ Tie a newly synchronized data signal's integer code-period count to its bit
 buffer, retaining the replica phase at the common reception boundary. Applied
 once per channel assignment, after the estimator folds the chunk's records.
 """
-# The hardware phase is referenced to the common fold boundary, whereas the
-# bit buffer counts completed records through this channel's last record end.
-# At first bit sync those two clocks must be joined explicitly: pre-sync phase
-# wraps every primary period, and a chunk can contain more records after the
-# one that found the bit edge. Losing that count introduces an integer-ms
-# pseudorange error even with perfectly continuous records and valid decoding.
 function anchor_bit_phases!(link::HardwareCorrelatorLink, track_state, boundary)
     for ch in eachindex(link.assignments)
         assignment = link.assignments[ch]
