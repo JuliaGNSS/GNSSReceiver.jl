@@ -50,6 +50,8 @@ correlator_gain
 epoch_strobe
 is_epoch_strobe
 is_observation_gap
+advance_code_phases!
+anchor_bit_phases!
 restart_lost_bit_clocks!
 take_bit_clock_restart!
 coherent_integration_blocks
