@@ -287,3 +287,30 @@ end
     expected = Threads.nthreads(:interactive) > 0 ? :interactive : :default
     @test all(d -> d.pool == expected, data)
 end
+
+@testset "receive forwards the code-lock threshold" begin
+    system = GPSL1CA()
+    key = get_signal_id(system)
+    prn = 19
+    chunk = 4000
+    channel = GNSSReceiver.spawn_signal_channel_thread(;
+        T = ComplexF64, num_samples = chunk, num_antenna_channels = 1,
+    ) do ch
+        for c in 0:199
+            samples = ComplexF64[
+                get_code(system, 512.3 + 1.023e6 * (c * chunk + n) / 4e6, prn)
+                for n in 0:(chunk-1)
+            ]
+            put!(ch, reshape(samples, :, 1))
+        end
+    end
+    threshold(state) = haskey(state.receiver_sat_states[key], prn) ?
+        state.receiver_sat_states[key][prn].code_lock_detector.cn0_threshold : -999.0dBHz
+    values = collect(receive(
+        channel, system, 4e6Hz;
+        prns = [prn], code_lock_cn0_threshold = 24.0dBHz, extract = threshold,
+    ))
+    acquired = filter(!=(-999.0dBHz), values)
+    @test !isempty(acquired)
+    @test all(==(24.0dBHz), acquired)
+end

@@ -1329,3 +1329,108 @@ end
         @test Tracking.get_bit_buffer(track_state, prn).code_block_buffer_length == 0
     end
 end
+
+@testset "A lost shorter primary period still restarts bit sync" begin
+    system = GPSL1CA()
+    # Both adjacent-period quantisation and a preceding partial arm record
+    # must be independent of the loss classification.
+    for (previous_samples, lost_samples, doppler) in ((4000, 3999, 1000.0Hz), (4001, 4000, -1000.0Hz), (1149, 4000, 0.0Hz))
+        sdr = RecordingSDR(EPL, 2)
+        link = HardwareCorrelatorLink(sdr; sampling_freq = 4e6Hz, reference_signal = system)
+        state = TrackState(system, [TrackedSat(system, 7, 0.0, doppler)])
+        assignment = GNSSReceiver.HardwareChannelAssignment(:default, 7, 1)
+        link.assignments[1] = assignment
+        link.channel_of[assignment] = 1
+        GNSSReceiver._append_dump!(link, state,
+            dump_at(1, 7, previous_samples; integrated_samples = previous_samples))
+        @test_logs (:warn, r"records lost") GNSSReceiver._append_dump!(link, state,
+            dump_at(1, 7, previous_samples + lost_samples + 4000))
+        @test link.lost_record_samples[1] == lost_samples
+        @test link.rearm_gaps == 0
+        @test link.bit_clock_lost[1]
+        GNSSReceiver.restart_lost_bit_clocks!(link, state)
+        @test GNSSReceiver.take_bit_clock_restart!(link, :default, 7)
+    end
+end
+
+@testset "A transport gap preserves lock but withholds navigation measurements" begin
+    system = GPSL1CA()
+    key = get_signal_id(system)
+    prn = 5
+    track_state = single_sat_track_state(system, prn)
+    sat = get_sat_state(track_state, key, prn)
+    signal = first(Tracking.get_signals(sat))
+    bb = Tracking.get_bit_buffer(signal)
+    synced = typeof(bb)(bb.code_block_buffer, 40, true, 0, Int8(1),
+        0.0 + 0.0im, 0, bb.soft_bits, bb.phase_acc)
+    Tracking.get_sat_states(track_state, key)[prn] = Tracking.TrackedSat(sat;
+        code_phase = 0.0, code_doppler = 0.0Hz,
+        signals = (Tracking.TrackedSignal(signal; bit_buffer = synced),))
+    ready = pvt_sat_state(system, prn,
+        ranging_ready_code_detector(), ranging_ready_carrier_detector())
+    receiver_states = (; key => Dictionary([prn], [ready]))
+    sdr = RecordingSDR(EPL, 2)
+    link = HardwareCorrelatorLink(sdr; sampling_freq = 4e6Hz, reference_signal = system,
+        max_dump_gap = 30ms)
+    assignment = GNSSReceiver.HardwareChannelAssignment(key, prn, 1)
+    link.assignments[1] = assignment
+    link.channel_of[assignment] = 1
+    link.phase_ref_sample[1] = 0
+    link.last_record_at_samples[1] = 0
+
+    # Other channels/strobes move the epoch clock through a full navigation
+    # bit, while this satellite's decoder receives no additional bits.
+    for boundary in 4000:4000:100_000
+        link.samples_consumed = boundary
+        GNSSReceiver.advance_code_phases!(link, track_state, boundary)
+        receiver_states = GNSSReceiver.update_all_receiver_sat_states(
+            receiver_states, track_state, (system,), 1ms, link)
+    end
+    @test receiver_states[key][prn] === ready
+    @test get_code_phase(get_sat_state(track_state, key, prn)) ≈ 5 * 1023
+    # Check the navigation entry point as well as the collector: passing the
+    # source only to lock handling would leave this measurement in the solve.
+    measurements = SatelliteState[]
+    vt = ReceiverState(ComplexF64, system;
+        num_samples_for_acquisition = 4000, vector_tracking = true).vt
+    for mode in (nothing, vt)
+        GNSSReceiver.update_navigation(mode, (system,), track_state, receiver_states,
+            PVTSolution(), measurements, 4e6Hz, 25ms, 25ms; correlator_source = link)
+        @test isempty(measurements)
+    end
+    # Expiring the lock-freeze budget must not re-admit stale measurements.
+    link.samples_consumed = 200_000
+    GNSSReceiver.collect_pvt_sat_states!(measurements, (system,), receiver_states,
+        track_state, 2u"s"; correlator_source = link)
+    @test isempty(measurements)
+    # Software callers keep their existing cadence.
+    GNSSReceiver.collect_pvt_sat_states!(measurements, (system,), receiver_states,
+        track_state, 2u"s")
+    @test length(measurements) == 1
+    # Fresh observations lift the transport gate; decoder validity remains
+    # checked by PVT after the loss handler has restarted bit sync.
+    push!(get_filtered_prompts(track_state, key, prn, 1), 1.0 + 0.0im)
+    empty!(measurements)
+    GNSSReceiver.collect_pvt_sat_states!(measurements, (system,), receiver_states,
+        track_state, 2u"s"; correlator_source = link)
+    @test length(measurements) == 1
+end
+
+
+@testset "Navigation requires both ranging and data observations" begin
+    system = GNSSReceiver.CombinedSignal(GPSL5Q(), GPSL5I())
+    key = GNSSReceiver.signal_group_key(system)
+    signals = GNSSReceiver.tracking_signals(system)
+    sat = TrackedSat(signals, 5, 0.0, 0.0Hz)
+    group = Tracking.SignalGroup(get_band(first(signals)), Dictionary([5], [sat]), signals, NumAnts(1))
+    state = TrackState(; signals = (; key => group))
+    link = HardwareCorrelatorLink(RecordingSDR(EPL, 3);
+        sampling_freq = 30e6Hz, reference_signal = GPSL5Q())
+    @test !GNSSReceiver.has_current_observations(link, state, system, 5)
+    push!(get_filtered_prompts(state, key, 5, 1), 1.0 + 0.0im)
+    @test !GNSSReceiver.has_current_observations(link, state, system, 5)
+    push!(get_filtered_prompts(state, key, 5, 2), 1.0 + 0.0im)
+    @test GNSSReceiver.has_current_observations(link, state, system, 5)
+    empty!(get_filtered_prompts(state, key, 5, 1))
+    @test !GNSSReceiver.has_current_observations(link, state, system, 5)
+end

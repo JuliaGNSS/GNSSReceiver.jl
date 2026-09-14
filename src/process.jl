@@ -284,6 +284,7 @@ function process(
                 sampling_freq,
                 runtime,
                 integration_time;
+                correlator_source,
                 time_in_lock_before_calculating_pvt,
                 enable_ionospheric_correction,
                 enable_tropospheric_correction,
@@ -331,6 +332,7 @@ function update_navigation(
     sampling_freq,
     runtime,
     integration_time;
+    correlator_source = nothing,
     time_in_lock_before_calculating_pvt = 2s,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
@@ -342,6 +344,7 @@ function update_navigation(
         receiver_sat_states,
         pvt,
         pvt_sat_state_buffer;
+        correlator_source,
         time_in_lock_before_calculating_pvt,
         enable_ionospheric_correction,
         enable_tropospheric_correction,
@@ -364,6 +367,7 @@ function update_navigation(
     sampling_freq,
     runtime,
     integration_time;
+    correlator_source = nothing,
     time_in_lock_before_calculating_pvt = 2s,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
@@ -377,6 +381,7 @@ function update_navigation(
             receiver_sat_states,
             sampling_freq,
             integration_time;
+            correlator_source,
             enable_ionospheric_correction,
             enable_tropospheric_correction,
             pvt_approximate_year,
@@ -389,6 +394,7 @@ function update_navigation(
             receiver_sat_states,
             pvt,
             pvt_sat_state_buffer;
+            correlator_source,
             time_in_lock_before_calculating_pvt,
             enable_ionospheric_correction,
             enable_tropospheric_correction,
@@ -453,12 +459,14 @@ function collect_pvt_sat_states!(
     systems,
     receiver_sat_states,
     track_state,
-    time_in_lock_before_calculating_pvt,
+    time_in_lock_before_calculating_pvt;
+    correlator_source = nothing,
 )
     for system in systems
         group_key = signal_group_key(system)
         for receiver_sat_state in receiver_sat_states[group_key]
-            if is_in_lock(receiver_sat_state) &&
+            if has_current_observations(correlator_source, track_state, system, receiver_sat_state.prn) &&
+               is_in_lock(receiver_sat_state) &&
                is_ranging_ready(receiver_sat_state) &&
                receiver_sat_state.time_in_lock > time_in_lock_before_calculating_pvt
                 # Hand PVT the *ranging* signal (the pilot, for a combined spec) as
@@ -491,6 +499,7 @@ function update_pvt(
     receiver_sat_states,
     pvt,
     pvt_sat_state_buffer;
+    correlator_source = nothing,
     time_in_lock_before_calculating_pvt = 2s,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
@@ -504,7 +513,8 @@ function update_pvt(
         all_systems,
         receiver_sat_states,
         track_state,
-        time_in_lock_before_calculating_pvt,
+        time_in_lock_before_calculating_pvt;
+        correlator_source,
     )
 
     calc_pvt(

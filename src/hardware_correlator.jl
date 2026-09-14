@@ -872,7 +872,12 @@ than held in a lock nothing is confirming.
     ```julia
     GNSSReceiver.is_observation_gap(w::MyWrapper, track_state, group_key, prn) =
         GNSSReceiver.is_observation_gap(w.link, track_state, group_key, prn)
+    GNSSReceiver.has_current_observations(w::MyWrapper, track_state, system, prn) =
+        GNSSReceiver.has_current_observations(w.link, track_state, system, prn)
     ```
+
+    The second method keeps stale bit counts out of navigation while the first
+    preserves lock through a bounded gap.
 """
 is_observation_gap(correlator_source, track_state, group_key, prn) = false
 
@@ -886,6 +891,20 @@ function is_observation_gap(
     # one per completed record, so "empty" is exactly "no record this chunk".
     isempty(get_filtered_prompts(track_state, group_key, prn, RANGING_SIGNAL_INDEX)) &&
         is_within_dump_gap_budget(link, group_key, prn)
+end
+
+# Lock detectors may coast through a transport gap, but navigation must not use
+# the frozen decoder bit count with a code phase that keeps wrapping. Require
+# records on both the ranging and data components, regardless of the lock-gap
+# budget. The software path retains its normal measurement cadence.
+has_current_observations(source, track_state, system, prn) = true
+function has_current_observations(link::HardwareCorrelatorLink, track_state, system, prn)
+    group_key = signal_group_key(system)
+    sats = get_sat_states(track_state, group_key)
+    haskey(sats, prn) || return false
+    all((RANGING_SIGNAL_INDEX, data_signal_index(system))) do signal_index
+        !isempty(get_filtered_prompts(track_state, group_key, prn, signal_index))
+    end
 end
 
 # Whether the satellite's hardware channel has been silent for less than the
@@ -1749,20 +1768,17 @@ function _account_record_continuity!(
     if expected_start != typemin(Int64)
         gap = record_start - expected_start
         if gap > 0
-            # Two different faults, told apart by size. A record that never
-            # reached the host costs at least one whole epoch of span — you
-            # cannot lose a dump and lose less than the span it covered. A
-            # shorter hole is the device not integrating at all, which is what a
-            # channel re-arm looks like: `assign_channel!`'s phase load takes
-            # effect some milliseconds after the host issued it, the channel
-            # stops, and it resumes with a *short* record running to the next
-            # epoch boundary. The hole is the remainder of that epoch, so it is
-            # always under one. Charging the two together made every handover
-            # read as dropped correlator output (issue #107).
-            # Either way the records after the hole are a different stretch of
-            # signal: close the coherent accumulation before it.
+            # A re-arm leaves a sub-period hole followed by a short record.
+            # Compare against the signal's Doppler-adjusted primary period,
+            # not the previous record: adjacent full periods can differ by a
+            # sample, and the previous record can itself be a short arm record.
+            signal = get_signal(Tracking.get_signals(sat_state)[assignment.signal_index])
+            code_rate = ustrip(Hz, get_code_frequency(signal) + get_code_doppler(sat_state))
+            min_period_samples = floor(
+                Int, get_code_length(signal) * link.sampling_freq_hz / code_rate,
+            )
             _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
-            if gap < link.last_record_samples[hw_channel]
+            if gap < min_period_samples && output.integrated_samples < min_period_samples
                 link.rearm_dead_samples[hw_channel] += gap
                 link.rearm_gaps += 1
             else

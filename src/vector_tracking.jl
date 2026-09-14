@@ -1772,6 +1772,7 @@ function run_vt_iteration(
     receiver_sat_states,
     sampling_freq,
     integration_time;
+    correlator_source = nothing,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
     pvt_approximate_year::Integer = year(now(UTC)),
@@ -1809,7 +1810,10 @@ function run_vt_iteration(
         # would also withhold discriminators from *existing* members, which is wrong. The
         # two uses need separating first; the filter meanwhile has its own innovation-based
         # release.
-        prns_in_lock = filter(prn -> is_in_lock(receiver_group_states[prn]), eligible_prns)
+        prns_in_lock = filter(eligible_prns) do prn
+            is_in_lock(receiver_group_states[prn]) &&
+                has_current_observations(correlator_source, track_state, system, prn)
+        end
         enable_vt!(track_state, group_key, prns_in_lock)
         member_prns = [get_prn(sat) for sat in tracked_sats if in_vt_loop(sat)]
         ineligible = setdiff(member_prns, eligible_prns)

@@ -815,6 +815,7 @@ function receive(
                     num_ants,
                     acquire_every,
                     acq_pfa,
+                    code_lock_cn0_threshold,
                     pvt_update_interval,
                     time_in_lock_before_calculating_pvt,
                     enable_ionospheric_correction,
