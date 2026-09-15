@@ -84,6 +84,7 @@ export ReceiverState,
     CorrelatorDump,
     NCOUpdate,
     HardwareCorrelatorLink,
+    NCOReferencedPLLAndDLL,
     raw_sample_channel,
     correlator_dump_channel,
     nco_update_channel,
@@ -826,6 +827,7 @@ end
 include("read_file.jl")
 include("hardware_correlator.jl")
 include("receive.jl")
+include("nco_referenced_loop.jl")
 include("process.jl")
 include("async_acquisition.jl")
 include("gui.jl")

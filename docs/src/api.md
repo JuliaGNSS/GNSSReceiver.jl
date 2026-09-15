@@ -57,6 +57,18 @@ take_bit_clock_restart!
 coherent_integration_blocks
 advance_tracking!
 flush_partial_records!
+push_nco_updates!
+estimate_dopplers!
+```
+
+### The delay-aware tracking loop
+
+```@docs
+NCOReferencedPLLAndDLL
+GNSSReceiver.SatNCOReferencedPLLAndDLL
+NCOTimeline
+mean_nco_word
+FixedNCOWord
 ```
 
 ## Consuming the results

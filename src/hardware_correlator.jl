@@ -356,6 +356,144 @@ assignment_start_sample(::AbstractHardwareCorrelatorSDR, hw_channel) = typemin(I
 # Host-side ingest state
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# What the device NCO ran: per-channel word timelines
+# ─────────────────────────────────────────────────────────────────────────────
+
+# One NCO word the host has scheduled at a named device sample (`apply_at_sample`
+# of the `NCOUpdate` that carried it). Plain `Float64` Hz, like `NCOUpdate`.
+struct ScheduledNCOWord
+    sample::Int64
+    carrier_doppler::Float64
+    code_doppler::Float64
+end
+
+"""
+    NCOTimeline
+
+The carrier and code words one hardware channel's NCOs ran and will run: the
+word in effect now and the words already scheduled at named device samples.
+
+A hardware loop is closed through a device that holds each word until the next
+one lands, milliseconds after the record that motivated it ended. The loop
+filter therefore cannot assume that the word it last computed is the one a
+record was integrated under — during a pull-in the two differ by tens of Hz —
+and a correction computed against the wrong word restates an error the device
+is already about to remove. The timeline is the link's record of what the NCO
+actually did, so the estimator can attribute every record to the word that
+really ran ([`mean_nco_word`](@ref)) and size its correction for the moment it
+will land ([`NCOReferencedPLLAndDLL`](@ref)).
+
+Fed by [`push_nco_updates!`](@ref) with every update the device accepted, and
+reset at every handover to the words `assign_channel!` loaded. Only words the
+device has actually been sent are entered — an update the feedback ring
+refused never reaches the NCO, so it never reaches the timeline either.
+"""
+mutable struct NCOTimeline
+    applied_carrier_doppler::Float64
+    applied_code_doppler::Float64
+    # Ascending in `sample`; every entry lands strictly after the applied word.
+    const scheduled::Vector{ScheduledNCOWord}
+end
+
+NCOTimeline() = NCOTimeline(0.0, 0.0, ScheduledNCOWord[])
+
+# A handover: the device starts on these words and nothing is in flight.
+function reset_timeline!(timeline::NCOTimeline, carrier_doppler_hz, code_doppler_hz)
+    timeline.applied_carrier_doppler = Float64(carrier_doppler_hz)
+    timeline.applied_code_doppler = Float64(code_doppler_hz)
+    empty!(timeline.scheduled)
+    timeline
+end
+
+# Record a word the device has accepted for `sample`. A device keeps the newest
+# command for a given sample, and the link never schedules a later command for
+# an earlier sample, so anything queued at or past `sample` is superseded.
+function schedule_word!(timeline::NCOTimeline, sample, carrier_doppler_hz, code_doppler_hz)
+    while !isempty(timeline.scheduled) && last(timeline.scheduled).sample >= sample
+        pop!(timeline.scheduled)
+    end
+    push!(
+        timeline.scheduled,
+        ScheduledNCOWord(Int64(sample), Float64(carrier_doppler_hz), Float64(code_doppler_hz)),
+    )
+    timeline
+end
+
+# Everything scheduled at or before `sample` has landed: fold it into the applied
+# word. Only call this once no query will start before `sample` again.
+function promote_words!(timeline::NCOTimeline, sample)
+    n = 0
+    for word in timeline.scheduled
+        word.sample <= sample || break
+        timeline.applied_carrier_doppler = word.carrier_doppler
+        timeline.applied_code_doppler = word.code_doppler
+        n += 1
+    end
+    n == 0 || deleteat!(timeline.scheduled, 1:n)
+    timeline
+end
+
+# Whether a scheduled word takes effect in `(lo, hi]`, i.e. whether records
+# ending at `lo` and starting at `hi` ran on different words.
+word_changes_within(timeline::NCOTimeline, lo, hi) =
+    any(word -> lo < word.sample <= hi, timeline.scheduled)
+
+# The word in effect at device sample `sample`.
+function nco_word_at(timeline::NCOTimeline, sample)
+    carrier, code = timeline.applied_carrier_doppler, timeline.applied_code_doppler
+    for word in timeline.scheduled
+        word.sample <= sample || break
+        carrier, code = word.carrier_doppler, word.code_doppler
+    end
+    carrier, code
+end
+
+"""
+    mean_nco_word(words, a, b) -> (carrier_doppler_hz, code_doppler_hz)
+
+Time-weighted mean of the carrier and code words in effect over the device
+samples `[a, b)` — the replica frequencies a record integrated over that span
+was really correlated with. For `b <= a` the word in effect at `a`.
+
+`words` is an [`NCOTimeline`](@ref) for a hardware channel, or a
+[`FixedNCOWord`](@ref) where the replica ran on one known word (the software
+receiver regenerates its replicas from the satellite's Doppler every chunk).
+"""
+function mean_nco_word(timeline::NCOTimeline, a::Real, b::Real)
+    total = b - a
+    total > 0 || return nco_word_at(timeline, a)
+    carrier, code = timeline.applied_carrier_doppler, timeline.applied_code_doppler
+    carrier_sum = 0.0
+    code_sum = 0.0
+    t = a
+    for word in timeline.scheduled
+        word.sample >= b && break
+        if word.sample > t
+            carrier_sum += carrier * (word.sample - t)
+            code_sum += code * (word.sample - t)
+            t = word.sample
+        end
+        carrier, code = word.carrier_doppler, word.code_doppler
+    end
+    carrier_sum += carrier * (b - t)
+    code_sum += code * (b - t)
+    carrier_sum / total, code_sum / total
+end
+
+"""
+    FixedNCOWord(carrier_doppler_hz, code_doppler_hz)
+
+A replica that ran on one known word for every span asked about — what the
+software receiver's replicas do within a chunk. See [`mean_nco_word`](@ref).
+"""
+struct FixedNCOWord
+    carrier_doppler::Float64
+    code_doppler::Float64
+end
+
+mean_nco_word(word::FixedNCOWord, a::Real, b::Real) = word.carrier_doppler, word.code_doppler
+
 # One hardware channel's current occupant. `signal_index` addresses the
 # component within the satellite's `tracking_signals` tuple, so a pilot/data
 # pair simply occupies two hardware channels.
@@ -384,7 +522,12 @@ Keywords:
     primary code period of `reference_signal`.
   - `feedback_delay_epochs` — how many epochs ahead an [`NCOUpdate`](@ref) is
     scheduled, i.e. the `n` in "the correction from epoch `k` applies at
-    `k + n`". Must be large enough to cover the PCIe round trip.
+    `k + n`". Must be large enough to cover the PCIe round trip. The link
+    records every accepted update in the channel's [`NCOTimeline`](@ref), so a
+    delay-aware estimator ([`NCOReferencedPLLAndDLL`](@ref), the hardware
+    receiver's default) sees both the word each record ran on and the sample
+    its own correction will land at; the delay is then a known constant the
+    loop compensates rather than a lag it has to be de-tuned for.
   - `max_dumps_per_drain` — cap on records pulled from the ring per chunk, so a
     backlog cannot monopolise one call.
   - `max_catchup_epochs` — how far the fold loop replays before treating the
@@ -606,8 +749,29 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     # again, in raw samples. Without a bound a permanently dead dump path would
     # hold every satellite in lock for ever.
     const max_dump_gap_samples::Int64
+    # ── NCO word timelines, per hardware channel ─────────────────────────────
+    # What each channel's NCOs ran and will run (see `NCOTimeline`): reset to
+    # the handover words by `_assign!`, extended by `push_nco_updates!` with
+    # every update the device accepted, and folded forward by
+    # `promote_applied_words!` once the records that ran on a word have been
+    # folded. This is what lets the estimator attribute a record to the word
+    # that really ran under it, and what lets the record accumulation cut on a
+    # word boundary the way it cuts on a bit edge.
+    const nco_timelines::Vector{NCOTimeline}
+    # Stand-in for a satellite the link holds no channel for; it never carries
+    # records, so its words are never read.
+    const unassigned_timeline::NCOTimeline
+    # Device sample the updates computed from the fold in progress will land
+    # at (`push_nco_updates!` schedules every channel's update there). Set
+    # before the estimator runs so a delay-aware estimator can size its
+    # correction for that moment; `typemin` until the first fold.
+    scheduled_apply_at_sample::Int64
     # Diagnostics.
     dropped_dumps::Int
+    # `NCOUpdate`s the feedback ring refused because the device's writer was not
+    # keeping up. Each one is a chunk in which every channel free-ran on its
+    # previous word — the loop was open, and the estimator has to know it.
+    dropped_nco_updates::Int
     stale_dumps::Int
     unassignable_signals::Int
     skipped_epochs::Int
@@ -741,6 +905,10 @@ function HardwareCorrelatorLink(
         0,
         fill(typemin(Int64), n),
         max_dump_gap_samples,
+        [NCOTimeline() for _ = 1:n],
+        NCOTimeline(),
+        typemin(Int64),
+        0,
         0,
         0,
         0,
@@ -1223,6 +1391,7 @@ function release_stale_channels!(link, track_state)
         link.pending_blocks[hw_channel] = 0
         link.bit_clock_lost[hw_channel] = false
         filter!(!=(assignment), link.bit_clock_restarts)
+        reset_timeline!(link.nco_timelines[hw_channel], 0.0, 0.0)
         # A part-accumulated record belongs to the satellite that just left; it
         # can neither be finished nor handed to anyone else.
         _discard_partial!(link, hw_channel)
@@ -1320,6 +1489,13 @@ function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampl
     # dump-gap budget is spent from here rather than from whatever the previous
     # occupant left behind.
     link.last_record_at_samples[hw_channel] = link.samples_consumed
+    # The device starts on exactly the words just handed to `assign_channel!`,
+    # and nothing scheduled for the previous occupant applies to this one.
+    reset_timeline!(
+        link.nco_timelines[hw_channel],
+        ustrip(Hz, uconvert(Hz, get_carrier_doppler(sat_state))),
+        ustrip(Hz, uconvert(Hz, get_code_doppler(sat_state))),
+    )
     _discard_partial!(link, hw_channel)
     link
 end
@@ -1482,14 +1658,54 @@ function fold_closed_epochs!(
     # on this path fills it, so the reference has to land before the estimator
     # runs, not after it.
     append_noise_observations!(link, track_state, band_systems, band_measurements)
-    Tracking.estimate_dopplers_and_filter_prompt!(track_state, band_measurements)
+    # Where this fold's corrections will land, decided before the estimator runs
+    # so it can size them for that moment (`push_nco_updates!` schedules them
+    # at exactly this sample).
+    link.scheduled_apply_at_sample = nco_apply_at_sample(link, boundary)
+    estimate_dopplers!(link, track_state, band_measurements)
     # The estimator consumed every record emitted this chunk, so the bit buffers
     # are current again and nothing is pending against them.
     fill!(link.pending_blocks, 0)
     anchor_bit_phases!(link, track_state, boundary)
     restart_lost_bit_clocks!(link, track_state)
     push_nco_updates!(link, track_state, boundary)
+    promote_applied_words!(link)
     folds
+end
+
+"""
+    estimate_dopplers!(link, track_state, band_measurements) -> TrackState
+
+Run the tracking state's Doppler estimator over the records the link folded
+this chunk. `Tracking`'s estimators are called as they are; an
+[`NCOReferencedPLLAndDLL`](@ref) is additionally handed the link's per-channel
+[`NCOTimeline`](@ref)s and the sample its corrections will land at.
+"""
+estimate_dopplers!(link::HardwareCorrelatorLink, track_state, band_measurements) =
+    Tracking.estimate_dopplers_and_filter_prompt!(track_state, band_measurements)
+
+# The device sample at which the updates from the fold closing `boundary` are
+# scheduled: `feedback_delay_epochs` past the newest record the host has seen.
+# See `push_nco_updates!` for why the newest record rather than the boundary.
+nco_apply_at_sample(link::HardwareCorrelatorLink, boundary) =
+    Int64(max(boundary, link.latest_sample_index)) +
+    Int64(link.feedback_delay_epochs) * Int64(link.epoch_length)
+
+# Fold each channel's timeline forward over the words its folded records ran
+# on. Everything scheduled up to the start of the newest folded record has
+# landed and can be absorbed into the applied word; no later query starts
+# before that record's centre, so nothing the estimator will ask about is lost.
+function promote_applied_words!(link::HardwareCorrelatorLink)
+    for hw_channel in eachindex(link.assignments)
+        isnothing(link.assignments[hw_channel]) && continue
+        last_end = link.last_record_end[hw_channel]
+        last_end == typemin(Int64) && continue
+        promote_words!(
+            link.nco_timelines[hw_channel],
+            last_end - link.last_record_samples[hw_channel],
+        )
+    end
+    link
 end
 
 """
@@ -1986,6 +2202,18 @@ end
 function _accumulate_dump!(link, track_state, assignment, sat_state, hw_channel, output)
     target = coherent_integration_blocks(link, sat_state, assignment.signal_index, hw_channel)
     blocks = _record_code_blocks(link, sat_state, assignment.signal_index, output)
+    # A record is cut where the NCO word changed, the way it is cut on a bit
+    # edge: the dumps accumulated so far ran on one word and this one starts on
+    # another, and a record straddling the switch could be attributed to
+    # neither. (A switch *inside* a dump cannot be cut; `mean_nco_word` weights
+    # the two words by the samples each ran for.)
+    if link.partial_blocks[hw_channel] > 0 && word_changes_within(
+        link.nco_timelines[hw_channel],
+        link.partial_end[hw_channel] - link.partial_samples[hw_channel],
+        output.sample_index - output.integrated_samples,
+    )
+        _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
+    end
     if link.partial_blocks[hw_channel] == 0
         link.partial_correlator[hw_channel] = output.correlator
         link.partial_samples[hw_channel] = output.integrated_samples
@@ -2120,15 +2348,18 @@ update late by however far behind the host is — or, on a device that honours t
 schedule strictly, to discard it. Anchoring to the newest record keeps the
 correction a fixed, small distance in the *device's* future either way.
 
+Every update the device accepts is entered in its channel's
+[`NCOTimeline`](@ref), so the estimator can later attribute records to the word
+that ran under them.
+
 A full ring means the device's writer is not keeping up; the updates are
-dropped rather than blocking the receiver, and counted in `link.dropped_dumps`'
-sibling diagnostics.
+dropped rather than blocking the receiver, counted in `link.dropped_nco_updates`
+and kept out of the timelines — the device never saw them, so every channel
+runs on its previous word for another chunk.
 """
 function push_nco_updates!(link::HardwareCorrelatorLink, track_state, boundary)
     channel = link.ncos
-    apply_at_sample =
-        max(boundary, link.latest_sample_index) +
-        link.feedback_delay_epochs * link.epoch_length
+    apply_at_sample = nco_apply_at_sample(link, boundary)
     empty!(link.nco_buffer)
     for hw_channel in eachindex(link.assignments)
         assignment = link.assignments[hw_channel]
@@ -2148,8 +2379,22 @@ function push_nco_updates!(link::HardwareCorrelatorLink, track_state, boundary)
         )
     end
     isempty(link.nco_buffer) && return 0
-    length(link.nco_buffer) <= n_avail_space(channel) || return 0
+    if length(link.nco_buffer) > n_avail_space(channel)
+        link.dropped_nco_updates += length(link.nco_buffer)
+        @warn "NCO feedback ring full; this chunk's corrections were dropped and every " *
+              "hardware channel free-runs on its previous word" dropped_total =
+            link.dropped_nco_updates maxlog = 10
+        return 0
+    end
     put!(channel, link.nco_buffer)
+    for update in link.nco_buffer
+        schedule_word!(
+            link.nco_timelines[update.channel],
+            update.apply_at_sample,
+            update.carrier_doppler,
+            update.code_doppler,
+        )
+    end
     length(link.nco_buffer)
 end
 

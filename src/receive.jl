@@ -548,6 +548,19 @@ for what a vendor package has to provide.
 `feedback_delay_epochs` how far ahead each NCO update is scheduled so the loop
 delay stays a known constant. Every other keyword is [`receive`](@ref)'s.
 
+The tracking loops default to the delay-aware [`NCOReferencedPLLAndDLL`](@ref)
+at each signal's reference bandwidth (18 Hz for GPS L1 C/A): the conventional
+loop at that bandwidth cannot hold a lock through the few milliseconds between
+a record and the NCO write it motivates (issue #107), and lowering its bandwidth
+trades that for a loop four to five times noisier than the software receiver's.
+Pass `doppler_estimator` to override; under `vector_tracking` the vector
+estimator is used as in the software receiver.
+
+Pass a pre-built `link` (a [`HardwareCorrelatorLink`](@ref) over `sdr`) to keep
+hold of it — its diagnostic counters are the only record of dump-stream gaps,
+dropped feedback and skipped epochs. The link's own keywords are then ignored
+here, since the link already carries them.
+
 Acquisition runs asynchronously by default here (`acquire_async = true`), unlike
 the plain sample-channel methods: a hardware-correlator receiver is live by
 construction, and a scan that blocked the chunk pipeline would delay the NCO
@@ -576,16 +589,26 @@ function receive(
     correlator_gain = nothing,
     acquire_async::Bool = true,
     processing_threadpool::Symbol = :interactive,
+    doppler_estimator = nothing,
+    vector_tracking::Union{Bool,VectorTracking} = false,
+    link::Union{Nothing,HardwareCorrelatorLink} = nothing,
     kwargs...,
 )
-    link = HardwareCorrelatorLink(
-        sdr;
-        sampling_freq,
-        reference_signal = ranging_signal(first(as_systems(systems))),
-        doppler_update_interval,
-        feedback_delay_epochs,
-        correlator_gain,
-    )
+    if isnothing(link)
+        link = HardwareCorrelatorLink(
+            sdr;
+            sampling_freq,
+            reference_signal = ranging_signal(first(as_systems(systems))),
+            doppler_update_interval,
+            feedback_delay_epochs,
+            correlator_gain,
+        )
+    elseif get_sdr(link) !== sdr
+        throw(ArgumentError("`link` was built over a different device than `sdr`"))
+    end
+    if isnothing(doppler_estimator) && !vt_enabled(vector_tracking)
+        doppler_estimator = NCOReferencedPLLAndDLL()
+    end
     receive(
         raw_sample_channel(sdr),
         systems,
@@ -593,6 +616,8 @@ function receive(
         correlator_source = link,
         acquire_async,
         processing_threadpool,
+        doppler_estimator,
+        vector_tracking,
         kwargs...,
     )
 end
