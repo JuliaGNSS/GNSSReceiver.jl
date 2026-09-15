@@ -471,238 +471,42 @@ end
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# A simulated FPGA correlator: the software stand-in for the real gateware.
-#
-# It generates the received signal, puts it on the raw channel *and* correlates
-# it with its own replicas — exactly the "non-intrusive observer on the RX
-# stream" arrangement the LiteX-M2SDR gateware uses — then emits one dump per
-# code period per channel plus a periodic epoch strobe, and applies the NCO
-# updates the host sends back at their scheduled sample.
-#
-# Nothing here is a mock: the loop really has to close through it, so if the
-# ingest path fed the estimator the wrong accumulator order, the wrong spacing,
-# a wrong epoch tag or dropped the feedback, the satellite would lose lock.
+# Closed loop through a simulated FPGA correlator (test/simulated_fpga.jl): the
+# device generates nothing itself — the test puts the received signal on the
+# raw channel *and* has the device correlate it with its own replicas, exactly
+# the "non-intrusive observer on the RX stream" arrangement the LiteX-M2SDR
+# gateware uses — then emits one dump per code period per channel plus a
+# periodic epoch strobe, and applies the NCO updates the host sends back at
+# their scheduled sample.
 # ─────────────────────────────────────────────────────────────────────────────
 
-using SignalChannels: SignalChannel
-using Tracking: get_early_late_sample_spacing
+include("simulated_fpga.jl")
 
-# One channel's replica state, i.e. what the gateware's NCOs hold.
-mutable struct SimulatedChannel
-    prn::Int
-    carrier_phase::Float64      # cycles
-    carrier_doppler::Float64    # Hz
-    code_phase::Float64         # chips
-    code_doppler::Float64       # Hz
-    el_offset_samples::Float64  # prompt→early lead, in samples
-    accumulators::MVector{3,ComplexF64}   # [late, prompt, early]
-    integrated_samples::Int
-    active::Bool
-end
-
-# Every field is concretely typed, including `raw` and `system`. That is not
-# cosmetic: `GPSL1CA` is a *parametric* type (`GPSL1CA{Matrix{Int16}}` — it
-# carries its code table), so a bare `system::GPSL1CA` field is abstract, and
-# the per-sample `get_code(sdr.system, …)` in `_correlate_chunk!` then goes
-# through dynamic dispatch and boxes its result: ~430 B per sample, i.e.
-# ~1.7 GB of garbage per second of replayed signal, which is most of the
-# closed-loop test's runtime.
-mutable struct SimulatedFPGA{C,R<:SignalChannel,S<:AbstractGNSSSignal} <:
-               AbstractHardwareCorrelatorSDR
-    const raw::R
-    const dumps::PipeChannel{CorrelatorDump{C}}
-    const ncos::PipeChannel{NCOUpdate}
-    const channels::Vector{SimulatedChannel}
-    const lock::ReentrantLock
-    const system::S
-    const sampling_freq::Float64
-    const epoch_length::Int
-    # The device's free-running sample counter, shared by both streams.
-    sample_count::Int
-    # NCO updates accepted but not yet due.
-    const scheduled::Vector{NCOUpdate}
-    const applied::Vector{NCOUpdate}
-    const handovers::Vector{Any}
-    # A deliberate handover code-phase error, in chips. Real handovers are never
-    # exact, and it is what forces the DLL to actually do something: without it
-    # the replica starts on truth and the code loop's sign is unobservable over a
-    # short run.
-    const handover_code_phase_error::Float64
-end
-
-GNSSReceiver.raw_sample_channel(sdr::SimulatedFPGA) = sdr.raw
-GNSSReceiver.correlator_dump_channel(sdr::SimulatedFPGA) = sdr.dumps
-GNSSReceiver.nco_update_channel(sdr::SimulatedFPGA) = sdr.ncos
-GNSSReceiver.num_hardware_channels(sdr::SimulatedFPGA) = length(sdr.channels)
-
-function GNSSReceiver.release_channel!(sdr::SimulatedFPGA, hw_channel)
-    @lock sdr.lock sdr.channels[hw_channel].active = false
-    nothing
-end
-
-function GNSSReceiver.assign_channel!(
-    sdr::SimulatedFPGA,
-    hw_channel,
-    prn,
-    carrier_doppler,
-    code_doppler,
-    code_phase,
-    valid_at_sample;
-    el_sample_spacing,
-    signal,
+# Run the whole receiver against the simulated device on `seconds` of a synthetic
+# GPS L1 C/A signal at `true_doppler`, with the link scheduling its feedback
+# `feedback_delay_epochs` ahead. `doppler_estimator = nothing` is the hardware
+# receiver's default estimator.
+function run_simulated_closed_loop(;
+    chunk,
+    feedback_delay_epochs = 2,
+    doppler_estimator = nothing,
+    seconds = 1.4,
+    prn = 11,
+    true_doppler = 1200.0,             # Hz
+    initial_code_phase = 137.4,        # chips
+    amplitude = 0.126,                 # ≈ 45 dBHz against unit-variance noise
+    handover_code_phase_error = 0.25,  # chips the DLL has to pull in
+    n_channels = 4,
 )
-    @lock sdr.lock begin
-        # The handover describes the satellite at `valid_at_sample` on the host's
-        # raw-sample count. This device's counter is the same stream, so the
-        # phase only has to be propagated over the samples generated since.
-        carrier_doppler_hz = ustrip(uconvert(Hz, carrier_doppler))
-        code_doppler_hz = ustrip(uconvert(Hz, code_doppler))
-        code_freq = ustrip(uconvert(Hz, get_code_frequency(sdr.system))) + code_doppler_hz
-        elapsed = sdr.sample_count - valid_at_sample
-        ch = sdr.channels[hw_channel]
-        ch.prn = prn
-        ch.carrier_doppler = carrier_doppler_hz
-        ch.carrier_phase = 0.0
-        ch.code_doppler = code_doppler_hz
-        ch.code_phase = mod(
-            code_phase + sdr.handover_code_phase_error +
-            code_freq * elapsed / sdr.sampling_freq,
-            get_code_length(sdr.system),
-        )
-        # Program exactly the spacing the host quantised; half of the E-to-L
-        # distance is the prompt→early lead.
-        ch.el_offset_samples = el_sample_spacing / 2
-        ch.accumulators .= 0
-        ch.integrated_samples = 0
-        ch.active = true
-        push!(sdr.handovers, (; hw_channel, prn, el_sample_spacing, valid_at_sample, signal))
-    end
-    nothing
-end
-
-# Apply every scheduled update whose sample has arrived. This is the deterministic
-# apply point that makes the feedback delay a constant.
-function _apply_due_ncos!(sdr::SimulatedFPGA)
-    while Base.n_avail(sdr.ncos) > 0
-        push!(sdr.scheduled, take!(sdr.ncos))
-    end
-    due = filter(u -> u.apply_at_sample <= sdr.sample_count, sdr.scheduled)
-    filter!(u -> u.apply_at_sample > sdr.sample_count, sdr.scheduled)
-    for u in due
-        ch = sdr.channels[u.channel]
-        (ch.active && ch.prn == u.prn) || continue
-        ch.carrier_doppler = u.carrier_doppler
-        ch.code_doppler = u.code_doppler
-        push!(sdr.applied, u)
-    end
-    sdr
-end
-
-# Correlate one chunk and emit whatever records it completed.
-function _correlate_chunk!(sdr::SimulatedFPGA{C}, samples) where {C}
-    code_length = get_code_length(sdr.system)
-    nominal_code_freq = ustrip(uconvert(Hz, get_code_frequency(sdr.system)))
-    out = CorrelatorDump{C}[]
-    @lock sdr.lock begin
-        for k in eachindex(samples)
-            _apply_due_ncos!(sdr)
-            sample = ComplexF64(samples[k])
-            for (index, ch) in enumerate(sdr.channels)
-                ch.active || continue
-                code_freq = nominal_code_freq + ch.code_doppler
-                el_chips = ch.el_offset_samples * code_freq / sdr.sampling_freq
-                wipeoff = sample * cis(-2π * ch.carrier_phase)
-                # [late, prompt, early] — Tracking's accumulator order.
-                for (slot, offset) in ((1, -el_chips), (2, 0.0), (3, el_chips))
-                    code = get_code(sdr.system, ch.code_phase + offset, ch.prn)
-                    ch.accumulators[slot] += wipeoff * code
-                end
-                ch.carrier_phase += ch.carrier_doppler / sdr.sampling_freq
-                ch.code_phase += code_freq / sdr.sampling_freq
-                ch.integrated_samples += 1
-                if ch.code_phase >= code_length
-                    ch.code_phase -= code_length
-                    push!(
-                        out,
-                        CorrelatorDump(
-                            index,
-                            ch.prn,
-                            CorrelatorOutput(
-                                EarlyPromptLateCorrelator(
-                                    SVector{3,ComplexF64}(ch.accumulators),
-                                    1,
-                                ),
-                                ch.integrated_samples,
-                                sdr.sample_count + 1,
-                            ),
-                            # The replica's code phase at the dump sample — the
-                            # absolute anchor a real device latches alongside the
-                            # accumulators (`dump_code_phase` on the M2SDR).
-                            ch.code_phase,
-                        ),
-                    )
-                    ch.accumulators .= 0
-                    ch.integrated_samples = 0
-                end
-            end
-            sdr.sample_count += 1
-            # The timebase marker, emitted regardless of what the channels did.
-            if sdr.sample_count % sdr.epoch_length == 0
-                push!(out, epoch_strobe(epl(0, 0, 0), sdr.sample_count))
-            end
-        end
-    end
-    isempty(out) || put!(sdr.dumps, out)
-    out
-end
-
-# Two chunk lengths. 4000 samples is one code period at 4 MS/s, and it hides a
-# whole class of handover errors: anything off by a whole number of chunks
-# vanishes modulo the code length. 3000 samples (0.75 ms, 767.25 chips) does not
-# — a handover declared valid at the wrong end of the chunk lands 256 chips off
-# the peak and the loop never closes (regression: `advance_tracking!` used to
-# count the chunk before handing over its acquisitions).
-@testset "Closed loop through a simulated hardware correlator ($chunk-sample chunks)" for chunk in (4000, 3000)
     system = GPSL1CA()
-    prn = 11
     sampling_freq = 4e6Hz
     fs = 4e6
-    epoch = 4000                      # the link's fold epoch: one code period
-    # 1.4 s of signal. The link pushes one NCO update per *chunk* (see
-    # `push_nco_updates!`) rather than one per folded epoch, because that is how
-    # often a correction can actually reach a device; a device like this one,
-    # which honours `apply_at_sample` strictly, used to receive a whole per-epoch
-    # sequence during a catch-up and could replay it, so it pulled in within
-    # 700 ms. Same convergence, more signal to get there.
-    num_chunks = cld(1400 * 4000, chunk)
-    true_doppler = 1200.0             # Hz
-    initial_code_phase = 137.4        # chips
-    amplitude = 0.126                 # ≈ 45 dBHz against unit-variance noise
-    handover_code_phase_error = 0.25  # chips the DLL has to pull in
-
-    code_length = get_code_length(system)
+    num_chunks = cld(round(Int, seconds * fs), chunk)
     nominal_code_freq = ustrip(uconvert(Hz, get_code_frequency(system)))
     true_code_freq =
         nominal_code_freq + true_doppler * get_code_center_frequency_ratio(system)
 
-    # The type parameters follow from the field types, so the default
-    # constructor infers them.
-    sdr = SimulatedFPGA(
-        SignalChannel{ComplexF64,1}(chunk, 4),
-        PipeChannel{CorrelatorDump{EPL}}(1 << 16),
-        PipeChannel{NCOUpdate}(1 << 12),
-        [SimulatedChannel(0, 0.0, 0.0, 0.0, 0.0, 0.0, zero(MVector{3,ComplexF64}), 0, false)
-         for _ = 1:4],
-        ReentrantLock(),
-        system,
-        fs,
-        chunk,
-        0,
-        NCOUpdate[],
-        NCOUpdate[],
-        Any[],
-        handover_code_phase_error,
-    )
+    sdr = SimulatedFPGA(system; sampling_freq = fs, chunk, n_channels, handover_code_phase_error)
 
     producer = Threads.@spawn begin
         rng = Random.Xoshiro(0xC0FFEE)
@@ -712,18 +516,14 @@ end
                 n0 = c * chunk
                 for k = 1:chunk
                     t = (n0 + k - 1) / fs
-                    code = get_code(
-                        system,
-                        initial_code_phase + true_code_freq * t,
-                        prn,
-                    )
+                    code = get_code(system, initial_code_phase + true_code_freq * t, prn)
                     buf[k, 1] =
                         amplitude * code * cis(2π * true_doppler * t) +
                         (randn(rng, ComplexF64) / sqrt(2)) * sqrt(2)
                 end
                 # Tap first, exactly like the gateware's observer sees a word
                 # only once DMA0 accepted it, then hand it to the host.
-                _correlate_chunk!(sdr, view(buf, :, 1))
+                correlate_chunk!(sdr, view(buf, :, 1))
                 put!(sdr.raw, copy(buf))
             end
         finally
@@ -732,14 +532,22 @@ end
     end
     Base.errormonitor(producer)
 
+    link = HardwareCorrelatorLink(
+        sdr;
+        sampling_freq,
+        reference_signal = system,
+        feedback_delay_epochs,
+    )
     data_channel = receive(
         sdr,
         system,
         sampling_freq;
+        link,
+        doppler_estimator,
         # Keep this synthetic finite stream deterministic even when the test
         # runner has only one Julia thread. An asynchronous acquisition cannot
         # overlap there and may finish after the producer has already closed
-        # its 1.4 s stream, leaving no opportunity to merge the handover.
+        # its stream, leaving no opportunity to merge the handover.
         acquire_async = false,
         # Acquire early and often enough that the run has a handover.
         acquire_every = 20ms,
@@ -748,17 +556,64 @@ end
         # converge; the loop itself is what this test is about.
         time_in_lock_before_calculating_pvt = 1000u"s",
     )
-
     results = collect_data(data_channel)
     wait(producer)
+    (;
+        sdr,
+        link,
+        results,
+        system,
+        prn,
+        fs,
+        chunk,
+        true_doppler,
+        initial_code_phase,
+        true_code_freq,
+        handover_code_phase_error,
+    )
+end
 
-    key = (get_signal_id(system), prn)
+# The device's current code-phase error for `prn`, in chips, signed and wrapped.
+function simulated_code_error(r)
+    code_length = get_code_length(r.system)
+    tracked = only(filter(c -> c.active && c.prn == r.prn, r.sdr.channels))
+    true_code_phase =
+        mod(r.initial_code_phase + r.true_code_freq * r.sdr.sample_count / r.fs, code_length)
+    mod(tracked.code_phase - true_code_phase + code_length / 2, code_length) - code_length / 2
+end
+
+# Two chunk lengths at the default delay, then longer delays on 2 ms chunks.
+#
+# 4000 samples is one code period at 4 MS/s, and it hides a whole class of
+# handover errors: anything off by a whole number of chunks vanishes modulo the
+# code length. 3000 samples (0.75 ms, 767.25 chips) does not — a handover
+# declared valid at the wrong end of the chunk lands 256 chips off the peak and
+# the loop never closes (regression: `advance_tracking!` used to count the chunk
+# before handing over its acquisitions).
+#
+# 8000 samples is the 2 ms chunk the M2SDR example runs, at one, three and four
+# epochs of feedback delay. Three to four epochs is where the conventional
+# 18 Hz loop limit-cycles and loses every satellite on the board (see the
+# reference below); the default estimator has to hold lock at all of them with
+# the *same* bandwidth (issue #107, docs/plans/2026-09-14-delay-aware-hardware-loop.md).
+@testset "Closed loop through a simulated hardware correlator ($chunk-sample chunks, $delay-epoch delay)" for (chunk, delay) in (
+    (4000, 2),
+    (3000, 2),
+    (8000, 1),
+    (8000, 3),
+    (8000, 4),
+)
+    r = run_simulated_closed_loop(; chunk, feedback_delay_epochs = delay)
+    sdr = r.sdr
+    prn = r.prn
+    epoch = 4000                      # the link's fold epoch: one code period
+    key = (get_signal_id(r.system), prn)
 
     # 1. The satellite was handed over to hardware, and the device was programmed
     #    with the very spacing Tracking normalises the DLL discriminator by — a
     #    device using the raw preferred chip shift instead would mis-scale the
     #    loop gain.
-    @test length(results) > 0
+    @test length(r.results) > 0
     @test !isempty(sdr.handovers)
     # The bank's first handover is the C/N0 reference's own open-loop channel
     # (it is armed before the satellites, so that it cannot be the thing that
@@ -768,15 +623,15 @@ end
     handover = first(satellite_handovers)
     expected_spacing = get_early_late_sample_spacing(
         EarlyPromptLateCorrelator(num_ants = NumAnts(1)),
-        sampling_freq,
-        get_code_frequency(system),
+        4e6Hz,
+        get_code_frequency(r.system),
     )
     @test handover.el_sample_spacing == expected_spacing
     @test isinteger(handover.el_sample_spacing)
 
     # 2. It ended the run tracked and in lock — which can only happen if dumps
     #    were folded and the NCO feedback kept the device's replica aligned.
-    final = last(results)
+    final = last(r.results)
     @test haskey(final.sat_data, key)
     @test final.sat_data[key].cn0 > 35dBHz
 
@@ -784,20 +639,15 @@ end
     #    Doppler it converged on is the true one.
     @test !isempty(sdr.applied)
     converged = last(sdr.applied)
-    @test converged.carrier_doppler ≈ true_doppler atol = 15.0
+    @test converged.carrier_doppler ≈ r.true_doppler atol = 15.0
+    # No correction was refused by the feedback ring.
+    @test r.link.dropped_nco_updates == 0
 
     # 4. The code loop closed too. The device was deliberately handed a replica
     #    0.25 chips off truth; only a DLL whose discriminator sign and spacing
     #    convention match the device's accumulator order pulls that in. Swap E
     #    and L in the device and this is what diverges.
-    tracked = only(filter(c -> c.active && c.prn == prn, sdr.channels))
-    true_code_phase = mod(
-        initial_code_phase + true_code_freq * sdr.sample_count / fs,
-        code_length,
-    )
-    code_error = mod(tracked.code_phase - true_code_phase + code_length / 2, code_length) -
-                 code_length / 2
-    @test abs(code_error) < 0.5 * handover_code_phase_error
+    @test abs(simulated_code_error(r)) < 0.5 * r.handover_code_phase_error
 
     # 5. Updates are scheduled on the epoch grid, a fixed number of epochs
     #    ahead — that is what makes the loop delay deterministic. Checked where
@@ -809,6 +659,28 @@ end
         @test all(d -> d % epoch == 0, deltas)
     end
 end
+
+# The documented failing reference: the conventional FLL-assisted loop at the
+# signal's 18 Hz reference bandwidth, three epochs of feedback delay, 2 ms
+# chunks — the hardware receiver's old defaults, which lose every satellite on
+# the LiteX-M2SDR within 15 s. The delay-aware default holds the same
+# configuration above; this pins that the difference is the estimator, not the
+# simulation.
+@testset "The conventional 18 Hz loop cannot hold three epochs of delay" begin
+    r = run_simulated_closed_loop(;
+        chunk = 8000,
+        feedback_delay_epochs = 3,
+        doppler_estimator = ConventionalAssistedPLLAndDLL(),
+    )
+    key = (get_signal_id(r.system), r.prn)
+    final = last(r.results)
+    converged =
+        haskey(final.sat_data, key) &&
+        !isempty(r.sdr.applied) &&
+        abs(last(r.sdr.applied).carrier_doppler - r.true_doppler) < 15
+    @test !converged
+end
+
 
 @testset "A stream gap resynchronises instead of replaying every epoch" begin
     band_systems = ((GPSL1CA(),),)
