@@ -628,7 +628,7 @@ end
     @test passed(comparison)
     # …and it stops at the symbol: the eleventh block would start a new record,
     # because past the data-bit boundary the symbol can flip sign.
-    @test link.partial_blocks[1] == 0
+    @test link.partial_periods[1] == 0
 end
 
 @testset "Reassignment and release leave no stale overlay phase" begin

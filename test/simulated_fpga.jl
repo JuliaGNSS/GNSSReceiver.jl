@@ -77,6 +77,13 @@ mutable struct SimulatedFPGA{
     const system::S
     const sampling_freq::Float64
     const epoch_length::Int
+    # How often a channel dumps, in samples, *besides* on the code wrap. 0 is the
+    # historical contract — one record per primary code period — and anything
+    # else is a device that can be told to dump inside one, which is what issue
+    # #133's long-code path needs from the gateware (steps 2 and 3). A record is
+    # still always cut on the wrap, so a dump interval that divides the code
+    # period keeps every record on the block grid.
+    const dump_interval_samples::Int
     # The device's free-running sample counter, shared by both streams.
     sample_count::Int
     # NCO updates accepted but not yet due.
@@ -96,12 +103,18 @@ end
 
 """
     SimulatedFPGA(system; sampling_freq, chunk, n_channels = 20, sample_type = ComplexF64,
-                  epoch_length = chunk, handover_code_phase_error = 0.0)
+                  epoch_length = chunk, handover_code_phase_error = 0.0,
+                  dump_interval_samples = 0)
 
 A simulated hardware correlator for `system` at `sampling_freq` (Hz, plain or
 Unitful), fed `chunk`-sample raw chunks of `sample_type` through
 [`correlate_chunk!`](@ref) and strobing the epoch clock every `epoch_length`
 samples.
+
+`dump_interval_samples` makes it dump *inside* a primary code period as well as
+on the wrap, which is what a 1.5 s GPS L2CL code needs from a device before a
+tracking loop can be closed around it at all. `0` (the default) is the historical
+one-record-per-code-period contract.
 
 Twenty channels by default, as the gnss-m2sdr gateware has: with fewer, the
 false alarms a first scan produces can occupy every channel and starve the real
@@ -116,6 +129,7 @@ function SimulatedFPGA(
     sample_type::Type = ComplexF64,
     epoch_length::Integer = chunk,
     handover_code_phase_error::Real = 0.0,
+    dump_interval_samples::Integer = 0,
     raw_capacity::Integer = 4,
     dump_capacity::Integer = 1 << 16,
     nco_capacity::Integer = 1 << 12,
@@ -130,6 +144,7 @@ function SimulatedFPGA(
         sampling_freq isa Real ? Float64(sampling_freq) :
         Float64(ustrip(Hz, uconvert(Hz, sampling_freq))),
         Int(epoch_length),
+        Int(dump_interval_samples),
         0,
         NCOUpdate[],
         NCOUpdate[],
@@ -166,6 +181,7 @@ function GNSSReceiver.hardware_capabilities(sdr::SimulatedFPGA)
         num_rf_inputs = 1,
         max_secondary_code_length = 1,
         reports_code_phase = true,
+        supports_partial_code_dumps = sdr.dump_interval_samples > 0,
     )
 end
 
@@ -263,8 +279,17 @@ function correlate_chunk!(sdr::SimulatedFPGA{C}, samples) where {C}
                 ch.carrier_phase += ch.carrier_doppler / sdr.sampling_freq
                 ch.code_phase += code_freq / sdr.sampling_freq
                 ch.integrated_samples += 1
-                if ch.code_phase >= code_length
-                    ch.code_phase -= code_length
+                wrapped = ch.code_phase >= code_length
+                wrapped && (ch.code_phase -= code_length)
+                # A record is cut on the code wrap, and — for a device that can
+                # be told to — every `dump_interval_samples` besides. An interval
+                # that divides the code period therefore leaves every record on
+                # the primary-code block grid, which is what the host needs to
+                # place a sub-period record at all.
+                if wrapped || (
+                    sdr.dump_interval_samples > 0 &&
+                    ch.integrated_samples >= sdr.dump_interval_samples
+                )
                     push!(
                         out,
                         CorrelatorDump(
