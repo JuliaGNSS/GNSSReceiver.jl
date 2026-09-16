@@ -20,6 +20,14 @@ makedocs(
     format = Documenter.HTML(
         prettyurls = get(ENV, "CI", nothing) == "true",
         canonical = "https://JuliaGNSS.github.io/GNSSReceiver.jl",
+        # The API reference is one long page on purpose — it is read by search
+        # and by `@ref` from the prose pages, and splitting it would scatter the
+        # hardware-correlator contract's targets across files. It grew past
+        # Documenter's 200 KiB default when the RF-band interface landed
+        # (issue #134); raise the ceiling rather than shard the page. The warn
+        # threshold stays low so the growth is still visible in the build log.
+        size_threshold = 400 * 1024,
+        size_threshold_warn = 200 * 1024,
     ),
     pages = [
         "Home" => "index.md",
