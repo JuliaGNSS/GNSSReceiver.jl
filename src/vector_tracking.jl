@@ -1618,7 +1618,7 @@ function initialize_vector_tracking(
     receiver_sat_states,
     previous_pvt,
     pvt,
-    sampling_freq,
+    sampling_freqs,
     integration_time;
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
@@ -1686,7 +1686,7 @@ function initialize_vector_tracking(
             prns,
             0.0s, # placeholder reference epoch; the pseudoranges are rebuilt below
             nav_filter.integration_time,
-            sampling_freq,
+            _system_sampling_frequency(sampling_freqs, system),
         )
     end
     reference_time =
@@ -1770,7 +1770,7 @@ function run_vt_iteration(
     systems,
     track_state,
     receiver_sat_states,
-    sampling_freq,
+    sampling_freqs,
     integration_time;
     correlator_source = nothing,
     enable_ionospheric_correction = true,
@@ -1835,7 +1835,7 @@ function run_vt_iteration(
             prns_in_lock,
             reference_time,
             integration_time,
-            sampling_freq,
+            _system_sampling_frequency(sampling_freqs, system),
         )
     end
     active = trues(length(members))

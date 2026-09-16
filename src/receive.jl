@@ -475,10 +475,13 @@ tracked and decoded, and all are fused into a single multi-GNSS PVT solution. Th
 multi-band method takes a tuple of measurement channels (one per RF band), a tuple of
 per-band system groups and a tuple of `interm_freqs`, all aligned band-by-band, and fuses
 every band into one solution with per-constellation clock biases and per-band
-inter-frequency biases. The band channels must deliver equal-length frames from one shared
-time base (e.g. a single capture split by front-end channel) so one frame per band stays
-aligned each step. The number of antenna channels in each `SignalChannel` must equal `N`
-in `num_ants`.
+inter-frequency biases. The band channels must deliver frames of equal *duration* from
+one shared time base (e.g. a single capture split by front-end channel) so one frame per
+band stays aligned each step; the **first** band is the receiver's clock. `sampling_freq`
+is one frequency for every band — the usual case of one sample clock feeding the front
+end — or a tuple aligned with the bands, for a front end whose bands genuinely run at
+different rates, in which case the frames differ in length but not in span. The number of
+antenna channels in each `SignalChannel` must equal `N` in `num_ants`.
 
 Sampled at `sampling_freq`, each chunk is processed by [`process`](@ref) in a spawned
 task; one `ReceiverDataOfInterest` is emitted per `pvt_update_interval`. Acquisition
@@ -548,6 +551,25 @@ for what a vendor package has to provide.
 `feedback_delay_epochs` how far ahead each NCO update is scheduled so the loop
 delay stays a known constant. Every other keyword is [`receive`](@ref)'s.
 
+For a **multi-band** device, pass a tuple of per-band system groups and — where
+the bands run at different rates — a tuple of sampling frequencies:
+
+```julia
+receive(sdr, ((GPSL1CA(),), (GPSL5I(), GPSL5Q())), (4e6u\"Hz\", 25e6u\"Hz\"))
+```
+
+The first band is the *reference band*: its counter is the receiver timebase
+every epoch, fold and code-phase reference epoch is expressed on, and its raw
+stream is the receiver's clock. Each band's raw samples come from
+[`raw_sample_channel`](@ref)`(sdr, band_id)`, its satellites are armed on that
+band's own correlator bank ([`band_hardware_channels`](@ref)), its handovers and
+NCO updates are written on its own counter, and it keeps its own noise reference
+and replica gain. Which bands a device can receive *at once*, on which inputs and
+under what clock relationship, is the [`HardwareBandPlan`](@ref) — built from the
+device's declarations by [`hardware_band_plan`](@ref), overridable with
+`band_plan`, and validated as a whole before anything is armed. See the
+"Hardware-correlator contract" section of the manual.
+
 The tracking loops default to the delay-aware [`NCOReferencedPLLAndDLL`](@ref)
 at each signal's reference bandwidth (18 Hz for GPS L1 C/A): the conventional
 loop at that bandwidth cannot hold a lock through the few milliseconds between
@@ -599,27 +621,51 @@ function receive(
     doppler_estimator = nothing,
     vector_tracking::Union{Bool,VectorTracking} = false,
     link::Union{Nothing,HardwareCorrelatorLink} = nothing,
+    # The RF configuration. `nothing` asks the device for it
+    # ([`hardware_band_plan`](@ref)), which is what a single-band receiver wants.
+    band_plan::Union{Nothing,HardwareBandPlan} = nothing,
+    # The front end's intermediate frequency, per band. A single value applies to
+    # every band; `interm_freq` is the one-band spelling the sample-channel
+    # methods use and is accepted here for the same reason.
+    interm_freqs = nothing,
+    interm_freq = nothing,
     kwargs...,
 )
+    # The RF configuration: one route per band, the first of them the reference
+    # band whose counter is the receiver timebase. A single-band request builds
+    # the plan the link has always assumed.
+    band_systems = _band_system_groups(systems)
+    band_keys = map(s -> get_band_id(system_band(first(s))), band_systems)
+    band_sampling_freqs = _per_band_values(sampling_freq, band_systems)
+    plan = something(
+        band_plan,
+        isnothing(link) ? hardware_band_plan(sdr, band_keys, band_sampling_freqs) :
+        link.band_plan,
+    )
     # Pre-arm gate: every configured signal is checked against the device's
     # declared capabilities before anything else happens, so a device that
     # cannot serve the request says so here — with every reason at once — rather
     # than programming a channel that never locks, or failing deep in the ingest
     # path where a three-tap record meets a five-tap correlator (issue #131).
+    # The RF plan is checked as a whole in the same pass: receiving every
+    # requested band *at once* is a front-end capacity question, and a request
+    # past it is refused here rather than half-configured in silence (#134).
     validate_hardware_configuration(
         sdr,
-        systems,
-        sampling_freq;
+        band_systems,
+        band_sampling_freqs;
         num_ants = get(kwargs, :num_ants, NumAnts(1)),
+        band_plan = plan,
     )
     if isnothing(link)
         link = HardwareCorrelatorLink(
             sdr;
-            sampling_freq,
-            reference_signal = ranging_signal(first(as_systems(systems))),
+            sampling_freq = first(band_sampling_freqs),
+            reference_signal = ranging_signal(first(first(band_systems))),
             doppler_update_interval,
             feedback_delay_epochs,
             correlator_gain,
+            band_plan = plan,
         )
     elseif get_sdr(link) !== sdr
         throw(ArgumentError("`link` was built over a different device than `sdr`"))
@@ -627,10 +673,18 @@ function receive(
     if isnothing(doppler_estimator) && !vt_enabled(vector_tracking)
         doppler_estimator = NCOReferencedPLLAndDLL()
     end
+    # One raw stream per band, each driving its own band's acquisition at its own
+    # rate. A one-band device implements only `raw_sample_channel(sdr)` and gets
+    # that stream for its single band.
+    raw_channels = map(band_id -> raw_sample_channel(sdr, band_id), band_keys)
     receive(
-        raw_sample_channel(sdr),
-        systems,
-        sampling_freq;
+        raw_channels,
+        band_systems,
+        band_sampling_freqs;
+        interm_freqs = _per_band_values(
+            something(interm_freqs, interm_freq, 0.0Hz),
+            band_systems,
+        ),
         correlator_source = link,
         acquire_async,
         processing_threadpool,
@@ -753,6 +807,13 @@ function receive(
     # Normalise the systems band-by-band and derive each band's key up front.
     band_systems = map(as_systems, systems_per_band)
     band_keys = map(s -> get_band_id(system_band(first(s))), band_systems)
+    # One sampling frequency per band. A single frequency is every band off one
+    # sample clock — the ordinary case, and what every single-band caller
+    # passes; a tuple states them band by band, for a front end whose bands
+    # genuinely run at different rates (issue #134). The bands must still
+    # deliver frames of equal *duration*: the first band is the receiver's
+    # clock, and one frame per band is taken per step.
+    band_sampling_freqs = _per_band_values(sampling_freq, band_keys)
 
     # Acquisition Doppler resolution derived per system from the carrier loops'
     # *pull-in range* (bin = 2·margin·pull_in), so the worst-case post-acquisition
@@ -778,10 +839,14 @@ function receive(
 
     # Per-band acquisition plans and buffer sizes (each band is validated as
     # single-band by `plan_band_acquisition`).
-    setups = map(band_systems, band_acq_doppler_resolutions) do systems, acq_doppler_resolutions
+    setups = map(
+        band_systems,
+        band_acq_doppler_resolutions,
+        band_sampling_freqs,
+    ) do systems, acq_doppler_resolutions, band_sampling_freq
         plan_band_acquisition(
             systems,
-            sampling_freq,
+            band_sampling_freq,
             acq_doppler_resolutions;
             prns,
             acq_min_doppler_coverage,
@@ -850,7 +915,7 @@ function receive(
                     acq_plans,
                     measurements,
                     band_systems,
-                    sampling_freq,
+                    band_sampling_freqs,
                     interm_freqs;
                     downconvert_and_correlator = resolved_dc,
                     correlator_source,

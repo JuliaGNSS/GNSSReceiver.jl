@@ -90,6 +90,30 @@ supports_secondary_code_wipeoff
 GNSSReceiver.requested_secondary_code_mode
 ```
 
+### RF bands, inputs and the receiver timebase
+
+```@docs
+GNSSReceiver.HardwareBandRoute
+GNSSReceiver.HardwareBandPlan
+GNSSReceiver.hardware_band_plan
+GNSSReceiver.band_rf_input
+GNSSReceiver.band_device_index
+GNSSReceiver.band_hardware_channels
+GNSSReceiver.clock_synchronization
+GNSSReceiver.reference_band
+GNSSReceiver.reference_sampling_frequency
+GNSSReceiver.band_ids
+GNSSReceiver.band_route
+GNSSReceiver.band_sampling_frequency
+GNSSReceiver.receiver_timebase_scale
+GNSSReceiver.to_receiver_samples
+GNSSReceiver.to_band_samples
+GNSSReceiver.band_plan_error
+GNSSReceiver.receiver_sampling_frequency
+GNSSReceiver.channel_band_id
+GNSSReceiver.channel_sampling_frequency
+```
+
 ### The delay-aware tracking loop
 
 ```@docs

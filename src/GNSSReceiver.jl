@@ -616,6 +616,41 @@ as_systems(systems::Tuple) = systems
 as_systems(system::AbstractGNSSSignal) = (system,)
 as_systems(system::CombinedSignal) = (system,)
 
+# Normalise whatever `receive` was handed to the *per-band* shape: a tuple of
+# per-band system tuples. A single system, or a tuple of systems sharing one
+# band, is one band; a tuple whose elements are themselves tuples is already the
+# multi-band form. Used by the pre-arm hardware validation, which has to know
+# which band each system belongs to before it can say what it is sampled at.
+_band_system_groups(system::AbstractGNSSSignal) = ((system,),)
+_band_system_groups(system::CombinedSignal) = ((system,),)
+_band_system_groups(systems::Tuple) = all(s -> s isa Tuple, systems) ? systems : (systems,)
+
+# Spread one value over the bands of `template` (any per-band tuple: the band
+# keys, the measurement channels, the system groups), or pass an already
+# per-band tuple through. This is what lets `sampling_freq` stay a single
+# frequency for the ordinary receiver — every band off one sample clock — while
+# a front end whose bands run at different rates states them band by band.
+#
+# Spread with `map` over the template rather than `ntuple(_, n)`: the template's
+# length is in its type, so the result's is too, and the per-chunk path stays
+# inferable.
+_per_band_values(value::Tuple, template::Tuple) =
+    length(value) == length(template) ? value :
+    throw(
+        ArgumentError(
+            "expected one value per band ($(length(template))), got $(length(value))",
+        ),
+    )
+_per_band_values(value, template::Tuple) = map(_ -> value, template)
+
+# The sampling frequency of the band a system lives on. A `NamedTuple` keyed by
+# band id is the per-band form `process` builds; anything else is a single
+# frequency meaning "every band at this rate", which is what a single-band
+# receiver and every direct caller pass.
+_system_sampling_frequency(sampling_freqs::NamedTuple, system) =
+    sampling_freqs[get_band_id(system_band(system))]
+_system_sampling_frequency(sampling_freq, system) = sampling_freq
+
 # A single sample stream (SDR front-end or file) can only carry one RF band, so
 # every requested system must share one. `get_band` exposes the shared carrier
 # at the type level — GPS L1 C/A and Galileo E1B both report `L1()`, so multi-GNSS

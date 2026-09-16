@@ -154,7 +154,10 @@ Satellites that drop out of lock are removed and picked up again by the periodic
 (the fast reacquisition path of `should_reacquire` is off by default — see there).
 `measurements`, `band_systems` and `interm_freqs` are
 tuples aligned band-by-band (`interm_freqs` defaults to `0 Hz` for every band), and
-`acq_plans` is one `NamedTuple` keyed by group key across all bands. This is the function
+`acq_plans` is one `NamedTuple` keyed by group key across all bands. `sampling_freq` is
+one frequency for every band, or a tuple aligned with them for a front end whose bands
+run at different rates; the bands' frames must then still span the same *duration*, and
+the first band is the receiver's clock. This is the function
 [`receive`](@ref) calls for each chunk; see it for the remaining keyword arguments.
 """
 function process(
@@ -194,11 +197,19 @@ function process(
     # recomputing them from `band_systems` every chunk.
     band_keys = keys(receiver_state.acquisition_buffers)
     all_systems = _flatten_systems(band_systems)
+    # One sampling frequency per band. A single frequency applies to every band —
+    # the ordinary case of one sample clock feeding the whole front end — while a
+    # tuple states them band by band, for a receiver whose bands genuinely run at
+    # different rates (issue #134). Everything downstream reads its own band's.
+    band_sampling_freqs = _per_band_values(sampling_freq, band_keys)
+    reference_sampling_freq = first(band_sampling_freqs)
 
     runtime = receiver_state.runtime
-    # All bands advance from equal-length frames of the same time base, so they
-    # share one runtime and signal duration.
-    signal_duration = size(first(meas), 1) / sampling_freq
+    # Bands advance from frames of equal *duration* on one time base — not
+    # necessarily of equal length, since a band sampled faster delivers more
+    # samples for the same span — so the first band is the receiver's clock and
+    # they share one runtime and signal duration.
+    signal_duration = size(first(meas), 1) / reference_sampling_freq
 
     # (Re)acquire — on this task or on an acquisition worker, depending on the
     # scheduler; see `advance_acquisition`.
@@ -211,7 +222,7 @@ function process(
             meas,
             interm_freqs,
             acq_plans,
-            sampling_freq,
+            band_sampling_freqs,
             (
                 runtime,
                 num_ants,
@@ -233,9 +244,13 @@ function process(
     # both to `Hz` so the stored sampling frequency matches the loop filters and estimator.
     band_measurements = NamedTuple{band_keys}(
         map(
-            (m, interm_freq) ->
-                Tracking.BandMeasurement(m, uconvert(Hz, sampling_freq), uconvert(Hz, interm_freq)),
+            (m, band_sampling_freq, interm_freq) -> Tracking.BandMeasurement(
+                m,
+                uconvert(Hz, band_sampling_freq),
+                uconvert(Hz, interm_freq),
+            ),
             meas,
+            band_sampling_freqs,
             interm_freqs,
         ),
     )
@@ -281,7 +296,7 @@ function process(
                 receiver_sat_states,
                 receiver_state.pvt,
                 receiver_state.pvt_sat_state_buffer,
-                sampling_freq,
+                NamedTuple{band_keys}(band_sampling_freqs),
                 runtime,
                 integration_time;
                 correlator_source,
@@ -329,7 +344,7 @@ function update_navigation(
     receiver_sat_states,
     pvt,
     pvt_sat_state_buffer,
-    sampling_freq,
+    sampling_freqs,
     runtime,
     integration_time;
     correlator_source = nothing,
@@ -364,7 +379,7 @@ function update_navigation(
     receiver_sat_states,
     pvt,
     pvt_sat_state_buffer,
-    sampling_freq,
+    sampling_freqs,
     runtime,
     integration_time;
     correlator_source = nothing,
@@ -379,7 +394,7 @@ function update_navigation(
             all_systems,
             track_state,
             receiver_sat_states,
-            sampling_freq,
+            sampling_freqs,
             integration_time;
             correlator_source,
             enable_ionospheric_correction,
@@ -410,7 +425,7 @@ function update_navigation(
             receiver_sat_states,
             previous_pvt,
             pvt,
-            sampling_freq,
+            sampling_freqs,
             integration_time;
             enable_ionospheric_correction,
             enable_tropospheric_correction,
