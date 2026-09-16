@@ -83,10 +83,14 @@ Fields:
     time*. Simultaneous all-band reception is an RF-capacity constraint, not a
     correlator one, and this is where it is declared.
   - `max_secondary_code_length` — the longest secondary (overlay) code the
-    gateware can wipe off itself, or `1` for "primary code only". It does not
-    gate tracking: the host falls back to one primary-code block per record
-    (see [`coherent_integration_blocks`](@ref)). It is what
-    [`supports_secondary_code_wipeoff`](@ref) reads.
+    gateware can wipe off itself, or `1` for "primary code only". Purely a
+    declaration: the host removes the overlay from the dumps itself once the
+    sync detector has found its phase (see
+    [`GNSSReceiver.requested_secondary_code_mode`](@ref)), so nothing asks a
+    device to do it and `1` costs a device nothing. It is what
+    [`supports_secondary_code_wipeoff`](@ref) reads, and what a future
+    *scheduled* wipeoff contract — which would let a device pre-accumulate
+    across code periods — would gate on.
   - `reports_code_phase` — whether the device latches the replica's code phase
     alongside the accumulators (`CorrelatorDump.code_phase`). Informational:
     without it pseudoranges are dead-reckoned from the handover seed rather
@@ -184,11 +188,12 @@ Whether the device can wipe `signal`'s secondary (overlay) code off in the
 gateware, so consecutive dumps can be summed without the overlay cancelling
 them.
 
-`false` — the default for every device — is not an error: the link then folds
-one primary-code block per record (see [`coherent_integration_blocks`](@ref)),
-which costs sensitivity but tracks correctly. Requesting the wipeoff also needs
-the host to know the overlay's phase, which is issue #132's business; until
-then [`HardwareChannelConfig`](@ref) asks for `:primary_only` regardless.
+`false` — the default for every device — is not an error, and `true` changes
+nothing today: the host removes the overlay from each primary-period dump once
+it knows its phase, so [`HardwareChannelConfig`](@ref) asks for `:primary_only`
+whatever a device declares. See
+[`GNSSReceiver.requested_secondary_code_mode`](@ref) for why ownership sits
+there, and [`coherent_integration_blocks`](@ref) for what the removal unlocks.
 """
 supports_secondary_code_wipeoff(
     capabilities::HardwareCorrelatorCapabilities,
@@ -384,10 +389,15 @@ left everything else to a shared assumption. This carries the lot:
     to `GNSSSignals.get_code_amplitude(signal)`, so a gateware approximation
     does not move the satellite's C/N₀.
   - `secondary_code_mode` — `:primary_only` (the device replicates the primary
-    code and the host sees the overlay chips in consecutive dumps) or
-    `:wipeoff` (the device removes the overlay, so consecutive dumps may be
-    summed). The link asks for `:primary_only` today whatever the device can
-    do; see [`supports_secondary_code_wipeoff`](@ref) and issue #132.
+    code and the host removes the overlay from each dump) or `:wipeoff` (the
+    device removes it, so its dumps carry none). The link asks for
+    `:primary_only` for every device and every signal — an overlay's phase is
+    not known when a channel is armed, so the host owns the removal; see
+    [`GNSSReceiver.requested_secondary_code_mode`](@ref). What `:primary_only`
+    obliges a device to is one record per primary code period, which is the
+    dump contract anyway: a record spanning several code periods has summed
+    their overlay chips inside the accumulator, where no single sign takes them
+    off again.
   - `carrier_phase_offset` — the component's carrier phase against its band's
     in-phase reference, in radians (`GNSSSignals.get_carrier_phase_offset`).
     The device **must not** apply it: it mixes every component of a band
