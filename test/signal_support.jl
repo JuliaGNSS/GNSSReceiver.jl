@@ -174,6 +174,16 @@ const SOURCES = Dict(
                "acquired, tracked and held in lock with its C/N₀ within tolerance of " *
                "the case's.",
     ),
+    :harness_hardware_overlay => (
+        file = "test/secondary_code_removal.jl",
+        text = "GPS L5I through the simulated hardware correlator of " *
+               "`test/simulated_fpga.jl` over reference-harness samples: the device " *
+               "replicates the primary code only, `Tracking`'s own detector finds the " *
+               "NH10 overlay, the link then removes it from every dump, and the " *
+               "decoded symbols are the ones the harness transmitted — at close to the " *
+               "full ten blocks of energy per symbol rather than the overlay's own " *
+               "sum of two.",
+    ),
     :ion_recording => (
         file = "test/ion_rtlsdr_integration.jl",
         text = "The 60 s ION RTL-SDR live-sky GPS L1 recording through the software " *
@@ -346,11 +356,14 @@ const MATRIX = Dict{Symbol,NamedTuple{ROLES,NTuple{6,SupportEntry}}}(
         data_decode = _DECODE_NA,
         pvt = _PVT_PENDING,
     ),
+    # GPS L5I is where the hardware path's overlay removal is demonstrated end to
+    # end (issue #132): the only secondary-code row so far whose synchronisation
+    # has actually been run, and the only cell with simulated-FPGA evidence.
     :GPSL5I => (
         replica = _REPLICA_OK,
         acquisition_handover = _ACQ_OK,
         tracking = _TRACK_PENDING,
-        secondary_sync = _SEC_PENDING,
+        secondary_sync = supported(:simulated_fpga, :harness_hardware_overlay),
         data_decode = _DECODE_PENDING,
         pvt = _PVT_PENDING,
     ),

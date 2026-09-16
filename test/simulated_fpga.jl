@@ -16,10 +16,22 @@
 # a wrong epoch tag or dropped the feedback, the satellite would lose lock.
 # ─────────────────────────────────────────────────────────────────────────────
 
-using GNSSReceiver: CorrelatorDump, NCOUpdate, AbstractHardwareCorrelatorSDR, epoch_strobe
+using GNSSReceiver:
+    CorrelatorDump,
+    NCOUpdate,
+    AbstractHardwareCorrelatorSDR,
+    HardwareCorrelatorCapabilities,
+    epoch_strobe
 using GNSSReceiver.Tracking: CorrelatorOutput, EarlyPromptLateCorrelator
 using GNSSReceiver.GNSSSignals:
-    AbstractGNSSSignal, get_code, get_code_length, get_code_frequency
+    AbstractGNSSSignal,
+    get_band,
+    get_band_id,
+    get_code,
+    get_code_length,
+    get_code_frequency,
+    get_modulation,
+    get_signal_id
 using GNSSReceiver.StaticArrays: SVector, MVector
 using GNSSReceiver.Unitful: Hz, ustrip, uconvert
 
@@ -131,6 +143,31 @@ GNSSReceiver.raw_sample_channel(sdr::SimulatedFPGA) = sdr.raw
 GNSSReceiver.correlator_dump_channel(sdr::SimulatedFPGA) = sdr.dumps
 GNSSReceiver.nco_update_channel(sdr::SimulatedFPGA) = sdr.ncos
 GNSSReceiver.num_hardware_channels(sdr::SimulatedFPGA) = length(sdr.channels)
+
+# What this device can do, declared the way a real one has to (issue #131).
+# Without it the link takes any device for the legacy GPS L1 C/A one and refuses
+# to arm a channel for anything else — so a simulated device built for GPS L5I
+# could never be handed a satellite. Declared from the system it was built for,
+# which for `GPSL1CA()` reproduces `LEGACY_GPS_L1CA_CAPABILITIES` exactly: one
+# three-tap bank per channel reaching one chip either side of prompt, one
+# antenna, one band, the primary code only, and the replica's code phase latched
+# alongside the accumulators.
+function GNSSReceiver.hardware_capabilities(sdr::SimulatedFPGA)
+    code_freq = ustrip(Hz, uconvert(Hz, get_code_frequency(sdr.system)))
+    HardwareCorrelatorCapabilities(;
+        signals = [get_signal_id(sdr.system)],
+        modulations = [nameof(typeof(get_modulation(sdr.system)))],
+        max_primary_code_length = get_code_length(sdr.system),
+        code_frequency_limits = (code_freq, code_freq),
+        tap_layouts = [3],
+        max_tap_offset_chips = 1.0,
+        num_antennas = 1,
+        bands = [get_band_id(get_band(sdr.system))],
+        num_rf_inputs = 1,
+        max_secondary_code_length = 1,
+        reports_code_phase = true,
+    )
+end
 
 function GNSSReceiver.release_channel!(sdr::SimulatedFPGA, hw_channel)
     @lock sdr.lock sdr.channels[hw_channel].active = false

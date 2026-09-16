@@ -27,6 +27,16 @@ using GNSSReceiver: VectorTracking
 
 using Unitful: Hz, dBHz, ms
 
+# The reference harness (deterministic synthetic signals plus the noise-free
+# reference every check is measured against) and the per-signal support matrix
+# are shared by more than one file now — test/secondary_code_removal.jl
+# generates its signals with the harness and records its evidence in the matrix,
+# and test/signal_validation.jl runs the per-signal checks and the matrix
+# integrity tests over everything recorded. So both modules are defined here,
+# once, before anything that uses them.
+include("reference_harness.jl")
+include("signal_support.jl")
+
 include("aqua.jl")
 include("read_file.jl")
 include("beamformer.jl")
@@ -41,6 +51,7 @@ include("receive.jl")
 include("async_acquisition.jl")
 include("hardware_correlator.jl")
 include("hardware_capabilities.jl")
+include("secondary_code_removal.jl")
 include("nco_referenced_loop.jl")
 include("sample_buffer.jl")
 include("signal_validation.jl")

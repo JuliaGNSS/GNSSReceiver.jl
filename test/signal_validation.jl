@@ -27,9 +27,10 @@
 # statements for GNSSReceiver, GNSSSignals, Acquisition, Unitful and Test.
 # ─────────────────────────────────────────────────────────────────────────────
 
-include("reference_harness.jl")
-include("signal_support.jl")
-
+# `ReferenceHarness` and `SignalSupport` are defined by runtests.jl, ahead of
+# every file that uses them — this one runs the per-signal checks and the matrix
+# integrity tests, and test/secondary_code_removal.jl records evidence of its
+# own, which has to be in before the integrity tests read it.
 using .ReferenceHarness
 using .ReferenceHarness: cn0_dbhz, code_phase_resolution, data_bit, noiseless, reset!
 using .SignalSupport

@@ -948,6 +948,19 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     # Satellites whose bit clock was just restarted, waiting for the receiver to
     # restart the matching decoder (`take_bit_clock_restart!`).
     const bit_clock_restarts::Vector{HardwareChannelAssignment}
+    # ── Secondary-code (overlay) removal, per hardware channel ────────────────
+    # Whether the *host* takes this channel's overlay off every dump, i.e. the
+    # channel's signal has one and `requested_secondary_code_mode` left the job
+    # with the host rather than the device. False for a signal without an
+    # overlay, which is what keeps GPS L1 C/A's ingest path exactly as it was.
+    const secondary_wipe::Vector{Bool}
+    # The overlay chip index carried by the primary-code block that *starts* at
+    # `secondary_phase_sample`, or `-1` while it is unknown — before
+    # secondary/bit sync, and after anything that broke the record stream the
+    # counter rides. `anchor_secondary_phases!` seeds it from the bit buffer
+    # once per sync; every wiped dump advances it over the blocks it covered.
+    const secondary_phase::Vector{Int}
+    const secondary_phase_sample::Vector{Int64}
     # ── Noise reference ───────────────────────────────────────────────────────
     # Where the C/N₀ estimator's noise density comes from: `:channel` spends a
     # hardware channel on an open-loop despread (the documented FPGA recipe),
@@ -1047,6 +1060,12 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     # here means the tracking state grew a signal the configuration did not
     # declare.
     unsupported_signals::Int
+    # Times a known overlay phase was dropped because the record it was about to
+    # wipe did not start where the counter stood, or covered more than one
+    # primary-code block. Removal then stops until the next sync re-seeds it
+    # rather than wiping at a phase the host can no longer vouch for — a wrong
+    # sign is worse than no wipe, because nothing downstream can see it.
+    secondary_phase_losses::Int
 end
 
 function HardwareCorrelatorLink(
@@ -1163,6 +1182,9 @@ function HardwareCorrelatorLink(
         zeros(Int, n),
         fill(false, n),
         HardwareChannelAssignment[],
+        fill(false, n),
+        fill(-1, n),
+        fill(typemin(Int64), n),
         noise_source,
         0,
         Int32(0),
@@ -1181,6 +1203,7 @@ function HardwareCorrelatorLink(
         [NCOTimeline() for _ = 1:n],
         NCOTimeline(),
         typemin(Int64),
+        0,
         0,
         0,
         0,
@@ -1671,6 +1694,8 @@ function release_stale_channels!(link, track_state)
         link.channel_scale[hw_channel] = 1.0
         link.pending_blocks[hw_channel] = 0
         link.bit_clock_lost[hw_channel] = false
+        link.secondary_wipe[hw_channel] = false
+        forget_secondary_phase!(link, hw_channel)
         filter!(!=(assignment), link.bit_clock_restarts)
         reset_timeline!(link.nco_timelines[hw_channel], 0.0, 0.0)
         # A part-accumulated record belongs to the satellite that just left; it
@@ -1785,6 +1810,13 @@ function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampl
     link.overlapping_record_samples[hw_channel] = 0
     link.pending_blocks[hw_channel] = 0
     link.bit_clock_lost[hw_channel] = false
+    # Who takes this channel's overlay off, decided once here from what the
+    # device was asked for, and an overlay phase that is not yet known: the new
+    # occupant's secondary/bit sync has not been found on this channel.
+    link.secondary_wipe[hw_channel] =
+        get_secondary_code_length(signal) > 1 &&
+        requested_secondary_code_mode(link, signal) === :primary_only
+    forget_secondary_phase!(link, hw_channel)
     # The handover itself counts as the channel's last sign of life, so the
     # dump-gap budget is spent from here rather than from whatever the previous
     # occupant left behind.
@@ -1813,17 +1845,43 @@ _replica_amplitude(link::HardwareCorrelatorLink, band_id::Symbol) =
 """
     requested_secondary_code_mode(link, signal) -> Symbol
 
-Whether the link asks the device to wipe `signal`'s secondary (overlay) code
-off in the gateware (`:wipeoff`) or to replicate the primary code only
-(`:primary_only`).
+Which side of the link removes `signal`'s secondary (overlay) code:
+`:primary_only` — the device replicates the primary code and the **host** takes
+the overlay off each dump — or `:wipeoff`, the device doing it in the gateware.
 
-Always `:primary_only` today, whatever the device can do. Wiping the overlay
-off needs the *host* to know its phase and to keep the device's overlay counter
-tied to the decoded symbol grid; nothing on this path does that yet, and a
-device asked to wipe an overlay at the wrong phase cancels the signal rather
-than accumulating it. [`supports_secondary_code_wipeoff`](@ref) reports what the
-device could do; issue #132 is where this starts returning `:wipeoff`, and
-[`coherent_integration_blocks`](@ref) is what it unlocks.
+`:primary_only` for every device and every signal, deliberately, and this is the
+one place that decision is written down. The host-side removal keys off it —
+[`GNSSReceiver.is_secondary_code_removed`](@ref) is false for a channel whose
+device was asked to wipe — so a future `:wipeoff` turns the host's removal off
+in the same step it turns the device's on: the overlay comes off once, or not at
+all, never twice.
+
+**Why the host owns it.** The overlay's phase is not known when a channel is
+armed. It is recovered by the bit/secondary-code sync detector, some way into
+tracking, from the prompts themselves — and a device asked to wipe an overlay at
+the wrong phase cancels the signal instead of accumulating it. Handing the job
+to the gateware therefore needs more than a flag in
+[`HardwareChannelConfig`](@ref): it needs a *scheduled* command — "from device
+sample `n`, overlay chip `k`" — on the same sample-exact footing as
+[`NCOUpdate`](@ref), plus a way for the device to report the overlay counter
+back so a lost record cannot leave the two ends disagreeing silently. None of
+that exists yet, and the host can do the whole job with a per-dump sign, which
+is exact rather than approximate: the device's replicas run continuously, so
+multiplying a primary-period dump by its overlay chip *is* the correlation the
+device would have produced with the overlay baked in.
+
+What the host's ownership costs is that the overlay cannot be removed before
+the accumulators leave the device, so a dump must stay one primary-code period
+long for its single overlay chip to be separable — which is the device contract
+anyway (see [`CorrelatorDump`](@ref)) — and pre-accumulation in the gateware
+across code periods stays unavailable for overlaid signals. That is what a
+scheduled `:wipeoff` contract would buy, and issue #133 is where dumps shorter
+or longer than a primary period are dealt with.
+
+[`supports_secondary_code_wipeoff`](@ref) reports what a device *could* do, and
+is left as the declaration it is: nothing requests it yet.
+[`coherent_integration_blocks`](@ref) is what the removal unlocks either way —
+records may span several code blocks once the overlay is off them.
 """
 requested_secondary_code_mode(::HardwareCorrelatorLink, ::AbstractGNSSSignal) =
     :primary_only
@@ -1996,6 +2054,9 @@ function fold_closed_epochs!(
     fill!(link.pending_blocks, 0)
     anchor_bit_phases!(link, track_state, boundary)
     restart_lost_bit_clocks!(link, track_state)
+    # After the restart, so a bit clock that was just thrown away cannot hand
+    # the overlay counter a phase derived from the sync that went with it.
+    anchor_secondary_phases!(link, track_state)
     push_nco_updates!(link, track_state, boundary)
     promote_applied_words!(link)
     folds
@@ -2078,6 +2139,9 @@ function restart_lost_bit_clocks!(link::HardwareCorrelatorLink, track_state)
             signals = Base.setindex(signals, restarted, assignment.signal_index),
         )
         link.bit_phase_anchored[hw_channel] = false
+        # The overlay phase was derived from the sync that just went with the
+        # bit buffer; the fresh one carries a frozen zero that means nothing.
+        forget_secondary_phase!(link, hw_channel)
         assignment in link.bit_clock_restarts || push!(link.bit_clock_restarts, assignment)
     end
     link
@@ -2387,7 +2451,10 @@ function _append_dump!(link, track_state, dump)
             10
         return link
     end
-    _account_record_continuity!(
+    # Take the overlay chip off before anything reads the accumulators, so the
+    # coherent pre-accumulation, the discriminators, the C/N0 estimator and the
+    # navigation bit accumulation all see the same wiped record.
+    output = _wipe_secondary_code!(
         link,
         track_state,
         assignment,
@@ -2395,7 +2462,15 @@ function _append_dump!(link, track_state, dump)
         hw_channel,
         dump.output,
     )
-    _accumulate_dump!(link, track_state, assignment, sat_state, hw_channel, dump.output)
+    _account_record_continuity!(
+        link,
+        track_state,
+        assignment,
+        sat_state,
+        hw_channel,
+        output,
+    )
+    _accumulate_dump!(link, track_state, assignment, sat_state, hw_channel, output)
     # The channel is alive: the dump-gap budget starts again from here.
     link.last_record_at_samples[hw_channel] = link.samples_consumed
     # Collect the code-phase anchor for the phase bookkeeping. Only the
@@ -2410,6 +2485,169 @@ function _append_dump!(link, track_state, dump)
     end
     link
 end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Secondary (overlay) codes: taking them off the dumps, host-side (#132)
+#
+# A device replicates the primary code only (see
+# [`requested_secondary_code_mode`](@ref)), so each dump of an overlaid signal
+# carries that primary-code block's overlay chip as a ±1 sign on every one of
+# its accumulators. `Tracking` assumes the opposite: once bit/secondary sync is
+# found its software replica bakes the overlay into the code, and the prompts
+# reaching the post-sync bit accumulation are already wiped.
+#
+# Handing it un-wiped prompts does not break *tracking* — every discriminator is
+# a ratio of taps that all carry the same sign — but it cancels the navigation
+# symbol. Ten GPS L5I dumps of a constant +1 symbol sum to the NH10 code's own
+# sum, 2, where ten wiped ones sum to 10: 14 dB of the symbol thrown away, and a
+# soft bit whose sign is the overlay's rather than the satellite's.
+#
+# So the host does the wipe the device was not asked for, one primary-code block
+# at a time, at the ingest — ahead of the coherent pre-accumulation, and
+# therefore ahead of the discriminators, the C/N0 estimator and the bit buffer
+# alike, all of which read the same record.
+#
+# What it costs is a *phase*: which overlay chip a given block carries. That is
+# exactly what the sync detector recovers, and `anchor_secondary_phases!` reads
+# it out of the bit buffer on the fold that finds it. From there the link's own
+# counter rides the record stream, which tiles the sample axis one overlay chip
+# per primary-code block. A record that does not start where the counter stands
+# — a lost record, an overlap, a dump spanning more than one block — is a
+# counter that can no longer be vouched for, and the removal stops until the
+# next sync re-seeds it. Nothing is ever wiped at a guessed phase: a wrong sign
+# is worse than no wipe, because every consumer downstream is blind to it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    is_secondary_code_removed(link, hw_channel) -> Bool
+
+Whether the host is removing this hardware channel's secondary (overlay) code
+from every dump right now — i.e. the channel carries an overlay the device was
+not asked to wipe *and* the link knows the overlay's phase.
+
+This is the condition under which consecutive dumps may be summed:
+[`coherent_integration_blocks`](@ref) holds an overlaid signal at one
+primary-code block per record until it is true.
+"""
+is_secondary_code_removed(link::HardwareCorrelatorLink, hw_channel::Integer) =
+    link.secondary_wipe[hw_channel] && link.secondary_phase[hw_channel] >= 0
+
+# Drop a channel's overlay phase: the removal stops, and the next
+# `anchor_secondary_phases!` re-seeds it from the bit buffer if sync still
+# stands. Cheap and idempotent, so every path that can invalidate the counter
+# calls it rather than reasoning about whether it has to.
+function forget_secondary_phase!(link::HardwareCorrelatorLink, hw_channel::Integer)
+    link.secondary_phase[hw_channel] = -1
+    link.secondary_phase_sample[hw_channel] = typemin(Int64)
+    link
+end
+
+"""
+    anchor_secondary_phases!(link, track_state) -> link
+
+Seed every overlaid channel's secondary-code phase from its bit buffer, and drop
+it again wherever synchronization no longer stands.
+
+Run once per chunk, after the estimator has folded the chunk's records and after
+[`restart_lost_bit_clocks!`](@ref). The sync detector reports the overlay chip
+the *upcoming* integration aligns to, and `Tracking` walks that anchor along
+every further record folded in the same chunk (the ones it marks
+`correlated_pre_sync` and keeps out of the coherent bit sum, because they were
+correlated against the pre-sync replica — here, un-wiped). So by the time the
+fold returns, the reported phase belongs to the block starting at
+`last_record_end`: exactly where the channel's next dump begins.
+
+Only the *seed* comes from the bit buffer. `Tracking` freezes
+`BitBuffer.secondary_phase` after sync — it reads it once, at the code-phase
+snap — so from there the link's own counter is what the removal runs on, and a
+channel that is already counting is left alone.
+"""
+function anchor_secondary_phases!(link::HardwareCorrelatorLink, track_state)
+    for hw_channel in eachindex(link.assignments)
+        link.secondary_wipe[hw_channel] || continue
+        assignment = link.assignments[hw_channel]
+        isnothing(assignment) && continue
+        sat_states = get_sat_states(track_state, assignment.group_key)
+        if !haskey(sat_states, assignment.prn)
+            forget_secondary_phase!(link, hw_channel)
+            continue
+        end
+        tracked_signal =
+            Tracking.get_signals(sat_states[assignment.prn])[assignment.signal_index]
+        bit_buffer = Tracking.get_bit_buffer(tracked_signal)
+        if !has_bit_or_secondary_code_been_found(bit_buffer)
+            # Sync has not been found yet, or it was thrown away with the bit
+            # clock. Either way the phase is not knowable from here.
+            forget_secondary_phase!(link, hw_channel)
+            continue
+        end
+        # Already counting: the link's counter has moved past the frozen value
+        # in the bit buffer, and re-seeding from it would step the overlay back.
+        link.secondary_phase[hw_channel] >= 0 && continue
+        last_end = link.last_record_end[hw_channel]
+        # Sync without a record on this channel is a satellite that synced
+        # elsewhere (a re-assignment inheriting a synced bit buffer); there is
+        # no sample to hang the phase on until its first record arrives.
+        last_end == typemin(Int64) && continue
+        link.secondary_phase[hw_channel] = mod(
+            bit_buffer.secondary_phase,
+            get_secondary_code_length(get_signal(tracked_signal)),
+        )
+        link.secondary_phase_sample[hw_channel] = last_end
+    end
+    link
+end
+
+# Take the overlay chip off one record and advance the channel's overlay counter
+# over it. Returns what the rest of the ingest path sees: the record unchanged
+# on a channel that is not being wiped, and one whose accumulators have all been
+# multiplied by the same ±1 where it is.
+#
+# The sign comes from `GNSSSignals.secondary_value`, the very lookup the
+# software replica is built from, so a shared overlay (GPS L5's NH10/NH20), a
+# per-PRN one (the 1800-chip GPS L1C / BeiDou B1C overlays) and any
+# PRN-dependent exception a signal model carries are all handled by the model
+# rather than restated here.
+function _wipe_secondary_code!(link, track_state, assignment, sat_state, hw_channel, output)
+    is_secondary_code_removed(link, hw_channel) || return output
+    tracked_signal = Tracking.get_signals(sat_state)[assignment.signal_index]
+    signal = get_signal(tracked_signal)
+    blocks = _record_code_blocks(link, sat_state, assignment.signal_index, output)
+    # The counter rides a record stream that tiles the sample axis, one overlay
+    # chip per primary-code block. A record starting anywhere else, or covering
+    # more than one block — whose per-block chips are already summed inside the
+    # accumulator, where no single sign can separate them again — leaves the
+    # host unable to say which chip this record carries.
+    if output.sample_index - output.integrated_samples !=
+       link.secondary_phase_sample[hw_channel] || blocks != 1
+        # Cut the record here: what has accumulated so far was wiped and what
+        # follows will not be, and one record cannot be both.
+        _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
+        forget_secondary_phase!(link, hw_channel)
+        link.secondary_phase_losses += 1
+        return output
+    end
+    chip = GNSSSignals.secondary_value(
+        get_secondary_code(signal),
+        assignment.prn,
+        link.secondary_phase[hw_channel],
+    )
+    link.secondary_phase[hw_channel] =
+        mod(link.secondary_phase[hw_channel] + blocks, get_secondary_code_length(signal))
+    link.secondary_phase_sample[hw_channel] = output.sample_index
+    chip > 0 && return output
+    Tracking.CorrelatorOutput(
+        _negate_accumulators(output.correlator),
+        output.integrated_samples,
+        output.sample_index,
+    )
+end
+
+# Flip the sign of every accumulator, keeping everything else from the
+# correlator — the overlay chip is one sign for the whole primary-code period,
+# so every tap carries it and every tap loses it together.
+_negate_accumulators(correlator::Tracking.AbstractCorrelator) =
+    @set correlator.accumulators = -get_accumulators(correlator)
 
 """
     coherent_integration_blocks(link, sat_state, signal_index, hw_channel) -> Int
@@ -2498,13 +2736,14 @@ function coherent_integration_blocks(
     has_bit_or_secondary_code_been_found(bit_buffer) || return 1
     link.bit_clock_lost[hw_channel] && return 1
     signal = get_signal(tracked_signal)
-    # A device replica reproduces the primary code only — nothing in
-    # `assign_channel!` asks it to wipe off a secondary/overlay code — so
-    # consecutive dumps of an overlaid signal carry alternating overlay chips.
-    # Summing across them would cancel the signal rather than accumulate it, so
-    # such signals stay at one block per record until the interface can tell a
-    # device to apply the overlay itself.
-    get_secondary_code_length(signal) == 1 || return 1
+    # Consecutive dumps of an overlaid signal carry different overlay chips, so
+    # summing them cancels the signal rather than accumulating it — unless the
+    # overlay has already been taken off them. The host does that from the
+    # moment it knows the phase ([`is_secondary_code_removed`](@ref)); until
+    # then such a signal stays at one block per record.
+    get_secondary_code_length(signal) == 1 ||
+        is_secondary_code_removed(link, hw_channel) ||
+        return 1
     blocks_per_symbol = _code_blocks_per_symbol(signal)
     blocks_per_symbol <= 1 && return 1
     requested =

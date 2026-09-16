@@ -98,7 +98,7 @@ then dropped, which is correct only for the L1 C/A shape it was written for.
 | `tap_sample_shifts`                                                | Program **exactly** these replica offsets, in whole input samples, latest first, prompt at zero.                                 |
 | `el_sample_spacing`                                                | The Early-to-Late distance implied by the shifts; kept because it is the one number the legacy call carried.                     |
 | `replica_amplitude`, `code_amplitude`                              | Declare, do not change: what the host divides out (see below).                                                                   |
-| `secondary_code_mode`                                              | `:primary_only` — replicate the primary code only. `:wipeoff` is reserved; the link does not request it yet.                     |
+| `secondary_code_mode`                                              | `:primary_only` — replicate the primary code only; the host removes the overlay (see below). `:wipeoff` is reserved and never requested. |
 | `carrier_phase_offset`                                             | Informational. Do **not** add it (see below).                                                                                    |
 | `band_id`, `sampling_freq`                                         | Which RF band, and the rate the shifts and sample counts are expressed in.                                                       |
 
@@ -204,18 +204,52 @@ That only works if the phase relationship survives into the accumulators. So:
 
 ## 7. Secondary codes
 
-`max_secondary_code_length` declares the longest overlay the gateware can wipe
-off itself; `1` means "primary code only", which is the default and is not an
-error. Where the device does not wipe the overlay, the host folds one
-primary-code block per record ([`coherent_integration_blocks`](@ref)) — correct,
-but it forgoes the longer coherent integration a wiped overlay would allow.
+**The host removes the overlay; the device replicates the primary code.** That
+is the ownership decision, and
+[`HardwareChannelConfig`](@ref)`.secondary_code_mode` is where it is stated per
+channel: it is `:primary_only` for every device and every signal, and
+[`GNSSReceiver.requested_secondary_code_mode`](@ref) is the one function that
+decides it. A device is never asked to wipe an overlay, so the overlay is removed
+exactly once — on the host, at the ingest, before the coherent pre-accumulation
+and therefore before the discriminators, the C/N₀ estimator and the navigation
+bit accumulation alike.
 
-[`GNSSReceiver.requested_secondary_code_mode`](@ref) always asks for
-`:primary_only` today, whatever the device declares, because wiping an overlay
-needs the *host* to know its phase and to keep the device's overlay counter tied
-to the decoded symbol grid. Removing secondary codes from hardware dumps after
-synchronisation is
-[issue #132](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/132).
+Why the host: an overlay's *phase* is not known when a channel is armed. It is
+recovered by the bit/secondary-code sync detector, some way into tracking, from
+the prompts themselves, and a device asked to wipe at the wrong phase cancels the
+signal instead of accumulating it. Handing the job to the gateware therefore
+needs more than a flag in the handover — it needs a *scheduled* command ("from
+device sample `n`, overlay chip `k`") on the same sample-exact footing as an
+[`NCOUpdate`](@ref), plus a way to read the device's overlay counter back so that
+a lost record cannot leave the two ends disagreeing in silence. That contract is
+not defined yet. The host's per-dump sign, meanwhile, is exact rather than
+approximate: the device's replicas run continuously, so multiplying one
+primary-period dump by its overlay chip *is* the correlation the device would
+have produced with the overlay baked into its replica.
+
+What the device owes this is therefore only what section 4 already asks for:
+**one record per primary code period**. A record covering several code periods
+has summed those periods' overlay chips inside the accumulator, and no single
+sign takes them off again — the host detects that, stops removing rather than
+guessing, and counts it. The same holds for a record that does not start where
+the previous one ended: the overlay counter rides the record stream, so a lost
+record, a duplicate or a counter step back drops the phase until the next
+synchronisation re-seeds it. Nothing is ever wiped at a guessed phase, because a
+wrong sign is invisible to everything downstream.
+
+`max_secondary_code_length` therefore stays a *declaration* — the longest overlay
+the gateware could wipe if it were asked — and `1`, the default, is not an error
+and costs a device nothing. It is what [`supports_secondary_code_wipeoff`](@ref)
+reads, and nothing requests it. Where it would become load-bearing is the
+scheduled-wipeoff contract sketched above, which would additionally let a device
+pre-accumulate across code periods; until then
+[`coherent_integration_blocks`](@ref) does that on the host, across records the
+host has wiped.
+
+Removing secondary codes from hardware dumps after synchronisation is
+[issue #132](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/132). The
+host-side half of it has landed; the scheduled hardware-wipeoff contract has not,
+and no live-hardware demonstration has been run.
 
 ## 8. Feedback
 
@@ -242,6 +276,8 @@ status, and [`assignment_start_sample`](@ref) if arming is asynchronous.
     code
   - [ ] Dump records: latest-first accumulators, correct `num_taps`, a wire type
     wide enough for every layout, epoch strobes, `code_phase` if available
+  - [ ] One record per primary code period, tiling the sample axis with neither
+    gaps nor overlap — what the host's overlay removal rides on (section 7)
   - [ ] [`dropped_dump_count!`](@ref) and [`assignment_start_sample`](@ref)
     where the hardware can support them
 
@@ -251,8 +287,10 @@ This page is the interface as of
 [issue #131](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/131). Extending
 the hardware path from GPS L1 C/A to every GNSSSignals signal is tracked by
 [issue #130](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/130); the parts
-still to land are secondary-code wipeoff (#132), primary codes longer than a
-device's memory and dumps shorter than a primary period (#133), routing channels
+still to land are a *scheduled* hardware secondary-code wipeoff (#132 removes the
+overlay on the host; the device-side contract is sketched in section 7), primary
+codes longer than a device's memory and dumps shorter than a primary period
+(#133), routing channels
 and noise estimates across RF bands (#134), and the per-signal validation matrix
 (#135). Until those land, declare conservatively: a capability you cannot serve
 is a channel that never locks.

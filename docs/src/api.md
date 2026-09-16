@@ -58,6 +58,8 @@ advance_code_phases!
 anchor_bit_phases!
 restart_lost_bit_clocks!
 take_bit_clock_restart!
+anchor_secondary_phases!
+GNSSReceiver.is_secondary_code_removed
 coherent_integration_blocks
 advance_tracking!
 flush_partial_records!

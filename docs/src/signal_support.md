@@ -42,60 +42,60 @@ compare against the *same* reference rather than against each other.
 ## The matrix
 
 <!-- BEGIN GENERATED MATRIX -->
-
-| Family           | Signal             | replica                    | acquisition handover              | tracking                          | secondary sync                          | data decode                     | pvt                          |
-|:---------------- |:------------------ |:-------------------------- |:--------------------------------- |:--------------------------------- |:--------------------------------------- |:------------------------------- |:---------------------------- |
-| GPS L1 C/A       | `GPSL1CA`          | software (harness_replica) | software (harness_acquisition)    | software (harness_receive)        | n/a (no_secondary_code)                 | software (ion_recording)        | software (ion_recording)     |
-| GPS L1C          | `GPSL1C_D`         | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | n/a (no_secondary_code)                 | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
-|                  | `GPSL1C_P`         | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data)             | untested (pvt_sweep_pending) |
-| GPS L2C          | `GPSL2CM`          | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | n/a (no_secondary_code)                 | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
-|                  | `GPSL2CL`          | software (harness_replica) | n/a (acquisition_window_too_long) | untested (tracking_sweep_pending) | n/a (no_secondary_code)                 | n/a (pilot_no_data)             | untested (pvt_sweep_pending) |
-| GPS L5           | `GPSL5I`           | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
-|                  | `GPSL5Q`           | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data)             | untested (pvt_sweep_pending) |
-| Galileo E1       | `GalileoE1B`       | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | n/a (no_secondary_code)                 | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
-|                  | `GalileoE1C`       | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data)             | untested (pvt_sweep_pending) |
-|                  | `GalileoE1B_BOC11` | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | n/a (no_secondary_code)                 | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
-|                  | `GalileoE1C_BOC11` | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data)             | untested (pvt_sweep_pending) |
-| Galileo E5       | `GalileoE5aI`      | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
-|                  | `GalileoE5aQ`      | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data)             | untested (pvt_sweep_pending) |
-|                  | `GalileoE5aQP`     | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | n/a (no_secondary_code)                 | n/a (pilot_no_data)             | untested (pvt_sweep_pending) |
-|                  | `GalileoE5bI`      | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
-|                  | `GalileoE5bQ`      | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data)             | untested (pvt_sweep_pending) |
-| Galileo E6       | `GalileoE6B`       | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | n/a (no_secondary_code)                 | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
-|                  | `GalileoE6C`       | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data)             | untested (pvt_sweep_pending) |
-| BeiDou legacy/B2 | `BeiDouB1I`        | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
-|                  | `BeiDouB3I`        | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
-|                  | `BeiDouB2bI`       | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | n/a (no_secondary_code)                 | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
-|                  | `BeiDouB2aI`       | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
-|                  | `BeiDouB2aQ`       | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data)             | untested (pvt_sweep_pending) |
-| BeiDou B1C       | `BeiDouB1C_D`      | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | n/a (no_secondary_code)                 | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
-|                  | `BeiDouB1C_P`      | software (harness_replica) | software (harness_acquisition)    | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data)             | untested (pvt_sweep_pending) |
+| Family | Signal | replica | acquisition handover | tracking | secondary sync | data decode | pvt |
+|---|---|---|---|---|---|---|---|
+| GPS L1 C/A | `GPSL1CA` | software (harness_replica) | software (harness_acquisition) | software (harness_receive) | n/a (no_secondary_code) | software (ion_recording) | software (ion_recording) |
+| GPS L1C | `GPSL1C_D` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | n/a (no_secondary_code) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
+|  | `GPSL1C_P` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
+| GPS L2C | `GPSL2CM` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | n/a (no_secondary_code) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
+|  | `GPSL2CL` | software (harness_replica) | n/a (acquisition_window_too_long) | untested (tracking_sweep_pending) | n/a (no_secondary_code) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
+| GPS L5 | `GPSL5I` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | simulated_fpga (harness_hardware_overlay) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
+|  | `GPSL5Q` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
+| Galileo E1 | `GalileoE1B` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | n/a (no_secondary_code) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
+|  | `GalileoE1C` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
+|  | `GalileoE1B_BOC11` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | n/a (no_secondary_code) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
+|  | `GalileoE1C_BOC11` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
+| Galileo E5 | `GalileoE5aI` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
+|  | `GalileoE5aQ` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
+|  | `GalileoE5aQP` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | n/a (no_secondary_code) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
+|  | `GalileoE5bI` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
+|  | `GalileoE5bQ` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
+| Galileo E6 | `GalileoE6B` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | n/a (no_secondary_code) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
+|  | `GalileoE6C` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
+| BeiDou legacy/B2 | `BeiDouB1I` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
+|  | `BeiDouB3I` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
+|  | `BeiDouB2bI` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | n/a (no_secondary_code) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
+|  | `BeiDouB2aI` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
+|  | `BeiDouB2aQ` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
+| BeiDou B1C | `BeiDouB1C_D` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | n/a (no_secondary_code) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
+|  | `BeiDouB1C_P` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
 
 ### Roles
 
-  - **replica** — The code replica is generated correctly: unit-power, balanced, correlating to a single dominant peak at the stated code phase, isolated from other PRNs, and (where there is one) carrying the right secondary code.
-  - **acquisition handover** — A cold acquisition detects the satellite and hands over a code phase and Doppler accurate enough for the tracking loops to pull in.
-  - **tracking** — The code and carrier loops hold lock and keep the replica aligned.
-  - **secondary sync** — The receiver synchronises to the secondary (overlay) code, so integration can extend past one primary code period.
-  - **data decode** — The navigation message is demodulated and decoded into a usable ephemeris.
-  - **pvt** — The satellite contributes valid measurements to a position/velocity/time fix.
+- **replica** — The code replica is generated correctly: unit-power, balanced, correlating to a single dominant peak at the stated code phase, isolated from other PRNs, and (where there is one) carrying the right secondary code.
+- **acquisition handover** — A cold acquisition detects the satellite and hands over a code phase and Doppler accurate enough for the tracking loops to pull in.
+- **tracking** — The code and carrier loops hold lock and keep the replica aligned.
+- **secondary sync** — The receiver synchronises to the secondary (overlay) code, so integration can extend past one primary code period.
+- **data decode** — The navigation message is demodulated and decoded into a usable ephemeris.
+- **pvt** — The satellite contributes valid measurements to a position/velocity/time fix.
 
 ### Evidence sources
 
-  - **`harness_acquisition`** (`test/signal_validation.jl`) — The reference harness's per-signal acquisition check: a cold `acquire!` over harness samples has to detect the satellite and hand over a code phase and Doppler within the stated tolerances.
-  - **`harness_receive`** (`test/signal_validation.jl`) — A full `receive` run over harness samples: the satellite has to be acquired, tracked and held in lock with its C/N₀ within tolerance of the case's.
-  - **`harness_replica`** (`test/signal_validation.jl`) — The reference harness's per-signal replica check: unit code power, code balance, peak alignment against a fractional code phase and a Doppler, main-peak dominance, cross-PRN isolation and secondary-code agreement, all against `ReferenceHarness`' noise-free reference.
-  - **`ion_recording`** (`test/ion_rtlsdr_integration.jl`) — The 60 s ION RTL-SDR live-sky GPS L1 recording through the software receive path, asserted against a captured baseline: eleven healthy satellites, decoded ephemerides, and a PVT fix repeatable to one metre per ECEF component.
+- **`harness_acquisition`** (`test/signal_validation.jl`) — The reference harness's per-signal acquisition check: a cold `acquire!` over harness samples has to detect the satellite and hand over a code phase and Doppler within the stated tolerances.
+- **`harness_hardware_overlay`** (`test/secondary_code_removal.jl`) — GPS L5I through the simulated hardware correlator of `test/simulated_fpga.jl` over reference-harness samples: the device replicates the primary code only, `Tracking`'s own detector finds the NH10 overlay, the link then removes it from every dump, and the decoded symbols are the ones the harness transmitted — at close to the full ten blocks of energy per symbol rather than the overlay's own sum of two.
+- **`harness_receive`** (`test/signal_validation.jl`) — A full `receive` run over harness samples: the satellite has to be acquired, tracked and held in lock with its C/N₀ within tolerance of the case's.
+- **`harness_replica`** (`test/signal_validation.jl`) — The reference harness's per-signal replica check: unit code power, code balance, peak alignment against a fractional code phase and a Doppler, main-peak dominance, cross-PRN isolation and secondary-code agreement, all against `ReferenceHarness`' noise-free reference.
+- **`ion_recording`** (`test/ion_rtlsdr_integration.jl`) — The 60 s ION RTL-SDR live-sky GPS L1 recording through the software receive path, asserted against a captured baseline: eleven healthy satellites, decoded ephemerides, and a PVT fix repeatable to one metre per ECEF component.
 
 ### Why a cell is not supported
 
-  - **`acquisition_window_too_long`** — One coherent acquisition window is a whole primary code period, and this signal's is 1.5 s — 3 million samples at four samples per chip. So L2CL is never the signal a receiver acquires: `acquisition_signal` falls back to the pairing's L2CM data component above ~0.67 Hz Doppler resolution, and L2CL is handed over from L2CM's code phase rather than searched for. A property of the signal, not a gap in the evidence.
-  - **`decode_sweep_pending`** — A decoder exists for this signal (`GNSSDecoderState` has a method), but nothing has demonstrated a decode. Synthetic samples cannot: the harness modulates a reproducible bit stream, not a navigation message with a preamble, parity and an ephemeris. Evidence has to come from a recording or live sky.
-  - **`no_secondary_code`** — The signal has no secondary code (`get_secondary_code_length` is 1), so there is nothing to synchronise to.
-  - **`pilot_no_data`** — A pilot component carries no navigation data (`get_data_frequency` is 0 Hz), so there is no message to decode. It contributes to a fix through its `CombinedSignal` pairing with the data component, not on its own.
-  - **`pvt_sweep_pending`** — No fix has been computed with this signal contributing. Follows the decode sweep for a data component, and the tracking sweep for a pilot, which contributes pseudoranges through its `CombinedSignal` pairing.
-  - **`secondary_sync_sweep_pending`** — The receiver's own secondary-code synchronisation is not swept per signal yet. The harness does verify that the secondary code is recoverable from the reference (it is part of the replica check), which is the prerequisite, not the capability.
-  - **`tracking_sweep_pending`** — No per-signal tracking sweep exists yet. The harness can generate the case; what is missing is the run and its baseline — part of step 9 itself, and only meaningful once the loops it exercises are the ones the roadmap settles on.
+- **`acquisition_window_too_long`** — One coherent acquisition window is a whole primary code period, and this signal's is 1.5 s — 3 million samples at four samples per chip. So L2CL is never the signal a receiver acquires: `acquisition_signal` falls back to the pairing's L2CM data component above ~0.67 Hz Doppler resolution, and L2CL is handed over from L2CM's code phase rather than searched for. A property of the signal, not a gap in the evidence.
+- **`decode_sweep_pending`** — A decoder exists for this signal (`GNSSDecoderState` has a method), but nothing has demonstrated a decode. Synthetic samples cannot: the harness modulates a reproducible bit stream, not a navigation message with a preamble, parity and an ephemeris. Evidence has to come from a recording or live sky.
+- **`no_secondary_code`** — The signal has no secondary code (`get_secondary_code_length` is 1), so there is nothing to synchronise to.
+- **`pilot_no_data`** — A pilot component carries no navigation data (`get_data_frequency` is 0 Hz), so there is no message to decode. It contributes to a fix through its `CombinedSignal` pairing with the data component, not on its own.
+- **`pvt_sweep_pending`** — No fix has been computed with this signal contributing. Follows the decode sweep for a data component, and the tracking sweep for a pilot, which contributes pseudoranges through its `CombinedSignal` pairing.
+- **`secondary_sync_sweep_pending`** — The receiver's own secondary-code synchronisation is not swept per signal yet. The harness does verify that the secondary code is recoverable from the reference (it is part of the replica check), which is the prerequisite, not the capability.
+- **`tracking_sweep_pending`** — No per-signal tracking sweep exists yet. The harness can generate the case; what is missing is the run and its baseline — part of step 9 itself, and only meaningful once the loops it exercises are the ones the roadmap settles on.
 
 <!-- END GENERATED MATRIX -->
 
