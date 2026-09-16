@@ -32,10 +32,14 @@ documentation.
 
 ## Hardware correlators
 
+See the [hardware-correlator contract](@ref "Hardware-correlator contract") for
+what an adapter package and its gateware have to satisfy.
+
 ```@docs
 AbstractHardwareCorrelatorSDR
 HardwareCorrelatorLink
 CorrelatorDump
+num_correlator_taps
 NCOUpdate
 EPOCH_STROBE_CHANNEL
 raw_sample_channel
@@ -59,6 +63,22 @@ advance_tracking!
 flush_partial_records!
 push_nco_updates!
 estimate_dopplers!
+```
+
+### Capabilities and channel configuration
+
+```@docs
+HardwareCorrelatorCapabilities
+GNSSReceiver.LEGACY_GPS_L1CA_CAPABILITIES
+hardware_capabilities
+HardwareChannelConfig
+validate_hardware_configuration
+check_hardware_support
+GNSSReceiver.hardware_support_error
+GNSSReceiver.wire_tap_slots
+replica_code_amplitude
+supports_secondary_code_wipeoff
+GNSSReceiver.requested_secondary_code_mode
 ```
 
 ### The delay-aware tracking loop

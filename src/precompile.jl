@@ -39,7 +39,13 @@ raw_sample_channel(sdr::_PrecompileHardwareSDR) = sdr.raw
 correlator_dump_channel(sdr::_PrecompileHardwareSDR) = sdr.dumps
 nco_update_channel(sdr::_PrecompileHardwareSDR) = sdr.ncos
 num_hardware_channels(::_PrecompileHardwareSDR) = 4
-assign_channel!(::_PrecompileHardwareSDR, args...; kwargs...) = nothing
+# The configuration form, spelled out rather than swallowed by a vararg
+# catch-all: a `assign_channel!(::MyDevice, args...)` method is neither more
+# nor less specific than GNSSReceiver's own
+# `assign_channel!(::AbstractHardwareCorrelatorSDR, hw_channel, ::HardwareChannelConfig)`
+# shim, so the call is ambiguous. This is the shape every device wants — see
+# `assign_channel!`.
+assign_channel!(::_PrecompileHardwareSDR, hw_channel, ::HardwareChannelConfig) = nothing
 release_channel!(::_PrecompileHardwareSDR, hw_channel) = nothing
 
 # The correlator a single-antenna Early/Prompt/Late device dumps. Both the

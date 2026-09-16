@@ -84,6 +84,8 @@ export ReceiverState,
     CorrelatorDump,
     NCOUpdate,
     HardwareCorrelatorLink,
+    HardwareCorrelatorCapabilities,
+    HardwareChannelConfig,
     NCOReferencedPLLAndDLL,
     raw_sample_channel,
     correlator_dump_channel,
@@ -94,6 +96,12 @@ export ReceiverState,
     assignment_start_sample,
     dropped_dump_count!,
     correlator_gain,
+    hardware_capabilities,
+    replica_code_amplitude,
+    supports_secondary_code_wipeoff,
+    check_hardware_support,
+    validate_hardware_configuration,
+    num_correlator_taps,
     epoch_strobe,
     is_epoch_strobe,
     CombinedSignal,
@@ -825,6 +833,7 @@ function ReceiverState(
 end
 
 include("read_file.jl")
+include("hardware_capabilities.jl")
 include("hardware_correlator.jl")
 include("receive.jl")
 include("nco_referenced_loop.jl")
