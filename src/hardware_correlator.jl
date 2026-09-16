@@ -508,6 +508,7 @@ function check_hardware_support(
     ),
     num_ants::Integer = Tracking.get_num_ants(correlator),
     dump_tap_slots::Union{Nothing,Integer} = _dump_tap_slots(sdr),
+    max_integration_time = DEFAULT_MAX_INTEGRATION_TIME,
 )
     message = hardware_support_error(
         hardware_capabilities(sdr),
@@ -516,6 +517,7 @@ function check_hardware_support(
         sampling_freq;
         num_ants,
         dump_tap_slots,
+        max_integration_time,
     )
     isnothing(message) && return nothing
     throw(ArgumentError("$(nameof(typeof(sdr))) $message\n" * _CONTRACT_POINTER))
@@ -544,6 +546,7 @@ function validate_hardware_configuration(
     systems,
     sampling_freq;
     num_ants::NumAnts{N} = NumAnts(1),
+    max_integration_time = DEFAULT_MAX_INTEGRATION_TIME,
 ) where {N}
     capabilities = hardware_capabilities(sdr)
     all_systems = as_systems(systems)
@@ -557,6 +560,7 @@ function validate_hardware_configuration(
             sampling_freq;
             num_ants = N,
             dump_tap_slots,
+            max_integration_time,
         )
         isnothing(message) || push!(problems, message)
     end
@@ -758,7 +762,9 @@ Keywords:
   - `doppler_update_interval` — the fixed processing epoch. Dumps are collected
     until a record crosses the boundary, then the estimator folds every
     satellite's collected outputs and updates each NCO once. Defaults to one
-    primary code period of `reference_signal`.
+    primary code period of `reference_signal`, or to `max_integration_time`
+    where that is shorter — a 1.5 s GPS L2CL code period is not an update
+    interval any tracking loop survives.
   - `feedback_delay_epochs` — how many epochs ahead an [`NCOUpdate`](@ref) is
     scheduled, i.e. the `n` in "the correction from epoch `k` applies at
     `k + n`". Must be large enough to cover the PCIe round trip. The link
@@ -778,6 +784,14 @@ Keywords:
     restores the old behaviour of folding every dump on its own. See
     [`coherent_integration_blocks`](@ref) for why this is not optional in
     practice.
+  - `max_integration_time` — the longest span of signal folded into one record,
+    whatever `coherent_code_blocks` asks for
+    (default [`DEFAULT_MAX_INTEGRATION_TIME`](@ref), 20 ms). This is the knob
+    that separates the *tracking-update cadence* from the *primary-code period*:
+    for every signal whose code period fits inside it a record is still a whole
+    number of code blocks, and for one whose does not — GPS L2CL's 1.5 s — the
+    record is cut inside a code period and counted as the fraction of one it is.
+    See [`coherent_integration_periods`](@ref).
   - `max_epoch_clock_advance` — how far ahead of everything seen so far a
     *single* record may place the epoch clock (default 1 s). A record beyond it
     is held back until a second record corroborates the jump, and counted in
@@ -921,15 +935,51 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     # Requested coherent integration length in primary-code blocks, or 0 for
     # "one full symbol" (see `coherent_integration_blocks`).
     const coherent_code_blocks::Int
+    # Longest span of signal, in seconds, that may be folded into one record —
+    # the ceiling `coherent_code_blocks` is clamped against, and the line above
+    # which a signal's primary-code period stops being a usable integration unit
+    # (see `coherent_integration_periods`).
+    const max_integration_time::Float64
     # The partially accumulated record: summed accumulators, the samples and
-    # whole code blocks they span, and the `sample_index` of the newest dump in
-    # it. `partial_blocks == 0` means "nothing accumulated", in which case
-    # `partial_correlator` is undefined rather than zero — a correlator type has
-    # no zero without an instance to take it from.
+    # (fractional) primary-code periods they span, and the `sample_index` of the
+    # newest dump in it. `partial_samples == 0` means "nothing accumulated", in
+    # which case `partial_correlator` is undefined rather than zero — a
+    # correlator type has no zero without an instance to take it from.
+    #
+    # `partial_periods` is a `Float64` rather than a block count, and that is the
+    # whole of issue #133 in one field: a record spanning a quarter of a code
+    # period spans a quarter of one, not "at least one block".
     const partial_correlator::Vector{C}
     const partial_samples::Vector{Int64}
-    const partial_blocks::Vector{Int}
+    const partial_periods::Vector{Float64}
+    # Primary-code wraps the open record has crossed. Not `round(partial_periods)`:
+    # the short record a channel produces between its sample-exact phase load and
+    # the next code wrap covers a *fraction* of a block and completes one, and
+    # that is the count the coherent accumulation is sized in.
+    const partial_wraps::Vector{Int}
     const partial_end::Vector{Int64}
+    # Where this channel's record stream currently stands on the primary-code
+    # block grid: the fraction of a code period at `last_record_end`, i.e. where
+    # the next record begins inside its block. Exactly `0.0` on a block
+    # boundary (`_snap_block_fraction` forces it there, so "is this on a
+    # boundary?" is an equality rather than a tolerance at every call site), and
+    # `NaN` while it is unknown — a channel with no record folded yet.
+    #
+    # Re-anchored to `CorrelatorDump.code_phase` on every record that reports
+    # one, which is what keeps a partial-primary stream on the grid instead of
+    # dead-reckoning a 1.5 s code period from the handover for the whole run.
+    const block_phase::Vector{Float64}
+    # Primary-code wraps this channel's record stream has completed since it was
+    # assigned — the count the code *did*, as opposed to the number of records
+    # the device produced. Read through `primary_code_wraps`.
+    const primary_wraps::Vector{Int64}
+    # The longest record seen on this channel since it was assigned, i.e. how
+    # long one of its records nominally is. `_account_record_continuity!` tells a
+    # re-arm hole from a lost record by comparing the hole to it: with a record
+    # per code period the code period served, but a device dumping four times per
+    # period leaves holes a quarter that size and every one of them would read as
+    # a re-arm. `typemin` = nothing seen yet.
+    const nominal_record_samples::Vector{Int64}
     # Primary-code blocks handed to the estimator since it last ran, per channel.
     # `coherent_integration_blocks` sizes a record against the bit buffer's
     # progress through the current symbol, but the bit buffer only advances when
@@ -1066,6 +1116,17 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     # rather than wiping at a phase the host can no longer vouch for — a wrong
     # sign is worse than no wipe, because nothing downstream can see it.
     secondary_phase_losses::Int
+    # Records handed to the loops that spanned less than one primary-code
+    # period. Zero for every signal whose code period fits inside
+    # `max_integration_time`, and one per record for GPS L2CL — which is the
+    # point, not a fault: it is what "the loop is updated without waiting 1.5 s"
+    # looks like from the accounting's side.
+    partial_primary_records::Int
+    # Records emitted past their target length because the device's dump grid
+    # does not divide its primary-code period, so no dump ever ended on a block
+    # boundary to cut on. A device producing partial dumps has to align them to
+    # the code-block boundary; this counts the times it did not.
+    misaligned_dump_boundaries::Int
 end
 
 function HardwareCorrelatorLink(
@@ -1077,20 +1138,31 @@ function HardwareCorrelatorLink(
     max_dumps_per_drain::Integer = 4096,
     max_catchup_epochs::Integer = 64,
     coherent_code_blocks::Union{Nothing,Integer} = nothing,
+    max_integration_time = DEFAULT_MAX_INTEGRATION_TIME,
     correlator_gain = nothing,
     noise_source::Symbol = :channel,
     noise_rearm_interval = 1u"s",
     max_epoch_clock_advance = 1u"s",
     max_dump_gap = 5u"s",
 )
-    interval = something(
-        doppler_update_interval,
-        get_code_length(reference_signal) / get_code_frequency(reference_signal),
+    max_integration_seconds = _seconds(max_integration_time)
+    max_integration_seconds > 0 || throw(
+        ArgumentError("max_integration_time must be positive (got $max_integration_time)"),
     )
-    epoch_length = round(Int, upreferred(interval * sampling_freq))
+    # The processing epoch is a *time*, not a property of the reference signal's
+    # code. One primary code period is the natural default and stays the default
+    # for every signal whose code period is a usable update interval — but GPS
+    # L2CL's is 1.5 s, and an epoch grid on that would fold the loops and push an
+    # NCO correction twice per three seconds, which is the conflation issue #133
+    # is about. Past `max_integration_time` the epoch is the integration length.
+    interval =
+        isnothing(doppler_update_interval) ?
+        min(code_period_seconds(reference_signal), max_integration_seconds) :
+        _seconds(doppler_update_interval)
+    epoch_length = round(Int, interval * _hz(sampling_freq))
     epoch_length > 0 || throw(
         ArgumentError(
-            "doppler_update_interval $interval is shorter than one sample period at " *
+            "doppler_update_interval $(interval) s is shorter than one sample period at " *
             "$sampling_freq",
         ),
     )
@@ -1175,9 +1247,14 @@ function HardwareCorrelatorLink(
         ones(Float64, n),
         Int(max_catchup_epochs),
         isnothing(coherent_code_blocks) ? 0 : Int(coherent_code_blocks),
+        max_integration_seconds,
         Vector{_correlator_type(dump_type)}(undef, n),
         zeros(Int64, n),
+        zeros(Float64, n),
         zeros(Int, n),
+        fill(typemin(Int64), n),
+        fill(NaN, n),
+        zeros(Int64, n),
         fill(typemin(Int64), n),
         zeros(Int, n),
         fill(false, n),
@@ -1203,6 +1280,8 @@ function HardwareCorrelatorLink(
         [NCOTimeline() for _ = 1:n],
         NCOTimeline(),
         typemin(Int64),
+        0,
+        0,
         0,
         0,
         0,
@@ -1688,6 +1767,9 @@ function release_stale_channels!(link, track_state)
         link.bit_phase_anchored[hw_channel] = false
         link.last_record_end[hw_channel] = typemin(Int64)
         link.last_record_samples[hw_channel] = typemin(Int64)
+        link.nominal_record_samples[hw_channel] = typemin(Int64)
+        link.block_phase[hw_channel] = NaN
+        link.primary_wraps[hw_channel] = 0
         link.lost_record_samples[hw_channel] = 0
         link.rearm_dead_samples[hw_channel] = 0
         link.overlapping_record_samples[hw_channel] = 0
@@ -1769,6 +1851,7 @@ function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampl
         sampling_freq;
         num_ants = Tracking.get_num_ants(correlator),
         dump_tap_slots = wire_tap_slots(_link_correlator_type(link)),
+        max_integration_time = link.max_integration_time,
     )
     if !isnothing(unsupported)
         link.unsupported_signals += 1
@@ -1805,6 +1888,12 @@ function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampl
     # end sample says nothing about where this one's first record begins.
     link.last_record_end[hw_channel] = typemin(Int64)
     link.last_record_samples[hw_channel] = typemin(Int64)
+    link.nominal_record_samples[hw_channel] = typemin(Int64)
+    # A fresh occupant's replica starts wherever the handover put it, so the
+    # channel's place on the primary-code block grid is unknown until its first
+    # record re-establishes it.
+    link.block_phase[hw_channel] = NaN
+    link.primary_wraps[hw_channel] = 0
     link.lost_record_samples[hw_channel] = 0
     link.rearm_dead_samples[hw_channel] = 0
     link.overlapping_record_samples[hw_channel] = 0
@@ -2174,10 +2263,18 @@ chunk. Called once per chunk, immediately before the estimator runs.
 
 Channels with nothing accumulated — and channels whose satellite the receiver
 has already dropped — are skipped.
+
+A part-record that does not yet end on a primary-code block boundary is *not*
+flushed where the signal's code period is the integration unit
+([`allows_partial_primary_records`](@ref)): `Tracking` credits a record to its
+bit clock in whole blocks, so handing it one cut inside a block moves the
+navigation bit grid by the cut for the rest of the run. Such a record waits for
+the dump that completes its block, which is at most one dump away — the cost is
+one update interval, once, against a bit stream that never comes back.
 """
 function flush_partial_records!(link::HardwareCorrelatorLink, track_state)
     for hw_channel in eachindex(link.assignments)
-        link.partial_blocks[hw_channel] == 0 && continue
+        link.partial_samples[hw_channel] == 0 && continue
         assignment = link.assignments[hw_channel]
         if isnothing(assignment)
             _discard_partial!(link, hw_channel)
@@ -2188,13 +2285,15 @@ function flush_partial_records!(link::HardwareCorrelatorLink, track_state)
             _discard_partial!(link, hw_channel)
             continue
         end
-        _emit_partial!(
+        sat_state = sat_states[assignment.prn]
+        signal = get_signal(Tracking.get_signals(sat_state)[assignment.signal_index])
+        _record_is_emittable(
             link,
-            track_state,
-            assignment,
-            sat_states[assignment.prn],
+            signal,
             hw_channel,
-        )
+            _block_boundary_tolerance(link, signal),
+        ) || continue
+        _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
     end
     link
 end
@@ -2370,23 +2469,30 @@ function _account_record_continuity!(
     sat_state,
     hw_channel,
     output,
+    span,
 )
     expected_start = link.last_record_end[hw_channel]
     record_start = output.sample_index - output.integrated_samples
     if expected_start != typemin(Int64)
         gap = record_start - expected_start
         if gap > 0
-            # A re-arm leaves a sub-period hole followed by a short record.
-            # Compare against the signal's Doppler-adjusted primary period,
-            # not the previous record: adjacent full periods can differ by a
-            # sample, and the previous record can itself be a short arm record.
-            signal = get_signal(Tracking.get_signals(sat_state)[assignment.signal_index])
-            code_rate = ustrip(Hz, get_code_frequency(signal) + get_code_doppler(sat_state))
-            min_period_samples = floor(
-                Int, get_code_length(signal) * link.sampling_freq_hz / code_rate,
-            )
+            # A re-arm leaves a hole shorter than one of the channel's records,
+            # followed by a short record running to the next boundary; a lost
+            # record leaves a hole of at least one whole record. The measure is
+            # therefore *the channel's own record length*, not the signal's code
+            # period: with a record per code period the two are the same number,
+            # but a device dumping four times per period leaves lost-record holes
+            # a quarter of a code period long and every one of them would read as
+            # a re-arm — which leaves the bit clock standing across a hole that
+            # cut it (#133).
+            #
+            # The nominal length is the longest record seen since the channel was
+            # assigned rather than the previous one: adjacent full records can
+            # differ by a sample, and the previous record can itself be a short
+            # arm record.
             _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
-            if gap < min_period_samples && output.integrated_samples < min_period_samples
+            nominal = _nominal_record_samples(link, sat_state, assignment, hw_channel)
+            if gap < nominal && output.integrated_samples < nominal
                 link.rearm_dead_samples[hw_channel] += gap
                 link.rearm_gaps += 1
             else
@@ -2405,7 +2511,28 @@ function _account_record_continuity!(
     end
     link.last_record_end[hw_channel] = output.sample_index
     link.last_record_samples[hw_channel] = output.integrated_samples
+    link.nominal_record_samples[hw_channel] =
+        max(link.nominal_record_samples[hw_channel], output.integrated_samples)
+    # The record stream's place on the primary-code block grid moves with the
+    # record, and only with it: `span.wraps` is what the *code* did, however many
+    # records the device produced while doing it.
+    link.block_phase[hw_channel] = span.block_phase
+    link.primary_wraps[hw_channel] += span.wraps
     link
+end
+
+# How long one of this channel's records nominally is, in device samples: the
+# longest seen since the channel was assigned, capped at one primary-code period
+# because a record spanning several of them says nothing about the device's dump
+# cadence. Falls back to the code period while nothing has been seen.
+function _nominal_record_samples(link, sat_state, assignment, hw_channel)
+    signal = get_signal(Tracking.get_signals(sat_state)[assignment.signal_index])
+    code_rate =
+        ustrip(Hz, get_code_frequency(signal)) +
+        ustrip(Hz, uconvert(Hz, get_code_doppler(sat_state)))
+    period = floor(Int64, get_code_length(signal) * link.sampling_freq_hz / code_rate)
+    seen = link.nominal_record_samples[hw_channel]
+    seen <= 0 ? period : min(period, seen)
 end
 
 function _append_dump!(link, track_state, dump)
@@ -2451,6 +2578,19 @@ function _append_dump!(link, track_state, dump)
             10
         return link
     end
+    # Where this record sits on the primary-code block grid, measured once and
+    # handed to everything downstream: the overlay removal needs to know which
+    # block's chip it carries, the continuity accounting moves the grid by it,
+    # and the coherent accumulation counts in it. Measured before any of them so
+    # the three cannot disagree about the same record (#133).
+    span = _record_block_span(
+        link,
+        sat_state,
+        assignment.signal_index,
+        hw_channel,
+        dump.output,
+        dump.code_phase,
+    )
     # Take the overlay chip off before anything reads the accumulators, so the
     # coherent pre-accumulation, the discriminators, the C/N0 estimator and the
     # navigation bit accumulation all see the same wiped record.
@@ -2461,6 +2601,7 @@ function _append_dump!(link, track_state, dump)
         sat_state,
         hw_channel,
         dump.output,
+        span,
     )
     _account_record_continuity!(
         link,
@@ -2469,8 +2610,9 @@ function _append_dump!(link, track_state, dump)
         sat_state,
         hw_channel,
         output,
+        span,
     )
-    _accumulate_dump!(link, track_state, assignment, sat_state, hw_channel, output)
+    _accumulate_dump!(link, track_state, assignment, sat_state, hw_channel, output, span)
     # The channel is alive: the dump-gap budget starts again from here.
     link.last_record_at_samples[hw_channel] = link.samples_consumed
     # Collect the code-phase anchor for the phase bookkeeping. Only the
@@ -2608,18 +2750,33 @@ end
 # per-PRN one (the 1800-chip GPS L1C / BeiDou B1C overlays) and any
 # PRN-dependent exception a signal model carries are all handled by the model
 # rather than restated here.
-function _wipe_secondary_code!(link, track_state, assignment, sat_state, hw_channel, output)
+function _wipe_secondary_code!(
+    link,
+    track_state,
+    assignment,
+    sat_state,
+    hw_channel,
+    output,
+    span,
+)
     is_secondary_code_removed(link, hw_channel) || return output
     tracked_signal = Tracking.get_signals(sat_state)[assignment.signal_index]
     signal = get_signal(tracked_signal)
-    blocks = _record_code_blocks(link, sat_state, assignment.signal_index, output)
     # The counter rides a record stream that tiles the sample axis, one overlay
-    # chip per primary-code block. A record starting anywhere else, or covering
-    # more than one block — whose per-block chips are already summed inside the
-    # accumulator, where no single sign can separate them again — leaves the
+    # chip per primary-code block. A record starting anywhere else, or crossing a
+    # block boundary inside itself — its blocks' chips are already summed inside
+    # the accumulator, where no single sign can separate them again — leaves the
     # host unable to say which chip this record carries.
+    #
+    # What a record must *not* do is cross a boundary; how long it is does not
+    # matter. A record shorter than a code period lies wholly inside one block
+    # and carries that block's chip exactly as a whole-period record does — which
+    # is what makes the removal work on a device that dumps inside a code period
+    # at all (#133). `wraps == 1` is admissible only when the record ends
+    # precisely on the boundary it crossed.
+    within_one_block = span.wraps == 0 || (span.wraps == 1 && span.block_phase == 0.0)
     if output.sample_index - output.integrated_samples !=
-       link.secondary_phase_sample[hw_channel] || blocks != 1
+       link.secondary_phase_sample[hw_channel] || !within_one_block
         # Cut the record here: what has accumulated so far was wiped and what
         # follows will not be, and one record cannot be both.
         _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
@@ -2632,8 +2789,13 @@ function _wipe_secondary_code!(link, track_state, assignment, sat_state, hw_chan
         assignment.prn,
         link.secondary_phase[hw_channel],
     )
-    link.secondary_phase[hw_channel] =
-        mod(link.secondary_phase[hw_channel] + blocks, get_secondary_code_length(signal))
+    # The counter advances over the code *wraps* the record completed, not over
+    # the record: two half-period records of one block carry the same chip and
+    # move the counter once, between them.
+    link.secondary_phase[hw_channel] = mod(
+        link.secondary_phase[hw_channel] + span.wraps,
+        get_secondary_code_length(signal),
+    )
     link.secondary_phase_sample[hw_channel] = output.sample_index
     chip > 0 && return output
     Tracking.CorrelatorOutput(
@@ -2744,7 +2906,15 @@ function coherent_integration_blocks(
     get_secondary_code_length(signal) == 1 ||
         is_secondary_code_removed(link, hw_channel) ||
         return 1
-    blocks_per_symbol = _code_blocks_per_symbol(signal)
+    # `Tracking`'s own structural ceiling, rather than this package's reading of
+    # the signal's metadata: one navigation bit where there is data, one
+    # secondary-code period for a pilot — and whatever a signal states for
+    # itself. Galileo E5a-QP is why that last clause matters: it has neither
+    # data nor an overlay, so the metadata says "one block", and one block is
+    # 64.5 µs. `Tracking` states 31 (one 2 ms code cycle) for exactly that
+    # reason, and taking the ceiling from there is what keeps the loops from
+    # being handed fifteen thousand records a second (#133).
+    blocks_per_symbol = Tracking.max_num_code_blocks_to_integrate(signal)
     blocks_per_symbol <= 1 && return 1
     requested =
         link.coherent_code_blocks == 0 ? blocks_per_symbol :
@@ -2758,18 +2928,45 @@ function coherent_integration_blocks(
     max(1, min(requested, remaining))
 end
 
-# Primary-code blocks in one symbol: a navigation bit where there is data, one
-# secondary-code period for a pilot, and 1 when neither applies (a signal whose
-# symbol *is* the code block, e.g. Galileo E1B).
-function _code_blocks_per_symbol(signal)
-    data_frequency = get_data_frequency(signal)
-    iszero(data_frequency) && return get_secondary_code_length(signal)
-    round(
-        Int,
-        upreferred(
-            get_code_frequency(signal) / (get_code_length(signal) * data_frequency),
-        ),
-    )
+"""
+    coherent_integration_periods(link, sat_state, signal_index, hw_channel) -> Float64
+
+How much signal, in primary-code periods, the link sums into one record for this
+signal right now — [`coherent_integration_blocks`](@ref) capped by the link's
+`max_integration_time`.
+
+The two differ by exactly the thing issue #133 is about.
+`coherent_integration_blocks` answers in whole code blocks, which is the right
+unit for every signal whose code period is short enough to *be* a unit of
+integration: GPS L1 C/A's 1 ms, GPS L2CM's 20 ms, Galileo E5a-QP's 64.5 µs. GPS
+L2CL's code period is 1.5 s, and one block of it is not an integration length, it
+is an outage — the loop filters would be handed one record and the device one NCO
+correction every one and a half seconds, which no tracking loop survives.
+
+So the answer is a `Float64`: for L2CL at the default 20 ms it is `0.0133`, and a
+record is cut after 20 ms of a code period with the fraction of a period it
+covers recorded rather than rounded up to one. That is the separation the issue
+asks for — the tracking-update cadence is a *time*, the code wrap is a property
+of the code, and neither is the other.
+
+`max_integration_time` bites only where it has to: on a signal whose code period
+is longer than it ([`allows_partial_primary_records`](@ref)). It is not a general
+ceiling on the coherent integration — a receiver that asks for twenty 10 ms GPS
+L1C-P blocks gets twenty, and the per-chunk flush is what decides the length in
+practice (see [`coherent_integration_blocks`](@ref)). Capping a *short* code here
+would silently shorten every deliberately long integration, which is a different
+decision from the one this is for.
+"""
+function coherent_integration_periods(
+    link::HardwareCorrelatorLink,
+    sat_state,
+    signal_index,
+    hw_channel,
+)
+    signal = get_signal(Tracking.get_signals(sat_state)[signal_index])
+    blocks = coherent_integration_blocks(link, sat_state, signal_index, hw_channel)
+    allows_partial_primary_records(link, signal) || return Float64(blocks)
+    min(Float64(blocks), _max_record_periods(link, signal))
 end
 
 # Add one dump to this channel's partial record and, once it spans the coherent
@@ -2783,58 +2980,280 @@ end
 # integration ending there — the loop bandwidth scaling, the integration time
 # the FLL divides by, and the bit clock's block credit all follow from those two
 # numbers.
-function _accumulate_dump!(link, track_state, assignment, sat_state, hw_channel, output)
-    target = coherent_integration_blocks(link, sat_state, assignment.signal_index, hw_channel)
-    blocks = _record_code_blocks(link, sat_state, assignment.signal_index, output)
+function _accumulate_dump!(
+    link,
+    track_state,
+    assignment,
+    sat_state,
+    hw_channel,
+    output,
+    span,
+)
+    signal = get_signal(Tracking.get_signals(sat_state)[assignment.signal_index])
+    target =
+        coherent_integration_periods(link, sat_state, assignment.signal_index, hw_channel)
+    tolerance = _block_boundary_tolerance(link, signal)
     # A record is cut where the NCO word changed, the way it is cut on a bit
     # edge: the dumps accumulated so far ran on one word and this one starts on
     # another, and a record straddling the switch could be attributed to
     # neither. (A switch *inside* a dump cannot be cut; `mean_nco_word` weights
     # the two words by the samples each ran for.)
-    if link.partial_blocks[hw_channel] > 0 && word_changes_within(
+    if link.partial_samples[hw_channel] > 0 && word_changes_within(
         link.nco_timelines[hw_channel],
         link.partial_end[hw_channel] - link.partial_samples[hw_channel],
         output.sample_index - output.integrated_samples,
     )
         _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
     end
-    if link.partial_blocks[hw_channel] == 0
+    if link.partial_samples[hw_channel] == 0
         link.partial_correlator[hw_channel] = output.correlator
         link.partial_samples[hw_channel] = output.integrated_samples
-        link.partial_blocks[hw_channel] = blocks
+        link.partial_periods[hw_channel] = span.periods
+        link.partial_wraps[hw_channel] = span.wraps
     else
-        link.partial_correlator[hw_channel] = _add_accumulators(
-            link.partial_correlator[hw_channel],
-            output.correlator,
-        )
+        link.partial_correlator[hw_channel] =
+            _add_accumulators(link.partial_correlator[hw_channel], output.correlator)
         link.partial_samples[hw_channel] += output.integrated_samples
-        link.partial_blocks[hw_channel] += blocks
+        link.partial_periods[hw_channel] += span.periods
+        link.partial_wraps[hw_channel] += span.wraps
     end
     link.partial_end[hw_channel] = output.sample_index
-    link.partial_blocks[hw_channel] >= target &&
+    # Two measures of "long enough", because the two cases count in different
+    # units. Where the code period is the integration unit the target is a block
+    # count and the accumulation is sized in the *wraps* it has crossed, which is
+    # what lands it on the bit grid; where a record is cut inside a code period
+    # the target is a fraction of one and the periods are what there is to count.
+    long_enough =
+        allows_partial_primary_records(link, signal) ?
+        link.partial_periods[hw_channel] >= target - tolerance :
+        link.partial_wraps[hw_channel] >= max(1, floor(Int, target + tolerance))
+    if long_enough && _record_is_emittable(link, signal, hw_channel, tolerance)
         _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
+    elseif link.partial_periods[hw_channel] >= target + 1
+        # The record is a whole code period past its target and still has not met
+        # a block boundary to be cut on, so the device's dump grid does not
+        # divide its code period. Hand over what there is rather than accumulate
+        # for ever, and say so: a stream like that cannot keep the navigation bit
+        # grid whatever the host does with it.
+        link.misaligned_dump_boundaries += 1
+        @warn "hardware correlator dumps do not align with the primary-code block " *
+              "boundary; the coherent accumulation cannot be cut on it" prn =
+            assignment.prn hw_channel maxlog = 10
+        _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
+    end
     link
 end
 
-# Whole primary-code blocks a record spans, recovered from its sample count the
-# same way `Tracking` recovers it for the bit clock, so the two cannot disagree
-# about how much signal time a record represents.
-function _record_code_blocks(link, sat_state, signal_index, output)
-    signal = get_signal(Tracking.get_signals(sat_state)[signal_index])
-    max(
-        1,
-        round(
-            Int,
-            output.integrated_samples * ustrip(Hz, get_code_frequency(signal)) /
-            (get_code_length(signal) * link.sampling_freq_hz),
-        ),
-    )
+# May this channel's part-accumulated record be handed to the tracking loops as
+# it stands?
+#
+# For a signal whose code period is a usable integration unit: only where the
+# accumulation ends on a code block boundary. `Tracking` credits its bit clock in
+# whole blocks recovered from the record's own sample count, so a record cut
+# inside a block is credited a block it did not cover — which slides the
+# navigation bit grid by the cut, for the rest of the run. Carrying the
+# part-record into the next chunk costs one update interval once; emitting it
+# costs the bit stream.
+#
+# The boundary is the whole of the condition, and the length deliberately is not:
+# the short first record after a channel is armed runs from the sample-exact
+# phase load to the next code wrap, so it is a *fraction* of a block that ends on
+# a boundary — and `Tracking` expects exactly that, crediting the first
+# integration one block whatever it covered. Everything after it starts on a
+# boundary, so ending on one means a whole number of blocks.
+#
+# For a long code (`allows_partial_primary_records`) there is no grid to keep and
+# waiting for the boundary means waiting a code period, so anything goes.
+function _record_is_emittable(link, signal, hw_channel, tolerance)
+    link.partial_samples[hw_channel] > 0 || return false
+    allows_partial_primary_records(link, signal) && return true
+    phase = link.block_phase[hw_channel]
+    isnan(phase) || phase == 0.0
 end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Where a record sits on the primary-code block grid (#133)
+#
+# The old accounting asked one question — "how many whole code blocks is this?"
+# — and answered it with `max(1, round(…))`. That conflates four separate
+# quantities, and the rounding and the floor each break a different one:
+#
+#   * the *dump integration duration* is whatever the device accumulated, which
+#     may be a fraction of a code period;
+#   * the *primary-code wraps* a record covers is how often the replica ran
+#     through its code inside it, which for a short dump is usually zero;
+#   * the *navigation/secondary-code block count* rides those wraps, because one
+#     overlay chip and one bit-clock credit belong to one code period;
+#   * the *tracking-update cadence* is how often the loops are handed a record,
+#     which for a 1.5 s code has to be far shorter than a code period.
+#
+# So a record is measured as a `Float64` count of code periods and placed on the
+# block grid by a running fraction, `link.block_phase`. A record that covers a
+# quarter of a period advances the fraction by a quarter and completes no wrap;
+# four of them complete one. Nothing is rounded up, and nothing is invented.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Primary-code periods a record spans — exactly, as a fraction. Doppler-adjusted,
+# because the fraction accumulates over a whole run where a rounded block count
+# never did: the nominal rate is what `Tracking` rounds with, and the two agree
+# to far better than the half period that rounding cares about.
+function _record_code_periods(link, sat_state, signal, output)
+    code_rate =
+        ustrip(Hz, get_code_frequency(signal)) +
+        ustrip(Hz, uconvert(Hz, get_code_doppler(sat_state)))
+    output.integrated_samples * code_rate /
+    (get_code_length(signal) * link.sampling_freq_hz)
+end
+
+# How close to a block boundary still counts as being on it, as a fraction of a
+# code period: one sample, and never less than a chip and a half.
+#
+# Both ends of that matter. A sampled code is piecewise constant, so a phase is
+# only ever known to within the sample it was latched on; and a device reporting
+# the replica phase at the sample that *completes* a code period reports a value
+# just below the code length rather than zero (see `CorrelatorDump.code_phase`),
+# which is the same boundary written the other way round. Snapping both to
+# exactly `0.0` is what lets every later test be an equality.
+_block_boundary_tolerance(link, signal) =
+    max(1.5, ustrip(Hz, get_code_frequency(signal)) / link.sampling_freq_hz) /
+    get_code_length(signal)
+
+# A block fraction with the boundary snapped to exactly zero.
+_snap_block_fraction(fraction, tolerance) =
+    (fraction < tolerance || fraction > 1 - tolerance) ? 0.0 : fraction
+
+"""
+    RecordBlockSpan
+
+Where one record sits on its signal's primary-code block grid: the code periods
+it spans (`periods`, fractional), the code wraps it completed (`wraps`), and the
+fraction of a code period its end falls at (`block_phase`, exactly `0.0` on a
+boundary).
+
+Measured once per dump as each record is appended, and handed to everything that
+needs it, so the overlay removal, the continuity accounting and the coherent
+accumulation cannot come to three different answers about the same record.
+"""
+struct RecordBlockSpan
+    periods::Float64
+    wraps::Int
+    block_phase::Float64
+end
+
+# Where a record *starts* inside its code block. Read off the channel's running
+# fraction where there is one — advanced over any hole between the previous
+# record and this one, so a gap does not silently shift the grid — and otherwise
+# recovered from the device's own reported replica phase, which is the only
+# thing that can place the first record of a channel that dumps inside a code
+# period.
+#
+# Failing both, the record is taken to *end* on a block boundary, because a
+# device on the historical contract dumps on the code wrap and nowhere else.
+# That covers the one record where it matters: the short first record after a
+# channel is armed, which runs from the sample-exact phase load to the next code
+# wrap and is a fraction of a block rather than one. Assuming it *started* on a
+# boundary instead would leave the channel's whole grid a fraction of a block
+# out for as long as the assignment lasts.
+function _record_start_fraction(link, hw_channel, output, periods, reported, tolerance)
+    previous_end = link.last_record_end[hw_channel]
+    standing = link.block_phase[hw_channel]
+    if previous_end != typemin(Int64) && !isnan(standing)
+        record_start = output.sample_index - output.integrated_samples
+        periods_per_sample = periods / max(1, output.integrated_samples)
+        hole = (record_start - previous_end) * periods_per_sample
+        return _snap_block_fraction(mod(standing + hole, 1.0), tolerance)
+    end
+    ends_at = isnan(reported) ? 0.0 : reported
+    _snap_block_fraction(mod(ends_at - periods, 1.0), tolerance)
+end
+
+# Measure one record against the block grid. Pure: it reads the channel's
+# standing fraction but moves nothing, so the ingest path can consult the answer
+# before deciding whether the record is usable at all.
+function _record_block_span(link, sat_state, signal_index, hw_channel, output, code_phase)
+    signal = get_signal(Tracking.get_signals(sat_state)[signal_index])
+    code_length = get_code_length(signal)
+    tolerance = _block_boundary_tolerance(link, signal)
+    periods = _record_code_periods(link, sat_state, signal, output)
+    reported = isnan(code_phase) ? NaN : mod(code_phase / code_length, 1.0)
+    start = _record_start_fraction(link, hw_channel, output, periods, reported, tolerance)
+    wraps = max(0, floor(Int, start + periods + tolerance))
+    block_phase = _snap_block_fraction(
+        isnan(reported) ? clamp(start + periods - wraps, 0.0, 1.0) : reported,
+        tolerance,
+    )
+    RecordBlockSpan(periods, wraps, block_phase)
+end
+
+"""
+    primary_code_wraps(link, hw_channel) -> Int
+
+Primary-code periods this hardware channel's record stream has completed since
+the channel was assigned.
+
+The count the *code* did, which for a device dumping inside a code period is not
+the number of records it produced: 1500 one-millisecond records of GPS L2CL
+complete one wrap, and 1499 of them complete none. Nothing here is rounded up —
+a record shorter than a code period never completes one.
+"""
+primary_code_wraps(link::HardwareCorrelatorLink, hw_channel::Integer) =
+    Int(link.primary_wraps[hw_channel])
+
+"""
+    primary_code_block_phase(link, hw_channel) -> Float64
+
+Where this hardware channel's next record begins inside its primary-code block,
+as a fraction of a code period in `[0, 1)` — exactly `0.0` on a block boundary,
+and `NaN` before the channel has folded a record.
+
+This is the partial-primary metadata the rest of the accounting hangs on: the
+overlay chip a record carries, whether a record may be handed to the loops
+(`Tracking` counts whole blocks), and how far through a 1.5 s code the receiver
+currently is, are all read off it. Re-anchored to
+[`CorrelatorDump`](@ref)`.code_phase` on every record that reports one.
+"""
+primary_code_block_phase(link::HardwareCorrelatorLink, hw_channel::Integer) =
+    link.block_phase[hw_channel]
+
+"""
+    record_integration_periods(link, hw_channel) -> Float64
+
+Primary-code periods accumulated into this channel's open record so far, as a
+fraction — `0.0` when nothing is accumulated.
+"""
+record_integration_periods(link::HardwareCorrelatorLink, hw_channel::Integer) =
+    link.partial_periods[hw_channel]
+
+"""
+    allows_partial_primary_records(link, signal) -> Bool
+
+Whether the link may hand the tracking loops a record spanning *less* than one
+primary-code period of `signal`.
+
+`false` for every signal whose code period fits inside the link's
+`max_integration_time`, and that is the safe answer: `Tracking` credits its bit
+clock and its overlay counter in whole code blocks, so a record cut inside a
+block would slide the navigation bit grid by the cut. Records are then whole
+blocks and a part-accumulated one is carried across the chunk boundary rather
+than emitted short.
+
+`true` for a code period longer than the integration length — GPS L2CL's 1.5 s
+against a 20 ms default — where the alternative is one loop update per code
+period. Such a signal has no navigation data and no overlay to keep a grid for
+(`Tracking`'s sync detector reports nothing to find), so the cut costs nothing
+that a wait of 1.5 s would not cost far more of.
+"""
+allows_partial_primary_records(link::HardwareCorrelatorLink, signal) =
+    code_period_seconds(signal) > link.max_integration_time * (1 + 1e-9)
+
+# Code periods `max_integration_time` is worth for this signal — the ceiling on
+# one record, in the units the accumulation counts in.
+_max_record_periods(link, signal) = link.max_integration_time / code_period_seconds(signal)
 
 # Hand the accumulated record to the estimator and start a fresh one. A no-op
 # when nothing is accumulated, so it is safe to call as a flush.
 function _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
-    link.partial_blocks[hw_channel] == 0 && return link
+    link.partial_samples[hw_channel] == 0 && return link
     append_correlator_output!(
         track_state,
         _retag_spacing(
@@ -2850,9 +3269,16 @@ function _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
         assignment.prn,
         assignment.signal_index,
     )
-    link.pending_blocks[hw_channel] += link.partial_blocks[hw_channel]
+    # What `Tracking` will credit this record to the bit clock: the whole code
+    # blocks its sample count rounds to, which is *its* arithmetic, so the two
+    # cannot come to different answers about the same record. A partial-primary
+    # record rounds to none, and is counted as the partial record it is instead.
+    blocks = round(Int, link.partial_periods[hw_channel])
+    link.pending_blocks[hw_channel] += blocks
+    blocks == 0 && (link.partial_primary_records += 1)
     link.partial_samples[hw_channel] = 0
-    link.partial_blocks[hw_channel] = 0
+    link.partial_periods[hw_channel] = 0.0
+    link.partial_wraps[hw_channel] = 0
     link.partial_end[hw_channel] = typemin(Int64)
     link
 end
@@ -2861,7 +3287,8 @@ end
 # cannot be completed or attributed: a channel changing occupant.
 function _discard_partial!(link, hw_channel)
     link.partial_samples[hw_channel] = 0
-    link.partial_blocks[hw_channel] = 0
+    link.partial_periods[hw_channel] = 0.0
+    link.partial_wraps[hw_channel] = 0
     link.partial_end[hw_channel] = typemin(Int64)
     link
 end

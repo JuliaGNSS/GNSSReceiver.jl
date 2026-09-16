@@ -50,6 +50,7 @@ HardwareCorrelatorCapabilities(;
     num_rf_inputs = 1,                      # bands that can be received at once
     max_secondary_code_length = 1,          # longest overlay the gateway can wipe off; 1 = none
     reports_code_phase = true,              # does it latch `CorrelatorDump.code_phase`?
+    supports_partial_code_dumps = false,    # can it dump *inside* a code period?
 )
 ```
 
@@ -94,7 +95,21 @@ Fields:
   - `reports_code_phase` — whether the device latches the replica's code phase
     alongside the accumulators (`CorrelatorDump.code_phase`). Informational:
     without it pseudoranges are dead-reckoned from the handover seed rather
-    than anchored to the replica the DLL steers.
+    than anchored to the replica the DLL steers, and a partial-primary record
+    stream has to dead-reckon its place on the code-block grid from the
+    handover instead of reading it off every record.
+  - `supports_partial_code_dumps` — whether a channel can be told to dump
+    *inside* a primary code period rather than only on the code wrap. `false`
+    is the historical contract (one record per code period) and is what every
+    device declares until issue #133's steps 2 and 3 land.
+
+    This is a hard requirement rather than a nicety for a long code: GPS L2CL's
+    767 250 chips at 511.5 kcps are a 1.5 s period, so a device that only dumps
+    on the wrap hands the tracking loops one record and one NCO correction every
+    1.5 s. [`hardware_support_error`](@ref) refuses that combination before a
+    channel is armed — see its `max_integration_time` keyword for where the
+    line is drawn, and [`GNSSReceiver.coherent_integration_periods`](@ref) for
+    what the host does with a device that can.
 
 A device declares its own with [`hardware_capabilities`](@ref); one that does
 not is taken to be [`LEGACY_GPS_L1CA_CAPABILITIES`](@ref).
@@ -111,6 +126,7 @@ struct HardwareCorrelatorCapabilities
     num_rf_inputs::Int
     max_secondary_code_length::Int
     reports_code_phase::Bool
+    supports_partial_code_dumps::Bool
 end
 
 function HardwareCorrelatorCapabilities(;
@@ -125,6 +141,7 @@ function HardwareCorrelatorCapabilities(;
     num_rf_inputs::Integer = 1,
     max_secondary_code_length::Integer = 1,
     reports_code_phase::Bool = false,
+    supports_partial_code_dumps::Bool = false,
 )
     layouts = collect(Int, tap_layouts)
     isempty(layouts) &&
@@ -151,6 +168,7 @@ function HardwareCorrelatorCapabilities(;
         Int(num_rf_inputs),
         Int(max_secondary_code_length),
         reports_code_phase,
+        supports_partial_code_dumps,
     )
 end
 
@@ -179,7 +197,39 @@ const LEGACY_GPS_L1CA_CAPABILITIES = HardwareCorrelatorCapabilities(;
     num_rf_inputs = 1,
     max_secondary_code_length = 1,
     reports_code_phase = true,
+    supports_partial_code_dumps = false,
 )
+
+"""
+    DEFAULT_MAX_INTEGRATION_TIME
+
+The longest span of signal the hardware path folds into one correlator record by
+default, in seconds: 20 ms, one GPS navigation bit.
+
+It is the line between a signal whose *primary code period* can be the unit of
+integration and one whose cannot. Every signal in issue #130's scope but GPS
+L2CL has a code period at or below it — 1 ms for GPS L1 C/A and L5, 4 ms for
+Galileo E1, 20 ms for GPS L2CM, 64.5 µs for Galileo E5a-QP — and for those the
+records the loops are handed are whole code blocks, which is what keeps the
+navigation bit grid and the overlay counter exact. L2CL's 1.5 s period is three
+orders of magnitude past it, so its records are *partial*: cut inside a code
+period, counted as the fraction of one they are, and never as a completed
+period.
+
+Both the link ([`HardwareCorrelatorLink`](@ref)'s `max_integration_time`) and
+the pre-arm gate ([`hardware_support_error`](@ref)) read it, so a device is
+refused for exactly the signals the configured integration length cannot serve.
+"""
+const DEFAULT_MAX_INTEGRATION_TIME = 20e-3
+
+# One primary code period of `signal` in plain seconds — the receiver's own
+# `primary_code_period` with the unit stripped, because the record accounting
+# multiplies and compares it on every dump. For a long code it is also the
+# quantity that makes "one record per code period" unusable as a
+# tracking-update interval: 1 ms for GPS L1 C/A, 1.5 s for GPS L2CL, 64.5 µs
+# for Galileo E5a-QP.
+code_period_seconds(signal::AbstractGNSSSignal) =
+    get_code_length(signal) / _hz(get_code_frequency(signal))
 
 """
     supports_secondary_code_wipeoff(capabilities, signal) -> Bool
@@ -209,6 +259,11 @@ supports_secondary_code_wipeoff(
 _hz(x::Real) = Float64(x)
 _hz(x) = Float64(ustrip(uconvert(Hz, x)))
 
+# Plain seconds from either a `Real` or a Unitful time, so a caller may write
+# `20u"ms"` or `0.02` and mean the same thing.
+_seconds(x::Real) = Float64(x)
+_seconds(x) = Float64(ustrip(uconvert(s, x)))
+
 _modulation_name(signal) = nameof(typeof(get_modulation(signal)))
 
 # Quantised replica offsets for `correlator`, latest first and prompt at zero —
@@ -236,6 +291,15 @@ is checked. `dump_tap_slots`, when given, is how many accumulator slots the
 device's dump record carries — a wire too narrow for the correlator cannot
 transport it, which is the same refusal one step earlier in the path.
 
+`max_integration_time` is the longest span of signal the receiver will fold into
+one record (the link's own `max_integration_time`, and
+[`DEFAULT_MAX_INTEGRATION_TIME`](@ref) here). It is what decides whether the
+signal's *primary code period* can be the unit of integration: past it a record
+has to be cut inside a code period, which a device that only dumps on the code
+wrap cannot do. That is the one check here about timing rather than replicas,
+and it is the reason a 1.5 s GPS L2CL code is refused on a device that has the
+code memory for it but dumps once per period.
+
 All reasons are collected rather than reported one at a time: a message that
 stops at the first one sends the reader round the loop for each of the rest.
 """
@@ -246,6 +310,7 @@ function hardware_support_error(
     sampling_freq;
     num_ants::Integer = Tracking.get_num_ants(correlator),
     dump_tap_slots::Union{Nothing,Integer} = nothing,
+    max_integration_time = DEFAULT_MAX_INTEGRATION_TIME,
 )
     reasons = String[]
     signal_id = get_signal_id(signal)
@@ -312,6 +377,24 @@ function hardware_support_error(
             reasons,
             "$num_ants antennas were requested and the correlator bank despreads " *
             "$(capabilities.num_antennas)",
+        )
+    end
+    # Timing, not replicas: one code period is the shortest record a device that
+    # dumps only on the code wrap can produce, so for a long code that period is
+    # also the loops' update interval. Past the configured integration length
+    # that is not tracking, it is an open loop with a heartbeat — refuse it here
+    # rather than let a satellite "track" at one correction per 1.5 s.
+    period = code_period_seconds(signal)
+    max_time = _seconds(max_integration_time)
+    if period > max_time * (1 + 1e-9) && !capabilities.supports_partial_code_dumps
+        push!(
+            reasons,
+            "one primary code period of $signal_id is $(round(period; sigdigits = 4)) s, " *
+            "past the $(round(max_time * 1e3; sigdigits = 4)) ms this receiver folds " *
+            "into one record, and the device dumps only once per code period — so " *
+            "every tracking-loop update would wait a whole code period. The device " *
+            "has to be able to dump inside one " *
+            "(`HardwareCorrelatorCapabilities.supports_partial_code_dumps`)",
         )
     end
     band_id = get_band_id(get_band(signal))

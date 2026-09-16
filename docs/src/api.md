@@ -61,6 +61,12 @@ take_bit_clock_restart!
 anchor_secondary_phases!
 GNSSReceiver.is_secondary_code_removed
 coherent_integration_blocks
+coherent_integration_periods
+allows_partial_primary_records
+primary_code_wraps
+primary_code_block_phase
+record_integration_periods
+GNSSReceiver.RecordBlockSpan
 advance_tracking!
 flush_partial_records!
 push_nco_updates!
@@ -78,6 +84,7 @@ validate_hardware_configuration
 check_hardware_support
 GNSSReceiver.hardware_support_error
 GNSSReceiver.wire_tap_slots
+GNSSReceiver.DEFAULT_MAX_INTEGRATION_TIME
 replica_code_amplitude
 supports_secondary_code_wipeoff
 GNSSReceiver.requested_secondary_code_mode

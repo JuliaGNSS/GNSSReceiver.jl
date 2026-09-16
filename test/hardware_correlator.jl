@@ -966,10 +966,10 @@ end
     # A channel that changes occupant must not carry its predecessor's partial
     # into the newcomer's fold.
     GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 188_000))
-    @test link.partial_blocks[1] == 1
+    @test link.partial_periods[1] == 1
     GNSSReceiver.release_stale_channels!(
         link, TrackState(system, [TrackedSat(system, prn + 1, 0.0, 0.0Hz)]))
-    @test link.partial_blocks[1] == 0
+    @test link.partial_periods[1] == 0
 end
 
 @testset "A device re-arm is not counted as lost records" begin
@@ -1064,7 +1064,7 @@ end
     GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 4000))
     GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 8000))
     @test link.lost_record_gaps == 0
-    @test link.partial_blocks[1] == 2
+    @test link.partial_periods[1] == 2
     @test isempty(outputs())
 
     # Three records lost: the next one starts 12000 samples late. Nothing about
@@ -1180,7 +1180,7 @@ end
         # Matching PRN is insufficient while the scheduled phase load is pending.
         GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, target - 1539))
         @test link.last_record_end[1] == typemin(Int64)
-        @test link.partial_blocks[1] == 0
+        @test link.partial_periods[1] == 0
         @test link.anchor_sample[1] == typemin(Int64)
 
         sdr.assignment_start[1] = target
@@ -1188,7 +1188,7 @@ end
         GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, target - 1539))
         GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, target + 1))
         @test link.last_record_end[1] == typemin(Int64)
-        @test link.partial_blocks[1] == 0
+        @test link.partial_periods[1] == 0
         # The short first integration starts exactly at the applied phase load.
         GNSSReceiver._append_dump!(link, track_state,
             dump_at(1, prn, target + 1149; integrated_samples = 1149))

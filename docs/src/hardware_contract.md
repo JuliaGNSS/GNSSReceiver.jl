@@ -146,7 +146,72 @@ whenever every channel falls silent.
 
 Report `CorrelatorDump.code_phase` if the hardware can latch it. It is the
 absolute pseudorange anchor; without it the host dead-reckons from the
-acquisition seed, which tracks fine and ranges worse.
+acquisition seed, which tracks fine and ranges worse — and for a device that
+dumps inside a code period (section 4a) it is not optional at all.
+
+## 4a. Dump cadence, and codes longer than an integration
+
+**The default contract is one record per primary code period**, and for almost
+every signal that is also the right one: GPS L1 C/A's code period is 1 ms, GPS
+L5's 1 ms, Galileo E1's 4 ms, GPS L2CM's 20 ms. The host's whole record
+accounting — the navigation bit clock, the overlay counter, the coherent
+pre-accumulation — is built on code blocks, and a device that dumps on the code
+wrap hands it exactly those.
+
+GPS L2CL breaks it. Its primary code is 767 250 chips at 511.5 kcps: **one code
+period is 1.5 seconds**. A device that only dumps on the wrap would hand the
+tracking loops one record, and take one NCO correction, every one and a half
+seconds — which is not a tracking loop, it is an open loop with a heartbeat. So
+for a code period longer than the receiver's `max_integration_time`
+([`GNSSReceiver.DEFAULT_MAX_INTEGRATION_TIME`](@ref), 20 ms) the device has to be
+able to dump *inside* a code period, and
+[`HardwareCorrelatorCapabilities`](@ref)`.supports_partial_code_dumps` is where
+it says so. The pre-arm validation refuses the combination otherwise, naming the
+code period and the integration length, rather than arming a channel that
+"tracks" at 0.67 Hz of update rate.
+
+What a device producing such **partial-primary dumps** owes the host:
+
+  - **Align the dump grid to the code-block boundary.** The dump interval must
+    divide the primary code period, so that a record always ends on the code
+    wrap when it reaches one. The host cuts its coherent accumulation on that
+    boundary — it is what keeps a record a whole number of code blocks for every
+    signal that has a navigation bit or an overlay grid to stay on — and a
+    device whose dumps straddle the wrap leaves nothing to cut on. The host
+    detects it, folds the record anyway and counts it in the link's
+    `misaligned_dump_boundaries`.
+  - **Report `CorrelatorDump.code_phase` on every record.** A record shorter than
+    a code period cannot be placed on the code-block grid from its sample count
+    alone, because the phase it starts at is not the boundary. The host
+    re-anchors its running block phase
+    ([`primary_code_block_phase`](@ref)) to the reported replica phase on every
+    record that carries one, which is also what keeps a 1.5 s code from being
+    dead-reckoned across a whole run.
+  - **Keep the records tiling the sample axis.** Unchanged from the
+    one-per-period contract, and it matters more, not less: the host tells a
+    re-arm hole from a lost record by comparing the hole to *the channel's own
+    record length*, so a stream of quarter-period records has quarter-period
+    holes and each of them is a lost record.
+
+The host side of this is [`coherent_integration_periods`](@ref), which sizes a
+record in fractional code periods, and
+[`allows_partial_primary_records`](@ref), which decides per signal whether a
+record shorter than a code period may reach the loops at all. A short record is
+never counted as a completed code period: [`primary_code_wraps`](@ref) counts
+what the code did, not what the device streamed.
+
+The converse extreme is Galileo E5a-QP, whose 330-chip primary code is 64.5 µs —
+one record per code period would be fifteen thousand records a second. Nothing
+is asked of the device there; the host folds to `Tracking`'s own stated ceiling
+for the signal (one 2 ms, 31-block code cycle).
+
+Neither the gateware nor the adapter side of this has landed:
+[gnss-m2sdr#29](https://github.com/JuliaGNSS/gnss-m2sdr/issues/29) is the
+configurable dump interval and the absolute code-phase metadata, and
+[GNSSM2SDR.jl#8](https://github.com/JuliaGNSS/GNSSM2SDR.jl/issues/8) is the
+adapter that configures it. Until they do, every device declares
+`supports_partial_code_dumps = false` and GPS L2CL is refused before arming —
+which is the honest outcome, and the one this section exists to make legible.
 
 ## 5. Amplitude normalisation, per band and per signal
 
@@ -278,6 +343,10 @@ status, and [`assignment_start_sample`](@ref) if arming is asynchronous.
     wide enough for every layout, epoch strobes, `code_phase` if available
   - [ ] One record per primary code period, tiling the sample axis with neither
     gaps nor overlap — what the host's overlay removal rides on (section 7)
+  - [ ] `supports_partial_code_dumps`, and — if it is `true` — a dump interval
+    that divides the code period plus `code_phase` on every record (section 4a);
+    without it a code period longer than the receiver's integration length is
+    refused before arming
   - [ ] [`dropped_dump_count!`](@ref) and [`assignment_start_sample`](@ref)
     where the hardware can support them
 
@@ -288,9 +357,11 @@ This page is the interface as of
 the hardware path from GPS L1 C/A to every GNSSSignals signal is tracked by
 [issue #130](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/130); the parts
 still to land are a *scheduled* hardware secondary-code wipeoff (#132 removes the
-overlay on the host; the device-side contract is sketched in section 7), primary
-codes longer than a device's memory and dumps shorter than a primary period
-(#133), routing channels
+overlay on the host; the device-side contract is sketched in section 7), the
+gateware and adapter halves of dumps shorter than a primary period (#133 has
+landed on the host and is specified for a device in section 4a; the gateware is
+gnss-m2sdr#29 and the adapter GNSSM2SDR.jl#8), primary codes longer than a
+device's code memory, routing channels
 and noise estimates across RF bands (#134), and the per-signal validation matrix
 (#135). Until those land, declare conservatively: a capability you cannot serve
 is a channel that never locks.

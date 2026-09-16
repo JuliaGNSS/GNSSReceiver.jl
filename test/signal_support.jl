@@ -223,6 +223,21 @@ const _REASON_TEXT = Dict(
         "No fix has been computed with this signal contributing. Follows the decode " *
         "sweep for a data component, and the tracking sweep for a pilot, which " *
         "contributes pseudoranges through its `CombinedSignal` pairing.",
+    :l2cl_tracking_sweep_pending =>
+        "The hardware path's *timing and accounting* for this signal are validated and " *
+        "the code loop does pull in: test/partial_primary_records.jl runs GPS L2CL " *
+        "through the simulated correlator of test/simulated_fpga.jl dumping inside its " *
+        "1.5 s primary code period, the summed dumps reproduce the harness's " *
+        "`reference_correlation` over the same span, the loops are handed a record " *
+        "every `max_integration_time` instead of once per 1.5 s code wrap, and no short " *
+        "record is counted as a completed code period. That is not a tracking sweep. " *
+        "Nothing has yet shown the *carrier* loop holding lock on L2CL — in the same " *
+        "simulated run its Doppler estimate barely moves against a deliberate offset, " *
+        "while GPS L1 C/A through the identical harness converges — and whether that is " *
+        "a property of the signal, of the 20 ms coherent window a 1.5 s code forces, or " *
+        "of `Tracking`'s per-signal support is the subject of the software-support " *
+        "audit (JuliaGNSS/Tracking.jl#236) and the per-signal tracking sweep of step 9, " *
+        "not of the record accounting.",
     :acquisition_window_too_long =>
         "One coherent acquisition window is a whole primary code period, and this " *
         "signal's is 1.5 s — 3 million samples at four samples per chip. So L2CL is " *
@@ -348,10 +363,14 @@ const MATRIX = Dict{Symbol,NamedTuple{ROLES,NTuple{6,SupportEntry}}}(
         data_decode = _DECODE_PENDING,
         pvt = _PVT_PENDING,
     ),
+    # GPS L2CL is where the long-code timing work of issue #133 is demonstrated —
+    # its 1.5 s primary code period is the one in the scope that a
+    # per-code-period dump contract cannot serve at all. The timing and
+    # accounting are validated; the tracking cell is not, and says why.
     :GPSL2CL => (
         replica = _REPLICA_OK,
         acquisition_handover = not_applicable(:acquisition_window_too_long),
-        tracking = _TRACK_PENDING,
+        tracking = untested(:l2cl_tracking_sweep_pending),
         secondary_sync = _SEC_NA,
         data_decode = _DECODE_NA,
         pvt = _PVT_PENDING,
