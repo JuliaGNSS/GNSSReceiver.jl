@@ -26,6 +26,7 @@ makedocs(
         "Getting Started" => "getting_started.md",
         "Acquisition & Tracking Parameters" => "parameters.md",
         "Worked Example (Real Data)" => "example.md",
+        "Signal Support & Evidence" => "signal_support.md",
         "Custom Receiver Output" => "custom_output.md",
         "Graphical User Interface" => "gui.md",
         "Hardware-Correlator Contract" => "hardware_contract.md",
