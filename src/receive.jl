@@ -556,6 +556,13 @@ trades that for a loop four to five times noisier than the software receiver's.
 Pass `doppler_estimator` to override; under `vector_tracking` the vector
 estimator is used as in the software receiver.
 
+Every configured signal is checked against the device's declared
+[`hardware_capabilities`](@ref) before anything is armed, so an unserviceable
+request is an `ArgumentError` naming every reason rather than a channel that
+never locks. A device that declares nothing is taken to be the GPS L1 C/A
+correlator this interface was written against
+([`LEGACY_GPS_L1CA_CAPABILITIES`](@ref)).
+
 Pass a pre-built `link` (a [`HardwareCorrelatorLink`](@ref) over `sdr`) to keep
 hold of it — its diagnostic counters are the only record of dump-stream gaps,
 dropped feedback and skipped epochs. The link's own keywords are then ignored
@@ -594,6 +601,17 @@ function receive(
     link::Union{Nothing,HardwareCorrelatorLink} = nothing,
     kwargs...,
 )
+    # Pre-arm gate: every configured signal is checked against the device's
+    # declared capabilities before anything else happens, so a device that
+    # cannot serve the request says so here — with every reason at once — rather
+    # than programming a channel that never locks, or failing deep in the ingest
+    # path where a three-tap record meets a five-tap correlator (issue #131).
+    validate_hardware_configuration(
+        sdr,
+        systems,
+        sampling_freq;
+        num_ants = get(kwargs, :num_ants, NumAnts(1)),
+    )
     if isnothing(link)
         link = HardwareCorrelatorLink(
             sdr;

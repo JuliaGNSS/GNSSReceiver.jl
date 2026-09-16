@@ -62,6 +62,28 @@ correlator however is convenient; only the values and their order matter.
     reckon from the acquisition seed, which is fine for tracking but degrades
     the pseudoranges; report it if the hardware can.
 
+  - `num_taps` — how many of the wire correlator's accumulator slots this
+    record actually filled, counted from the first. Defaults to all of them,
+    which is what a device serving one tap layout wants.
+
+    This is what lets **one** link carry both E/P/L and VE/E/P/L/VL records: a
+    device that serves both fixes its stream's correlator type at the *widest*
+    layout it produces, and a three-tap channel fills the leading three slots
+    and says `num_taps = 3`. The meaningful taps are ordered latest-first with
+    prompt at `div(num_taps - 1, 2) + 1` — `Tracking`'s own rule — so a
+    three-tap record reads `[late, prompt, early]` and a five-tap one
+    `[very late, late, prompt, early, very early]`, whatever the wire is wide
+    enough for. The trailing slots are not read and need not be zeroed.
+
+    The host does *not* invent what is missing in either direction: a record
+    whose `num_taps` does not match the tap count of the correlator its
+    satellite is tracked with is dropped and counted, because a three-tap
+    record reshaped into a five-tap correlator would hand `dll_disc` two
+    accumulators that never saw a replica. Which layouts a device may produce
+    at all is declared through
+    [`HardwareCorrelatorCapabilities`](@ref)`.tap_layouts` and checked before
+    anything is armed.
+
 `isbits` (so a `PipeChannel{CorrelatorDump{C}}` ring stays allocation-free)
 provided `C` is. Use integer accumulators off the FPGA and let
 `integrated_samples` do the float normalisation on the host.
@@ -76,6 +98,7 @@ struct CorrelatorDump{C<:Tracking.AbstractCorrelator}
     prn::Int32
     output::Tracking.CorrelatorOutput{C}
     code_phase::Float64
+    num_taps::Int32
 end
 
 CorrelatorDump(
@@ -83,7 +106,17 @@ CorrelatorDump(
     prn::Integer,
     output::Tracking.CorrelatorOutput,
     code_phase::Real = NaN,
-) = CorrelatorDump(Int32(channel), Int32(prn), output, Float64(code_phase))
+    num_taps::Integer = Tracking.get_num_accumulators(output.correlator),
+) = CorrelatorDump(Int32(channel), Int32(prn), output, Float64(code_phase), Int32(num_taps))
+
+"""
+    num_correlator_taps(dump::CorrelatorDump) -> Int
+
+How many of `dump`'s accumulator slots carry a correlation, counted from the
+first. See [`CorrelatorDump`](@ref) for the ordering and for why the rest are
+neither read nor invented.
+"""
+num_correlator_taps(dump::CorrelatorDump) = Int(dump.num_taps)
 
 """
     EPOCH_STROBE_CHANNEL
@@ -294,9 +327,56 @@ error (~2.3 % at 4 MHz and 0.5 chips).
 
 `signal` is the `AbstractGNSSSignal` the channel must replicate (e.g. which
 component of a pilot/data pair).
+
+# The configuration form
+
+    assign_channel!(sdr, hw_channel, config::HardwareChannelConfig)
+
+is what the link actually calls, and what a device beyond GPS L1 C/A should
+implement. [`HardwareChannelConfig`](@ref) carries everything above *and*
+everything the positional form left to a shared assumption: all the quantised
+tap offsets rather than only the Early-to-Late distance, the band's replica
+amplitude and the code replica's amplitude, whether the overlay code is to be
+wiped off, the component's identity within its satellite and its carrier-phase
+reference.
+
+A device that implements only the positional form keeps working: the default
+method below unpacks the configuration into it, which is exactly the L1 C/A
+compatibility path — three taps, one antenna, one band, primary code only, all
+of which the configuration's extra fields then restate rather than change.
+
+!!! warning "Give `assign_channel!` a concrete signature"
+
+    Define the arguments your device takes, never a
+    `assign_channel!(::MyDevice, args...; kwargs...)` catch-all. Such a method
+    is neither more nor less specific than the configuration shim below — it
+    wins on the device argument and loses on the configuration one — so the
+    call becomes an `ambiguous` `MethodError` at the first handover.
 """
 assign_channel!(sdr::AbstractHardwareCorrelatorSDR, args...; kwargs...) =
     _not_implemented("assign_channel!", sdr)
+
+# The compatibility path: a device that only implements the positional
+# handover gets the fields it knows about. Everything the configuration adds
+# describes what that interface already implied — a single three-tap E/P/L
+# bank on one band replicating the primary code at unit amplitude — so
+# dropping it here changes nothing for such a device, and
+# `validate_hardware_configuration` has already refused anything that would.
+assign_channel!(
+    sdr::AbstractHardwareCorrelatorSDR,
+    hw_channel,
+    config::HardwareChannelConfig,
+) = assign_channel!(
+    sdr,
+    hw_channel,
+    config.prn,
+    config.carrier_doppler * Hz,
+    config.code_doppler * Hz,
+    config.code_phase,
+    config.valid_at_sample;
+    el_sample_spacing = config.el_sample_spacing,
+    signal = config.signal,
+)
 
 """
     release_channel!(sdr, hw_channel)
@@ -337,8 +417,20 @@ from the raw samples, and there a wrong gain is a `20·log10(g)` dB offset on
 every satellite. Getting it wrong is therefore visible only as a uniform C/N₀
 bias, which is exactly the kind of error a lock-detector threshold silently
 absorbs, so declare it rather than leaving it at the default.
+
+    correlator_gain(sdr, band_id) -> Real
+
+The same thing for one RF band (`GNSSSignals.get_band_id`: `:L1`, `:L5`, …),
+defaulting to the device-wide value. A multi-band front end rarely has one
+scale: each band has its own gain chain and its own replica table, and a C/N₀
+referenced to raw-sample power is biased by `20·log10(g)` per band. Declare it
+per band and every band's satellites land on the same scale.
+
+Read once per assignment — [`HardwareChannelConfig`](@ref) carries the result
+as its `replica_amplitude` — so a device may compute it rather than store it.
 """
 correlator_gain(::AbstractHardwareCorrelatorSDR) = 1
+correlator_gain(sdr::AbstractHardwareCorrelatorSDR, ::Symbol) = correlator_gain(sdr)
 
 """
     assignment_start_sample(sdr, hw_channel) -> Int64
@@ -351,6 +443,153 @@ The Receiver rejects integrations starting before this boundary, including
 already queued dumps. Synchronous producers default to no additional cutoff.
 """
 assignment_start_sample(::AbstractHardwareCorrelatorSDR, hw_channel) = typemin(Int64)
+
+"""
+    hardware_capabilities(sdr) -> HardwareCorrelatorCapabilities
+
+What `sdr`'s gateware can replicate and correlate. Optional; the default is
+[`LEGACY_GPS_L1CA_CAPABILITIES`](@ref), i.e. "the GPS L1 C/A device this
+interface was written against".
+
+Declare it as soon as a device does anything else — the receiver validates
+every configured signal against it before it arms a channel
+([`validate_hardware_configuration`](@ref)), so an undeclared capability is a
+capability the receiver will refuse to use, and an over-declared one is a
+channel that never locks.
+"""
+hardware_capabilities(::AbstractHardwareCorrelatorSDR) = LEGACY_GPS_L1CA_CAPABILITIES
+
+supports_secondary_code_wipeoff(sdr::AbstractHardwareCorrelatorSDR, signal) =
+    supports_secondary_code_wipeoff(hardware_capabilities(sdr), signal)
+
+"""
+    replica_code_amplitude(sdr, signal) -> Real
+
+Per-sample RMS amplitude of the *code* replica `sdr`'s gateware correlates
+`signal` with, on the same scale `GNSSSignals.get_code_amplitude` reports for
+the host's own table.
+
+The default is `get_code_amplitude(signal)`: the device reproduces the modelled
+code exactly, which is true for every ±1 code (BPSK, BOC, TMBOC) and is the only
+case the legacy L1 C/A path had. It is *not* true where the gateware
+approximates — a device that replicates Galileo E1B with a plain ±1 BOC(1,1)
+replica has a code amplitude of `1` where GNSSSignals' multi-level CBOC table
+has ≈ 19.92 — and there the ingest has to rescale, or the same satellite reads
+~26 dB apart depending on which correlator produced it.
+
+This is a pure amplitude convention: the ingest divides every accumulator by
+`replica_code_amplitude(sdr, signal) / get_code_amplitude(signal)`, so the
+prompt reaching `Tracking` is always on the host table's scale and
+`Tracking.normalize`'s own division by `get_code_amplitude` lands on a
+modulation-independent, unit-power amplitude. It says nothing about the *shape*
+of an approximated correlation function; which approximations are usable at all
+is issue #135's matrix.
+"""
+replica_code_amplitude(::AbstractHardwareCorrelatorSDR, signal::AbstractGNSSSignal) =
+    get_code_amplitude(signal)
+
+"""
+    check_hardware_support(sdr, signal, sampling_freq; correlator, num_ants, dump_tap_slots) -> nothing
+
+Throw an `ArgumentError` naming `sdr` and every reason it cannot track `signal`
+at `sampling_freq`, or return `nothing` when it can. The single-signal form of
+[`validate_hardware_configuration`](@ref).
+
+`correlator` defaults to the one `Tracking` tracks `signal` with; pass it when
+the receiver is configured with another.
+"""
+function check_hardware_support(
+    sdr::AbstractHardwareCorrelatorSDR,
+    signal::AbstractGNSSSignal,
+    sampling_freq;
+    correlator::Tracking.AbstractCorrelator = Tracking.get_default_correlator(
+        signal,
+        NumAnts(1),
+    ),
+    num_ants::Integer = Tracking.get_num_ants(correlator),
+    dump_tap_slots::Union{Nothing,Integer} = _dump_tap_slots(sdr),
+)
+    message = hardware_support_error(
+        hardware_capabilities(sdr),
+        signal,
+        correlator,
+        sampling_freq;
+        num_ants,
+        dump_tap_slots,
+    )
+    isnothing(message) && return nothing
+    throw(ArgumentError("$(nameof(typeof(sdr))) $message\n" * _CONTRACT_POINTER))
+end
+
+"""
+    validate_hardware_configuration(sdr, systems, sampling_freq; num_ants) -> nothing
+
+Check every signal the receiver would track against `sdr`'s declared
+[`hardware_capabilities`](@ref) and throw one `ArgumentError` listing every
+problem — *before* a channel is armed, before a single CSR is written.
+
+`systems` is what [`receive`](@ref) was given (a signal, a
+[`CombinedSignal`](@ref) or a tuple of them); each system's components are
+checked one by one, so a pilot/data pair is accepted only if the device can
+serve both. The device's dump record is checked too: a three-slot record cannot
+carry a five-tap correlator, which is the failure this validation exists to
+replace — at PR #129's head that combination reached the ingest path and died
+there as a `DimensionMismatch` (issue #131).
+
+This is the pre-arm gate; [`receive`](@ref)`(::AbstractHardwareCorrelatorSDR, …)`
+calls it for you. Call it directly when building a link by hand.
+"""
+function validate_hardware_configuration(
+    sdr::AbstractHardwareCorrelatorSDR,
+    systems,
+    sampling_freq;
+    num_ants::NumAnts{N} = NumAnts(1),
+) where {N}
+    capabilities = hardware_capabilities(sdr)
+    all_systems = as_systems(systems)
+    dump_tap_slots = _dump_tap_slots(sdr)
+    problems = String[]
+    for system in all_systems, signal in tracking_signals(system)
+        message = hardware_support_error(
+            capabilities,
+            signal,
+            Tracking.get_default_correlator(signal, num_ants),
+            sampling_freq;
+            num_ants = N,
+            dump_tap_slots,
+        )
+        isnothing(message) || push!(problems, message)
+    end
+    bands = unique(map(system -> get_band_id(system_band(system)), all_systems))
+    if length(bands) > capabilities.num_rf_inputs
+        push!(
+            problems,
+            "cannot receive bands $(join(bands, ", ")) at once: the device has " *
+            "$(capabilities.num_rf_inputs) RF input(s)",
+        )
+    end
+    isempty(problems) && return nothing
+    throw(
+        ArgumentError(
+            "$(nameof(typeof(sdr))) " * join(problems, "\n") * "\n" * _CONTRACT_POINTER,
+        ),
+    )
+end
+
+# Accumulator slots one of the device's dump records carries, read off its
+# stream's element type. `nothing` when the device exposes neither the stream
+# nor a wire correlator this package knows the width of — nothing to check
+# against, rather than a failure.
+function _dump_tap_slots(sdr::AbstractHardwareCorrelatorSDR)
+    dumps = try
+        correlator_dump_channel(sdr)
+    catch
+        return nothing
+    end
+    dump_type = eltype(dumps)
+    dump_type <: CorrelatorDump || return nothing
+    wire_tap_slots(_correlator_type(dump_type))
+end
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Host-side ingest state
@@ -596,8 +835,19 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     const sampling_freq_hz::Float64
     # Amplitude of the replica the device wipes off with, relative to the unit
     # replica the host's own correlator would use. Divided out of every
-    # accumulator on ingest — see `_retag_spacing`.
+    # accumulator on ingest — see `_retag_spacing`. Device-wide; a per-band
+    # declaration (`correlator_gain(sdr, band_id)`) overrides it per channel
+    # when `gain_is_per_band`.
     const correlator_gain::Float64
+    # What the device says it can replicate and correlate, resolved once here
+    # rather than asked per assignment: `_assign!` runs on the chunk path and
+    # `hardware_capabilities` is a device call, i.e. an `invokelatest`.
+    const capabilities::HardwareCorrelatorCapabilities
+    # Whether each channel's replica amplitude is asked of the device per band.
+    # False when the caller declared one gain for the whole device, and false
+    # for a `:channel` noise reference, where the amplitude divides out of the
+    # C/N₀ ratio and the declared gain is neither needed nor wanted.
+    const gain_is_per_band::Bool
     const feedback_delay_epochs::Int
     const max_dumps_per_drain::Int
     # ── Absolute code-phase bookkeeping (pseudoranges) ────────────────────────
@@ -657,6 +907,13 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     # How far this channel's records have overlapped (a record starting before
     # the previous one ended: a duplicate or a device counter step back).
     const overlapping_record_samples::Vector{Int64}
+    # Amplitude scale each channel's accumulators are divided by on ingest: the
+    # band's replica amplitude, times the ratio of the code amplitude the
+    # device's replica actually has to the one GNSSSignals models. Fixed at the
+    # assignment (`correlator_output_scale`), because both factors are
+    # properties of the signal and band the channel was armed for, not of the
+    # device as a whole. 1.0 for an unassigned channel.
+    const channel_scale::Vector{Float64}
     # How many epochs the fold loop will replay in one chunk before treating the
     # shortfall as a gap and resynchronising the grid (see `fold_closed_epochs!`).
     const max_catchup_epochs::Int
@@ -781,6 +1038,15 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     # are per channel, above), split the same way.
     lost_record_gaps::Int
     rearm_gaps::Int
+    # Records whose `num_taps` did not match the tap count of the correlator
+    # their satellite is tracked with. Dropped rather than reshaped — see
+    # `CorrelatorDump`.
+    tap_layout_mismatches::Int
+    # Satellites the device's declared capabilities cannot serve, so no channel
+    # was armed for them. Validated before the run starts, so a non-zero count
+    # here means the tracking state grew a signal the configuration did not
+    # declare.
+    unsupported_signals::Int
 end
 
 function HardwareCorrelatorLink(
@@ -826,6 +1092,10 @@ function HardwareCorrelatorLink(
         Float64(something(correlator_gain, GNSSReceiver.correlator_gain(sdr)))
     gain > 0 ||
         throw(ArgumentError("correlator_gain must be positive (got $gain)"))
+    # Ask the device per band only where the answer can matter: an explicit
+    # `correlator_gain` is the caller overriding every band at once, and a
+    # `:channel` noise reference has already forced the scale to 1.
+    gain_is_per_band = noise_source === :samples && isnothing(correlator_gain)
     noise_rearm_epochs =
         max(1, round(Int, upreferred(noise_rearm_interval * sampling_freq) / epoch_length))
     isnothing(coherent_code_blocks) ||
@@ -870,6 +1140,8 @@ function HardwareCorrelatorLink(
         epoch_length,
         Float64(ustrip(uconvert(Hz, sampling_freq))),
         Float64(gain),
+        hardware_capabilities(sdr),
+        gain_is_per_band,
         Int(feedback_delay_epochs),
         Int(max_dumps_per_drain),
         fill(typemin(Int64), n),
@@ -881,6 +1153,7 @@ function HardwareCorrelatorLink(
         zeros(Int64, n),
         zeros(Int64, n),
         zeros(Int64, n),
+        ones(Float64, n),
         Int(max_catchup_epochs),
         isnothing(coherent_code_blocks) ? 0 : Int(coherent_code_blocks),
         Vector{_correlator_type(dump_type)}(undef, n),
@@ -908,6 +1181,8 @@ function HardwareCorrelatorLink(
         [NCOTimeline() for _ = 1:n],
         NCOTimeline(),
         typemin(Int64),
+        0,
+        0,
         0,
         0,
         0,
@@ -1269,7 +1544,6 @@ function _noise_reference_signal(band_systems)
 end
 
 function _arm_noise_channel!(link, signal, sampling_freq)
-    code_frequency = get_code_frequency(signal)
     # Rotate through the family rather than picking one and staying: a PRN whose
     # cross-correlation with a strong satellite happens to be unusually high is
     # then one observation in the window, not the window.
@@ -1283,23 +1557,29 @@ function _arm_noise_channel!(link, signal, sampling_freq)
     # are correlated, so the window's variance improves a little more slowly
     # than `1/M`; each tap on its own is still an unbiased look at the noise
     # power, so the density itself is unaffected.
-    el_sample_spacing = Tracking.get_early_late_sample_spacing(
-        Tracking.EarlyPromptLateCorrelator(num_ants = Tracking.NumAnts(size(link.noise_accumulator, 1))),
-        sampling_freq,
-        code_frequency,
+    correlator = Tracking.EarlyPromptLateCorrelator(
+        num_ants = Tracking.NumAnts(size(link.noise_accumulator, 1)),
     )
-    _call_device(
-        assign_channel!,
-        link,
-        link.noise_channel,
-        Int(link.noise_prn),
-        (rand() * 10_000 - 5_000) * Hz,   # carrier dither, ±5 kHz
-        0.0Hz,                            # open loop: the replica free-runs
-        rand() * get_code_length(signal), # uniform code phase
-        link.samples_consumed;
-        el_sample_spacing,
+    # `signal_index = 0`: the reference belongs to no satellite's component
+    # list. Everything else is an ordinary assignment, which is the point — the
+    # floor it measures is only model-free because it goes through the same
+    # replica, the same quantisation and the same accumulators as a satellite.
+    config = HardwareChannelConfig(
         signal,
+        correlator;
+        signal_index = 0,
+        group_key = signal_group_key(signal),
+        prn = Int(link.noise_prn),
+        carrier_doppler = (rand() * 10_000 - 5_000) * Hz,  # carrier dither, ±5 kHz
+        code_doppler = 0.0Hz,                              # open loop: it free-runs
+        code_phase = rand() * get_code_length(signal),     # uniform code phase
+        valid_at_sample = link.samples_consumed,
+        sampling_freq,
+        replica_amplitude = _replica_amplitude(link, get_band_id(get_band(signal))),
+        code_amplitude = Float64(_call_device(replica_code_amplitude, link, signal)),
+        secondary_code_mode = requested_secondary_code_mode(link, signal),
     )
+    _call_device(assign_channel!, link, link.noise_channel, config)
     link.noise_epochs_since_rearm = 0
     # A re-arm invalidates whatever was part-accumulated against the old PRN.
     _reset_noise_accumulator!(link)
@@ -1318,10 +1598,10 @@ end
 # independent looks and nothing about their relative values means anything, so
 # they are summed. For an antenna array the pooled payload is the array's
 # spatial covariance, whose diagonal is each antenna's own floor.
-function _accumulate_noise_dump!(link, output)
+function _accumulate_noise_dump!(link, output, num_taps)
     accumulators = get_accumulators(output.correlator)
-    for tap in accumulators
-        _add_outer!(link.noise_accumulator, tap)
+    for index = 1:min(num_taps, length(accumulators))
+        _add_outer!(link.noise_accumulator, accumulators[index])
         link.noise_looks += 1
     end
     # Every tap of one dump integrates the same samples, so the span of a look
@@ -1388,6 +1668,7 @@ function release_stale_channels!(link, track_state)
         link.lost_record_samples[hw_channel] = 0
         link.rearm_dead_samples[hw_channel] = 0
         link.overlapping_record_samples[hw_channel] = 0
+        link.channel_scale[hw_channel] = 1.0
         link.pending_blocks[hw_channel] = 0
         link.bit_clock_lost[hw_channel] = false
         filter!(!=(assignment), link.bit_clock_restarts)
@@ -1449,24 +1730,43 @@ end
 function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampling_freq)
     signal = get_signal(tracked_signal)
     correlator = get_correlator(tracked_signal)
-    code_frequency = get_code_frequency(signal)
-    # Quantise exactly the way Tracking does, and hand the device the whole
-    # number of samples it must offset the Early and Late replicas by — see
-    # `assign_channel!`.
-    el_sample_spacing =
-        Tracking.get_early_late_sample_spacing(correlator, sampling_freq, code_frequency)
-    _call_device(
-        assign_channel!,
-        link,
-        hw_channel,
-        assignment.prn,
-        get_carrier_doppler(sat_state),
-        get_code_doppler(sat_state),
-        get_code_phase(sat_state),
-        link.samples_consumed;
-        el_sample_spacing,
+    # Last line of defence before a device write. `receive` validated the whole
+    # configuration before the run started, so reaching this is a tracking state
+    # that grew a signal the configuration never declared; refuse the channel
+    # rather than throwing, because this runs on the chunk path and taking the
+    # receiver down would cost every other satellite its lock. Unarmed, the
+    # satellite simply receives no correlator output and its lock detectors
+    # release it — the same path as one that faded.
+    unsupported = hardware_support_error(
+        link.capabilities,
         signal,
+        correlator,
+        sampling_freq;
+        num_ants = Tracking.get_num_ants(correlator),
+        dump_tap_slots = wire_tap_slots(_link_correlator_type(link)),
     )
+    if !isnothing(unsupported)
+        link.unsupported_signals += 1
+        @warn "hardware correlator $unsupported" prn = assignment.prn maxlog = 10
+        return link
+    end
+    config = HardwareChannelConfig(
+        signal,
+        correlator;
+        signal_index = assignment.signal_index,
+        group_key = assignment.group_key,
+        prn = assignment.prn,
+        carrier_doppler = get_carrier_doppler(sat_state),
+        code_doppler = get_code_doppler(sat_state),
+        code_phase = get_code_phase(sat_state),
+        valid_at_sample = link.samples_consumed,
+        sampling_freq,
+        replica_amplitude = _replica_amplitude(link, get_band_id(get_band(signal))),
+        code_amplitude = Float64(_call_device(replica_code_amplitude, link, signal)),
+        secondary_code_mode = requested_secondary_code_mode(link, signal),
+    )
+    _call_device(assign_channel!, link, hw_channel, config)
+    link.channel_scale[hw_channel] = correlator_output_scale(config)
     link.assignments[hw_channel] = assignment
     link.channel_of[assignment] = hw_channel
     # The sat's `code_phase` is the acquisition seed, which lives on the host's
@@ -1499,6 +1799,34 @@ function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampl
     _discard_partial!(link, hw_channel)
     link
 end
+
+# The correlator type a link's records are carried in — its own type parameter,
+# so no instance and no device call is needed.
+_link_correlator_type(::HardwareCorrelatorLink{C}) where {C} = C
+
+# Replica amplitude for one band: the device's per-band declaration where the
+# link is set up to ask for it, and the single device-wide value otherwise.
+_replica_amplitude(link::HardwareCorrelatorLink, band_id::Symbol) =
+    link.gain_is_per_band ? Float64(_call_device(correlator_gain, link, band_id)) :
+    link.correlator_gain
+
+"""
+    requested_secondary_code_mode(link, signal) -> Symbol
+
+Whether the link asks the device to wipe `signal`'s secondary (overlay) code
+off in the gateware (`:wipeoff`) or to replicate the primary code only
+(`:primary_only`).
+
+Always `:primary_only` today, whatever the device can do. Wiping the overlay
+off needs the *host* to know its phase and to keep the device's overlay counter
+tied to the decoded symbol grid; nothing on this path does that yet, and a
+device asked to wipe an overlay at the wrong phase cancels the signal rather
+than accumulating it. [`supports_secondary_code_wipeoff`](@ref) reports what the
+device could do; issue #132 is where this starts returning `:wipeoff`, and
+[`coherent_integration_blocks`](@ref) is what it unlocks.
+"""
+requested_secondary_code_mode(::HardwareCorrelatorLink, ::AbstractGNSSSignal) =
+    :primary_only
 
 # Per-band sampling frequency for a system, read off the `BandMeasurement` the
 # chunk was built with so the ingest path and the estimator can never disagree.
@@ -2029,7 +2357,8 @@ function _append_dump!(link, track_state, dump)
         # A dump still carrying the previous decoy PRN was produced before the
         # re-arm took effect; pooling it would credit the window a look at a
         # replica the accumulator is no longer about.
-        dump.prn == link.noise_prn ? _accumulate_noise_dump!(link, dump.output) :
+        dump.prn == link.noise_prn ?
+        _accumulate_noise_dump!(link, dump.output, num_correlator_taps(dump)) :
         (link.stale_dumps += 1)
         return link
     end
@@ -2042,6 +2371,22 @@ function _append_dump!(link, track_state, dump)
         return link
     end
     sat_state = get_sat_state(track_state, assignment.group_key, assignment.prn)
+    # The record has to describe the correlator its satellite is tracked with.
+    # Taking the first three of five accumulators for a five-tap signal would
+    # hand `dll_disc` two taps that never saw a replica, and padding a three-tap
+    # record out to five would invent them outright — so a mismatch is dropped
+    # and counted. `validate_hardware_configuration` refuses the configurations
+    # that make this reachable before the run starts; reaching it means the
+    # gateware is producing a layout it was not asked for.
+    expected_taps =
+        Tracking.get_num_accumulators(get_correlator(sat_state, assignment.signal_index))
+    if num_correlator_taps(dump) != expected_taps
+        link.tap_layout_mismatches += 1
+        @warn "hardware correlator dump carries the wrong tap layout; dropping it" prn =
+            assignment.prn hw_channel dump_taps = num_correlator_taps(dump) expected_taps maxlog =
+            10
+        return link
+    end
     _account_record_continuity!(
         link,
         track_state,
@@ -2260,7 +2605,7 @@ function _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
                 link.partial_samples[hw_channel],
                 link.partial_end[hw_channel],
             ),
-            link.correlator_gain,
+            link.channel_scale[hw_channel],
         ),
         assignment.group_key,
         assignment.prn,
@@ -2307,14 +2652,23 @@ _add_accumulators(a::Tracking.AbstractCorrelator, b::Tracking.AbstractCorrelator
 # `[late, prompt, early]` order.
 #
 # The accumulators are also brought onto the host's amplitude scale here, by
-# dividing out `correlator_gain` — the amplitude of the replica the device wipes
-# off with, where the host's own correlator uses unit amplitude. It is a pure
-# scale factor, so every discriminator (a ratio) and the old moment-ratio C/N₀
+# dividing out the channel's `channel_scale` — the amplitude of the replica the
+# device wipes off with (where the host's own correlator uses unit amplitude),
+# times the ratio of the code amplitude the device's replica actually has to the
+# one GNSSSignals models (see `replica_code_amplitude`). It is a pure scale
+# factor, so every discriminator (a ratio) and the old moment-ratio C/N₀
 # estimators are blind to it. `NoiseRefCN0Estimator` is not: it divides the
 # prompt power by a noise density measured somewhere else, so a device reporting
 # `g ×` the host's prompt reads `20·log10(g)` dB too high — 42 dB for a replica
 # of amplitude 127. See `append_noise_observations!` for where the floor comes
 # from.
+#
+# Only the record's *meaningful* taps are read: the template's own accumulator
+# count decides how many leading slots of the wire correlator are taken, so one
+# link can carry a wide record for a five-tap satellite and a narrow one for a
+# three-tap satellite (see `CorrelatorDump`). `_append_dump!` has already
+# refused any record whose declared tap count is not the template's, so the
+# slots taken here are exactly the ones the device filled.
 # Antenna count off the correlator *type*, so the noise accumulator can be sized
 # before any dump has arrived.
 _num_ants(::Type{<:Tracking.AbstractCorrelator{M}}) where {M} = M
@@ -2322,12 +2676,24 @@ _num_ants(::Type{<:Tracking.AbstractCorrelator{M}}) where {M} = M
 _retag_spacing(
     template::Tracking.AbstractCorrelator,
     output::Tracking.CorrelatorOutput,
-    gain::Float64,
+    scale::Float64,
 ) = Tracking.CorrelatorOutput(
-    @set(template.accumulators = get_accumulators(output.correlator) ./ gain),
+    @set(
+        template.accumulators = _leading_taps(
+            get_accumulators(template),
+            get_accumulators(output.correlator),
+            scale,
+        )
+    ),
     output.integrated_samples,
     output.sample_index,
 )
+
+# The first `N` accumulators of `wire`, scaled — `N` taken from the template's
+# own `SVector` type, so the result is the exact type the template's field
+# wants and the whole thing stays allocation-free.
+@inline _leading_taps(::SVector{N,T}, wire::AbstractVector, scale::Float64) where {N,T} =
+    SVector{N,T}(ntuple(index -> wire[index] / scale, Val(N)))
 
 """
     push_nco_updates!(link, track_state, boundary) -> Int

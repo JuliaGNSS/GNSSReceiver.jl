@@ -1,0 +1,258 @@
+# Hardware-correlator contract
+
+```@meta
+CurrentModule = GNSSReceiver
+```
+
+This page is the contract between GNSSReceiver and a *hardware correlator* — an
+SDR whose FPGA downconverts and correlates on-device and streams correlator
+dumps to the host, which runs only the loop filters and pushes NCO words back.
+It is what an adapter package (the Julia side) and the gateware it drives have
+to satisfy. The types themselves are documented in the
+[API reference](@ref "Hardware correlators"); this page says what they *oblige*
+you to do.
+
+The split itself is described under [`AbstractHardwareCorrelatorSDR`](@ref): the
+device's raw sample stream keeps driving acquisition, decoding, PVT and the
+runtime clock exactly as in the software receiver, and only the per-chunk
+correlator outputs change origin.
+
+## 1. Declare what the device can do
+
+```julia
+GNSSReceiver.hardware_capabilities(sdr::MyDevice) = HardwareCorrelatorCapabilities(;
+    signals = [:GPSL1CA, :GalileoE1B, :GalileoE1C],
+    modulations = [:LOC, :CBOC],
+    max_primary_code_length = 4092,
+    code_frequency_limits = (1.023e6, 1.023e6),
+    tap_layouts = [3, 5],
+    max_tap_offset_chips = 1.0,
+    num_antennas = 1,
+    bands = [:L1],
+    num_rf_inputs = 1,
+    max_secondary_code_length = 1,
+    reports_code_phase = true,
+)
+```
+
+A device that implements nothing is taken to be
+[`LEGACY_GPS_L1CA_CAPABILITIES`](@ref) — the GPS L1 C/A correlator this
+interface was originally written against. That is the compatibility path: an
+adapter written before this interface existed keeps working unchanged, and keeps
+being described truthfully.
+
+Declare every field honestly. An **under**-declared capability is one the
+receiver will refuse to use; an **over**-declared one is a channel that arms and
+never locks, which is far harder to attribute.
+
+## 2. Nothing is armed before it is validated
+
+[`receive`](@ref)`(::AbstractHardwareCorrelatorSDR, systems, sampling_freq; …)`
+calls [`validate_hardware_configuration`](@ref) before it builds a link, before
+it starts a task and before a single CSR is written. Every component of every
+configured system is checked against the declaration above, and every problem is
+reported in one `ArgumentError`:
+
+```
+MyDevice cannot track GalileoE1B on this hardware correlator:
+  - the device has no code generator for GalileoE1B (it declares GPSL1CA)
+  - the device cannot synthesise CBOC modulation (it declares LOC)
+  - the primary code is 4092 chips, past the device's 1023-chip code memory
+  - GalileoE1B is tracked with a 5-tap VeryEarlyPromptLateCorrelator, and the
+    device's correlator bank produces 3-tap layouts
+```
+
+Use [`check_hardware_support`](@ref) for a single signal, and
+[`GNSSReceiver.hardware_support_error`](@ref) when you want the reasons as a
+string rather than an exception.
+
+The same check runs again, per assignment, immediately before the device write
+in `GNSSReceiver._assign!`. There it refuses the channel and counts it in the
+link's `unsupported_signals` instead of throwing: that code runs on the chunk
+path, where taking the receiver down would cost every other satellite its lock.
+
+## 3. Arming a channel
+
+The link calls
+
+```julia
+GNSSReceiver.assign_channel!(sdr, hw_channel, config::HardwareChannelConfig)
+```
+
+Implement this method for anything beyond GPS L1 C/A. A device that implements
+only the older positional [`assign_channel!`](@ref) still works — GNSSReceiver
+unpacks the configuration into it — but everything the configuration adds is
+then dropped, which is correct only for the L1 C/A shape it was written for.
+
+!!! warning "Give `assign_channel!` a concrete signature"
+    An `assign_channel!(::MyDevice, args...; kwargs...)` catch-all is neither
+    more nor less specific than GNSSReceiver's configuration shim, so the first
+    handover raises an ambiguity `MethodError`.
+
+[`HardwareChannelConfig`](@ref) carries:
+
+| Field                                                              | The device's obligation                                                                                                          |
+|:------------------------------------------------------------------ |:-------------------------------------------------------------------------------------------------------------------------------- |
+| `signal`, `signal_index`, `group_key`, `prn`                       | Replicate *this* component of this satellite. A pilot/data pair occupies two channels differing only in `signal`/`signal_index`. |
+| `carrier_doppler`, `code_doppler`, `code_phase`, `valid_at_sample` | The satellite at `valid_at_sample` on the host's raw-sample count; propagate to whatever sample you actually start on.           |
+| `tap_sample_shifts`                                                | Program **exactly** these replica offsets, in whole input samples, latest first, prompt at zero.                                 |
+| `el_sample_spacing`                                                | The Early-to-Late distance implied by the shifts; kept because it is the one number the legacy call carried.                     |
+| `replica_amplitude`, `code_amplitude`                              | Declare, do not change: what the host divides out (see below).                                                                   |
+| `secondary_code_mode`                                              | `:primary_only` — replicate the primary code only. `:wipeoff` is reserved; the link does not request it yet.                     |
+| `carrier_phase_offset`                                             | Informational. Do **not** add it (see below).                                                                                    |
+| `band_id`, `sampling_freq`                                         | Which RF band, and the rate the shifts and sample counts are expressed in.                                                       |
+
+### Why all the tap offsets, and not just the spacing
+
+`Tracking`'s discriminators do not use the spacing the host programmed: they
+recover it from the correlator handed back to them, through that correlator's
+preferred code shifts. So the device has to reproduce the *host's* quantisation,
+not its own. For a three-tap bank getting this wrong is a DLL loop-gain error
+(~2.3 % at 4 MHz and a 0.5-chip preferred shift). For a five-tap bank it is
+worse: the VE/VL distance enters the discriminator separately, and there is no
+single number to re-derive it from. `tap_sample_shifts` removes the guesswork —
+program the array.
+
+## 4. Streaming dumps
+
+Each completed integration becomes a [`CorrelatorDump`](@ref) on the device's
+[`correlator_dump_channel`](@ref). The record is `isbits` so the ring stays
+allocation-free; use integer accumulators and let `integrated_samples` do the
+float normalisation on the host.
+
+**Accumulator order is latest first.** For three taps that is
+`[late, prompt, early]`; for five,
+`[very late, late, prompt, early, very early]`. Building it in E/P/L order
+inverts the DLL discriminator and the loop never converges.
+
+**One link can carry both layouts.** Fix your stream's correlator type at the
+*widest* layout the device produces — `VeryEarlyPromptLateCorrelator` if it does
+five taps at all — and set `num_taps` on each record to how many leading slots
+that channel actually filled ([`num_correlator_taps`](@ref)). The trailing slots
+are never read and need not be zeroed. The host takes the leading `num_taps`
+values and retags them with the tracked satellite's own correlator type and
+spacing.
+
+Nothing is invented in either direction. A record whose `num_taps` is not the
+tap count of the correlator its satellite is tracked with is **dropped** and
+counted in the link's `tap_layout_mismatches`: padding a three-tap record out to
+five would hand `dll_disc` two accumulators that never saw a replica.
+[`GNSSReceiver.wire_tap_slots`](@ref) is what the pre-arm validation compares
+your stream's width against.
+
+Also stream [epoch strobes](@ref epoch_strobe) at a fixed period, regardless of
+what the channels are doing — without them the host's epoch clock stalls
+whenever every channel falls silent.
+
+Report `CorrelatorDump.code_phase` if the hardware can latch it. It is the
+absolute pseudorange anchor; without it the host dead-reckons from the
+acquisition seed, which tracks fine and ranges worse.
+
+## 5. Amplitude normalisation, per band and per signal
+
+The host brings every accumulator onto one scale — the scale its own software
+correlator would have produced from the same samples — by dividing by
+
+```
+replica_amplitude × code_amplitude / GNSSSignals.get_code_amplitude(signal)
+```
+
+Both factors come from the device:
+
+  - [`correlator_gain`](@ref)`(sdr, band_id)` — the amplitude of the *carrier*
+    replica the gateware wipes off with, relative to a unit-amplitude replica.
+    A device mixing with a ±127 sine/cosine table returns `127`. Declare it per
+    band: a multi-band front end rarely has one gain chain, and the error is a
+    flat `20·log10(g)` dB offset on that band's C/N₀ — exactly the kind of bias
+    a lock-detector threshold silently absorbs.
+  - [`replica_code_amplitude`](@ref)`(sdr, signal)` — the RMS amplitude of the
+    *code* replica, on the scale `GNSSSignals.get_code_amplitude` reports. The
+    default says the device reproduces the modelled code exactly, which is true
+    for every ±1 code. Override it where the gateware approximates: a device
+    replicating Galileo E1B with a plain ±1 BOC(1,1) replica has an amplitude of
+    `1` where the modelled CBOC table has ≈ 19.92, and without the override the
+    same satellite reads ~26 dB apart depending on which correlator produced it.
+
+Both are read once per assignment and frozen into the channel's scale, so they
+may be computed rather than stored.
+
+The discriminators are ratios and cannot see any of this; the noise-referenced
+C/N₀ estimator can, because it divides the prompt power by a floor measured
+elsewhere. That is why it has to be declared rather than left at the default.
+
+## 6. Carrier-phase conventions for components
+
+A satellite's components share one carrier. The receiver locks the *driver*
+component (the first of `tracking_signals`, i.e. the pilot for a pilot/data
+pair) onto the real axis and de-rotates every other component by its own ICD
+phase offset — `GNSSSignals.get_carrier_phase_offset`, e.g. `−π/2` for GPS L5-Q
+against L5-I — so a quadrature component does not decode off the collapsed real
+part.
+
+That only works if the phase relationship survives into the accumulators. So:
+
+  - Mix every channel of one band against **one common in-phase carrier
+    reference**, at the band's carrier, with no per-component rotation.
+  - `HardwareChannelConfig.carrier_phase_offset` states the component's offset
+    against that reference. It is there to be *preserved*, not applied. A device
+    that unavoidably rotates per component must remove exactly this value again
+    before dumping.
+  - Do not pre-combine components in hardware, and do not pre-combine antennas:
+    beamforming is post-correlation on the host and adapts from the per-antenna
+    prompt covariance, so an N-antenna device streams `SVector{N,Complex}`
+    accumulators.
+
+## 7. Secondary codes
+
+`max_secondary_code_length` declares the longest overlay the gateware can wipe
+off itself; `1` means "primary code only", which is the default and is not an
+error. Where the device does not wipe the overlay, the host folds one
+primary-code block per record ([`coherent_integration_blocks`](@ref)) — correct,
+but it forgoes the longer coherent integration a wiped overlay would allow.
+
+[`GNSSReceiver.requested_secondary_code_mode`](@ref) always asks for
+`:primary_only` today, whatever the device declares, because wiping an overlay
+needs the *host* to know its phase and to keep the device's overlay counter tied
+to the decoded symbol grid. Removing secondary codes from hardware dumps after
+synchronisation is
+[issue #132](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/132).
+
+## 8. Feedback
+
+One [`NCOUpdate`](@ref) per assigned channel is pushed per folded epoch, each
+scheduled at a named future sample. Read the warning in [`NCOUpdate`](@ref)
+before implementing the apply path: a device that treats arming as a
+single-register commit and lets a new update cancel a pending one silently opens
+every loop, which cost a season of "tracks, then walks off and never decodes" in
+issue #107.
+
+Implement [`dropped_dump_count!`](@ref) if the gateware has a sticky overflow
+status, and [`assignment_start_sample`](@ref) if arming is asynchronous.
+
+## 9. Adapter checklist
+
+  - [ ] [`raw_sample_channel`](@ref), [`correlator_dump_channel`](@ref),
+    [`nco_update_channel`](@ref), [`num_hardware_channels`](@ref)
+  - [ ] [`assign_channel!`](@ref) taking a [`HardwareChannelConfig`](@ref), with
+    a concrete signature
+  - [ ] [`release_channel!`](@ref)
+  - [ ] [`hardware_capabilities`](@ref), declared field by field
+  - [ ] [`correlator_gain`](@ref) per band, and
+    [`replica_code_amplitude`](@ref) wherever the gateware approximates a
+    code
+  - [ ] Dump records: latest-first accumulators, correct `num_taps`, a wire type
+    wide enough for every layout, epoch strobes, `code_phase` if available
+  - [ ] [`dropped_dump_count!`](@ref) and [`assignment_start_sample`](@ref)
+    where the hardware can support them
+
+## 10. What this contract does not yet cover
+
+This page is the interface as of
+[issue #131](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/131). Extending
+the hardware path from GPS L1 C/A to every GNSSSignals signal is tracked by
+[issue #130](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/130); the parts
+still to land are secondary-code wipeoff (#132), primary codes longer than a
+device's memory and dumps shorter than a primary period (#133), routing channels
+and noise estimates across RF bands (#134), and the per-signal validation matrix
+(#135). Until those land, declare conservatively: a capability you cannot serve
+is a channel that never locks.
