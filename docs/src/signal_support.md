@@ -26,6 +26,17 @@ reference harness described at the end of this page.
     `simulated_fpga`, `hardware_replay` or `live_rf` when a check produces that
     evidence.
 
+!!! note "Simultaneous multi-band reception is not a cell in this table"
+
+    Support is recorded per (signal, role) because those are properties of the
+    *signal*. Whether a given receiver can have two of these signals in the air
+    at the same time is a property of its **front end** — how many bands it can
+    tune at once, on which inputs, at which sample rates, and on what clock —
+    and it is declared, validated and documented in the
+    [hardware-correlator contract](@ref "Hardware-correlator contract") instead
+    (section 5a). A row that reads `supported` for every role still says
+    nothing about receiving that signal alongside one from another band.
+
 ## Evidence levels
 
 | Level             | What it means                                                                       |

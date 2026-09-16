@@ -245,6 +245,174 @@ The discriminators are ratios and cannot see any of this; the noise-referenced
 C/N₀ estimator can, because it divides the prompt power by a floor measured
 elsewhere. That is why it has to be declared rather than left at the default.
 
+## 5a. RF bands, inputs and the receiver timebase
+
+Supporting every signal is not the same as receiving every RF band at once. The
+first is a property of the correlator; the second is a property of the front end,
+and this section is where it is declared, checked and — where it is exceeded —
+refused.
+
+### Declare where each band arrives
+
+```julia
+GNSSReceiver.band_rf_input(sdr::MyDevice, band_id) = band_id === :L1 ? 1 : 2
+GNSSReceiver.band_device_index(sdr::MyDevice, band_id) = 1
+GNSSReceiver.clock_synchronization(sdr::MyDevice) = :single_device
+GNSSReceiver.band_hardware_channels(sdr::MyDevice, band_id) =
+    band_id === :L1 ? (1:10) : (11:20)
+GNSSReceiver.raw_sample_channel(sdr::MyDevice, band_id) = sdr.raw[band_id]
+```
+
+Everything here has a single-band default, so a one-band adapter implements none
+of it. A device that receives several bands at once implements all of it, and
+the receiver builds a [`HardwareBandPlan`](@ref) from it
+([`hardware_band_plan`](@ref)) — one [`HardwareBandRoute`](@ref) per band,
+carrying the band's RF input, its device and its sample rate.
+
+| Concept             | What it counts                               | Where it is declared                                                              |
+|:------------------- |:-------------------------------------------- |:--------------------------------------------------------------------------------- |
+| **RF input**        | Independently *tuned* bands received at once | [`band_rf_input`](@ref), capped by `HardwareCorrelatorCapabilities.num_rf_inputs` |
+| **Antenna**         | Coherent chains of **one** band              | `HardwareCorrelatorCapabilities.num_antennas`                                     |
+| **Correlator bank** | The channels that can see a given band       | [`band_hardware_channels`](@ref)                                                  |
+
+These are three different things and none substitutes for another. A four-antenna
+L1 front end is *one* route with `num_antennas = 4`: the antennas share one LO
+and one sample clock, and the bank despreads all of them into one
+`SVector{4,Complex}` per tap so the host can beamform from the prompt covariance.
+Two *bands* share nothing but the board.
+
+### Per-band sample rates and the one receiver timebase
+
+Each band's raw samples, each dump's `sample_index` and each
+[`NCOUpdate`](@ref)'s `apply_at_sample` are counted **on that band's own
+counter**, at that band's own rate. The receiver folds, ranges and schedules on
+one axis instead: the **reference band** — the first route of the plan — whose
+counter *is* the receiver timebase. [`receive`](@ref) takes that band's rate as
+its `sampling_freq` and the others alongside it:
+
+```julia
+receive(sdr, ((GPSL1CA(),), (BeiDouB1I(),)), (4e6u"Hz", 5e6u"Hz"))
+```
+
+The mapping between the axes is the exact ratio of the two rates — no offset, no
+estimate, no drift — so one millisecond is 4000 counts on a 4 MS/s band and 5000
+on a 5 MS/s one, and both close the *same* epoch. Concretely:
+
+  - a record's `sample_index` is mapped onto the timebase before the epoch clock
+    sees it, so a band sampled faster cannot drive the clock fast and strand
+    every slower band's records in the past;
+  - `HardwareChannelConfig.valid_at_sample` is written on the channel's own band
+    counter, so a handover is propagated in the units the device counts in;
+  - every `NCOUpdate` of one fold names the same *instant*, written on each
+    channel's own counter;
+  - every satellite's code phase is extrapolated to the same instant on its own
+    band's axis, which is the common reception time the multi-band pseudoranges
+    are differences of.
+
+**Epoch strobes are the exception, and deliberately so**: a strobe is the
+timebase marker, so it is stated *in* the timebase. Emit them on the reference
+band's counter only.
+
+For a single-band device every scale is exactly `1.0`, both mappings are the
+identity, and nothing above changes anything.
+
+### Multi-device clock synchronisation
+
+[`clock_synchronization`](@ref) says what makes counters on different devices
+comparable:
+
+| Value            | Meaning                                                                                          | Supported                           |
+|:---------------- |:------------------------------------------------------------------------------------------------ |:----------------------------------- |
+| `:single_device` | One device, one sample clock                                                                     | yes (the default)                   |
+| `:shared_clock`  | Several devices on one reference **and** one distributed sample clock, counters aligned at start | yes                                 |
+| `:independent`   | Free-running clocks                                                                              | **refused** for a multi-device plan |
+
+`:independent` is refused rather than approximated. Two free-running clocks drift
+by parts per million against each other — metres of pseudorange per second — and
+the ratio mapping above has no offset term to absorb it, so there is no common
+reception epoch and a fix built from both bands would be wrong with nothing
+looking wrong. A receiver that needs it has to estimate and steer the
+inter-device offset first, which this package does not do.
+
+### What happens when the request exceeds the front end
+
+[`validate_hardware_configuration`](@ref) checks the plan as a whole, before
+anything is armed, and reports every problem at once
+([`GNSSReceiver.band_plan_error`](@ref)):
+
+  - a band the front end does not declare it can tune;
+  - more bands on one device than it has RF inputs;
+  - two bands routed to one RF input;
+  - a multi-device plan whose clocks are `:independent`.
+
+There is **no automatic fallback to sequential retuning** — receiving band A for
+a while, then retuning to band B. It would turn a simultaneous request into a
+time-multiplexed one behind the caller's back, changing every band's C/N₀, its
+measurement epochs and its fix rate, and leaving no band continuously tracked. A
+receiver that wants it runs one [`receive`](@ref) per band configuration and
+retunes between them, which is explicit; the refusal message says so.
+
+### Per-band noise references and replica gain
+
+A noise density belongs to one front end's gain chain, antenna, filter and
+interference environment, and to the modulation that despreads it. Two bands
+share none of those, so the receiver keeps **one reference per band** and never
+pools them:
+
+  - `noise_source = :channel` (the default) spends one hardware channel *of each
+    band's own bank* on an open-loop despread, armed on a signal of that band at
+    that band's rate, and its observation reaches only that band's signals;
+  - `noise_source = :samples` meters `Σ|x|²` on each band's own raw frame;
+  - [`correlator_gain`](@ref)`(sdr, band_id)` is read per band, so a band whose
+    replica table is scaled differently still lands on the same C/N₀ scale.
+
+Pooling two floors would describe neither band, and the error lands on every
+satellite of both as a C/N₀ bias — the quantity the code lock detector thresholds
+on, and the one number in the receiver that nothing downstream can contradict.
+
+### Measured: what the LiteX-M2SDR front end can actually do
+
+The reference device for this contract is a **one-band** front end, and that is
+worth stating precisely rather than leaving to be discovered. Read off the board
+(`orin2`, gateware `LiteX-M2SDR SoC / m2 variant / built on 2026-07-29`,
+20-channel GNSS build) on 2026-09-16:
+
+  - the RF configuration registers are **singular**: one
+    `ad9361_active_rx_frequency_khz`, one `ad9361_active_sample_rate`, one
+    `ad9361_active_bandwidth`. There is no per-input frequency or rate register
+    anywhere in the CSR map.
+  - the *only* per-RX-chain registers are the AGC saturation counters
+    (`ad9361_agc_count_rx1_*`, `ad9361_agc_count_rx2_*`), and the RF utility
+    exposes `--rx-gain1` / `--rx-gain2` against a single `--rx-freq` and a single
+    `--sample-rate`. RX1 and RX2 are two coherent **antenna** chains behind one
+    AD9361 RX LO and one sample clock — `num_antennas = 2`, `num_rf_inputs = 1`.
+  - none of the 20 correlator channels (`gnss_ch0…gnss_ch19`) carries a band, RF
+    input or antenna selector: one bank, fed from one datapath.
+  - retuning is device-wide. Writing L5 into that one register moved the whole
+    front end (`0x001809fc` = 1 575 420 kHz → `0x0011f382` = 1 176 450 kHz) and
+    writing L1 back moved it all the way back; nothing stayed on L1 in between.
+
+So **a supported multi-band configuration cannot be demonstrated on this
+hardware**, and this page does not claim one. An M2SDR adapter should declare
+`num_rf_inputs = 1` and whatever `num_antennas` its build has, and a two-band
+request will then be refused before arming with the message in
+[`GNSSReceiver.band_plan_error`](@ref) — which is the correct outcome for this
+front end, not a limitation of the routing. The multi-band path above is
+validated in simulation (`test/multi_band_routing.jl`) and awaits a front end
+with two independently tuned inputs.
+
+### Supported configurations, today
+
+| Configuration                                                                 | Status                                                            |
+|:----------------------------------------------------------------------------- |:----------------------------------------------------------------- |
+| One band, one or more coherent antennas                                       | Supported; the path every existing adapter is on                  |
+| Several bands on one device, one sample rate                                  | Supported                                                         |
+| Several bands on one device, different sample rates per band                  | Supported (validated in simulation, `test/multi_band_routing.jl`) |
+| Several bands over several devices on a shared reference **and** sample clock | Accepted by the validation; not demonstrated on hardware          |
+| Two bands on the LiteX-M2SDR                                                  | Impossible: one RX LO, one sample clock (measured above)          |
+| Several bands over devices on independent clocks                              | Refused before arming                                             |
+| More bands than RF inputs, by sequential retuning                             | Not performed; refused before arming                              |
+
 ## 6. Carrier-phase conventions for components
 
 A satellite's components share one carrier. The receiver locks the *driver*
@@ -339,6 +507,11 @@ status, and [`assignment_start_sample`](@ref) if arming is asynchronous.
   - [ ] [`correlator_gain`](@ref) per band, and
     [`replica_code_amplitude`](@ref) wherever the gateware approximates a
     code
+  - [ ] For a multi-band device: [`band_rf_input`](@ref),
+    [`band_hardware_channels`](@ref), [`raw_sample_channel`](@ref)`(sdr, band_id)`,
+    and — across devices — [`band_device_index`](@ref) and
+    [`clock_synchronization`](@ref) (section 5a). Dumps and NCO updates on each
+    band's own counter; epoch strobes on the reference band's
   - [ ] Dump records: latest-first accumulators, correct `num_taps`, a wire type
     wide enough for every layout, epoch strobes, `code_phase` if available
   - [ ] One record per primary code period, tiling the sample axis with neither
@@ -361,7 +534,10 @@ overlay on the host; the device-side contract is sketched in section 7), the
 gateware and adapter halves of dumps shorter than a primary period (#133 has
 landed on the host and is specified for a device in section 4a; the gateware is
 gnss-m2sdr#29 and the adapter GNSSM2SDR.jl#8), primary codes longer than a
-device's code memory, routing channels
-and noise estimates across RF bands (#134), and the per-signal validation matrix
-(#135). Until those land, declare conservatively: a capability you cannot serve
-is a channel that never locks.
+device's code memory, and the per-signal validation matrix (#135). Routing
+channels and noise estimates across RF bands (#134) is specified in section 5a
+and validated in simulation; what is *not* yet demonstrated there is a live
+multi-band capture on real gateware, and multi-device operation on a shared
+sample clock is accepted by the validation without having been run. Until the
+rest lands, declare conservatively: a capability you cannot serve is a channel
+that never locks.

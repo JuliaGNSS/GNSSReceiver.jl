@@ -276,6 +276,115 @@ raw_sample_channel(sdr::AbstractHardwareCorrelatorSDR) =
     _not_implemented("raw_sample_channel", sdr)
 
 """
+    raw_sample_channel(sdr, band_id::Symbol) -> SignalChannel
+
+One RF band's raw sample stream. The default is the device's single stream, so
+a one-band device implements nothing; a device that receives several bands at
+once returns a separate stream per band, each counted at that band's own
+[`band_sampling_frequency`](@ref) and each driving its own band's acquisition.
+
+The streams stay separate rather than being interleaved for the same reason the
+dumps and the raw samples do: they have different rates, and the receiver's
+acquisition, buffering and code-phase correction are all per band already.
+"""
+raw_sample_channel(sdr::AbstractHardwareCorrelatorSDR, ::Symbol) = raw_sample_channel(sdr)
+
+"""
+    band_rf_input(sdr, band_id) -> Int
+
+Which RF input (tuner / downconversion chain) of the device `band_id` arrives
+on, 1-based. The default is `1`, which is right for every single-band device.
+
+A device that can receive several bands at once **must** implement this: the
+receiver will not guess which tuner a band lands on, and refuses a plan that
+puts two bands on one input rather than configuring a subset in silence. An RF
+input is not an antenna — see [`HardwareBandRoute`](@ref).
+"""
+band_rf_input(::AbstractHardwareCorrelatorSDR, ::Symbol) = 1
+
+"""
+    band_hardware_channels(sdr, band_id) -> AbstractVector{Int}
+
+Which of the device's hardware channels can correlate `band_id` — its
+*correlator bank* for that band, as 1-based indices into
+[`num_hardware_channels`](@ref).
+
+The default is every channel, which is right for a single-band device and for a
+multi-band one whose bank can be pointed at any input. A device whose replica
+sets are wired to one downconversion chain each returns that chain's slice, and
+the link then only ever hands a band's satellites a channel that can actually see
+it — the raw acquisition stream and the correlator bank that serves it are the
+same front end.
+
+Getting this wrong is not a subtle failure: a channel of the wrong bank
+correlates the *other* band's samples with this band's replica, produces records
+that never rise above the noise, and the satellite is dropped as if it had faded.
+
+The returned ranges must not overlap between bands.
+"""
+band_hardware_channels(sdr::AbstractHardwareCorrelatorSDR, ::Symbol) =
+    Base.OneTo(Int(num_hardware_channels(sdr)))
+
+"""
+    band_device_index(sdr, band_id) -> Int
+
+Which physical device of a multi-device array `band_id` arrives on, 1-based.
+The default is `1`. Anything else needs a declared
+[`clock_synchronization`](@ref).
+"""
+band_device_index(::AbstractHardwareCorrelatorSDR, ::Symbol) = 1
+
+"""
+    clock_synchronization(sdr) -> Symbol
+
+How the sample clocks of the devices this adapter drives relate to each other:
+`:single_device` (the default), `:shared_clock` or `:independent`. See
+[`HardwareBandPlan`](@ref) for what each obliges and why `:independent` is
+refused for a multi-device plan.
+"""
+clock_synchronization(::AbstractHardwareCorrelatorSDR) = :single_device
+
+"""
+    hardware_band_plan(sdr, band_ids, sampling_freqs) -> HardwareBandPlan
+
+The device's RF configuration for the requested bands: one
+[`HardwareBandRoute`](@ref) per band, in the order given — so the **first band
+is the reference band and its counter is the receiver timebase** — plus the
+device's declared [`clock_synchronization`](@ref).
+
+The default builds it from [`band_rf_input`](@ref) and
+[`band_device_index`](@ref), which is all a device usually has to declare.
+Override the whole function only where the routing cannot be expressed per band
+(a device that swaps inputs depending on the combination requested, say).
+
+`sampling_freqs` is aligned with `band_ids`; a single frequency applies to every
+band, which is the common case of one sample clock feeding several tuners.
+"""
+function hardware_band_plan(sdr::AbstractHardwareCorrelatorSDR, band_ids, sampling_freqs)
+    ids = collect(Symbol, band_ids)
+    freqs =
+        sampling_freqs isa Union{Tuple,AbstractVector} ? collect(map(_hz, sampling_freqs)) :
+        fill(_hz(sampling_freqs), length(ids))
+    length(freqs) == length(ids) || throw(
+        ArgumentError(
+            "hardware_band_plan needs one sampling frequency per band (got " *
+            "$(length(freqs)) for $(length(ids)) bands)",
+        ),
+    )
+    HardwareBandPlan(
+        map(ids, freqs) do band_id, sampling_freq
+            HardwareBandRoute(
+                band_id,
+                Int(Base.invokelatest(band_rf_input, sdr, band_id)),
+                Int(Base.invokelatest(band_device_index, sdr, band_id)),
+                sampling_freq,
+            )
+        end;
+        clock_synchronization = Base.invokelatest(clock_synchronization, sdr),
+    )
+end
+
+"""
     correlator_dump_channel(sdr::AbstractHardwareCorrelatorSDR) -> PipeChannel{<:CorrelatorDump}
 
 The device → host stream of correlator dumps. Required; see
@@ -531,12 +640,20 @@ Check every signal the receiver would track against `sdr`'s declared
 problem — *before* a channel is armed, before a single CSR is written.
 
 `systems` is what [`receive`](@ref) was given (a signal, a
-[`CombinedSignal`](@ref) or a tuple of them); each system's components are
-checked one by one, so a pilot/data pair is accepted only if the device can
-serve both. The device's dump record is checked too: a three-slot record cannot
-carry a five-tap correlator, which is the failure this validation exists to
-replace — at PR #129's head that combination reached the ingest path and died
-there as a `DimensionMismatch` (issue #131).
+[`CombinedSignal`](@ref), a tuple of them sharing one band, or a tuple of such
+tuples, one per band); each system's components are checked one by one against
+its **own band's** sampling frequency, so a pilot/data pair is accepted only if
+the device can serve both. The device's dump record is checked too: a three-slot
+record cannot carry a five-tap correlator, which is the failure this validation
+exists to replace — at PR #129's head that combination reached the ingest path
+and died there as a `DimensionMismatch` (issue #131).
+
+`sampling_freq` is one frequency for every band, or a tuple aligned with the
+band groups. `band_plan` is the RF configuration to check
+([`hardware_band_plan`](@ref) builds the device's own); its bands, RF inputs,
+devices and clock relationship are validated as a whole, because receiving every
+requested band *at once* is an RF-capacity question the per-signal checks cannot
+answer (see [`band_plan_error`](@ref)).
 
 This is the pre-arm gate; [`receive`](@ref)`(::AbstractHardwareCorrelatorSDR, …)`
 calls it for you. Call it directly when building a link by hand.
@@ -547,31 +664,37 @@ function validate_hardware_configuration(
     sampling_freq;
     num_ants::NumAnts{N} = NumAnts(1),
     max_integration_time = DEFAULT_MAX_INTEGRATION_TIME,
+    band_plan::Union{Nothing,HardwareBandPlan} = nothing,
 ) where {N}
     capabilities = hardware_capabilities(sdr)
-    all_systems = as_systems(systems)
+    band_systems = _band_system_groups(systems)
+    plan = something(
+        band_plan,
+        hardware_band_plan(
+            sdr,
+            map(systems -> get_band_id(system_band(first(systems))), band_systems),
+            _per_band_values(sampling_freq, band_systems),
+        ),
+    )
     dump_tap_slots = _dump_tap_slots(sdr)
     problems = String[]
-    for system in all_systems, signal in tracking_signals(system)
-        message = hardware_support_error(
-            capabilities,
-            signal,
-            Tracking.get_default_correlator(signal, num_ants),
-            sampling_freq;
-            num_ants = N,
-            dump_tap_slots,
-            max_integration_time,
-        )
-        isnothing(message) || push!(problems, message)
+    for systems in band_systems, system in systems
+        band_freq = band_sampling_frequency(plan, get_band_id(system_band(system)))
+        for signal in tracking_signals(system)
+            message = hardware_support_error(
+                capabilities,
+                signal,
+                Tracking.get_default_correlator(signal, num_ants),
+                band_freq;
+                num_ants = N,
+                dump_tap_slots,
+                max_integration_time,
+            )
+            isnothing(message) || push!(problems, message)
+        end
     end
-    bands = unique(map(system -> get_band_id(system_band(system)), all_systems))
-    if length(bands) > capabilities.num_rf_inputs
-        push!(
-            problems,
-            "cannot receive bands $(join(bands, ", ")) at once: the device has " *
-            "$(capabilities.num_rf_inputs) RF input(s)",
-        )
-    end
+    rf_problem = band_plan_error(capabilities, plan)
+    isnothing(rf_problem) || push!(problems, rf_problem)
     isempty(problems) && return nothing
     throw(
         ArgumentError(
@@ -797,6 +920,15 @@ Keywords:
     is held back until a second record corroborates the jump, and counted in
     `implausible_dumps`. One nonsense index is otherwise permanent: the clock
     only moves forward and the grid resynchronises onto it.
+  - `band_plan` — the RF configuration ([`HardwareBandPlan`](@ref)): which band
+    arrives on which input of which device, at what rate, and what makes their
+    counters comparable. `nothing` (the default) builds the single-band plan the
+    link has always assumed — `reference_signal`'s band at `sampling_freq` —
+    so nothing about a one-band receiver changes. With several bands the
+    **first** route's band is the reference band and its counter is the receiver
+    timebase: `sampling_freq` must be that band's rate, every epoch boundary and
+    fold is counted on it, and a record or a command on another band is mapped
+    across by the exact ratio of the two rates.
   - `max_dump_gap` — how long a hardware channel's records may be missing before
     the receiver stops protecting its satellite (default 5 s). Within it a
     satellite that receives no record is *frozen* rather than decayed — a gap in
@@ -842,11 +974,28 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     const drain_buffer::Vector{CorrelatorDump{C}}
     const nco_buffer::Vector{NCOUpdate}
     # Epoch grid on the *sample-index* axis (Δ = interval × fs), not wall clock,
-    # so it is deterministic and replayable.
+    # so it is deterministic and replayable. Counted in *reference-band* samples
+    # — the receiver timebase — so one boundary is one instant across every
+    # band, whatever rate each one is counted at (see `band_plan`).
     const epoch_length::Int
-    # Sampling frequency (Hz) of the band the epoch grid lives on. Used to turn
-    # device-sample spans into chips for the code-phase bookkeeping.
-    const sampling_freq_hz::Float64
+    # Which RF band arrives on which input of which device, at what rate, and
+    # what makes their counters comparable. The first route's band is the
+    # reference band; everything above is expressed on its counter. See
+    # `HardwareBandPlan`.
+    const band_plan::HardwareBandPlan
+    # Per hardware channel: the band its occupant lives on, that band's sample
+    # rate, and how many receiver-timebase samples one of its device samples is
+    # worth. A single-band receiver has scale 1.0 everywhere and the rate is the
+    # reference rate, so none of the arithmetic below changes for it.
+    const channel_band::Vector{Symbol}
+    const channel_sampling_freq::Vector{Float64}
+    const channel_timebase_scale::Vector{Float64}
+    # The correlator bank each band may draw channels from
+    # (`band_hardware_channels`), indexed by the band's position in the plan.
+    # A satellite is only ever armed on a channel of its own band's bank: a
+    # channel wired to another downconversion chain would correlate the wrong
+    # band's samples with this band's replica and never rise above the noise.
+    const band_channels::Vector{Vector{Int}}
     # Amplitude of the replica the device wipes off with, relative to the unit
     # replica the host's own correlator would use. Divided out of every
     # accumulator on ingest — see `_retag_spacing`. Device-wide; a per-band
@@ -1011,25 +1160,38 @@ mutable struct HardwareCorrelatorLink{C<:Tracking.AbstractCorrelator}
     # once per sync; every wiped dump advances it over the blocks it covered.
     const secondary_phase::Vector{Int}
     const secondary_phase_sample::Vector{Int64}
-    # ── Noise reference ───────────────────────────────────────────────────────
+    # ── Noise reference, per RF band ──────────────────────────────────────────
     # Where the C/N₀ estimator's noise density comes from: `:channel` spends a
     # hardware channel on an open-loop despread (the documented FPGA recipe),
     # `:samples` meters Σ|x|² off the raw stream. See `append_noise_observations!`.
     const noise_source::Symbol
-    # The channel the open-loop reference occupies, or 0 while it has none. It
-    # is never handed to a satellite and never receives an `NCOUpdate`.
-    noise_channel::Int
-    # The decoy PRN it currently replicates, and how many epochs since it was
-    # last re-armed onto a fresh PRN / phase / carrier offset.
-    noise_prn::Int32
-    noise_epochs_since_rearm::Int
+    # **One reference per band**, all five vectors indexed by the band's position
+    # in `band_plan.routes`. A noise density is a property of one front end's
+    # gain chain, one antenna, one filter and one modulation — pooling an L1
+    # floor with an L5 one describes neither, and a C/N₀ referenced to the pooled
+    # value is wrong on both bands by whatever they differ by. So each band gets
+    # its own open-loop despread, on its own signal, at its own sample rate, and
+    # its observation reaches only that band's signals.
+    #
+    # The channel each band's reference occupies, or 0 while it has none. It is
+    # never handed to a satellite and never receives an `NCOUpdate`.
+    const noise_channels::Vector{Int}
+    # The decoy PRN each one currently replicates, and how many epochs since it
+    # was last re-armed onto a fresh PRN / phase / carrier offset.
+    const noise_prns::Vector{Int32}
+    const noise_epochs_since_rearm::Vector{Int}
     const noise_rearm_epochs::Int
-    # This chunk's pooled accumulation: `Σ b·bᴴ` over every tap of every dump
-    # the noise channel produced (a 1×1 matrix for one antenna), the number of
-    # independent looks that pooled, and the samples one look spans.
-    const noise_accumulator::Matrix{ComplexF64}
-    noise_looks::Int
-    noise_samples_per_look::Int
+    # This chunk's pooled accumulation *per band*: `Σ b·bᴴ` over every tap of
+    # every dump that band's noise channel produced (a 1×1 matrix for one
+    # antenna), the number of independent looks that pooled, and the samples one
+    # look spans.
+    const noise_accumulators::Vector{Matrix{ComplexF64}}
+    const noise_looks::Vector{Int}
+    const noise_samples_per_look::Vector{Int}
+    # Reverse index: hardware channel → the band whose noise reference it
+    # carries, or 0 for an ordinary (or free) channel. A dump's routing is then
+    # an O(1) lookup rather than a scan over the bands.
+    const noise_band_of_channel::Vector{Int}
     # Sample index at which the currently open epoch closes. `typemin` until the
     # first record arrives and anchors the grid (see `_anchor_epoch_grid!`).
     next_epoch_boundary::Int
@@ -1144,7 +1306,27 @@ function HardwareCorrelatorLink(
     noise_rearm_interval = 1u"s",
     max_epoch_clock_advance = 1u"s",
     max_dump_gap = 5u"s",
+    band_plan::Union{Nothing,HardwareBandPlan} = nothing,
 )
+    # The RF plan. A link built without one is the single-band receiver it has
+    # always been: one band — the reference signal's — at `sampling_freq`, on
+    # the device's first input, so every scale below is exactly 1.0.
+    plan = something(
+        band_plan,
+        hardware_band_plan(
+            sdr,
+            (get_band_id(get_band(reference_signal)),),
+            (sampling_freq,),
+        ),
+    )
+    _hz(sampling_freq) ≈ reference_sampling_frequency(plan) || throw(
+        ArgumentError(
+            "`sampling_freq` ($(_hz(sampling_freq)) Hz) must be the band plan's " *
+            "reference band $(reference_band(plan)) rate " *
+            "($(reference_sampling_frequency(plan)) Hz): the reference band's counter " *
+            "is the receiver timebase",
+        ),
+    )
     max_integration_seconds = _seconds(max_integration_time)
     max_integration_seconds > 0 || throw(
         ArgumentError("max_integration_time must be positive (got $max_integration_time)"),
@@ -1218,6 +1400,7 @@ function HardwareCorrelatorLink(
     )
     ncos = nco_update_channel(sdr)
     n = num_hardware_channels(sdr)
+    num_bands = length(plan.routes)
 
     HardwareCorrelatorLink{_correlator_type(dump_type)}(
         sdr,
@@ -1229,7 +1412,17 @@ function HardwareCorrelatorLink(
         dump_type[],
         NCOUpdate[],
         epoch_length,
-        Float64(ustrip(uconvert(Hz, sampling_freq))),
+        plan,
+        fill(reference_band(plan), n),
+        fill(reference_sampling_frequency(plan), n),
+        ones(Float64, n),
+        [
+            [
+                hw_channel for
+                hw_channel in Base.invokelatest(band_hardware_channels, sdr, route.band_id) if
+                1 <= hw_channel <= n
+            ] for route in plan.routes
+        ],
         Float64(gain),
         hardware_capabilities(sdr),
         gain_is_per_band,
@@ -1263,13 +1456,20 @@ function HardwareCorrelatorLink(
         fill(-1, n),
         fill(typemin(Int64), n),
         noise_source,
-        0,
-        Int32(0),
-        0,
+        zeros(Int, num_bands),
+        zeros(Int32, num_bands),
+        zeros(Int, num_bands),
         noise_rearm_epochs,
-        zeros(ComplexF64, _num_ants(_correlator_type(dump_type)), _num_ants(_correlator_type(dump_type))),
-        0,
-        0,
+        [
+            zeros(
+                ComplexF64,
+                _num_ants(_correlator_type(dump_type)),
+                _num_ants(_correlator_type(dump_type)),
+            ) for _ = 1:num_bands
+        ],
+        zeros(Int, num_bands),
+        zeros(Int, num_bands),
+        zeros(Int, n),
         typemin(Int),
         typemin(Int),
         max_index_advance,
@@ -1321,6 +1521,94 @@ get_sdr(link::HardwareCorrelatorLink) = link.sdr
 # when consuming records, so loading a vendor cannot invalidate the fold.
 _call_device(f::F, link::HardwareCorrelatorLink, args...; kwargs...) where {F} =
     Base.invokelatest(f, link.sdr, args...; kwargs...)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The receiver timebase (#134)
+#
+# Every band the device receives counts its own samples at its own rate, so a
+# dump's `sample_index` means "so many samples of *that* band". The link folds,
+# ranges and schedules on one axis instead — the reference band's counter, which
+# is the receiver timebase — and the two conversions below are the only place
+# the two axes meet. Both are exact scalings: the rates are ratios of one
+# hardware clock (`HardwareBandPlan` refuses a configuration where they are
+# not), so there is no offset to estimate and no drift to track.
+#
+# For a single-band receiver every scale is exactly `1.0` and both functions are
+# the identity, which is why none of the arithmetic downstream had to change.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Position of `band_id` in the plan, or 0 for a band it does not route.
+function _band_index(link::HardwareCorrelatorLink, band_id::Symbol)
+    routes = link.band_plan.routes
+    for index in eachindex(routes)
+        routes[index].band_id === band_id && return index
+    end
+    0
+end
+
+_band_index(link::HardwareCorrelatorLink, system) =
+    _band_index(link, get_band_id(system_band(system)))
+
+# One of this channel's device samples on the receiver timebase, and back.
+_receiver_sample(link::HardwareCorrelatorLink, hw_channel::Integer, sample) =
+    _scale_sample(sample, link.channel_timebase_scale[hw_channel])
+
+_band_sample(link::HardwareCorrelatorLink, hw_channel::Integer, sample) =
+    _scale_sample(sample, 1 / link.channel_timebase_scale[hw_channel])
+
+# A record's place on the receiver timebase. An epoch strobe carries no channel
+# (`EPOCH_STROBE_CHANNEL`), and a device emits it on the *reference* band's
+# counter — it is the timebase marker, so it is stated in the timebase — which
+# is what the out-of-range fallback says.
+@inline function _epoch_sample(link::HardwareCorrelatorLink, dump::CorrelatorDump)
+    hw_channel = Int(dump.channel)
+    checkbounds(Bool, link.channel_timebase_scale, hw_channel) ||
+        return Int64(dump.output.sample_index)
+    _receiver_sample(link, hw_channel, dump.output.sample_index)
+end
+
+# Point one hardware channel at a band: the rate its records, replica offsets and
+# handover times are counted at, and the scale onto the receiver timebase.
+function _route_channel!(link::HardwareCorrelatorLink, hw_channel::Integer, band_id::Symbol)
+    plan = link.band_plan
+    link.channel_band[hw_channel] = band_id
+    link.channel_sampling_freq[hw_channel] = band_sampling_frequency(plan, band_id)
+    link.channel_timebase_scale[hw_channel] = receiver_timebase_scale(plan, band_id)
+    link
+end
+
+# …and back to the reference band, for a channel that has been released.
+_unroute_channel!(link::HardwareCorrelatorLink, hw_channel::Integer) =
+    _route_channel!(link, hw_channel, reference_band(link.band_plan))
+
+"""
+    receiver_sampling_frequency(link) -> Float64
+
+The rate, in Hz, of the receiver timebase — the reference band's sampling
+frequency. Every epoch boundary, `latest_sample_index`, `samples_consumed` and
+fold boundary is counted at it; a channel's own band rate is
+[`channel_sampling_frequency`](@ref).
+"""
+receiver_sampling_frequency(link::HardwareCorrelatorLink) =
+    reference_sampling_frequency(link.band_plan)
+
+"""
+    channel_band_id(link, hw_channel) -> Symbol
+
+The RF band the channel's current occupant lives on — the band its dumps'
+`sample_index`, its replica offsets and its [`NCOUpdate`](@ref)s are all counted
+on. The reference band for a channel that holds nothing.
+"""
+channel_band_id(link::HardwareCorrelatorLink, hw_channel::Integer) =
+    link.channel_band[hw_channel]
+
+"""
+    channel_sampling_frequency(link, hw_channel) -> Float64
+
+The sample rate, in Hz, of the band the channel's occupant lives on.
+"""
+channel_sampling_frequency(link::HardwareCorrelatorLink, hw_channel::Integer) =
+    link.channel_sampling_freq[hw_channel]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # The dispatch seam: how one chunk advances the tracking state
@@ -1497,7 +1785,12 @@ Two sources, chosen by the link's `noise_source`:
     as a fallback for a device that cannot spare a channel.
 
 A noise *density* is a property of the band and the modulation, not of a
-satellite, so one observation serves every satellite tracking that signal.
+satellite, so one observation serves every satellite tracking that signal — and
+only those. Both sources are **per band**: `:samples` meters each band's own raw
+frame, and `:channel` keeps one open-loop reference per band
+([`ensure_noise_channel!`](@ref)). Unrelated RF floors are never pooled, because
+a pooled floor is a C/N₀ bias on every satellite of every band involved and
+nothing downstream can see it.
 """
 function append_noise_observations!(link, track_state, band_systems, band_measurements)
     isempty(track_state.noise_estimators) && return track_state
@@ -1565,8 +1858,12 @@ function _accumulated_power(samples::AbstractMatrix)
     acc
 end
 
-# Samples in this chunk. Every band advances from equal-length frames of one
-# time base (`receive` enforces it), so the first band speaks for all of them.
+# Samples in this chunk, counted on the **receiver timebase** — so, on the
+# reference band's frame. Every band advances from frames of one duration on one
+# time base, but not necessarily of one length: a band sampled faster delivers
+# proportionally more samples for the same span. The reference band is the one
+# `samples_consumed` (and with it every handover time) is counted in, so it is
+# the one that speaks here.
 _chunk_num_samples(band_measurements::NamedTuple) =
     _chunk_num_samples(first(values(band_measurements)))
 _chunk_num_samples(m::Tracking.BandMeasurement) = size(Tracking.get_samples(m), 1)
@@ -1599,8 +1896,18 @@ end
 """
     ensure_noise_channel!(link, track_state, band_systems, band_measurements)
 
-Keep one hardware channel running an **open-loop despread** as the C/N₀
-estimator's noise reference, and re-arm it periodically.
+Keep **one hardware channel per RF band** running an open-loop despread as that
+band's C/N₀ noise reference, and re-arm each of them periodically.
+
+One per band, not one for the receiver: a noise density is a property of a front
+end's gain chain, antenna, filter and interference environment, and of the
+modulation that despreads it. Two bands share none of those. Pooling their
+floors into one number describes neither band, and the error lands on every
+satellite of both as a C/N₀ bias — the quantity the code lock detector thresholds
+on, and the one thing in the receiver with nothing to contradict it. So each
+band's reference is armed on a signal of that band, at that band's sample rate,
+with that band's replica gain, and its observation reaches only that band's
+signals ([`append_noise_observations!`](@ref)).
 
 The channel is an ordinary tracking channel programmed with a *decoy* PRN: same
 code generator, same carrier NCO, same quantisation, same accumulators as every
@@ -1622,22 +1929,36 @@ nothing about which satellites are tracked.
 function ensure_noise_channel!(link, track_state, band_systems, band_measurements)
     link.noise_source === :channel || return link
     isempty(track_state.noise_estimators) && return link
-    signal = _noise_reference_signal(band_systems)
-    isnothing(signal) && return link
-    if link.noise_channel == 0
-        hw_channel = _find_free_channel(link)
-        isnothing(hw_channel) && return link
-        link.noise_channel = hw_channel
-        link.noise_epochs_since_rearm = link.noise_rearm_epochs
+    for systems in band_systems
+        isempty(systems) && continue
+        signal = _noise_reference_signal(systems)
+        isnothing(signal) && continue
+        band_index = _band_index(link, first(systems))
+        band_index == 0 && continue
+        if link.noise_channels[band_index] == 0
+            hw_channel = _find_free_channel(link, band_index)
+            isnothing(hw_channel) && continue
+            link.noise_channels[band_index] = hw_channel
+            link.noise_band_of_channel[hw_channel] = band_index
+            link.noise_epochs_since_rearm[band_index] = link.noise_rearm_epochs
+        end
+        link.noise_epochs_since_rearm[band_index] >= link.noise_rearm_epochs || continue
+        _arm_noise_channel!(
+            link,
+            band_index,
+            signal,
+            _band_sampling_frequency(band_measurements, signal),
+        )
     end
-    link.noise_epochs_since_rearm >= link.noise_rearm_epochs || return link
-    _arm_noise_channel!(link, signal, _band_sampling_frequency(band_measurements, signal))
+    link
 end
 
-# The reference despreads one signal, and it is the same one the epoch grid and
-# the handovers are referenced to: the ranging signal of the first system.
-function _noise_reference_signal(band_systems)
-    for systems in band_systems, system in systems
+# The reference despreads one signal of *this band*, and it is the same one the
+# band's handovers are referenced to: the ranging signal of its first system.
+# Per band, because a noise density belongs to one front end — see the
+# `noise_channels` field.
+function _noise_reference_signal(systems)
+    for system in systems
         for signal in tracking_signals(system)
             return signal
         end
@@ -1645,11 +1966,15 @@ function _noise_reference_signal(band_systems)
     nothing
 end
 
-function _arm_noise_channel!(link, signal, sampling_freq)
+function _arm_noise_channel!(link, band_index, signal, sampling_freq)
+    hw_channel = link.noise_channels[band_index]
+    band_id = get_band_id(get_band(signal))
+    _route_channel!(link, hw_channel, band_id)
+    route = _route_or_reference(link.band_plan, band_id)
     # Rotate through the family rather than picking one and staying: a PRN whose
     # cross-correlation with a strong satellite happens to be unusually high is
     # then one observation in the window, not the window.
-    link.noise_prn = Int32(mod(Int(link.noise_prn), 32) + 1)
+    link.noise_prns[band_index] = Int32(mod(Int(link.noise_prns[band_index]), 32) + 1)
     # The same quantised spacing a tracked satellite gets, asked of `Tracking` the
     # same way `_assign!` asks. Wider taps would be better — at a whole chip the
     # three of them are three *independent* looks, which is what pooling them
@@ -1660,7 +1985,7 @@ function _arm_noise_channel!(link, signal, sampling_freq)
     # than `1/M`; each tap on its own is still an unbiased look at the noise
     # power, so the density itself is unaffected.
     correlator = Tracking.EarlyPromptLateCorrelator(
-        num_ants = Tracking.NumAnts(size(link.noise_accumulator, 1)),
+        num_ants = Tracking.NumAnts(size(link.noise_accumulators[band_index], 1)),
     )
     # `signal_index = 0`: the reference belongs to no satellite's component
     # list. Everything else is an ordinary assignment, which is the point — the
@@ -1671,27 +1996,29 @@ function _arm_noise_channel!(link, signal, sampling_freq)
         correlator;
         signal_index = 0,
         group_key = signal_group_key(signal),
-        prn = Int(link.noise_prn),
+        prn = Int(link.noise_prns[band_index]),
         carrier_doppler = (rand() * 10_000 - 5_000) * Hz,  # carrier dither, ±5 kHz
         code_doppler = 0.0Hz,                              # open loop: it free-runs
         code_phase = rand() * get_code_length(signal),     # uniform code phase
-        valid_at_sample = link.samples_consumed,
+        valid_at_sample = _band_sample(link, hw_channel, link.samples_consumed),
         sampling_freq,
-        replica_amplitude = _replica_amplitude(link, get_band_id(get_band(signal))),
+        replica_amplitude = _replica_amplitude(link, band_id),
         code_amplitude = Float64(_call_device(replica_code_amplitude, link, signal)),
         secondary_code_mode = requested_secondary_code_mode(link, signal),
+        rf_input = route.rf_input,
+        device_index = route.device_index,
     )
-    _call_device(assign_channel!, link, link.noise_channel, config)
-    link.noise_epochs_since_rearm = 0
+    _call_device(assign_channel!, link, hw_channel, config)
+    link.noise_epochs_since_rearm[band_index] = 0
     # A re-arm invalidates whatever was part-accumulated against the old PRN.
-    _reset_noise_accumulator!(link)
+    _reset_noise_accumulator!(link, band_index)
     link
 end
 
-function _reset_noise_accumulator!(link)
-    fill!(link.noise_accumulator, zero(ComplexF64))
-    link.noise_looks = 0
-    link.noise_samples_per_look = 0
+function _reset_noise_accumulator!(link, band_index)
+    fill!(link.noise_accumulators[band_index], zero(ComplexF64))
+    link.noise_looks[band_index] = 0
+    link.noise_samples_per_look[band_index] = 0
     link
 end
 
@@ -1700,15 +2027,15 @@ end
 # independent looks and nothing about their relative values means anything, so
 # they are summed. For an antenna array the pooled payload is the array's
 # spatial covariance, whose diagonal is each antenna's own floor.
-function _accumulate_noise_dump!(link, output, num_taps)
+function _accumulate_noise_dump!(link, band_index, output, num_taps)
     accumulators = get_accumulators(output.correlator)
     for index = 1:min(num_taps, length(accumulators))
-        _add_outer!(link.noise_accumulator, accumulators[index])
-        link.noise_looks += 1
+        _add_outer!(link.noise_accumulators[band_index], accumulators[index])
+        link.noise_looks[band_index] += 1
     end
     # Every tap of one dump integrates the same samples, so the span of a look
     # is the dump's own length, counted once.
-    link.noise_samples_per_look = output.integrated_samples
+    link.noise_samples_per_look[band_index] = output.integrated_samples
     link
 end
 
@@ -1725,33 +2052,45 @@ end
 # sample count: it is what makes observations from producers of different
 # granularity combinable, and what the sliding window weights by.
 function _flush_channel_noise!(link, track_state, band_systems, band_measurements)
-    link.noise_looks == 0 && return track_state
-    signal = _noise_reference_signal(band_systems)
-    isnothing(signal) && return track_state
-    sampling_freq = _band_sampling_frequency(band_measurements, signal)
-    observation = Tracking.noise_observation_from_correlator(
-        _pooled_noise(link),
-        link.noise_looks,
-        link.noise_looks * link.noise_samples_per_look,
-        sampling_freq;
-        prn = Int(link.noise_prn),
-        duration = link.noise_samples_per_look / sampling_freq,
-    )
-    _append_signal_noise!(
-        track_state,
-        observation,
-        _flatten_systems(map(tracking_signals, _flatten_systems(band_systems))),
-        keys(track_state.noise_estimators),
-    )
-    _reset_noise_accumulator!(link)
+    configured = keys(track_state.noise_estimators)
+    for systems in band_systems
+        isempty(systems) && continue
+        band_index = _band_index(link, first(systems))
+        band_index == 0 && continue
+        link.noise_looks[band_index] == 0 && continue
+        signal = _noise_reference_signal(systems)
+        isnothing(signal) && continue
+        sampling_freq = _band_sampling_frequency(band_measurements, signal)
+        samples_per_look = link.noise_samples_per_look[band_index]
+        observation = Tracking.noise_observation_from_correlator(
+            _pooled_noise(link, band_index),
+            link.noise_looks[band_index],
+            link.noise_looks[band_index] * samples_per_look,
+            sampling_freq;
+            prn = Int(link.noise_prns[band_index]),
+            duration = samples_per_look / sampling_freq,
+        )
+        # Only *this band's* signals. A density measured through an L1 front
+        # end says nothing about an L5 one, and handing it to L5's estimator
+        # biases every L5 satellite's C/N₀ by whatever the two gain chains,
+        # filters and interference environments differ by — silently, because
+        # a C/N₀ has no second opinion to disagree with.
+        _append_signal_noise!(
+            track_state,
+            observation,
+            _flatten_systems(map(tracking_signals, systems)),
+            configured,
+        )
+        _reset_noise_accumulator!(link, band_index)
+    end
     track_state
 end
 
-_pooled_noise(link) =
-    size(link.noise_accumulator, 1) == 1 ? real(link.noise_accumulator[1, 1]) :
-    SMatrix{size(link.noise_accumulator, 1),size(link.noise_accumulator, 2),ComplexF64}(
-        link.noise_accumulator,
-    )
+function _pooled_noise(link, band_index)
+    accumulator = link.noise_accumulators[band_index]
+    size(accumulator, 1) == 1 ? real(accumulator[1, 1]) :
+    SMatrix{size(accumulator, 1),size(accumulator, 2),ComplexF64}(accumulator)
+end
 
 function release_stale_channels!(link, track_state)
     for hw_channel in eachindex(link.assignments)
@@ -1777,6 +2116,7 @@ function release_stale_channels!(link, track_state)
         link.pending_blocks[hw_channel] = 0
         link.bit_clock_lost[hw_channel] = false
         link.secondary_wipe[hw_channel] = false
+        _unroute_channel!(link, hw_channel)
         forget_secondary_phase!(link, hw_channel)
         filter!(!=(assignment), link.bit_clock_restarts)
         reset_timeline!(link.nco_timelines[hw_channel], 0.0, 0.0)
@@ -1798,14 +2138,17 @@ function assign_new_channels!(link, track_state, band_systems, band_measurements
     for systems in band_systems, system in systems
         group_key = signal_group_key(system)
         sampling_freq = _band_sampling_frequency(band_measurements, system)
+        # The correlator bank that sees this system's band — the same front end
+        # its raw acquisition stream comes from.
+        band_index = _band_index(link, system)
         for sat_state in get_sat_states(track_state, group_key)
             prn = get_prn(sat_state)
             for (signal_index, tracked_signal) in enumerate(get_signals(sat_state))
                 assignment = HardwareChannelAssignment(group_key, prn, signal_index)
                 haskey(link.channel_of, assignment) && continue
-                hw_channel = _find_free_channel(link)
+                hw_channel = _find_free_channel(link, band_index)
                 if isnothing(hw_channel)
-                    # More tracked signals than the gateware has replica sets.
+                    # More tracked signals than this band's bank has replica sets.
                     # The unassigned ones simply get no correlator outputs, so
                     # their lock detectors decay and the receiver drops them —
                     # the same path as a satellite that faded.
@@ -1826,9 +2169,15 @@ function assign_new_channels!(link, track_state, band_systems, band_measurements
     link
 end
 
-function _find_free_channel(link)
-    for hw_channel in eachindex(link.assignments)
-        hw_channel == link.noise_channel && continue
+# A free channel of `band_index`'s own correlator bank, or `nothing` when that
+# bank is full. Scoped to the band rather than to the device: a channel wired to
+# another RF input sees another band's samples, so handing it this band's
+# satellite would arm a replica against the wrong spectrum.
+function _find_free_channel(link, band_index::Integer)
+    band_index in eachindex(link.band_channels) || return nothing
+    for hw_channel in link.band_channels[band_index]
+        # Every band's noise reference holds its channel for the whole run.
+        link.noise_band_of_channel[hw_channel] == 0 || continue
         isnothing(link.assignments[hw_channel]) && return hw_channel
     end
     nothing
@@ -1858,6 +2207,13 @@ function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampl
         @warn "hardware correlator $unsupported" prn = assignment.prn maxlog = 10
         return link
     end
+    # Route the channel to its band *before* the handover is built: the band's
+    # own sample rate, RF input and device are what the configuration states,
+    # and the handover instant is stated on that band's counter rather than on
+    # the receiver timebase the host counts `samples_consumed` in.
+    band_id = get_band_id(get_band(signal))
+    _route_channel!(link, hw_channel, band_id)
+    route = _route_or_reference(link.band_plan, band_id)
     config = HardwareChannelConfig(
         signal,
         correlator;
@@ -1867,11 +2223,13 @@ function _assign!(link, hw_channel, assignment, sat_state, tracked_signal, sampl
         carrier_doppler = get_carrier_doppler(sat_state),
         code_doppler = get_code_doppler(sat_state),
         code_phase = get_code_phase(sat_state),
-        valid_at_sample = link.samples_consumed,
+        valid_at_sample = _band_sample(link, hw_channel, link.samples_consumed),
         sampling_freq,
-        replica_amplitude = _replica_amplitude(link, get_band_id(get_band(signal))),
+        replica_amplitude = _replica_amplitude(link, band_id),
         code_amplitude = Float64(_call_device(replica_code_amplitude, link, signal)),
         secondary_code_mode = requested_secondary_code_mode(link, signal),
+        rf_input = route.rf_input,
+        device_index = route.device_index,
     )
     _call_device(assign_channel!, link, hw_channel, config)
     link.channel_scale[hw_channel] = correlator_output_scale(config)
@@ -2005,12 +2363,17 @@ function drain_dumps!(link::HardwareCorrelatorLink)
     take!(channel, link.drain_buffer)
     taken = 0
     for dump in link.drain_buffer
-        _is_plausible_index!(link, dump.output.sample_index) || continue
+        # Every comparison the epoch clock makes is on the receiver timebase, so
+        # the record's own band counter is mapped onto it first. Without that a
+        # band sampled 25 % faster would drive the clock 25 % fast and every
+        # record of every slower band would be permanently "in the past".
+        epoch_sample = _epoch_sample(link, dump)
+        _is_plausible_index!(link, epoch_sample) || continue
         push!(link.pending, dump)
         # The epoch clock advances on *any* record, strobe or not: that is what
         # lets a silent channel stall the loop only when the device also stops
         # strobing.
-        link.latest_sample_index = max(link.latest_sample_index, dump.output.sample_index)
+        link.latest_sample_index = max(link.latest_sample_index, epoch_sample)
         taken += 1
     end
     _anchor_epoch_grid!(link)
@@ -2053,7 +2416,7 @@ end
 function _anchor_epoch_grid!(link)
     link.next_epoch_boundary == typemin(Int) || return link
     isempty(link.pending) && return link
-    first_index = minimum(dump -> dump.output.sample_index, link.pending)
+    first_index = minimum(dump -> _epoch_sample(link, dump), link.pending)
     link.next_epoch_boundary = first_index + link.epoch_length
     link
 end
@@ -2112,7 +2475,7 @@ function fold_closed_epochs!(
         advance_code_phases!(link, track_state, boundary)
         link.next_epoch_boundary = boundary + link.epoch_length
         folds += 1
-        link.noise_epochs_since_rearm += 1
+        link.noise_epochs_since_rearm .+= 1
     end
     folds == 0 && return 0
 
@@ -2291,7 +2654,7 @@ function flush_partial_records!(link::HardwareCorrelatorLink, track_state)
             link,
             signal,
             hw_channel,
-            _block_boundary_tolerance(link, signal),
+            _block_boundary_tolerance(link, signal, hw_channel),
         ) || continue
         _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
     end
@@ -2317,7 +2680,10 @@ fixed-point steps, neither of which any tracking loop would otherwise ever see.
 
 Referencing every satellite to the same boundary is what makes the code phases
 comparable across satellites — the common-reception-time assumption PVT's
-pseudoranges are built on. Satellites without an anchor yet (assigned, but no
+pseudoranges are built on. `boundary` is on the **receiver timebase**, so that
+holds across RF bands too: it is converted to each channel's own band counter
+before the dead reckoning, and a satellite on a 5 MS/s band and one on a 4 MS/s
+band are both extrapolated to the same instant. Satellites without an anchor yet (assigned, but no
 dump seen) keep their acquisition seed: it lives on the host's raw-sample axis,
 which the link cannot place on the device counter, and the DLL pull-in doesn't
 need it to be moved.
@@ -2327,7 +2693,7 @@ The whole-code-period count picked up before bit sync is arbitrary.
 first finds synchronization. Tracking's secondary-code snap does not perform
 this operation for signals without a secondary code, such as GPS L1 C/A.
 """
-function advance_code_phases!(link::HardwareCorrelatorLink, track_state, boundary)
+function advance_code_phases!(link::HardwareCorrelatorLink, track_state, epoch_boundary)
     for hw_channel in eachindex(link.assignments)
         assignment = link.assignments[hw_channel]
         (isnothing(assignment) || assignment.signal_index != 1) && continue
@@ -2338,9 +2704,18 @@ function advance_code_phases!(link::HardwareCorrelatorLink, track_state, boundar
         signals = Tracking.get_signals(sat_state)
         signal = get_signal(first(signals))
         code_length = get_code_length(signal)
+        # Chips per sample *of this channel's band*: the dumps, the anchors and
+        # the reference below are all counted on that band's counter, and only
+        # the fold boundary arrives on the receiver timebase.
         chips_per_sample =
             (ustrip(Hz, get_code_frequency(signal)) +
-             ustrip(Hz, uconvert(Hz, get_code_doppler(sat_state)))) / link.sampling_freq_hz
+             ustrip(Hz, uconvert(Hz, get_code_doppler(sat_state)))) /
+            link.channel_sampling_freq[hw_channel]
+        # The common reception epoch, expressed on this band's counter. Every
+        # band's satellites are extrapolated to the *same instant*, which is the
+        # common-reception-time assumption PVT's pseudoranges rest on — it just
+        # happens to be a different integer on each band's counter.
+        boundary = _band_sample(link, hw_channel, epoch_boundary)
 
         reference = link.phase_ref_sample[hw_channel]
         anchor = link.anchor_sample[hw_channel]
@@ -2388,7 +2763,7 @@ Tie a newly synchronized data signal's integer code-period count to its bit
 buffer, retaining the replica phase at the common reception boundary. Applied
 once per channel assignment, after the estimator folds the chunk's records.
 """
-function anchor_bit_phases!(link::HardwareCorrelatorLink, track_state, boundary)
+function anchor_bit_phases!(link::HardwareCorrelatorLink, track_state, epoch_boundary)
     for ch in eachindex(link.assignments)
         assignment = link.assignments[ch]
         (isnothing(assignment) || assignment.signal_index != 1) && continue
@@ -2405,13 +2780,16 @@ function anchor_bit_phases!(link::HardwareCorrelatorLink, track_state, boundary)
         get_secondary_code_length(signal) == 1 || continue
         iszero(get_data_frequency(signal)) && continue
         bb.found || continue
+        # Both the reference and the record end live on this channel's band
+        # counter, so the fold boundary is converted onto it first.
+        boundary = _band_sample(link, ch, epoch_boundary)
         link.phase_ref_sample[ch] == boundary || continue
         last = link.last_record_end[ch]
         last == typemin(Int64) && continue
         primary = get_code_length(signal)
         rate =
             (ustrip(Hz, get_code_frequency(signal)) + ustrip(Hz, get_code_doppler(sat))) /
-            link.sampling_freq_hz
+            link.channel_sampling_freq[ch]
         elapsed = (boundary - last) * rate
         # A dump may report the last sample before wrap (near `primary`) or
         # the first after it (near zero). Recover its signed residual about
@@ -2430,10 +2808,13 @@ end
 # drop it from `pending`. Records at or past the boundary belong to the next
 # epoch and stay.
 function append_epoch_outputs!(link, track_state, boundary)
-    sort!(link.pending; by = dump -> dump.output.sample_index)
+    # Ordered — and cut — on the receiver timebase, so records from bands
+    # counted at different rates interleave by the instant they were produced
+    # rather than by the integer their own counter happens to be at.
+    sort!(link.pending; by = dump -> _epoch_sample(link, dump))
     keep = 0
     for dump in link.pending
-        if dump.output.sample_index >= boundary
+        if _epoch_sample(link, dump) >= boundary
             keep += 1
             link.pending[keep] = dump
             continue
@@ -2530,7 +2911,10 @@ function _nominal_record_samples(link, sat_state, assignment, hw_channel)
     code_rate =
         ustrip(Hz, get_code_frequency(signal)) +
         ustrip(Hz, uconvert(Hz, get_code_doppler(sat_state)))
-    period = floor(Int64, get_code_length(signal) * link.sampling_freq_hz / code_rate)
+    period = floor(
+        Int64,
+        get_code_length(signal) * link.channel_sampling_freq[hw_channel] / code_rate,
+    )
     seen = link.nominal_record_samples[hw_channel]
     seen <= 0 ? period : min(period, seen)
 end
@@ -2544,12 +2928,14 @@ function _append_dump!(link, track_state, dump)
         link.stale_dumps += 1
         return link
     end
-    if hw_channel == link.noise_channel
+    noise_band = link.noise_band_of_channel[hw_channel]
+    if noise_band != 0
         # A dump still carrying the previous decoy PRN was produced before the
         # re-arm took effect; pooling it would credit the window a look at a
-        # replica the accumulator is no longer about.
-        dump.prn == link.noise_prn ?
-        _accumulate_noise_dump!(link, dump.output, num_correlator_taps(dump)) :
+        # replica the accumulator is no longer about. The band index is what
+        # keeps one front end's floor out of another's estimate.
+        dump.prn == link.noise_prns[noise_band] ?
+        _accumulate_noise_dump!(link, noise_band, dump.output, num_correlator_taps(dump)) :
         (link.stale_dumps += 1)
         return link
     end
@@ -2992,7 +3378,7 @@ function _accumulate_dump!(
     signal = get_signal(Tracking.get_signals(sat_state)[assignment.signal_index])
     target =
         coherent_integration_periods(link, sat_state, assignment.signal_index, hw_channel)
-    tolerance = _block_boundary_tolerance(link, signal)
+    tolerance = _block_boundary_tolerance(link, signal, hw_channel)
     # A record is cut where the NCO word changed, the way it is cut on a bit
     # edge: the dumps accumulated so far ran on one word and this one starts on
     # another, and a record straddling the switch could be attributed to
@@ -3097,12 +3483,12 @@ end
 # because the fraction accumulates over a whole run where a rounded block count
 # never did: the nominal rate is what `Tracking` rounds with, and the two agree
 # to far better than the half period that rounding cares about.
-function _record_code_periods(link, sat_state, signal, output)
+function _record_code_periods(link, sat_state, signal, output, hw_channel)
     code_rate =
         ustrip(Hz, get_code_frequency(signal)) +
         ustrip(Hz, uconvert(Hz, get_code_doppler(sat_state)))
     output.integrated_samples * code_rate /
-    (get_code_length(signal) * link.sampling_freq_hz)
+    (get_code_length(signal) * link.channel_sampling_freq[hw_channel])
 end
 
 # How close to a block boundary still counts as being on it, as a fraction of a
@@ -3114,9 +3500,11 @@ end
 # just below the code length rather than zero (see `CorrelatorDump.code_phase`),
 # which is the same boundary written the other way round. Snapping both to
 # exactly `0.0` is what lets every later test be an equality.
-_block_boundary_tolerance(link, signal) =
-    max(1.5, ustrip(Hz, get_code_frequency(signal)) / link.sampling_freq_hz) /
-    get_code_length(signal)
+_block_boundary_tolerance(link, signal, hw_channel) =
+    max(
+        1.5,
+        ustrip(Hz, get_code_frequency(signal)) / link.channel_sampling_freq[hw_channel],
+    ) / get_code_length(signal)
 
 # A block fraction with the boundary snapped to exactly zero.
 _snap_block_fraction(fraction, tolerance) =
@@ -3173,8 +3561,8 @@ end
 function _record_block_span(link, sat_state, signal_index, hw_channel, output, code_phase)
     signal = get_signal(Tracking.get_signals(sat_state)[signal_index])
     code_length = get_code_length(signal)
-    tolerance = _block_boundary_tolerance(link, signal)
-    periods = _record_code_periods(link, sat_state, signal, output)
+    tolerance = _block_boundary_tolerance(link, signal, hw_channel)
+    periods = _record_code_periods(link, sat_state, signal, output, hw_channel)
     reported = isnan(code_phase) ? NaN : mod(code_phase / code_length, 1.0)
     start = _record_start_fraction(link, hw_channel, output, periods, reported, tolerance)
     wraps = max(0, floor(Int, start + periods + tolerance))
@@ -3368,9 +3756,12 @@ Push one [`NCOUpdate`](@ref) per assigned hardware channel and return how many
 were sent.
 
 Called once per chunk, right after the estimator folded it, so the Dopplers read
-back are the newest. All updates are scheduled at the same future sample —
+back are the newest. All updates are scheduled at the same future *instant* —
 `feedback_delay_epochs × Δ` past the *newest record the host has seen* — which is
-what keeps the loop delay a known constant instead of PCIe jitter.
+what keeps the loop delay a known constant instead of PCIe jitter. That instant
+is computed on the receiver timebase and then written on each channel's **own
+band counter**, so a multi-band device reads every `apply_at_sample` in the
+units its band is clocked in.
 
 The reference is `latest_sample_index` rather than the epoch `boundary` because
 the two part company exactly when it matters. `boundary` is where the fold grid
@@ -3406,7 +3797,13 @@ function push_nco_updates!(link::HardwareCorrelatorLink, track_state, boundary)
                 assignment.prn,
                 get_carrier_doppler(sat_state),
                 get_code_doppler(sat_state),
-                apply_at_sample,
+                # One landing *instant* for the whole fold, stated on each
+                # channel's own band counter — the same moment is a different
+                # integer on a 4 MS/s band and a 5 MS/s one, and a device
+                # applying the reference band's integer on another band would
+                # land the correction a quarter of the feedback delay early or
+                # late.
+                _band_sample(link, hw_channel, apply_at_sample),
             ),
         )
     end

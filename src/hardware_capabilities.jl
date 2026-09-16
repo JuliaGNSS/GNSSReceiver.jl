@@ -253,11 +253,302 @@ supports_secondary_code_wipeoff(
     get_secondary_code_length(signal) <= capabilities.max_secondary_code_length
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Validation, before anything is armed
+# RF bands: where each one arrives, and what clock it is counted on (#134)
+#
+# "Every signal is supported" and "every band is received at once" are different
+# claims, and the second one is an RF-capacity statement about a particular
+# front end. A [`HardwareBandPlan`](@ref) is where that statement is written
+# down: which physical input each requested band comes in on, at what sample
+# rate, on which device — and therefore how the device's several free-running
+# counters relate to the one timebase the receiver folds, ranges and fixes on.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _hz(x::Real) = Float64(x)
 _hz(x) = Float64(ustrip(uconvert(Hz, x)))
+
+"""
+    HardwareBandRoute(band_id; rf_input, device_index, sampling_freq)
+
+Where one RF band physically arrives and how fast it is counted.
+
+  - `band_id` — the `GNSSSignals.get_band_id` symbol (`:L1`, `:L5`, `:B1I`, …).
+    One route per band; a band is what a front end *tunes*.
+  - `rf_input` — the device's RF input (tuner / downconversion chain) this band
+    comes in on, 1-based. Two independently tuned bands need two inputs, and
+    the pre-arm validation refuses a plan that puts two bands on one.
+  - `device_index` — which physical device, 1-based, for a multi-device array.
+    Anything past `1` needs a declared clock relationship (see
+    [`HardwareBandPlan`](@ref)).
+  - `sampling_freq` — the rate, in Hz, this band's raw samples *and* its
+    correlator dumps' `sample_index` are counted at. It need not equal any other
+    band's.
+
+!!! note "An RF input is not an antenna"
+
+    `rf_input` selects a *band*; `HardwareCorrelatorCapabilities.num_antennas`
+    counts the coherent chains that band is received on. An N-antenna L1 front
+    end is one route with `num_antennas = N`, not N routes: the antennas share
+    one LO and one sample clock, and the correlator bank despreads all of them
+    into one `SVector{N,Complex}` accumulator per tap so that the host can
+    beamform from the prompt covariance. Two *bands* share nothing but the
+    board.
+"""
+struct HardwareBandRoute
+    band_id::Symbol
+    rf_input::Int
+    device_index::Int
+    sampling_freq::Float64
+end
+
+HardwareBandRoute(
+    band_id::Symbol;
+    rf_input::Integer = 1,
+    device_index::Integer = 1,
+    sampling_freq,
+) = HardwareBandRoute(band_id, Int(rf_input), Int(device_index), _hz(sampling_freq))
+
+"""
+    HardwareBandPlan(routes; clock_synchronization = :single_device)
+
+The receiver's RF configuration: one [`HardwareBandRoute`](@ref) per band, in
+order, plus the clock relationship between the devices they live on.
+
+**The first route's band is the reference band, and its sample counter is the
+receiver timebase.** Every epoch boundary, every fold, every NCO landing sample
+and every code-phase reference epoch is expressed in reference-band samples;
+a record arriving on another band is mapped onto that axis by the exact ratio of
+the two rates ([`to_receiver_samples`](@ref)), and a command going the other way
+is mapped back ([`to_band_samples`](@ref)). Since the ratio is exact and both
+counters are derived from one hardware clock, the mapping is a scaling and not
+an estimate — which is what lets two bands at 4 and 5 MS/s close the *same*
+epoch at the same instant, and what makes the pseudoranges of both bands
+referenced to one common reception time.
+
+`clock_synchronization` says what makes that true across `device_index`es:
+
+  - `:single_device` (the default) — one device, one sample clock. Nothing to
+    synchronise.
+  - `:shared_clock` — several devices driven from one reference and one sample
+    clock (a common 10 MHz plus a distributed sample-clock/PPS), with their
+    sample counters aligned at start. This is the only multi-device
+    configuration the receiver supports, because the timebase mapping above is
+    a ratio with no offset term.
+  - `:independent` — devices on free-running clocks. Their counters drift
+    against each other by parts per million, which is metres of pseudorange per
+    second and no bounded relationship for the fold grid at all. The pre-arm
+    validation refuses it rather than producing a fix nothing can vouch for; a
+    receiver that needs it has to estimate and steer the inter-device offset
+    first, which this package does not do.
+"""
+struct HardwareBandPlan
+    routes::Vector{HardwareBandRoute}
+    clock_synchronization::Symbol
+end
+
+const CLOCK_SYNCHRONIZATIONS = (:single_device, :shared_clock, :independent)
+
+function HardwareBandPlan(routes; clock_synchronization::Symbol = :single_device)
+    rs = collect(HardwareBandRoute, routes)
+    isempty(rs) && throw(ArgumentError("a band plan needs at least one band route"))
+    allunique(map(r -> r.band_id, rs)) || throw(
+        ArgumentError(
+            "a band plan carries one route per band; got " *
+            join(map(r -> r.band_id, rs), ", "),
+        ),
+    )
+    all(r -> r.sampling_freq > 0, rs) ||
+        throw(ArgumentError("every band route needs a positive sampling frequency"))
+    all(r -> r.rf_input >= 1 && r.device_index >= 1, rs) ||
+        throw(ArgumentError("rf_input and device_index are 1-based"))
+    clock_synchronization in CLOCK_SYNCHRONIZATIONS || throw(
+        ArgumentError(
+            "clock_synchronization must be one of " *
+            join(CLOCK_SYNCHRONIZATIONS, ", ") *
+            " (got $clock_synchronization)",
+        ),
+    )
+    HardwareBandPlan(rs, clock_synchronization)
+end
+
+"""
+    reference_band(plan) -> Symbol
+
+The band whose sample counter *is* the receiver timebase: the plan's first.
+"""
+reference_band(plan::HardwareBandPlan) = first(plan.routes).band_id
+
+"""
+    reference_sampling_frequency(plan) -> Float64
+
+The receiver timebase's rate in Hz — the reference band's sampling frequency.
+"""
+reference_sampling_frequency(plan::HardwareBandPlan) = first(plan.routes).sampling_freq
+
+"""
+    band_ids(plan) -> Vector{Symbol}
+
+Every band the plan routes, in order, the reference band first.
+"""
+band_ids(plan::HardwareBandPlan) = map(r -> r.band_id, plan.routes)
+
+"""
+    band_route(plan, band_id) -> Union{Nothing,HardwareBandRoute}
+
+The route for `band_id`, or `nothing` when the plan does not carry that band.
+"""
+function band_route(plan::HardwareBandPlan, band_id::Symbol)
+    for route in plan.routes
+        route.band_id === band_id && return route
+    end
+    nothing
+end
+
+# The route for `band_id`, falling back to the reference band's. A band the plan
+# does not know about is a configuration error the pre-arm gate has already
+# refused; on the chunk path the reference route is the conservative answer
+# (it is what a single-band receiver has always used) rather than a throw that
+# would cost every other satellite its lock.
+_route_or_reference(plan::HardwareBandPlan, band_id::Symbol) =
+    something(band_route(plan, band_id), first(plan.routes))
+
+"""
+    band_sampling_frequency(plan, band_id) -> Float64
+
+The rate in Hz that `band_id`'s samples, dump `sample_index`es and replica tap
+offsets are counted at.
+"""
+band_sampling_frequency(plan::HardwareBandPlan, band_id::Symbol) =
+    _route_or_reference(plan, band_id).sampling_freq
+
+"""
+    receiver_timebase_scale(plan, band_id) -> Float64
+
+How many receiver-timebase samples one of `band_id`'s samples is worth:
+`reference_sampling_frequency(plan) / band_sampling_frequency(plan, band_id)`.
+Exactly `1.0` for the reference band, and for every band of a device that
+samples all of them at one rate — which is why a single-band receiver's
+arithmetic is untouched by any of this.
+"""
+receiver_timebase_scale(plan::HardwareBandPlan, band_id::Symbol) =
+    reference_sampling_frequency(plan) / band_sampling_frequency(plan, band_id)
+
+"""
+    to_receiver_samples(plan, band_id, sample) -> Int64
+
+Map a count on `band_id`'s device counter onto the receiver timebase.
+"""
+to_receiver_samples(plan::HardwareBandPlan, band_id::Symbol, sample) =
+    _scale_sample(sample, receiver_timebase_scale(plan, band_id))
+
+"""
+    to_band_samples(plan, band_id, sample) -> Int64
+
+Map a count on the receiver timebase onto `band_id`'s own device counter — the
+inverse of [`to_receiver_samples`](@ref), and what a handover time or an
+[`NCOUpdate`](@ref)'s `apply_at_sample` is expressed in before it is handed to
+the device.
+"""
+to_band_samples(plan::HardwareBandPlan, band_id::Symbol, sample) =
+    _scale_sample(sample, 1 / receiver_timebase_scale(plan, band_id))
+
+# Scale a sample count, leaving the sentinels alone: `typemin`/`typemax` mark
+# "no sample" rather than an instant, and scaling them would turn a sentinel
+# into an ordinary (and wrong) index.
+@inline function _scale_sample(sample, scale::Float64)
+    n = Int64(sample)
+    (scale == 1.0 || n == typemin(Int64) || n == typemax(Int64)) && return n
+    round(Int64, n * scale)
+end
+
+"""
+    band_plan_error(capabilities, plan) -> Union{Nothing,String}
+
+Every reason a device with `capabilities` cannot receive `plan`'s bands *at the
+same time*, as one message — or `nothing` when it can.
+
+This is the RF-capacity gate, and it is deliberately separate from the
+per-signal one: a device may be perfectly able to replicate and correlate every
+signal it is asked for and still have exactly one tuner. Supporting every signal
+individually is not the same as receiving every band simultaneously, and the
+receiver never quietly configures a subset.
+
+The checks:
+
+  - every band is one the front end declares it can tune;
+  - no more bands than the device has RF inputs — per device, since that is what
+    the declaration counts;
+  - no two bands on one RF input of one device;
+  - a multi-device plan has a declared clock relationship that makes its
+    counters comparable (see [`HardwareBandPlan`](@ref)).
+
+There is no automatic fallback to *sequential retuning* — receiving band A for a
+while, then retuning to band B. It would silently turn a simultaneous request
+into a time-multiplexed one, which changes the C/N₀, the measurement epochs and
+the fix rate of every band involved, and leaves no band continuously tracked.
+A receiver that wants it runs one [`receive`](@ref) per band configuration and
+retunes between them, which is explicit and is what the error below says.
+"""
+function band_plan_error(
+    capabilities::HardwareCorrelatorCapabilities,
+    plan::HardwareBandPlan,
+)
+    problems = String[]
+    bands = band_ids(plan)
+    if !isnothing(capabilities.bands)
+        unknown = filter(b -> !(b in capabilities.bands), bands)
+        isempty(unknown) || push!(
+            problems,
+            "the front end cannot tune band(s) $(join(unknown, ", ")) (it declares " *
+            "$(join(capabilities.bands, ", ")))",
+        )
+    end
+    devices = unique(map(r -> r.device_index, plan.routes))
+    for device in devices
+        on_device = filter(r -> r.device_index == device, plan.routes)
+        where_ = length(devices) == 1 ? "" : " on device $device"
+        if length(on_device) > capabilities.num_rf_inputs
+            push!(
+                problems,
+                "cannot receive bands $(join(map(r -> r.band_id, on_device), ", "))" *
+                "$where_ at once: the device has $(capabilities.num_rf_inputs) RF " *
+                "input(s), which is what caps *simultaneously tuned bands* — " *
+                "`num_antennas` ($(capabilities.num_antennas)) counts the coherent " *
+                "antenna chains of one band and cannot stand in for it. Sequential " *
+                "retuning is not performed automatically: run one receiver per band " *
+                "configuration and retune between them",
+            )
+        end
+        inputs = map(r -> r.rf_input, on_device)
+        if !allunique(inputs)
+            clashing = [
+                "$(r.band_id)→input $(r.rf_input)" for
+                r in on_device if count(==(r.rf_input), inputs) > 1
+            ]
+            push!(
+                problems,
+                "two bands share one RF input$where_ ($(join(clashing, ", "))): an RF " *
+                "input is tuned to one band at a time. Declare " *
+                "`GNSSReceiver.band_rf_input(sdr, band_id)` for this device",
+            )
+        end
+    end
+    if length(devices) > 1 && plan.clock_synchronization === :independent
+        push!(
+            problems,
+            "bands are spread over devices $(join(devices, ", ")) whose clocks are " *
+            "declared `:independent`: their sample counters drift against each other, " *
+            "so nothing maps them onto one receiver timebase and no common reception " *
+            "epoch exists. Drive the devices from one reference and one sample clock " *
+            "and declare `GNSSReceiver.clock_synchronization(sdr) = :shared_clock`",
+        )
+    end
+    isempty(problems) && return nothing
+    join(problems, "\n")
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation, before anything is armed
+# ─────────────────────────────────────────────────────────────────────────────
 
 # Plain seconds from either a `Real` or a Unitful time, so a caller may write
 # `20u"ms"` or `0.02` and mean the same thing.
@@ -491,6 +782,22 @@ left everything else to a shared assumption. This carries the lot:
   - `band_id` / `sampling_freq` — which RF band the channel lives on and the
     sample rate its `tap_sample_shifts` and `valid_at_sample` are counted in.
     Per-band, because gain, sample rate and replica offsets are all per-band.
+  - `rf_input` / `device_index` — which RF input of which device that band
+    arrives on ([`HardwareBandRoute`](@ref)). This is what tells a multi-band
+    front end which correlator bank to arm the channel in and which datapath to
+    tap; a single-input device sees `1`/`1` and nothing changes. **An RF input
+    is not an antenna**: the channel still despreads every antenna of its band
+    into one `SVector{N,Complex}` accumulator per tap.
+
+!!! note "`valid_at_sample` is on this band's own counter"
+
+    A multi-band device counts each band at its own rate, so the handover time
+    is converted before it is handed over: the same instant is `40 000` on a
+    4 MS/s band and `50 000` on a 5 MS/s one. Propagate it on the counter of
+    `band_id`, which is also the counter every [`CorrelatorDump`](@ref) from
+    this channel and every [`NCOUpdate`](@ref) to it is expressed on. The
+    receiver keeps its own timebase (the reference band's) and does the
+    conversion — see [`HardwareBandPlan`](@ref).
 
 Built by the link from the tracking state; a vendor package only reads it.
 """
@@ -511,6 +818,8 @@ struct HardwareChannelConfig{S<:AbstractGNSSSignal}
     carrier_phase_offset::Float64
     band_id::Symbol
     sampling_freq::Float64
+    rf_input::Int
+    device_index::Int
 end
 
 function HardwareChannelConfig(
@@ -527,6 +836,8 @@ function HardwareChannelConfig(
     replica_amplitude::Real = 1.0,
     code_amplitude::Real = get_code_amplitude(signal),
     secondary_code_mode::Symbol = :primary_only,
+    rf_input::Integer = 1,
+    device_index::Integer = 1,
 )
     secondary_code_mode in (:primary_only, :wipeoff) || throw(
         ArgumentError(
@@ -559,6 +870,8 @@ function HardwareChannelConfig(
         Float64(get_carrier_phase_offset(signal)),
         get_band_id(get_band(signal)),
         _hz(sampling_freq),
+        Int(rf_input),
+        Int(device_index),
     )
 end
 

@@ -463,7 +463,7 @@ end
         Tracking._band_sampling_frequency(band_measurements, get_band_id(g.band))
     noise = Tracking._signal_noise_densities(noise_estimators, eltype(g.satellites))
     Tracking._warn_noise_density_missing(eltype(g.satellites), noise, noise_estimators)
-    landing_sample = link.scheduled_apply_at_sample
+    landing = link.scheduled_apply_at_sample
     @inbounds for i in eachindex(vals)
         sat = vals[i]
         hw_channel = get(
@@ -473,6 +473,12 @@ end
         )
         # A satellite without a channel has no records; its words are never read.
         words = hw_channel == 0 ? link.unassigned_timeline : link.nco_timelines[hw_channel]
+        # The landing sample is decided once, on the receiver timebase, and read
+        # here on the *channel's own band counter* — the axis its records'
+        # `sample_index`es and its timeline's words are on. On a band counted at
+        # another rate the two axes differ by that ratio, and a shift measured
+        # across them would mis-size every predicted phase error by it.
+        landing_sample = hw_channel == 0 ? landing : _band_sample(link, hw_channel, landing)
         vals[i] = _nco_update_tracked_sat(
             sat,
             estimator,

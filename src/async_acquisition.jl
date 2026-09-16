@@ -339,7 +339,7 @@ function advance_acquisition(
     meas,
     interm_freqs,
     acq_plans,
-    sampling_freq,
+    sampling_freqs,
     invariant_acq_args,
 )
     runtime, _, acquire_every = invariant_acq_args
@@ -388,7 +388,7 @@ function advance_acquisition(
     meas,
     interm_freqs,
     acq_plans,
-    sampling_freq,
+    sampling_freqs,
     invariant_acq_args,
 )
     runtime, _, acquire_every = invariant_acq_args
@@ -416,7 +416,7 @@ function advance_acquisition(
         meas,
         interm_freqs,
         scheduler.workers,
-        sampling_freq,
+        sampling_freqs,
         invariant_acq_args,
     )
 end
@@ -433,7 +433,7 @@ end
     ::Tuple{},
     ::Tuple{},
     workers,
-    sampling_freq,
+    ::Tuple{},
     invariant_acq_args,
 ) = (track_state, receiver_sat_states, acquisition_buffers, last_time_acquisition_ran)
 @inline function _acquire_all_bands_async(
@@ -446,7 +446,7 @@ end
     measurements::Tuple,
     interm_freqs::Tuple,
     workers,
-    sampling_freq,
+    sampling_freqs::Tuple,
     invariant_acq_args,
 )
     band_key = first(band_keys)
@@ -460,7 +460,7 @@ end
         systems,
         first(measurements),
         last_time_acquisition_ran[band_key],
-        sampling_freq,
+        first(sampling_freqs),
         invariant_acq_args...,
     )
     receiver_sat_states = merge(receiver_sat_states, band_receiver_sat_states)
@@ -478,7 +478,7 @@ end
         Base.tail(measurements),
         Base.tail(interm_freqs),
         workers,
-        sampling_freq,
+        Base.tail(sampling_freqs),
         invariant_acq_args,
     )
 end
