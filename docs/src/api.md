@@ -109,6 +109,7 @@ GNSSReceiver.receiver_timebase_scale
 GNSSReceiver.to_receiver_samples
 GNSSReceiver.to_band_samples
 GNSSReceiver.band_plan_error
+GNSSReceiver.band_bank_error
 GNSSReceiver.receiver_sampling_frequency
 GNSSReceiver.channel_band_id
 GNSSReceiver.channel_sampling_frequency

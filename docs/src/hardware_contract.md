@@ -343,7 +343,10 @@ anything is armed, and reports every problem at once
   - a band the front end does not declare it can tune;
   - more bands on one device than it has RF inputs;
   - two bands routed to one RF input;
-  - a multi-device plan whose clocks are `:independent`.
+  - a multi-device plan whose clocks are `:independent`;
+  - a band whose correlator bank is empty, or two bands claiming one channel
+    ([`GNSSReceiver.band_bank_error`](@ref)) — a band the receiver can tune and
+    then never track anything on is the same silent partial configuration.
 
 There is **no automatic fallback to sequential retuning** — receiving band A for
 a while, then retuning to band B. It would turn a simultaneous request into a

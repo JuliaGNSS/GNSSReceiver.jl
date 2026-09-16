@@ -345,6 +345,54 @@ refused for a multi-device plan.
 clock_synchronization(::AbstractHardwareCorrelatorSDR) = :single_device
 
 """
+    band_bank_error(sdr, plan) -> Union{Nothing,String}
+
+Every reason `sdr`'s correlator banks cannot serve `plan`'s bands, as one
+message — or `nothing` when they can.
+
+A band whose bank ([`band_hardware_channels`](@ref)) holds no channel in range
+is a band the receiver can tune and then never track anything on: its satellites
+are acquired, find no channel of their own bank, and are counted in the link's
+`unassignable_signals` while their lock detectors quietly release them. Two
+bands sharing a channel is the same failure wearing the other hat — whichever
+band claims it first leaves the other one short, and which one that is depends
+on acquisition order.
+
+Both are exactly the silent partial configuration this gate exists to prevent,
+so they are refused before anything is armed rather than discovered as a band
+that never locks.
+"""
+function band_bank_error(sdr::AbstractHardwareCorrelatorSDR, plan::HardwareBandPlan)
+    total = Int(num_hardware_channels(sdr))
+    problems = String[]
+    banks = map(plan.routes) do route
+        channels = Int[
+            hw_channel for
+            hw_channel in Base.invokelatest(band_hardware_channels, sdr, route.band_id) if
+            1 <= hw_channel <= total
+        ]
+        isempty(channels) && push!(
+            problems,
+            "band $(route.band_id) has no correlator channel: " *
+            "`GNSSReceiver.band_hardware_channels(sdr, :$(route.band_id))` names none of " *
+            "the device's $total channels, so nothing could ever be armed on that band",
+        )
+        route.band_id => channels
+    end
+    for i in eachindex(banks), j = (i+1):lastindex(banks)
+        shared = intersect(last(banks[i]), last(banks[j]))
+        isempty(shared) || push!(
+            problems,
+            "bands $(first(banks[i])) and $(first(banks[j])) claim the same correlator " *
+            "channel(s) $(join(shared, ", ")): a channel belongs to one band's bank, and " *
+            "whichever band took it first would leave the other short",
+        )
+    end
+    isempty(problems) && return nothing
+    join(problems, "\n")
+end
+
+"""
     hardware_band_plan(sdr, band_ids, sampling_freqs) -> HardwareBandPlan
 
 The device's RF configuration for the requested bands: one
@@ -695,6 +743,8 @@ function validate_hardware_configuration(
     end
     rf_problem = band_plan_error(capabilities, plan)
     isnothing(rf_problem) || push!(problems, rf_problem)
+    bank_problem = band_bank_error(sdr, plan)
+    isnothing(bank_problem) || push!(problems, bank_problem)
     isempty(problems) && return nothing
     throw(
         ArgumentError(

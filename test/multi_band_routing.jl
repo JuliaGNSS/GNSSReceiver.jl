@@ -62,6 +62,7 @@ mutable struct TwoBandSDR{C} <: AbstractHardwareCorrelatorSDR
     const clock_sync::Symbol
     const inputs::Dict{Symbol,Int}
     const devices::Dict{Symbol,Int}
+    const banks::Dict{Symbol,UnitRange{Int}}
 end
 
 function TwoBandSDR(
@@ -75,6 +76,9 @@ function TwoBandSDR(
     clock_sync = :single_device,
     inputs = Dict(:L1 => 1, :B1I => 2),
     devices = Dict(:L1 => 1, :B1I => 1),
+    # Each band's replica sets are its own half of the bank — the arrangement a
+    # device with one downconversion chain per input really has.
+    banks = Dict(:L1 => 1:(n_channels÷2), :B1I => (n_channels÷2+1):n_channels),
 ) where {C}
     capabilities = HardwareCorrelatorCapabilities(;
         signals = [:GPSL1CA, :BeiDouB1I],
@@ -99,6 +103,7 @@ function TwoBandSDR(
         clock_sync,
         inputs,
         devices,
+        banks,
     )
 end
 
@@ -111,6 +116,7 @@ GNSSReceiver.correlator_gain(sdr::TwoBandSDR, band_id::Symbol) =
 GNSSReceiver.band_rf_input(sdr::TwoBandSDR, band_id::Symbol) = sdr.inputs[band_id]
 GNSSReceiver.band_device_index(sdr::TwoBandSDR, band_id::Symbol) = sdr.devices[band_id]
 GNSSReceiver.clock_synchronization(sdr::TwoBandSDR) = sdr.clock_sync
+GNSSReceiver.band_hardware_channels(sdr::TwoBandSDR, band_id::Symbol) = sdr.banks[band_id]
 GNSSReceiver.release_channel!(sdr::TwoBandSDR, hw_channel) = push!(sdr.released, hw_channel)
 GNSSReceiver.assign_channel!(
     sdr::TwoBandSDR,
@@ -523,6 +529,41 @@ end
             band_plan = hardware_band_plan(shared, MB_BANDS, (MB_FS.L1, MB_FS.B1I)),
         ),
     )
+
+    # A band the front end can tune but no correlator channel can see: its
+    # satellites would be acquired, find no channel of their own bank and be
+    # quietly released. Refused before arming, like every other partial
+    # configuration.
+    bankless = TwoBandSDR(MBEPL, 8; banks = Dict(:L1 => 1:8, :B1I => 1:0))
+    err = try
+        validate_hardware_configuration(
+            bankless,
+            ((GPSL1CA(),), (BeiDouB1I(),)),
+            (MB_FS.L1, MB_FS.B1I);
+            band_plan = hardware_band_plan(bankless, MB_BANDS, (MB_FS.L1, MB_FS.B1I)),
+        )
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("no correlator channel", err.msg)
+    @test occursin("band_hardware_channels", err.msg)
+
+    # …and two banks claiming one channel, which is the same failure from the
+    # other side: whichever band took it first leaves the other short.
+    overlapping = TwoBandSDR(MBEPL, 8; banks = Dict(:L1 => 1:5, :B1I => 5:8))
+    err = try
+        validate_hardware_configuration(
+            overlapping,
+            ((GPSL1CA(),), (BeiDouB1I(),)),
+            (MB_FS.L1, MB_FS.B1I);
+            band_plan = hardware_band_plan(overlapping, MB_BANDS, (MB_FS.L1, MB_FS.B1I)),
+        )
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("same correlator channel", err.msg)
 
     # A link whose `sampling_freq` is not the reference band's rate has no
     # timebase at all, and says so rather than scaling everything by 1.25.
