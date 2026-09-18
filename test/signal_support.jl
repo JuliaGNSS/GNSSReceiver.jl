@@ -194,7 +194,9 @@ const SOURCES = Dict(
                "placeSpread` (four channels, five taps, 4092-chip code memory, sub-chip " *
                "replicas), fs = 4 MS/s, one antenna seeing about a quarter of the " *
                "hemisphere, run by `examples/analysis/hardware_live_m2sdr.jl`. GPS L1 " *
-               "C/A on three-tap channels held PRN 14 at 50–52 dBHz for 300 s; Galileo " *
+               "C/A on three-tap channels held PRN 14 at 50–52 dBHz for 300 s and, on the " *
+               "six-channel build with the link's record sizing fixed, decoded four LNAV " *
+               "ephemerides and produced a GPS fix after 205 s; Galileo " *
                "E1B (BOC(1,1) replica on five-tap channels) held four satellites at " *
                "36–47 dBHz, decoded their I/NAV ephemerides and produced a Galileo-only " *
                "position fix after 40 s. The log excerpts and the counters are in the " *

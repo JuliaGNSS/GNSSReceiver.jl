@@ -3357,9 +3357,31 @@ function coherent_integration_blocks(
         min(link.coherent_code_blocks, blocks_per_symbol)
     # Land on the symbol boundary the bit buffer is counting toward, so a
     # truncated record is absorbed once instead of shifting every later one.
-    counted =
-        bit_buffer.prompt_accumulator_integrated_code_blocks +
-        link.pending_blocks[hw_channel]
+    #
+    # What the bit buffer will count when it gets there is its own block count
+    # plus the blocks of every record already handed to `Tracking` and not yet
+    # folded — read off the signal's own `correlator_outputs` queue, which the
+    # estimator clears as it consumes, and credited with `Tracking`'s own block
+    # arithmetic. The link's `pending_blocks` tally is not that number: it is
+    # zeroed after every estimator pass on the assumption that the pass consumed
+    # every record, and a record that ends past the fold boundary stays queued
+    # for the next pass. The tally then said 0 where the queue held one block,
+    # the next record was sized one block too long, and the bit buffer's count
+    # sailed past the symbol boundary — after which `Tracking` never emits
+    # another bit for that satellite (it looks for the boundary with `==`). On
+    # orin2 that was every GPS L1 C/A satellite within 30 s of bit sync: prompt
+    # accumulators at 18 + 1 queued + a 2-block record = 21, no ephemeris ever,
+    # while Galileo E1B (one block per symbol) decoded (2026-09-18).
+    queued = 0
+    for output in Tracking.get_correlator_outputs(tracked_signal)
+        queued += Tracking.calc_num_code_blocks_for_bit_buffer(
+            signal,
+            output.integrated_samples,
+            link.channel_sampling_freq[hw_channel] * Hz,
+            true,
+        )
+    end
+    counted = bit_buffer.prompt_accumulator_integrated_code_blocks + queued
     remaining = blocks_per_symbol - mod(counted, blocks_per_symbol)
     max(1, min(requested, remaining))
 end
@@ -3426,8 +3448,6 @@ function _accumulate_dump!(
     span,
 )
     signal = get_signal(Tracking.get_signals(sat_state)[assignment.signal_index])
-    target =
-        coherent_integration_periods(link, sat_state, assignment.signal_index, hw_channel)
     tolerance = _block_boundary_tolerance(link, signal, hw_channel)
     # A record is cut where the NCO word changed, the way it is cut on a bit
     # edge: the dumps accumulated so far ran on one word and this one starts on
@@ -3440,6 +3460,30 @@ function _accumulate_dump!(
         output.sample_index - output.integrated_samples,
     )
         _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
+    end
+    # The target is read *after* any cut above, so a record that has just been
+    # handed over is counted toward the symbol boundary the next one is sized
+    # for. And where the part-accumulated record already reaches the target —
+    # the target shrinks when a cut hands over blocks the partial was sized
+    # without — it goes over before this dump joins it. A partial therefore
+    # never grows past the boundary: sized with a stale target it used to reach
+    # 2 wraps against a remaining 1, `Tracking` counted 18 + 1 + 2 = 21, and
+    # since it looks for the boundary with `==` that satellite never produced
+    # another bit (orin2, 2026-09-18: every GPS L1 C/A satellite within a
+    # minute of bit sync, no ephemeris in ten minutes at 45 dBHz).
+    target =
+        coherent_integration_periods(link, sat_state, assignment.signal_index, hw_channel)
+    if link.partial_samples[hw_channel] > 0 &&
+       !allows_partial_primary_records(link, signal) &&
+       link.partial_wraps[hw_channel] >= max(1, floor(Int, target + tolerance)) &&
+       _record_is_emittable(link, signal, hw_channel, tolerance)
+        _emit_partial!(link, track_state, assignment, sat_state, hw_channel)
+        target = coherent_integration_periods(
+            link,
+            sat_state,
+            assignment.signal_index,
+            hw_channel,
+        )
     end
     if link.partial_samples[hw_channel] == 0
         link.partial_correlator[hw_channel] = output.correlator

@@ -133,19 +133,73 @@ NCO commits: 1074708 at their scheduled sample, landing 0.04 ms late on average 
 dump stream: lost-record gaps 0, re-arm gaps 0, device-reported drops 0, skipped epochs 450, implausible indices 0, dropped NCO updates 0, tap-layout mismatches 0, unsupported signals 0
 ```
 
-**No fix in either run.** A 240 s run with the per-satellite flags printed
-shows why: every GPS satellite becomes ranging-ready (bit clock found) within
-seconds, but in 240 s only PRN 5 (39–44 dBHz) reached a decoded, healthy
-ephemeris (after ~80 s), while PRN 20 at 41–45 dBHz and PRN 15 at 43–46 dBHz
-stayed ranging-ready and undecoded for the whole run. Galileo E1B decoded four
-ephemerides in 40 s through the same link on the same day. **GPS L1 C/A
-navigation decoding on the hardware path is the open item**: the loops and
-the bit clock are fine, the LNAV frames are not coming out of the bit stream.
-Whether that is the pre-accumulation of twenty code-period dumps into one
-bit-aligned record, the bit-phase anchor after the step-4/6 changes, or the
-NCO-queue change is not established; the software receiver on the ION
-recording decodes as before (`test/ion_rtlsdr_integration.jl`), so it is
-specific to the hardware path.
+**No fix in either run**, and the per-satellite flags showed why: every GPS
+satellite became ranging-ready (bit clock found) within seconds, but in 240 s
+only one of five reached a decoded, healthy ephemeris while satellites at 41
+to 46 dBHz stayed undecoded.
+
+### Why GPS did not decode, and the fix
+
+Logging every folded prompt for the strong satellites first ruled out the loop:
+PRN 15 at 41 dBHz had a carrier-phase error of 17° standard deviation after
+removing the bit sign and an imaginary part 0.2 of the real part, so the PLL
+was phase-locked, not merely frequency-locked, and the feedback delay was not
+the problem.
+
+Logging the decoder's soft-bit buffer and `Tracking`'s bit accumulator found
+it. After bit sync the decoder received bits at 50 per second for under a
+second, then never again: the bit buffer's `prompt_accumulator_integrated_code_blocks`
+had gone 18 → 21 and kept climbing (33 000 blocks two minutes later) instead of
+wrapping at 20. `Tracking` emits a bit only when that count *equals* the blocks
+per bit, so a single record that crosses the boundary silences a satellite for
+good. Galileo E1B is one block per symbol and cannot cross anything, which is
+why it decoded.
+
+A block-level trace of the link showed the record that crosses. Two causes,
+both in `coherent_integration_blocks` / `_accumulate_dump!`:
+
+1. The link sized records from its own `pending_blocks` tally, zeroed after every
+   estimator pass on the assumption that the pass consumed every queued record.
+   A record ending past the fold boundary stays queued for the next pass, so the
+   tally said 0 where the queue held one block. Now the sizing reads the blocks
+   still queued in the signal's own `correlator_outputs`, with `Tracking`'s own
+   block arithmetic.
+2. A record cut on an NCO-word change hands over blocks the part-accumulated
+   record after it was sized without: at 18 blocks the target was 2, a 1-block
+   cut went out, and the partial already holding 1 wrap met a target that had
+   shrunk to 1 with 2 wraps — `>=` let it through as a 2-block record, 18 + 1 + 2
+   = 21. Now the target is read after the cut, and a partial that already
+   reaches it is handed over before the next dump joins it, so a record never
+   grows past the boundary.
+
+With both, a traced 160 s run showed no satellite's accumulator above 19,
+every decoder buffer filled to its 308 bits, and PRN 13, 15, 20 and 23 (40 to
+42 dBHz) synchronised their LNAV frames; PRN 10 and 12 at 33 to 35 dBHz had
+full buffers and no sync yet within the run.
+
+### GPS L1 C/A alone, 600 s, with both fixes (`HW_ACQ_EVERY=150`)
+
+```
+first fix after 205.1 s: 50.770094° 6.073362° 218 m (4 sats)
+NCO commits: 688136 at their scheduled sample, landing 0.041 ms late on average (max 15.343 ms); 112 dropped as stale
+dump stream: lost-record gaps 4, re-arm gaps 0, device-reported drops 0, skipped epochs 2072, implausible indices 0, dropped NCO updates 0, tap-layout mismatches 0, unsupported signals 0
+first fix after 205.1 s, 1095 fresh solutions afterwards
+```
+
+PRN 23 decoded first (healthy at 39 s), then 20, 12 and 15; the fix came when
+the fourth ephemeris landed, and held for the remaining 100 s of the run, at the
+same site the Galileo-only fix had placed the antenna. **GPS L1 C/A through the
+six-channel hardware correlator: acquisition, tracking, LNAV decode and a
+position fix, on sky.** The time to fix is set by the LNAV frame cadence and by
+bit sync arriving late for some satellites (below), not by the correlator.
+
+Two things seen on the way, not fixed here: `Tracking`'s bit buffer should not
+be silenced forever by one overshooting record (an `>=` with a resync, or a
+reported error, would be kinder than the `==`); and bit sync on the hardware
+path often arrives only after a record-loss restart rather than within seconds
+of the handover (PRN 13 at 41 dBHz: tracked from t = 8 s, bit sync at
+t = 122 s, right after the second acquisition scan's stall restarted it), which
+points at the first, fractional record after arming and deserves its own look.
 
 ## What the four-channel build cannot show
 
