@@ -1,6 +1,5 @@
-# Live run of the hardware-correlator receiver on the LiteX-M2SDR with the
-# four-channel five-tap gnss-m2sdr gateware
-# (`gnss_m2sdr_m2_x1_ch4_ant1_code4092_tap5_sub12_placeSpread`). This is the
+# Live run of the hardware-correlator receiver on the LiteX-M2SDR with a
+# five-tap gnss-m2sdr gateware (four or six channels; HW_BUILD picks the build). This is the
 # script behind the `live_m2sdr_l1_20260918` field record of the signal-support
 # matrix (see hardware_live_m2sdr.md next to it).
 #
@@ -18,6 +17,8 @@
 #             m2sdr_rf --sample-rate 4000000 --rx-freq 1575420000 --rx-gain 60 --bandwidth 4000000
 #   HW_DELAY  the link's feedback_delay_epochs (default 2)
 #   HW_TRACE  1 prints the link's epoch grid every 5 s
+#   HW_BUILD  gateware build directory under ~/gnss-m2sdr/build (default: the six-channel build)
+#   HW_ACQ_EVERY  seconds between acquisition scans (default 60)
 #   HW_GPS_PRNS  comma-separated GPS PRNs to search (default: all), e.g. 14,5 in a
 #             mixed run so a four-channel bank keeps channels for Galileo
 #
@@ -38,8 +39,10 @@ const MAX_SECONDS = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 240.0
 const SECONDS_AFTER_FIX = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : 60.0
 const FS = get(ENV, "HW_FS", "4e6") |> x -> parse(Float64, x) * Hz
 const CHUNK = round(Int, ustrip(Hz, FS) * 2e-3)   # 2 ms of samples per processing chunk
-const N_HW_CHANNELS = 4
-const CSR_CSV = expanduser("~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch4_ant1_code4092_tap5_sub12_placeSpread/csr.csv")
+# HW_BUILD names the gateware build directory under ~/gnss-m2sdr/build; the
+# channel count is read from its capability CSRs.
+const HW_BUILD = get(ENV, "HW_BUILD", "gnss_m2sdr_m2_x1_ch6_ant1_code4092_tap5_sub12_synthPerfSpread")
+const CSR_CSV = expanduser("~/gnss-m2sdr/build/$HW_BUILD/csr.csv")
 const gpsl1 = GPSL1CA()
 
 systems_for(mode) =
@@ -55,7 +58,9 @@ cn0_db(cn0) = 10 * log10(Unitful.linear(cn0) / Hz)
 function sat_summary(sat_data)
     join(
         (
-            @sprintf("%s%d:%.0f%s", string(sys)[1], prn, cn0_db(sat.cn0), sat.is_in_lock ? "" : "?")
+            # suffix: "?" not in lock, "r" ranging-ready (bit clock + code phase anchored), "h" decoded and healthy
+            @sprintf("%s%d:%.0f%s%s%s", string(sys)[1], prn, cn0_db(sat.cn0), sat.is_in_lock ? "" : "?",
+                     sat.is_ranging_ready ? "r" : "", sat.is_healthy ? "h" : "")
             for ((sys, prn), sat) in pairs(sat_data) if sat.is_in_lock || cn0_db(sat.cn0) > 30
         ),
         " ",
@@ -76,12 +81,12 @@ function main()
     run(ignorestatus(`pkill -x m2sdr_record`))
     sleep(0.3)
     stream = start_raw_stream(; chunk = CHUNK)
-    sdr = M2SDRCorrelator(CSR_CSV, stream.channel; fs = FS, n_channels = N_HW_CHANNELS)
-    @info "gateware exposes $(num_hardware_channels(sdr)) channels; driving $N_HW_CHANNELS" MODE FS
+    sdr = M2SDRCorrelator(CSR_CSV, stream.channel; fs = FS)
+    @info "gateware exposes $(num_hardware_channels(sdr)) channels" HW_BUILD MODE FS
     @info "capabilities" hardware_capabilities(sdr)
     # `noise_source = :samples`: the C/N₀ noise density is metered off the raw
     # stream, so no hardware channel is spent on the open-loop reference and all
-    # four can hold satellites -- the minimum for a fix.
+    # every channel can hold a satellite.
     link = HardwareCorrelatorLink(
         sdr;
         sampling_freq = FS,
@@ -103,7 +108,7 @@ function main()
         acq_min_doppler_coverage = 25_000.0Hz,
         acq_coherent_integration_time = 10ms,
         acq_noncoherent_rounds = 5,
-        acquire_every = 60s,
+        acquire_every = parse(Float64, get(ENV, "HW_ACQ_EVERY", "60"))s,
         code_lock_cn0_threshold = 24.0dBHz,
     )
     start!(sdr; dump_source = :dma, epoch_period = 25)

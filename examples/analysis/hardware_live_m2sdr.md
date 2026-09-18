@@ -116,9 +116,40 @@ C/N₀s of the same satellites agree with the single-constellation runs, so the
 per-layout scaling holds. No fix: a two-constellation solution needs a fifth
 satellite for the second clock bias, and four channels cannot hold one.
 
+## The six-channel build (`gnss_m2sdr_m2_x1_ch6_ant1_code4092_tap5_sub12_synthPerfSpread`, *queued*)
+
+Flashed 13:05 UTC (md5 `2ebd04238d9b6fa24dafbbcb270651ea`, WNS +0.007 ns),
+power-cycled, `hw_accept_v3.py` 5 of 5 (n_channels 6). Same RF settings.
+
+### GPS L1 C/A alone, 300 s and 600 s
+
+Six satellites in lock at once (PRN 18, 24, 20, 22, 5, 23 at 30–45 dBHz at
+t = 190 s of the first run); in the 600 s run with scans every 120 s, four to
+six satellites at 35–45 dBHz from t = 359 s to 537 s with **zero** lost-record
+gaps:
+
+```
+NCO commits: 1074708 at their scheduled sample, landing 0.04 ms late on average (max 16.577 ms); 80 dropped as stale
+dump stream: lost-record gaps 0, re-arm gaps 0, device-reported drops 0, skipped epochs 450, implausible indices 0, dropped NCO updates 0, tap-layout mismatches 0, unsupported signals 0
+```
+
+**No fix in either run.** A 240 s run with the per-satellite flags printed
+shows why: every GPS satellite becomes ranging-ready (bit clock found) within
+seconds, but in 240 s only PRN 5 (39–44 dBHz) reached a decoded, healthy
+ephemeris (after ~80 s), while PRN 20 at 41–45 dBHz and PRN 15 at 43–46 dBHz
+stayed ranging-ready and undecoded for the whole run. Galileo E1B decoded four
+ephemerides in 40 s through the same link on the same day. **GPS L1 C/A
+navigation decoding on the hardware path is the open item**: the loops and
+the bit clock are fine, the LNAV frames are not coming out of the bit stream.
+Whether that is the pre-accumulation of twenty code-period dumps into one
+bit-aligned record, the bit-phase anchor after the step-4/6 changes, or the
+NCO-queue change is not established; the software receiver on the ION
+recording decodes as before (`test/ion_rtlsdr_integration.jl`), so it is
+specific to the hardware path.
+
 ## What the four-channel build cannot show
 
 A GPS fix (four satellites with ephemerides at once did not coincide in
 300 s), a mixed-constellation fix (five satellites), and anything that needs
-the second antenna. The six-channel build that closed timing the same day is
-the next step for the first two.
+the second antenna. The six-channel build removes the first two limits in
+principle; the GPS decode finding above is what stands in the way now.
