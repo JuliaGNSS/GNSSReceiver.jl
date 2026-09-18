@@ -151,8 +151,11 @@ not_applicable(reason::Symbol) = SupportEntry(:not_applicable, :none, Symbol("")
 """
 Where a `:supported` cell's evidence comes from. A key starting with `harness_` is
 produced *at run time* by the checks in test/signal_validation.jl and is verified
-against [`recorded_evidence`](@ref); any other key names a test file, which is
-checked to exist and to be wired into test/runtests.jl.
+against [`recorded_evidence`](@ref); a key starting with `live_` is a **field
+record** — a live-RF run on real hardware, which no test suite can reproduce, so it
+names the script that was run and the file that records the run (both checked to
+exist, neither wired into test/runtests.jl); any other key names a test file, which
+is checked to exist and to be wired into test/runtests.jl.
 """
 const SOURCES = Dict(
     :harness_replica => (
@@ -183,6 +186,19 @@ const SOURCES = Dict(
                "decoded symbols are the ones the harness transmitted — at close to the " *
                "full ten blocks of energy per symbol rather than the overlay's own " *
                "sum of two.",
+    ),
+    :live_m2sdr_l1_20260918 => (
+        file = "examples/analysis/hardware_live_m2sdr.md",
+        text = "Live sky on orin2 through the LiteX-M2SDR hardware correlator, " *
+               "2026-09-18, gateware `gnss_m2sdr_m2_x1_ch4_ant1_code4092_tap5_sub12_" *
+               "placeSpread` (four channels, five taps, 4092-chip code memory, sub-chip " *
+               "replicas), fs = 4 MS/s, one antenna seeing about a quarter of the " *
+               "hemisphere, run by `examples/analysis/hardware_live_m2sdr.jl`. GPS L1 " *
+               "C/A on three-tap channels held PRN 14 at 50–52 dBHz for 300 s; Galileo " *
+               "E1B (BOC(1,1) replica on five-tap channels) held four satellites at " *
+               "36–47 dBHz, decoded their I/NAV ephemerides and produced a Galileo-only " *
+               "position fix after 40 s. The log excerpts and the counters are in the " *
+               "record file; the run is not reproducible without the board.",
     ),
     :ion_recording => (
         file = "test/ion_rtlsdr_integration.jl",
@@ -334,6 +350,8 @@ const MATRIX = Dict{Symbol,NamedTuple{ROLES,NTuple{6,SupportEntry}}}(
     :GPSL1CA => (
         replica = _REPLICA_OK,
         acquisition_handover = _ACQ_OK,
+        # Also tracked live through the hardware correlator on 2026-09-18 (see
+        # `live_m2sdr_l1_20260918`); the cell keeps the claim CI can reproduce.
         tracking = supported(:software, :harness_receive),
         secondary_sync = _SEC_NA,
         data_decode = supported(:software, :ion_recording),
@@ -410,13 +428,16 @@ const MATRIX = Dict{Symbol,NamedTuple{ROLES,NTuple{6,SupportEntry}}}(
         data_decode = _DECODE_NA,
         pvt = _PVT_PENDING,
     ),
+    # Galileo E1B with the BOC(1,1) replica is the first non-GPS signal through
+    # the hardware correlator on sky: five-tap channels, a 4092-chip code, an
+    # I/NAV decode and a Galileo-only fix (2026-09-18, see the source).
     :GalileoE1B_BOC11 => (
         replica = _REPLICA_OK,
-        acquisition_handover = _ACQ_OK,
-        tracking = _TRACK_PENDING,
+        acquisition_handover = supported(:live_rf, :live_m2sdr_l1_20260918),
+        tracking = supported(:live_rf, :live_m2sdr_l1_20260918),
         secondary_sync = _SEC_NA,
-        data_decode = _DECODE_PENDING,
-        pvt = _PVT_PENDING,
+        data_decode = supported(:live_rf, :live_m2sdr_l1_20260918),
+        pvt = supported(:live_rf, :live_m2sdr_l1_20260918),
     ),
     :GalileoE1C_BOC11 => (
         replica = _REPLICA_OK,

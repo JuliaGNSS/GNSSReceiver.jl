@@ -19,8 +19,9 @@ reference harness described at the end of this page.
 !!! note "Most cells are `untested`, on purpose"
 
     This matrix is being filled in by the all-signal roadmap
-    ([issue #130](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/130)), whose
-    hardware-correlator steps have not landed yet. An `untested` cell means no evidence
+    ([issue #130](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/130)). The
+    hardware-correlator steps have landed and the first live-RF cells are in; the
+    per-signal sweeps have not been run. An `untested` cell means no evidence
     exists, not that the capability is known to be missing — and recording that
     honestly is the entire value of the artifact. A cell only turns into `software`,
     `simulated_fpga`, `hardware_replay` or `live_rf` when a check produces that
@@ -46,9 +47,15 @@ reference harness described at the end of this page.
 | `hardware_replay` | Recorded samples replayed through real gateware.                                    |
 | `live_rf`         | A live antenna through the hardware-correlator path.                                |
 
-Only `software` evidence exists today. The other three become reachable as the
-gateware steps of the roadmap land, and the harness is deliberately arranged so they
-compare against the *same* reference rather than against each other.
+`software` evidence covers every row; `simulated_fpga` evidence exists for the GPS L5I
+overlay removal; and `live_rf` evidence exists for Galileo E1B with the BOC(1,1)
+replica, the first non-GPS signal tracked through the hardware correlator on sky
+(2026-09-18, four-channel five-tap LiteX-M2SDR gateware; the record is
+`examples/analysis/hardware_live_m2sdr.md`). A live-RF cell names a **field record**
+rather than a test: the run cannot be repeated without the board, so the matrix says
+where the log is instead of pretending CI produced it. The harness is deliberately
+arranged so every path compares against the *same* reference rather than against
+each other.
 
 ## The matrix
 
@@ -64,7 +71,7 @@ compare against the *same* reference rather than against each other.
 |  | `GPSL5Q` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
 | Galileo E1 | `GalileoE1B` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | n/a (no_secondary_code) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
 |  | `GalileoE1C` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
-|  | `GalileoE1B_BOC11` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | n/a (no_secondary_code) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
+|  | `GalileoE1B_BOC11` | software (harness_replica) | live_rf (live_m2sdr_l1_20260918) | live_rf (live_m2sdr_l1_20260918) | n/a (no_secondary_code) | live_rf (live_m2sdr_l1_20260918) | live_rf (live_m2sdr_l1_20260918) |
 |  | `GalileoE1C_BOC11` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
 | Galileo E5 | `GalileoE5aI` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
 |  | `GalileoE5aQ` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
@@ -97,6 +104,7 @@ compare against the *same* reference rather than against each other.
 - **`harness_receive`** (`test/signal_validation.jl`) — A full `receive` run over harness samples: the satellite has to be acquired, tracked and held in lock with its C/N₀ within tolerance of the case's.
 - **`harness_replica`** (`test/signal_validation.jl`) — The reference harness's per-signal replica check: unit code power, code balance, peak alignment against a fractional code phase and a Doppler, main-peak dominance, cross-PRN isolation and secondary-code agreement, all against `ReferenceHarness`' noise-free reference.
 - **`ion_recording`** (`test/ion_rtlsdr_integration.jl`) — The 60 s ION RTL-SDR live-sky GPS L1 recording through the software receive path, asserted against a captured baseline: eleven healthy satellites, decoded ephemerides, and a PVT fix repeatable to one metre per ECEF component.
+- **`live_m2sdr_l1_20260918`** (`examples/analysis/hardware_live_m2sdr.md`) — Live sky on orin2 through the LiteX-M2SDR hardware correlator, 2026-09-18, gateware `gnss_m2sdr_m2_x1_ch4_ant1_code4092_tap5_sub12_placeSpread` (four channels, five taps, 4092-chip code memory, sub-chip replicas), fs = 4 MS/s, one antenna seeing about a quarter of the hemisphere, run by `examples/analysis/hardware_live_m2sdr.jl`. GPS L1 C/A on three-tap channels held PRN 14 at 50–52 dBHz for 300 s; Galileo E1B (BOC(1,1) replica on five-tap channels) held four satellites at 36–47 dBHz, decoded their I/NAV ephemerides and produced a Galileo-only position fix after 40 s. The log excerpts and the counters are in the record file; the run is not reproducible without the board.
 
 ### Why a cell is not supported
 

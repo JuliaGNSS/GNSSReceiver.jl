@@ -847,10 +847,22 @@ end
     # stale matrix, which is the other way this artifact rots.
     @test setdiff(recorded, claimed) == Set()
 
+    # Claims backed by a field record (`live_*`): a live-RF run nothing in CI can
+    # repeat. The record file and the script it names have to exist, and the
+    # cell may only claim the `:live_rf` level — a field record is not software
+    # evidence and must not be dressed up as any other kind.
+    live_claims = filter(c -> startswith(String(c[3]), "live_"), claimed)
+    for (signal_id, role, source) in live_claims
+        file = SOURCES[source].file
+        @test isfile(joinpath(@__DIR__, "..", file))
+        @test entry(signal_id, role).evidence === :live_rf
+        script = joinpath(@__DIR__, "..", replace(file, r"\.md$" => ".jl"))
+        @test isfile(script)
+    end
     # Claims backed by another test file: the file has to exist and be wired into
     # the suite, or the evidence is a citation of something that never runs.
     runtests = read(joinpath(@__DIR__, "runtests.jl"), String)
-    for (_, _, source) in setdiff(claimed, harness_claims)
+    for (_, _, source) in setdiff(claimed, harness_claims, live_claims)
         file = SOURCES[source].file
         @test isfile(joinpath(@__DIR__, "..", file))
         @test occursin(basename(file), runtests)
