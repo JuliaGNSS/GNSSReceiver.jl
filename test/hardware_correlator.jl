@@ -1157,11 +1157,17 @@ end
     @test [o.integrated_samples ÷ 4000 for o in outputs()] == [7, 20, 3]
     @test [o.sample_index for o in outputs()] == [7 * 4000, 27 * 4000, 30 * 4000]
     @test Tracking.get_prompt(outputs()[2].correlator) ≈ 20 + 0im
-    # The blocks the estimator has not seen yet are what the sizing added in.
     @test link.pending_blocks[1] == 30
-    # Once it has, the count is cleared and the next chunk starts from the
-    # buffer's own progress again.
-    fill!(link.pending_blocks, 0)
+    # The blocks the estimator has not seen yet are what the sizing adds in, and
+    # it reads them off the signal's own output queue: 13 in the buffer plus the
+    # 30 still queued is 43, so the next record has 17 blocks to the boundary.
+    # (Sizing from the link's own tally instead let a record still queued past
+    # the fold boundary go uncounted, and the next record crossed the bit edge.)
+    @test GNSSReceiver.coherent_integration_blocks(
+        link, get_sat_state(track_state, prn), 1, 1) == 17
+    # Once the estimator has consumed them the queue is empty and the next chunk
+    # starts from the buffer's own progress again.
+    empty!(outputs())
     @test GNSSReceiver.coherent_integration_blocks(
         link, get_sat_state(track_state, prn), 1, 1) == 7
 end
