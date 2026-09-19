@@ -435,7 +435,10 @@ const MATRIX = Dict{Symbol,NamedTuple{ROLES,NTuple{6,SupportEntry}}}(
     # I/NAV decode and a Galileo-only fix (2026-09-18, see the source).
     :GalileoE1B_BOC11 => (
         replica = _REPLICA_OK,
-        acquisition_handover = supported(:live_rf, :live_m2sdr_l1_20260918),
+        # The harness acquisition check records this cell every run; the live
+        # handovers of 2026-09-18 are in the source below. The cell keeps the
+        # claim CI reproduces, as GPS L1 C/A's tracking cell does.
+        acquisition_handover = _ACQ_OK,
         tracking = supported(:live_rf, :live_m2sdr_l1_20260918),
         secondary_sync = _SEC_NA,
         data_decode = supported(:live_rf, :live_m2sdr_l1_20260918),

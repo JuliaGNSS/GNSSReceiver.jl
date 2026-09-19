@@ -71,7 +71,7 @@ each other.
 |  | `GPSL5Q` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
 | Galileo E1 | `GalileoE1B` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | n/a (no_secondary_code) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
 |  | `GalileoE1C` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
-|  | `GalileoE1B_BOC11` | software (harness_replica) | live_rf (live_m2sdr_l1_20260918) | live_rf (live_m2sdr_l1_20260918) | n/a (no_secondary_code) | live_rf (live_m2sdr_l1_20260918) | live_rf (live_m2sdr_l1_20260918) |
+|  | `GalileoE1B_BOC11` | software (harness_replica) | software (harness_acquisition) | live_rf (live_m2sdr_l1_20260918) | n/a (no_secondary_code) | live_rf (live_m2sdr_l1_20260918) | live_rf (live_m2sdr_l1_20260918) |
 |  | `GalileoE1C_BOC11` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
 | Galileo E5 | `GalileoE5aI` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | untested (decode_sweep_pending) | untested (pvt_sweep_pending) |
 |  | `GalileoE5aQ` | software (harness_replica) | software (harness_acquisition) | untested (tracking_sweep_pending) | untested (secondary_sync_sweep_pending) | n/a (pilot_no_data) | untested (pvt_sweep_pending) |
