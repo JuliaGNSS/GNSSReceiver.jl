@@ -240,6 +240,23 @@ The counts themselves are set at detector construction; see the
 [`CarrierLockDetector`](@ref GNSSReceiver.CarrierLockDetector) docstrings in the
 [API Reference](@ref) for the defaults.
 
+### Dead input
+
+Samples that read exactly zero on every antenna are not a signal at any gain: they are a
+front-end or DMA dropout, and a stream that delivers them is one the tracking loops cannot
+be run on. Tracking integrates such a stretch like any other, so an integration window that
+lies entirely inside it produces an all-zero correlator record, whose discriminators compute
+`0/0` and turn both Dopplers into `NaN` — the next correlate then throws and takes the whole
+processing task with it (JuliaGNSS/Tracking.jl#234). Until Tracking holds its loops through
+such a record, the receiver guards against it: a band whose samples have been zero for at
+least one primary code period (the shortest integration window a satellite can complete, so a
+shorter glitch is left to the loops to ride out) has its tracked satellites dropped *before*
+tracking, through the same lost-lock path a faded satellite takes — they are reacquired with
+the usual back-off once the signal returns, and a warning names the band and the dropped
+PRNs. The run length is remembered across chunks, so a dropout straddling a chunk boundary is
+recognised too. A dropout is a front-end fault to fix at the source; the guard only keeps it
+from ending the run.
+
 ## PVT
 
 | Keyword | Default | Meaning |

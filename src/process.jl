@@ -267,6 +267,23 @@ function process(
             subsample_interpolation,
         )
 
+    # A band whose samples have read exactly zero for a whole code period (a front-end
+    # or DMA dropout) must not reach `track!`: Tracking turns the all-zero correlator
+    # record into a NaN Doppler and the processing task dies (issue #142). Its
+    # satellites are dropped here through the normal lost-lock path instead; see
+    # `dead_input.jl`.
+    track_state, receiver_sat_states, trailing_dead_samples = guard_dead_input(
+        track_state,
+        receiver_sat_states,
+        receiver_state.trailing_dead_samples,
+        band_keys,
+        band_systems,
+        meas,
+        sampling_freq,
+        !isnothing(receiver_state.vt),
+        runtime,
+    )
+
     # Single multi-band tracking pass: one `BandMeasurement` per band, keyed by
     # band, fed to one `track!` call over the shared multi-band `TrackState`.
     #
@@ -340,6 +357,7 @@ function process(
         vt,
         runtime + signal_duration,
         last_time_pvt_ran,
+        trailing_dead_samples,
     )
 end
 

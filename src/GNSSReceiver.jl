@@ -391,6 +391,7 @@ struct ReceiverState{
     P<:PVTSolution,
     PB<:AbstractVector{<:SatelliteState},
     VT<:Union{Nothing,VectorTrackingState},
+    TD<:NamedTuple,
 }
     track_state::TS
     receiver_sat_states::RS
@@ -407,7 +408,37 @@ struct ReceiverState{
     vt::VT
     runtime::typeof(1.0s)
     last_time_pvt_ran::typeof(1.0s)
+    # Per band (keyed like `acquisition_buffers`): how many samples at the end of the
+    # last chunk read exactly zero on every antenna — the dead-input guard carries the
+    # run across chunks so a dropout straddling a chunk boundary is recognised (see
+    # `dead_input.jl`).
+    trailing_dead_samples::TD
 end
+
+# Before the dead-input guard the state had no dead-run memory; a state built without it
+# starts with none, exactly as a fresh receiver does.
+ReceiverState(
+    track_state,
+    receiver_sat_states,
+    acquisition_buffers,
+    last_time_acquisition_ran,
+    pvt,
+    pvt_sat_state_buffer,
+    vt,
+    runtime,
+    last_time_pvt_ran,
+) = ReceiverState(
+    track_state,
+    receiver_sat_states,
+    acquisition_buffers,
+    last_time_acquisition_ran,
+    pvt,
+    pvt_sat_state_buffer,
+    vt,
+    runtime,
+    last_time_pvt_ran,
+    map(_ -> 0, acquisition_buffers),
+)
 
 # Flatten a tuple of per-band system tuples into one flat tuple of systems.
 # Recursion (rather than `reduce`/splat) keeps every step concretely typed.
@@ -755,6 +786,7 @@ end
 
 include("read_file.jl")
 include("receive.jl")
+include("dead_input.jl")
 include("process.jl")
 include("gui.jl")
 # The terminal dashboard is a Tachikoma app in its own module, so the UI framework's
