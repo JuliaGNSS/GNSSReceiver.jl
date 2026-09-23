@@ -406,6 +406,15 @@ function validate_hardware_configuration(
     )
 end
 
+# ─────────────────────────────────────────────────────────────────────────────
+# The channel table
+#
+# Which satellite occupies which of the device's hardware channels is the
+# receiver's bookkeeping — it arms and releases them — even though the records
+# they produce are folded in the loop process. `RemoteHardwareLoop` keeps the
+# table; these two are shared with anything else that has to read it.
+# ─────────────────────────────────────────────────────────────────────────────
+
 # One hardware channel's current occupant. `signal_index` addresses the
 # component within the satellite's `tracking_signals` tuple, so a pilot/data
 # pair simply occupies two hardware channels.
