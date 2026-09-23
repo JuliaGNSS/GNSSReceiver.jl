@@ -15,7 +15,7 @@ against it.
 | Gateware | gnss-m2sdr `gnss_m2sdr_m2_x1_ch4_ant1_code4092_tap5_sub12_placeSpread` — 4 channels, 5 taps, 4092-chip code memory, 12 sub-chips, CSR layout v3, record format v2; built from gnss-m2sdr `fix/carrier-rom-init` (the carrier-ROM fix on top of `8795de1`) with LiteX `37b75bd4`, timing met at WNS +0.003 ns; md5 `107f9ab635d4bd7210a7dc43b42c6c85`; flashed 10:00 UTC |
 | RF | `m2sdr_rf --sample-rate 4000000 --rx-freq 1575420000 --rx-gain 60 --bandwidth 4000000` |
 | Host software | GNSSReceiver `hardware-correlator-12` at `d8886b2`; GNSSM2SDR `master` `67ca254` plus the NCO-queue fix (`fix/nco-queue`, `d5ba2f1`) for the runs marked *queued*; Tracking, Acquisition, GNSSSignals as resolved in the board's environment on that day |
-| Script | [`hardware_live_m2sdr.jl`](hardware_live_m2sdr.jl), `julia -t 6,4`, `noise_source = :samples`, `feedback_delay_epochs = 2`, `epoch_period = 25` (160 kHz strobes) |
+| Script | `hardware_live_m2sdr.jl` (this directory, at the commit above), `julia -t 6,4`, `noise_source = :samples`, `feedback_delay_epochs = 2`, `epoch_period = 25` (160 kHz strobes). The script drove the in-process `HardwareCorrelatorLink`, which was retired on 2026-09-23 when the tracking loops moved into their own process; it is in git history at the commit above. The live runner today is GNSSM2SDR's `examples/loop_process.jl` over `RemoteHardwareLoop`. |
 
 Acceptance of the gateware itself before any of this: gnss-m2sdr's
 `scripts/hw_accept_v3.py` passed all five checks (CSR layout 3 / record 2,

@@ -68,11 +68,16 @@ alternative was close.
 
 - **Two new packages.**
   - `TrackingLoops.jl` (tentative): discriminators, loop filters, the Doppler
-    estimators, the bit buffer, the C/N₀ estimator, the post-correlation filter
-    — plus the device-independent loop core: epoch fold, coherent accumulation,
-    NCO timelines, word scheduling, code-phase and bit-phase anchoring, secondary
-    code removal, and the driver API below. Tracking.jl depends on it for the
-    software correlator; the loop process depends on it without Tracking.
+    estimators, the bit buffer, the C/N₀ estimator, the post-correlation filter,
+    NCO timelines. Tracking.jl depends on it for the software correlator; the
+    loop process depends on it without Tracking.
+  - `HardwareLoopCore.jl` (added 2026-09-23, superseding the first draft's
+    placement of the core inside `TrackingLoops`): the device-independent loop
+    core — epoch fold, coherent accumulation, word scheduling, code-phase and
+    bit-phase anchoring, secondary code removal, the command handling, the
+    driver API below and the simulated FPGA. It depends on `TrackingLoops` and
+    `HardwareLoopProtocol`; nothing Tracking.jl imports knows a device or a
+    segment, and the protocol stays Base-only.
   - `HardwareLoopProtocol.jl` (tentative): the shared-memory layout, rings,
     event and command types. No dependencies beyond Base. Both GNSSReceiver
     and the vendor package depend on it.
@@ -88,7 +93,7 @@ alternative was close.
   trim verifier on the spike; strip a dependency only when the verifier rejects
   it. (Alternative: a plain-Float64 core with units at the rim — fall-back if
   the spike fails.)
-- **Driver API** (in `TrackingLoops`), concrete and statically dispatched (the
+- **Driver API** (in `HardwareLoopCore`), concrete and statically dispatched (the
   driver is a type parameter of the core state):
   `read_records!(driver, buffer) -> n`, `write_word!(driver, channel, carrier, code)`,
   `arm!(driver, channel, config)`, `release!(driver, channel)`,
@@ -223,7 +228,8 @@ alternative was close.
 2. **`HardwareLoopProtocol.jl`.** Segment layout, rings, seqlock slot, event and
    command types, header versioning; tests with two threads standing in for two
    processes, then two processes.
-3. **Loop core in `TrackingLoops`.** Epoch fold, accumulation, timelines and the
+3. **Loop core in `HardwareLoopCore`** (built inside `TrackingLoops` first, moved
+   out on 2026-09-23). Epoch fold, accumulation, timelines and the
    stall-tolerance rules, the driver API, the simulated FPGA as first driver;
    port the closed-loop and record-accounting tests; AllocCheck on the hot paths
    in the test suite.

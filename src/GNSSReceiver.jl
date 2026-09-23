@@ -67,7 +67,23 @@ using Unitful: m, s, ms, Hz, dBHz, dB, °, uconvert
 # packages (they replaced the vendored `channel.jl` / `soapy_sdr_helper.jl`). The
 # SDR streaming (`stream_data` / `SDRChannelConfig`) comes from SignalChannels'
 # SoapySDR extension, which `using SoapySDR` above loads.
-using PipeChannels: PipeChannel
+# The device-independent loop core. Tracking re-exports the estimators and the
+# record types; the NCO timeline's operations are bound here by name, since the
+# hardware link is their one consumer outside the loop core itself.
+using TrackingLoops:
+    TrackingLoops,
+    NCOTimeline,
+    scheduled_words,
+    FixedNCOWord,
+    NO_LANDING_SAMPLE,
+    reset_timeline!,
+    schedule_word!,
+    promote_words!,
+    word_changes_within,
+    nco_word_at,
+    mean_nco_word,
+    wrap_half_cycle,
+    SatNCOReferencedPLLAndDLL
 using SignalChannels:
     SignalChannel,
     SDRChannelConfig,
@@ -81,29 +97,18 @@ export ReceiverState,
     receive,
     VectorTracking,
     AbstractHardwareCorrelatorSDR,
-    CorrelatorDump,
-    NCOUpdate,
-    HardwareCorrelatorLink,
+    RemoteHardwareLoop,
+    device_sample_origin,
     HardwareCorrelatorCapabilities,
-    HardwareChannelConfig,
     NCOReferencedPLLAndDLL,
     raw_sample_channel,
-    correlator_dump_channel,
-    nco_update_channel,
     num_hardware_channels,
-    assign_channel!,
-    release_channel!,
-    assignment_start_sample,
-    dropped_dump_count!,
     correlator_gain,
     hardware_capabilities,
     replica_code_amplitude,
     supports_secondary_code_wipeoff,
     check_hardware_support,
     validate_hardware_configuration,
-    num_correlator_taps,
-    epoch_strobe,
-    is_epoch_strobe,
     CombinedSignal,
     read_files,
     read_uint8_iq_file,
@@ -869,9 +874,10 @@ end
 
 include("read_file.jl")
 include("hardware_capabilities.jl")
-include("hardware_correlator.jl")
+include("hardware_device.jl")
 include("receive.jl")
 include("nco_referenced_loop.jl")
+include("remote_hardware_loop.jl")
 include("process.jl")
 include("async_acquisition.jl")
 include("gui.jl")

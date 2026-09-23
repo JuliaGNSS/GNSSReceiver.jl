@@ -170,8 +170,9 @@ function process(
     downconvert_and_correlator = CPUThreadedDownconvertAndCorrelator(),
     # Where this chunk's correlator outputs come from. `nothing` ⇒ correlate the
     # raw samples on the CPU with `downconvert_and_correlator`. Pass a
-    # [`HardwareCorrelatorLink`](@ref) to take them from an FPGA correlator
-    # instead; the raw samples then still drive acquisition, decoding and PVT.
+    # [`RemoteHardwareLoop`](@ref) to take them from an FPGA correlator's loop
+    # process instead; the raw samples then still drive acquisition, decoding
+    # and PVT.
     correlator_source = nothing,
     # Where acquisition runs. [`InlineAcquisition`](@ref) searches on this task,
     # inside this call; an [`AsyncAcquisition`](@ref) hands the window to a
@@ -263,8 +264,7 @@ function process(
     # Which correlator produced this chunk's outputs is the one thing a
     # hardware-correlator receiver changes, and it changes it by dispatch: the
     # default source is the software backend and calls `track!` as above, while a
-    # `HardwareCorrelatorLink` ingests the FPGA's dumps instead. See
-    # [`advance_tracking!`](@ref).
+    # `RemoteHardwareLoop` mirrors the loop process's records instead.
     track_state = advance_tracking!(
         something(correlator_source, downconvert_and_correlator),
         band_measurements,

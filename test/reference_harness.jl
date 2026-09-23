@@ -569,8 +569,7 @@ end
 
 # The inner loop, behind a function barrier so the signal type (and with it the
 # `get_code` lookup) is concrete: `get_code` on an abstractly-typed signal boxes
-# its result, which costs more than the arithmetic (see the note on
-# `SimulatedFPGA`'s fields in test/simulated_fpga.jl).
+# its result, which costs more than the arithmetic.
 function _fill_samples!(
     samples,
     signal::S,

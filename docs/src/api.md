@@ -33,53 +33,27 @@ documentation.
 ## Hardware correlators
 
 See the [hardware-correlator contract](@ref "Hardware-correlator contract") for
-what an adapter package and its gateware have to satisfy.
+what a device package and its loop process have to satisfy.
 
 ```@docs
 AbstractHardwareCorrelatorSDR
-HardwareCorrelatorLink
-CorrelatorDump
-num_correlator_taps
-NCOUpdate
-EPOCH_STROBE_CHANNEL
+RemoteHardwareLoop
+receive(::RemoteHardwareLoop, ::Any, ::Any)
+device_sample_origin
 raw_sample_channel
-correlator_dump_channel
-nco_update_channel
 num_hardware_channels
-assign_channel!
-release_channel!
-assignment_start_sample
-dropped_dump_count!
 correlator_gain
-epoch_strobe
-is_epoch_strobe
 is_observation_gap
-advance_code_phases!
-anchor_bit_phases!
-restart_lost_bit_clocks!
 take_bit_clock_restart!
-anchor_secondary_phases!
-GNSSReceiver.is_secondary_code_removed
-coherent_integration_blocks
-coherent_integration_periods
-allows_partial_primary_records
-primary_code_wraps
-primary_code_block_phase
-record_integration_periods
-GNSSReceiver.RecordBlockSpan
 advance_tracking!
-flush_partial_records!
-push_nco_updates!
-estimate_dopplers!
 ```
 
-### Capabilities and channel configuration
+### Capabilities
 
 ```@docs
 HardwareCorrelatorCapabilities
 GNSSReceiver.LEGACY_GPS_L1CA_CAPABILITIES
 hardware_capabilities
-HardwareChannelConfig
 validate_hardware_configuration
 check_hardware_support
 GNSSReceiver.hardware_support_error
@@ -87,7 +61,6 @@ GNSSReceiver.wire_tap_slots
 GNSSReceiver.DEFAULT_MAX_INTEGRATION_TIME
 replica_code_amplitude
 supports_secondary_code_wipeoff
-GNSSReceiver.requested_secondary_code_mode
 ```
 
 ### RF bands, inputs and the receiver timebase
@@ -110,20 +83,17 @@ GNSSReceiver.to_receiver_samples
 GNSSReceiver.to_band_samples
 GNSSReceiver.band_plan_error
 GNSSReceiver.band_bank_error
-GNSSReceiver.receiver_sampling_frequency
-GNSSReceiver.channel_band_id
-GNSSReceiver.channel_sampling_frequency
 ```
 
 ### The delay-aware tracking loop
 
-```@docs
-NCOReferencedPLLAndDLL
-GNSSReceiver.SatNCOReferencedPLLAndDLL
-NCOTimeline
-mean_nco_word
-FixedNCOWord
-```
+The estimator a hardware correlator's loops run — `NCOReferencedPLLAndDLL`, its
+per-satellite state, the `NCOTimeline` of what a device NCO ran, and the
+per-record `step_loop` that attributes a record to the word it really ran under
+— lives in [TrackingLoops.jl](https://github.com/JuliaGNSS/TrackingLoops.jl) and
+is stepped by the loop process. Tracking.jl re-exports it, and the software
+receiver runs it with the chunk's own replica word and no landing sample, which
+makes it the conventional loop to the bit. Its documentation is TrackingLoops'.
 
 ## Consuming the results
 

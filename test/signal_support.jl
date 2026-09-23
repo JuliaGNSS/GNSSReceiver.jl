@@ -83,7 +83,7 @@ const EVIDENCE_LEVELS = (:none, :software, :simulated_fpga, :hardware_replay, :l
 const EVIDENCE_DESCRIPTIONS = Dict(
     :none => "No evidence.",
     :software => "The software receive path, over harness samples or a recording.",
-    :simulated_fpga => "The simulated hardware correlator of test/simulated_fpga.jl, fed the same samples.",
+    :simulated_fpga => "The loop core over HardwareLoopCore's simulated device, fed the same samples.",
     :hardware_replay => "Recorded samples replayed through real gateware.",
     :live_rf => "A live antenna through the hardware-correlator path.",
 )
@@ -177,25 +177,16 @@ const SOURCES = Dict(
                "acquired, tracked and held in lock with its C/N₀ within tolerance of " *
                "the case's.",
     ),
-    :harness_hardware_overlay => (
-        file = "test/secondary_code_removal.jl",
-        text = "GPS L5I through the simulated hardware correlator of " *
-               "`test/simulated_fpga.jl` over reference-harness samples: the device " *
-               "replicates the primary code only, `Tracking`'s own detector finds the " *
-               "NH10 overlay, the link then removes it from every dump, and the " *
-               "decoded symbols are the ones the harness transmitted — at close to the " *
-               "full ten blocks of energy per symbol rather than the overlay's own " *
-               "sum of two.",
-    ),
     :live_m2sdr_l1_20260918 => (
         file = "examples/analysis/hardware_live_m2sdr.md",
         text = "Live sky on orin2 through the LiteX-M2SDR hardware correlator, " *
                "2026-09-18, gateware `gnss_m2sdr_m2_x1_ch4_ant1_code4092_tap5_sub12_" *
                "placeSpread` (four channels, five taps, 4092-chip code memory, sub-chip " *
                "replicas), fs = 4 MS/s, one antenna seeing about a quarter of the " *
-               "hemisphere, run by `examples/analysis/hardware_live_m2sdr.jl`. GPS L1 " *
+               "hemisphere, run by the in-process adapter's live example (retired with " *
+               "it; see the record file and git history). GPS L1 " *
                "C/A on three-tap channels held PRN 14 at 50–52 dBHz for 300 s and, on the " *
-               "six-channel build with the link's record sizing fixed, decoded four LNAV " *
+               "six-channel build with the record sizing fixed, decoded four LNAV " *
                "ephemerides and produced a GPS fix after 205 s; Galileo " *
                "E1B (BOC(1,1) replica on five-tap channels) held four satellites at " *
                "36–47 dBHz, decoded their I/NAV ephemerides and produced a Galileo-only " *
@@ -227,6 +218,13 @@ const _REASON_TEXT = Dict(
         "No per-signal tracking sweep exists yet. The harness can generate the case; " *
         "what is missing is the run and its baseline — part of step 9 itself, and only " *
         "meaningful once the loops it exercises are the ones the roadmap settles on.",
+    :secondary_sync_loop_process_pending =>
+        "The overlay removal after synchronisation (issue #132) was demonstrated end to " *
+        "end for GPS L5I on the retired in-process link (the device replicated the " *
+        "primary code only, Tracking's detector found the NH10 overlay, the link removed " *
+        "it from every record, and the decoded symbols were the harness's). The loop " *
+        "core carries the same ingest path, but nothing has yet run a secondary-code " *
+        "signal through the loop process: that demonstration is the follow-up.",
     :secondary_sync_sweep_pending =>
         "The receiver's own secondary-code synchronisation is not swept per signal yet. " *
         "The harness does verify that the secondary code is recoverable from the " *
@@ -242,20 +240,17 @@ const _REASON_TEXT = Dict(
         "sweep for a data component, and the tracking sweep for a pilot, which " *
         "contributes pseudoranges through its `CombinedSignal` pairing.",
     :l2cl_tracking_sweep_pending =>
-        "The hardware path's *timing and accounting* for this signal are validated and " *
-        "the code loop does pull in: test/partial_primary_records.jl runs GPS L2CL " *
-        "through the simulated correlator of test/simulated_fpga.jl dumping inside its " *
-        "1.5 s primary code period, the summed dumps reproduce the harness's " *
-        "`reference_correlation` over the same span, the loops are handed a record " *
-        "every `max_integration_time` instead of once per 1.5 s code wrap, and no short " *
-        "record is counted as a completed code period. That is not a tracking sweep. " *
-        "Nothing has yet shown the *carrier* loop holding lock on L2CL — in the same " *
-        "simulated run its Doppler estimate barely moves against a deliberate offset, " *
-        "while GPS L1 C/A through the identical harness converges — and whether that is " *
-        "a property of the signal, of the 20 ms coherent window a 1.5 s code forces, or " *
-        "of `Tracking`'s per-signal support is the subject of the software-support " *
-        "audit (JuliaGNSS/Tracking.jl#236) and the per-signal tracking sweep of step 9, " *
-        "not of the record accounting.",
+        "The hardware path's record accounting for a 1.5 s primary code (records cut " *
+        "inside the code period, no short record counted as a completed period) was " *
+        "validated on the retired in-process link and is carried by the loop core " *
+        "(HardwareLoopCore.jl); nothing has yet run L2CL through the loop process. That " *
+        "is not a tracking sweep either way: nothing has shown the *carrier* loop " *
+        "holding lock on L2CL — on the in-process run its Doppler estimate barely moved " *
+        "against a deliberate offset while GPS L1 C/A through the identical harness " *
+        "converged — and whether that is a property of the signal, of the 20 ms coherent " *
+        "window a 1.5 s code forces, or of `Tracking`'s per-signal support is the subject " *
+        "of the software-support audit (JuliaGNSS/Tracking.jl#236) and the per-signal " *
+        "tracking sweep of step 9.",
     :acquisition_window_too_long =>
         "One coherent acquisition window is a whole primary code period, and this " *
         "signal's is 1.5 s — 3 million samples at four samples per chip. So L2CL is " *
@@ -395,14 +390,14 @@ const MATRIX = Dict{Symbol,NamedTuple{ROLES,NTuple{6,SupportEntry}}}(
         data_decode = _DECODE_NA,
         pvt = _PVT_PENDING,
     ),
-    # GPS L5I is where the hardware path's overlay removal is demonstrated end to
-    # end (issue #132): the only secondary-code row so far whose synchronisation
-    # has actually been run, and the only cell with simulated-FPGA evidence.
+    # GPS L5I is where the hardware path's overlay removal was demonstrated end
+    # to end (issue #132) — on the in-process link, retired with the loop
+    # process; the cell waits for the same run through the loop core.
     :GPSL5I => (
         replica = _REPLICA_OK,
         acquisition_handover = _ACQ_OK,
         tracking = _TRACK_PENDING,
-        secondary_sync = supported(:simulated_fpga, :harness_hardware_overlay),
+        secondary_sync = untested(:secondary_sync_loop_process_pending),
         data_decode = _DECODE_PENDING,
         pvt = _PVT_PENDING,
     ),

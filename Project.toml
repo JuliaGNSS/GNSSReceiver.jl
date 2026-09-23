@@ -12,10 +12,10 @@ Dictionaries = "85a47980-9c8c-11e8-2b9f-f7ca1fa99fb4"
 GNSSDecoder = "bf6b1ec8-12ad-4501-972c-3dec0d675c2b"
 GNSSSignals = "52c80523-2a4e-5c38-8979-05588f836870"
 Geodesy = "0ef565a4-170c-5f04-8de2-149903a85f3d"
+HardwareLoopProtocol = "d08c7759-00c5-4da6-80f1-3e02eb36f3f0"
 JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
 KalmanFilters = "272a6111-cf0e-4c1b-a056-8d658cb314ee"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
-PipeChannels = "316ea068-b8d4-4418-b34f-158552ec34f5"
 PositionVelocityTime = "52ec0b5e-ee36-11ea-211c-3d844fc5682d"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 SignalChannels = "59ec5e11-ed95-4167-ad38-35055440f478"
@@ -23,9 +23,16 @@ SoapySDR = "4fa426e6-03fd-45b2-b2dd-25f726820c03"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Tachikoma = "468859d6-42d8-48b7-8ad9-1d312e0e3b0a"
 Tracking = "10b2438b-ffd4-5096-aa58-44041d5c8f3b"
+TrackingLoops = "89eadfff-3a96-4166-8be0-4e8bed6efc30"
 UnicodeMaps = "93404ded-f489-4c96-9f3f-351522718b35"
 UnicodePlots = "b8865327-cd53-5732-bb35-84acbb429228"
 Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
+
+[sources]
+HardwareLoopCore = {url = "https://github.com/JuliaGNSS/HardwareLoopCore.jl"}
+HardwareLoopProtocol = {rev = "main", url = "https://github.com/JuliaGNSS/HardwareLoopProtocol.jl"}
+Tracking = {rev = "trackingloops", url = "https://github.com/JuliaGNSS/Tracking.jl"}
+TrackingLoops = {rev = "main", url = "https://github.com/JuliaGNSS/TrackingLoops.jl"}
 
 [compat]
 Accessors = "0.1.42"
@@ -37,10 +44,11 @@ Dictionaries = "0.4.5"
 GNSSDecoder = "4"
 GNSSSignals = "4"
 Geodesy = "1.1.0"
+HardwareLoopCore = "1"
+HardwareLoopProtocol = "1"
 JLD2 = "0.6"
 KalmanFilters = "0.1.6"
 LinearAlgebra = "1"
-PipeChannels = "1"
 PositionVelocityTime = "5.4"
 PrecompileTools = "1.2"
 Random = "1"
@@ -50,7 +58,8 @@ SoapySDR = "0.5"
 StaticArrays = "1"
 Tachikoma = "2"
 Test = "1"
-Tracking = "8.2"
+Tracking = "8.3"
+TrackingLoops = "1"
 UnicodeMaps = "1"
 UnicodePlots = "3.3.0"
 Unitful = "1"
@@ -60,9 +69,10 @@ julia = "1.12"
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 AstroTime = "c61b5328-d09d-5e37-a9a8-0eb41c39009c"
 Geodesy = "0ef565a4-170c-5f04-8de2-149903a85f3d"
+HardwareLoopCore = "b7e1c2d3-4f56-4a78-9b01-23c4d5e6f708"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Scratch = "6c6a2e73-6563-6170-7368-637461726353"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Aqua", "Test", "Geodesy", "AstroTime", "Random", "Scratch"]
+test = ["Aqua", "Test", "Geodesy", "AstroTime", "Random", "Scratch", "HardwareLoopCore"]

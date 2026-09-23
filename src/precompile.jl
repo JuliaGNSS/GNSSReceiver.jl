@@ -1,8 +1,8 @@
 # Precompile workload (PrecompileTools). A first `receive` on a fresh session
 # costs ~18 s of compilation on a workstation and three to four times that on
-# an embedded ARM host — the hardware-correlator harness in issue #107 spends
-# 43 s warming the pipeline up before it dares to start the stream, and the
-# paths the warm-up misses then compile live, each stall holding every tracking
+# an embedded ARM host — the hardware-correlator receiver in issue #107 spent
+# 43 s warming the pipeline up before it dared to start the stream, and the
+# paths the warm-up missed then compiled live, each stall holding every tracking
 # loop open. Running the standard pipeline here, on a short burst of noise
 # through the integer and the float sample paths, moves that cost into
 # `Pkg.precompile`. Nothing is detected, which is the point: acquisition, the
@@ -11,93 +11,6 @@
 # the system tuple, so it runs for one system, for the two default
 # constellations in one band, and for two bands in lock-step.
 using PrecompileTools: @setup_workload, @compile_workload
-
-# ── A device to compile the hardware-correlator pipeline against ─────────────
-#
-# The hardware receiver is a second, separate pipeline: `process` takes its
-# correlator outputs from a [`HardwareCorrelatorLink`](@ref) rather than from a
-# `Tracking` backend, and every method from `receive`'s processing closure down
-# to the epoch fold is specialised on that source. Compiling it live costs 1.7 s
-# on an Orin — 1.7 s inside one chunk, during which nothing drains the device's
-# dump ring, so it overruns and every satellite's records for the next second
-# and a half are simply gone (issue #107).
-#
-# Nothing here talks to hardware: the three streams are ordinary channels the
-# workload fills itself, which is all the pipeline ever sees of a device. The
-# link erases the device's type (see `HardwareCorrelatorLink`), so what is
-# cached here is what a *real* vendor device runs — this stub and an M2SDR
-# produce the same `HardwareCorrelatorLink{EarlyPromptLateCorrelator{…}}` and
-# therefore the same specialisations.
-struct _PrecompileHardwareSDR{C<:Tracking.AbstractCorrelator} <:
-       AbstractHardwareCorrelatorSDR
-    raw::SignalChannel{Complex{Int16},1}
-    dumps::PipeChannel{CorrelatorDump{C}}
-    ncos::PipeChannel{NCOUpdate}
-end
-
-raw_sample_channel(sdr::_PrecompileHardwareSDR) = sdr.raw
-correlator_dump_channel(sdr::_PrecompileHardwareSDR) = sdr.dumps
-nco_update_channel(sdr::_PrecompileHardwareSDR) = sdr.ncos
-num_hardware_channels(::_PrecompileHardwareSDR) = 4
-# The configuration form, spelled out rather than swallowed by a vararg
-# catch-all: a `assign_channel!(::MyDevice, args...)` method is neither more
-# nor less specific than GNSSReceiver's own
-# `assign_channel!(::AbstractHardwareCorrelatorSDR, hw_channel, ::HardwareChannelConfig)`
-# shim, so the call is ambiguous. This is the shape every device wants — see
-# `assign_channel!`.
-assign_channel!(::_PrecompileHardwareSDR, hw_channel, ::HardwareChannelConfig) = nothing
-release_channel!(::_PrecompileHardwareSDR, hw_channel) = nothing
-
-# The correlator a single-antenna Early/Prompt/Late device dumps. Both the
-# element type and the tap count are part of the link's type parameter, so this
-# is what pins the cached specialisations to the ones a vendor package's device
-# will hit.
-_precompile_epl(early, prompt, late) =
-    EarlyPromptLateCorrelator(SVector{3,ComplexF64}(early, prompt, late), 1)
-
-const _PRECOMPILE_EPL = typeof(_precompile_epl(0, 0, 0))
-
-# Feed the stub device: one raw chunk and one epoch's worth of dumps per
-# iteration, on a sample axis that advances exactly as a real device's does, and
-# drain whatever NCO updates the receiver pushes back so the ring cannot fill.
-function _precompile_drive_hardware_sdr(sdr, num_samples, num_chunks)
-    Threads.@spawn begin
-        try
-            chunk = Complex{Int16}.(round.(randn(ComplexF32, num_samples, 1) .* 512))
-            for i = 1:num_chunks
-                base = i * num_samples
-                batch = CorrelatorDump{_PRECOMPILE_EPL}[]
-                for hw_channel = 1:2
-                    push!(
-                        batch,
-                        CorrelatorDump(
-                            hw_channel,
-                            hw_channel,
-                            CorrelatorOutput(
-                                _precompile_epl(400 + 0im, 1000 + 10im, 400 + 0im),
-                                num_samples,
-                                base + hw_channel,
-                            ),
-                            mod(0.001 * base, 1023.0),
-                        ),
-                    )
-                end
-                # The strobe is what closes an epoch on a device whose channels
-                # are momentarily silent, so the fold path that depends on it is
-                # compiled here too.
-                push!(batch, epoch_strobe(_precompile_epl(0, 0, 0), base))
-                put!(sdr.dumps, batch)
-                put!(sdr.raw, chunk)
-                while Base.n_avail(sdr.ncos) > 0
-                    take!(sdr.ncos)
-                end
-            end
-        finally
-            close(sdr.raw)
-            close(sdr.dumps)
-        end
-    end
-end
 
 # Satellites for one real PVT solve, or an empty vector when this cannot be
 # built.
@@ -236,32 +149,5 @@ end
             pvt_update_interval = 4u"ms",
         )
         collect_data(data)
-
-        # The hardware-correlator receiver: the same pipeline taking its
-        # correlator outputs off a device instead of computing them. Run with
-        # the live defaults — asynchronous acquisition, the processing task on
-        # the interactive pool — so what is cached is the shape a hardware
-        # receiver actually runs,
-        # including the scan-merge path. The logger is silenced because
-        # `Pkg.precompile` runs single-threaded, where asynchronous acquisition
-        # rightly warns that it cannot overlap a scan with tracking.
-        Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
-            sdr = _PrecompileHardwareSDR(
-                SignalChannel{Complex{Int16},1}(4000, 8),
-                PipeChannel{CorrelatorDump{_PRECOMPILE_EPL}}(1 << 12),
-                PipeChannel{NCOUpdate}(1 << 8),
-            )
-            driver = _precompile_drive_hardware_sdr(sdr, 4000, 12)
-            data = receive(
-                sdr,
-                GPSL1CA(),
-                4e6Hz;
-                max_meas = 2^11,
-                acquire_every = 4u"ms",
-                pvt_update_interval = 4u"ms",
-            )
-            collect_data(data)
-            wait(driver)
-        end
     end
 end

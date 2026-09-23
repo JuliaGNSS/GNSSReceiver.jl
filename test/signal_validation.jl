@@ -856,8 +856,13 @@ end
         file = SOURCES[source].file
         @test isfile(joinpath(@__DIR__, "..", file))
         @test entry(signal_id, role).evidence === :live_rf
-        script = joinpath(@__DIR__, "..", replace(file, r"\.md$" => ".jl"))
-        @test isfile(script)
+        # The record has to say what produced the run, by naming a runner. The
+        # runner itself is not required to still exist: a field record outlives
+        # the code path it was taken on, and this one's did not survive the move
+        # of the tracking loops into their own process (2026-09-23). What the
+        # record may never become is a measurement with no stated provenance.
+        record = read(joinpath(@__DIR__, "..", file), String)
+        @test occursin(r"[\w./-]+\.jl", record)
     end
     # Claims backed by another test file: the file has to exist and be wired into
     # the suite, or the evidence is a citation of something that never runs.

@@ -5,10 +5,7 @@
 # Columns: runtime [s], prn, carrier_doppler [Hz], code_doppler [Hz],
 # code_phase [chips], prompt_re, prompt_im (the last fully integrated filtered
 # prompt), n_records (records folded this chunk), cn0 [dBHz], bit_found,
-# in_lock, time_in_lock [s], then the link's counters at the time of the row
-# (zero for a software run): stale dumps, lost-record gaps, skipped epochs,
-# dropped NCO updates, the device's newest sample index and the host's consumed
-# sample count.
+# in_lock, time_in_lock [s].
 #
 # `snapshot` runs inside the processing task and must copy everything out: the
 # `ReceiverState` it sees is mutated in place by the next chunk.
@@ -22,8 +19,7 @@ using GNSSReceiver
 cn0_db(cn0) = 10 * log10(Unitful.linear(cn0) / Hz)
 
 const CSV_HEADER = "runtime,prn,carrier_doppler,code_doppler,code_phase,prompt_re,prompt_im," *
-                   "n_records,cn0,bit_found,in_lock,time_in_lock," *
-                   "stale,lost_gaps,skipped,dropped_nco,latest_idx,samples_consumed"
+                   "n_records,cn0,bit_found,in_lock,time_in_lock"
 
 # One row per tracked satellite. Pass this as `extract` to `receive`.
 function snapshot(rs)
@@ -53,18 +49,13 @@ function snapshot(rs)
     rows
 end
 
-# Write one chunk's rows. `link` is the `HardwareCorrelatorLink` of a hardware
-# run, or `nothing`.
-function write_rows(io, rows, link)
-    stale, lost, skipped, dropped, latest, consumed =
-        isnothing(link) ? (0, 0, 0, 0, 0, 0) :
-        (link.stale_dumps, link.lost_record_gaps, link.skipped_epochs,
-         link.dropped_nco_updates, link.latest_sample_index, link.samples_consumed)
+# Write one chunk's rows.
+function write_rows(io, rows)
     for r in rows
-        @printf(io, "%.4f,%d,%.3f,%.5f,%.4f,%.1f,%.1f,%d,%.2f,%d,%d,%.3f,%d,%d,%d,%d,%d,%d\n",
+        @printf(io, "%.4f,%d,%.3f,%.5f,%.4f,%.1f,%.1f,%d,%.2f,%d,%d,%.3f\n",
             r.runtime, r.prn, r.carrier_doppler, r.code_doppler, r.code_phase,
             r.prompt_re, r.prompt_im, r.n_records, r.cn0, r.bit_found, r.in_lock,
-            r.time_in_lock, stale, lost, skipped, dropped, latest, consumed)
+            r.time_in_lock)
     end
 end
 

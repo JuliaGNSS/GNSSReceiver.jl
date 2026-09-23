@@ -62,7 +62,7 @@ function main()
     t0 = time()
     last_print = -Inf
     for rows in data
-        write_rows(io, rows, nothing)
+        write_rows(io, rows)
         if time() - last_print >= 5
             last_print = time()
             @info @sprintf("wall=%6.1f s  runtime=%6.1f s  locked[%s]", time() - t0,

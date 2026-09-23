@@ -5,12 +5,10 @@
 # carrier whose phase error advances by `2π (f_true − w) Δt` per record under
 # the replica word `w`, with the word the estimator commands landing `d`
 # records after the record that produced it. That isolates the one thing this
-# estimator changes — how the delay is handled — from everything the simulated
-# device in test/hardware_correlator.jl exercises as well (handover, code loop,
-# bit sync, C/N₀).
-#
-# Included after test/hardware_correlator.jl, whose `RecordingSDR`, `EPL` and
-# `dump_at` helpers the link-level tests below reuse.
+# estimator changes — how the delay is handled — from everything the loop
+# core's simulated device (HardwareLoopCore's tests and
+# test/remote_hardware_loop.jl) exercises as well: handover, code loop, bit
+# sync, C/N₀.
 
 using GNSSReceiver:
     NCOReferencedPLLAndDLL,
@@ -21,7 +19,8 @@ using GNSSReceiver:
     promote_words!,
     mean_nco_word,
     nco_word_at,
-    word_changes_within
+    word_changes_within,
+    scheduled_words
 
 @testset "An NCO timeline averages the words that ran over a span" begin
     tl = NCOTimeline()
@@ -50,22 +49,22 @@ using GNSSReceiver:
     # keeps the newest word it was given for a sample.
     schedule_word!(tl, 2000, 130.0, 0.13)
     @test mean_nco_word(tl, 2000, 3000) == (130.0, 0.13)
-    @test length(tl.scheduled) == 2
+    @test length(scheduled_words(tl)) == 2
     schedule_word!(tl, 1500, 140.0, 0.14)
-    @test [w.sample for w in tl.scheduled] == [1000, 1500]
+    @test [w.sample for w in scheduled_words(tl)] == [1000, 1500]
 
     # Promotion folds landed words into the applied one and forgets them.
     promote_words!(tl, 1200)
     @test tl.applied_carrier_doppler == 110.0
-    @test [w.sample for w in tl.scheduled] == [1500]
+    @test [w.sample for w in scheduled_words(tl)] == [1500]
     @test mean_nco_word(tl, 1000, 2000) == (125.0, 0.125)
     promote_words!(tl, 10_000)
-    @test isempty(tl.scheduled)
+    @test isempty(scheduled_words(tl))
     @test mean_nco_word(tl, 0, 1) == (140.0, 0.14)
 
     # A handover starts over.
     reset_timeline!(tl, 7.0, 0.007)
-    @test isempty(tl.scheduled)
+    @test isempty(scheduled_words(tl))
     @test mean_nco_word(tl, 0, 1) == (7.0, 0.007)
 
     @test mean_nco_word(FixedNCOWord(3.0, 0.3), 0, 100) == (3.0, 0.3)
@@ -218,228 +217,4 @@ end
     @test reset_state.init_carrier_doppler == 50.0Hz
     @test reset_state.carrier_loop_filter_bandwidth == 12.0Hz
     @test reset_state.carrier_loop_filter.x1 == 0.0Hz
-end
-
-# ── Through the link ─────────────────────────────────────────────────────────
-
-# A receiver track state whose estimator is the hardware default, with one
-# satellite handed over at the given Dopplers.
-function nco_track_state(system, prn; carrier_doppler = 1500.0Hz, code_doppler = 1.5Hz)
-    base = GNSSReceiver.ReceiverState(
-        ComplexF64,
-        system;
-        num_samples_for_acquisition = 20000,
-        num_ants = NumAnts(1),
-        doppler_estimator = NCOReferencedPLLAndDLL(),
-    )
-    merge_sats(
-        base.track_state,
-        get_signal_id(system),
-        [GNSSReceiver.create_tracked_sat(
-            GNSSReceiver.tracking_signals(system),
-            prn,
-            0.0,
-            carrier_doppler,
-            NumAnts(1),
-            base.track_state.doppler_estimator,
-        )],
-    )
-end
-
-@testset "The link keeps a timeline of what each channel's NCO ran" begin
-    system = GPSL1CA()
-    key = get_signal_id(system)
-    prn = 21
-    sdr = RecordingSDR(EPL, 3)
-    link = HardwareCorrelatorLink(sdr; sampling_freq = 4e6Hz, reference_signal = system)
-    track_state = nco_track_state(system, prn)
-    band_systems = ((system,),)
-    band_measurements = (; L1 = Tracking.BandMeasurement(zeros(ComplexF64, 4000), 4e6Hz, 0.0Hz))
-    # The estimator sizes acquisition the same way the conventional one does.
-    @test track_state.doppler_estimator isa NCOReferencedPLLAndDLL
-
-    # Handover: the channel's timeline starts on the words the device was given.
-    GNSSReceiver.sync_hardware_channels!(link, track_state, band_systems, band_measurements)
-    hw_channel = link.channel_of[GNSSReceiver.HardwareChannelAssignment(key, prn, 1)]
-    timeline = link.nco_timelines[hw_channel]
-    @test mean_nco_word(timeline, 0, 1) == (1500.0, ustrip(Hz, get_code_doppler(get_sat_state(track_state, key, prn))))
-    @test isempty(timeline.scheduled)
-
-    # A fold's updates are scheduled at one sample, decided before the estimator
-    # runs and entered in the timeline once the device has accepted them.
-    link.latest_sample_index = 100_000
-    boundary = 96_000
-    apply_at = GNSSReceiver.nco_apply_at_sample(link, boundary)
-    @test apply_at == 100_000 + 2 * 4000
-    @test GNSSReceiver.push_nco_updates!(link, track_state, boundary) == 1
-    update = take!(sdr.ncos)
-    @test update.apply_at_sample == apply_at
-    @test update.channel == hw_channel
-    @test [w.sample for w in timeline.scheduled] == [apply_at]
-    @test mean_nco_word(timeline, apply_at, apply_at + 1) == (update.carrier_doppler, update.code_doppler)
-    @test link.dropped_nco_updates == 0
-
-    # A refused update never reaches the device, so it never reaches the timeline
-    # either — and it is counted, where before it vanished.
-    while Base.n_avail(sdr.ncos) > 0
-        take!(sdr.ncos)
-    end
-    for _ = 1:(sdr.ncos.capacity-1)
-        put!(sdr.ncos, NCOUpdate(3, 1, 0.0Hz, 0.0Hz, 0))
-    end
-    @test GNSSReceiver.n_avail_space(sdr.ncos) == 0
-    @test (@test_logs (:warn, r"NCO feedback ring full") GNSSReceiver.push_nco_updates!(
-        link, track_state, boundary + 4000)) == 0
-    @test link.dropped_nco_updates == 1
-    @test [w.sample for w in timeline.scheduled] == [apply_at]
-
-    # Once the records that ran on a word have been folded, it is the applied word.
-    link.last_record_end[hw_channel] = apply_at + 8000
-    link.last_record_samples[hw_channel] = 4000
-    GNSSReceiver.promote_applied_words!(link)
-    @test isempty(timeline.scheduled)
-    @test timeline.applied_carrier_doppler == update.carrier_doppler
-
-    # A release clears it, and a new occupant starts on its own handover words.
-    empty_state = GNSSReceiver.ReceiverState(
-        ComplexF64, system; num_samples_for_acquisition = 20000, num_ants = NumAnts(1),
-        doppler_estimator = NCOReferencedPLLAndDLL()).track_state
-    GNSSReceiver.release_stale_channels!(link, empty_state)
-    @test mean_nco_word(timeline, 0, 1) == (0.0, 0.0)
-end
-
-@testset "A record is cut where the NCO word changed" begin
-    system = GPSL1CA()
-    key = get_signal_id(system)
-    prn = 9
-    sdr = RecordingSDR(EPL, 1)
-    link = HardwareCorrelatorLink(sdr; sampling_freq = 4e6Hz, reference_signal = system)
-    track_state = nco_track_state(system, prn)
-    assignment = GNSSReceiver.HardwareChannelAssignment(key, prn, 1)
-    link.assignments[1] = assignment
-    link.channel_of[assignment] = 1
-    signal() = Tracking.get_signals(get_sat_state(track_state, key, prn))[1]
-    outputs() = Tracking.get_correlator_outputs(get_sat_state(track_state, key, prn), 1)
-    # Post-sync, so the link would otherwise sum a chunk's dumps into one record.
-    bit_buffer = Tracking.get_bit_buffer(signal())
-    synced = typeof(bit_buffer)(
-        bit_buffer.code_block_buffer, bit_buffer.code_block_buffer_length, true, 0,
-        Int8(1), complex(0.0, 0.0), 0, bit_buffer.soft_bits, bit_buffer.phase_acc)
-    Tracking.get_sat_states(track_state, key)[prn] = Tracking.TrackedSat(
-        get_sat_state(track_state, key, prn);
-        signals = (Tracking.TrackedSignal(signal(); bit_buffer = synced),))
-
-    # Two dumps, no word change in between: one record, as before.
-    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 100_000))
-    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 104_000))
-    GNSSReceiver.flush_partial_records!(link, track_state)
-    @test only(outputs()).integrated_samples == 8000
-    empty!(outputs())
-    fill!(link.pending_blocks, 0)
-
-    # A word lands at the boundary between the two dumps: each is its own record,
-    # so neither straddles the switch.
-    schedule_word!(link.nco_timelines[1], 108_000, 1510.0, 1.51)
-    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 108_000))
-    @test isempty(outputs())
-    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 112_000))
-    @test length(outputs()) == 1
-    @test outputs()[1].integrated_samples == 4000
-    @test outputs()[1].sample_index == 108_000
-    GNSSReceiver.flush_partial_records!(link, track_state)
-    @test length(outputs()) == 2
-    @test outputs()[2].integrated_samples == 4000
-    empty!(outputs())
-    fill!(link.pending_blocks, 0)
-
-    # A word landing *inside* a dump cannot be cut; the dump that straddles it
-    # is closed off so the next one starts clean on the new word.
-    schedule_word!(link.nco_timelines[1], 114_000, 1520.0, 1.52)
-    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 116_000))
-    GNSSReceiver._append_dump!(link, track_state, dump_at(1, prn, 120_000))
-    GNSSReceiver.flush_partial_records!(link, track_state)
-    @test [o.integrated_samples for o in outputs()] == [4000, 4000]
-    @test mean_nco_word(link.nco_timelines[1], 112_000, 116_000) == (1515.0, 1.515)
-    @test mean_nco_word(link.nco_timelines[1], 116_000, 120_000) == (1520.0, 1.52)
-end
-
-@testset "The link hands the estimator the applied words and the landing sample" begin
-    system = GPSL1CA()
-    key = get_signal_id(system)
-    prn = 4
-    sdr = RecordingSDR(EPL, 2)
-    link = HardwareCorrelatorLink(sdr; sampling_freq = 4e6Hz, reference_signal = system)
-    band_systems = ((system,),)
-    band_measurements = (; L1 = Tracking.BandMeasurement(zeros(ComplexF64, 4000), 4e6Hz, 0.0Hz))
-    # A satellite handed over at 1000 Hz whose signal is really at 1000 Hz, so a
-    # prompt on the real axis means "no error" — unless the estimator believes
-    # the replica ran on some other word.
-    track_state = nco_track_state(system, prn; carrier_doppler = 1000.0Hz, code_doppler = 0.0Hz)
-    GNSSReceiver.sync_hardware_channels!(link, track_state, band_systems, band_measurements)
-    hw_channel = link.channel_of[GNSSReceiver.HardwareChannelAssignment(key, prn, 1)]
-    Tracking.append_noise_observation!(
-        track_state,
-        Tracking.noise_observation_from_samples(4000.0, 4000, 4e6Hz),
-        key,
-    )
-
-    # Fold one real-axis record with the handover word applied: nothing to
-    # correct, the command is the handover word.
-    Tracking.append_correlator_output!(
-        track_state,
-        CorrelatorOutput(epl(0.5, 1.0, 0.5), 4000, 100_000),
-        key, prn, 1,
-    )
-    link.latest_sample_index = 100_000
-    link.scheduled_apply_at_sample = GNSSReceiver.nco_apply_at_sample(link, 100_000)
-    GNSSReceiver.estimate_dopplers!(link, track_state, band_measurements)
-    @test get_carrier_doppler(get_sat_state(track_state, key, prn)) ≈ 1000.0Hz atol = 1e-9Hz
-
-    # Now the record ran on a word 40 Hz above the signal for its whole span —
-    # the estimator learns that from the timeline, not from its own last command
-    # — and the prompt has rotated accordingly. The absolute frequency
-    # measurement `word + FLL` says the signal is at 1000 Hz, so the command
-    # comes back toward it rather than restating the +40 Hz.
-    schedule_word!(link.nco_timelines[hw_channel], 100_000, 1040.0, 0.0)
-    rotated = cis(-2π * 40.0 * 0.5e-3)         # mean phase error over 1 ms at −40 Hz
-    Tracking.append_correlator_output!(
-        track_state,
-        CorrelatorOutput(epl(0.5rotated, rotated, 0.5rotated), 4000, 104_000),
-        key, prn, 1,
-    )
-    link.latest_sample_index = 104_000
-    link.scheduled_apply_at_sample = GNSSReceiver.nco_apply_at_sample(link, 104_000)
-    GNSSReceiver.estimate_dopplers!(link, track_state, band_measurements)
-    command = ustrip(Hz, get_carrier_doppler(get_sat_state(track_state, key, prn)))
-    @test command < 1040.0
-    # The same record folded through the software path (word = the satellite's
-    # own Doppler, no delay) reads the rotation as a real error and commands
-    # differently — the timeline is what the hardware fold adds.
-    software_state = nco_track_state(system, prn; carrier_doppler = 1000.0Hz, code_doppler = 0.0Hz)
-    Tracking.append_noise_observation!(
-        software_state, Tracking.noise_observation_from_samples(4000.0, 4000, 4e6Hz), key)
-    Tracking.append_correlator_output!(
-        software_state, CorrelatorOutput(epl(0.5, 1.0, 0.5), 4000, 100_000), key, prn, 1)
-    Tracking.estimate_dopplers_and_filter_prompt!(software_state, band_measurements)
-    Tracking.append_correlator_output!(
-        software_state, CorrelatorOutput(epl(0.5rotated, rotated, 0.5rotated), 4000, 104_000), key, prn, 1)
-    Tracking.estimate_dopplers_and_filter_prompt!(software_state, band_measurements)
-    software_command = ustrip(Hz, get_carrier_doppler(get_sat_state(software_state, key, prn)))
-    @test software_command != command
-    @test software_command < 1000.0     # it chases the rotation as a genuine error
-end
-
-@testset "The hardware receiver defaults to the NCO-referenced estimator" begin
-    # Through the public method only the estimator changes; everything else the
-    # link and pipeline do is as before (the closed-loop tests above run it).
-    system = GPSL1CA()
-    sdr = RecordingSDR(EPL, 2)
-    state = GNSSReceiver.ReceiverState(
-        ComplexF64, system; num_samples_for_acquisition = 20000, num_ants = NumAnts(1),
-        doppler_estimator = NCOReferencedPLLAndDLL())
-    @test state.track_state.doppler_estimator isa NCOReferencedPLLAndDLL
-    # A pre-built link must be the device's own.
-    other = RecordingSDR(EPL, 2)
-    link = HardwareCorrelatorLink(other; sampling_freq = 4e6Hz, reference_signal = system)
-    @test_throws ArgumentError receive(sdr, system, 4e6Hz; link, acquire_async = false)
 end

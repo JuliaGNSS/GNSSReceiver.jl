@@ -2,7 +2,7 @@
 # What a hardware correlator can do, and what it is asked to do
 # (GNSSReceiver.jl #131)
 #
-# The hardware path in `hardware_correlator.jl` was written against one device
+# The hardware path (`hardware_device.jl`) was written against one device
 # and one signal: GPS L1 C/A, a 1023-chip BPSK code, three taps. Every one of
 # those was an assumption rather than a statement — a request for Galileo E1B
 # reached the gateware unchallenged and failed later, as a `DimensionMismatch`
@@ -19,7 +19,7 @@
 #   * [`validate_hardware_configuration`](@ref) — run once, before the receiver
 #     starts, so an unserviceable request is an actionable error rather than a
 #     channel that never locks.
-#   * [`HardwareChannelConfig`](@ref) — the complete description of what one
+#   * the arm command a [`RemoteHardwareLoop`](@ref) sends — the complete description of what one
 #     hardware channel must do: every quantised tap offset, the replica
 #     amplitude and code normalisation, the overlay handling, the component's
 #     identity and its carrier-phase reference.
@@ -49,7 +49,7 @@ HardwareCorrelatorCapabilities(;
     bands = [:L1],                          # `GNSSSignals.get_band_id`s, or `nothing` for any
     num_rf_inputs = 1,                      # bands that can be received at once
     max_secondary_code_length = 1,          # longest overlay the gateway can wipe off; 1 = none
-    reports_code_phase = true,              # does it latch `CorrelatorDump.code_phase`?
+    reports_code_phase = true,              # does it latch the replica code phase per record?
     supports_partial_code_dumps = false,    # can it dump *inside* a code period?
 )
 ```
@@ -85,15 +85,14 @@ Fields:
     correlator one, and this is where it is declared.
   - `max_secondary_code_length` — the longest secondary (overlay) code the
     gateware can wipe off itself, or `1` for "primary code only". Purely a
-    declaration: the host removes the overlay from the dumps itself once the
-    sync detector has found its phase (see
-    [`GNSSReceiver.requested_secondary_code_mode`](@ref)), so nothing asks a
-    device to do it and `1` costs a device nothing. It is what
+    declaration: the loop process removes the overlay from the records itself
+    once the sync detector has found its phase, so nothing asks a device to do
+    it and `1` costs a device nothing. It is what
     [`supports_secondary_code_wipeoff`](@ref) reads, and what a future
     *scheduled* wipeoff contract — which would let a device pre-accumulate
     across code periods — would gate on.
   - `reports_code_phase` — whether the device latches the replica's code phase
-    alongside the accumulators (`CorrelatorDump.code_phase`). Informational:
+    alongside the accumulators (the record's code phase). Informational:
     without it pseudoranges are dead-reckoned from the handover seed rather
     than anchored to the replica the DLL steers, and a partial-primary record
     stream has to dead-reckon its place on the code-block grid from the
@@ -108,8 +107,8 @@ Fields:
     on the wrap hands the tracking loops one record and one NCO correction every
     1.5 s. [`hardware_support_error`](@ref) refuses that combination before a
     channel is armed — see its `max_integration_time` keyword for where the
-    line is drawn, and [`GNSSReceiver.coherent_integration_periods`](@ref) for
-    what the host does with a device that can.
+    line is drawn. What the loop process does with a device that can dump inside
+    a code period is HardwareLoopCore's record accounting.
 
 A device declares its own with [`hardware_capabilities`](@ref); one that does
 not is taken to be [`LEGACY_GPS_L1CA_CAPABILITIES`](@ref).
@@ -216,7 +215,7 @@ orders of magnitude past it, so its records are *partial*: cut inside a code
 period, counted as the fraction of one they are, and never as a completed
 period.
 
-Both the link ([`HardwareCorrelatorLink`](@ref)'s `max_integration_time`) and
+Both the loop process (its `LoopConfig.max_integration_time`) and
 the pre-arm gate ([`hardware_support_error`](@ref)) read it, so a device is
 refused for exactly the signals the configured integration length cannot serve.
 """
@@ -239,11 +238,11 @@ gateware, so consecutive dumps can be summed without the overlay cancelling
 them.
 
 `false` — the default for every device — is not an error, and `true` changes
-nothing today: the host removes the overlay from each primary-period dump once
-it knows its phase, so [`HardwareChannelConfig`](@ref) asks for `:primary_only`
-whatever a device declares. See
-[`GNSSReceiver.requested_secondary_code_mode`](@ref) for why ownership sits
-there, and [`coherent_integration_blocks`](@ref) for what the removal unlocks.
+nothing today: the loop process removes the overlay from each primary-period
+record once it knows its phase, so every arm command asks for `:primary_only`
+whatever a device declares. The "Secondary codes" section of the
+[hardware-correlator contract](@ref "Hardware-correlator contract") says why
+ownership sits there, and what the removal unlocks.
 """
 supports_secondary_code_wipeoff(
     capabilities::HardwareCorrelatorCapabilities,
@@ -445,7 +444,7 @@ to_receiver_samples(plan::HardwareBandPlan, band_id::Symbol, sample) =
 
 Map a count on the receiver timebase onto `band_id`'s own device counter — the
 inverse of [`to_receiver_samples`](@ref), and what a handover time or an
-[`NCOUpdate`](@ref)'s `apply_at_sample` is expressed in before it is handed to
+an NCO word's landing sample is expressed in before it is handed to
 the device.
 """
 to_band_samples(plan::HardwareBandPlan, band_id::Symbol, sample) =
@@ -583,7 +582,7 @@ device's dump record carries — a wire too narrow for the correlator cannot
 transport it, which is the same refusal one step earlier in the path.
 
 `max_integration_time` is the longest span of signal the receiver will fold into
-one record (the link's own `max_integration_time`, and
+one record (the loop process's `max_integration_time`, and
 [`DEFAULT_MAX_INTEGRATION_TIME`](@ref) here). It is what decides whether the
 signal's *primary code period* can be the unit of integration: past it a record
 has to be cut inside a code period, which a device that only dumps on the code
@@ -714,170 +713,11 @@ known from the type alone — before any dump has arrived, and without an
 instance to take a `length` of. `nothing` for a correlator type this package
 does not know the width of, which simply skips the wire-width check.
 
-A device's [`correlator_dump_channel`](@ref) fixes one such type for the whole
-run, and it has to be wide enough for every correlator the receiver tracks
-with: a three-slot record cannot carry a five-tap correlator, and the host
-will not invent the missing taps.
+A device's record format fixes one such width for the whole run, and it has
+to be wide enough for every correlator the receiver tracks with: a three-slot
+record cannot carry a five-tap correlator, and the loop will not invent the
+missing taps.
 """
 wire_tap_slots(::Type{<:Tracking.AbstractCorrelator}) = nothing
 wire_tap_slots(::Type{<:Tracking.EarlyPromptLateCorrelator}) = 3
 wire_tap_slots(::Type{<:Tracking.VeryEarlyPromptLateCorrelator}) = 5
-
-# ─────────────────────────────────────────────────────────────────────────────
-# The complete channel configuration
-# ─────────────────────────────────────────────────────────────────────────────
-
-"""
-    HardwareChannelConfig
-
-Everything one hardware channel needs to replicate and correlate one signal
-component of one satellite — the argument of the modern
-[`assign_channel!`](@ref).
-
-The legacy call passed a PRN, three Dopplers and an Early-to-Late spacing, and
-left everything else to a shared assumption. This carries the lot:
-
-  - `signal` — the `AbstractGNSSSignal` to replicate, and `signal_index` /
-    `group_key` / `prn`, which together identify *which component of which
-    satellite* the channel serves. A pilot/data pair occupies two channels that
-    differ only in `signal` and `signal_index`.
-  - `carrier_doppler` / `code_doppler` (Hz) and `code_phase` (chips) describe
-    the satellite at `valid_at_sample`, a count of raw samples the host has
-    consumed since the run began — unchanged from the legacy handover contract.
-  - `tap_sample_shifts` — **all** quantised replica offsets in whole input
-    samples, latest first, prompt at zero: `[-2, 0, 2]` for a three-tap bank,
-    `[-2, -1, 0, 1, 2]` for a five-tap one. Program exactly these. They are
-    what `Tracking` recovers from the correlator it is handed and normalises
-    the discriminators by, so a device that re-derives its own from the
-    preferred chip shift introduces a loop-gain error (~2.3 % at 4 MHz and
-    0.5 chips) or, for a five-tap bank, an outright wrong VE/VL distance.
-  - `el_sample_spacing` — the Early-to-Late distance in samples, i.e.
-    `tap_sample_shifts[early] - tap_sample_shifts[late]`. Redundant with the
-    shifts and kept because it is the one number the legacy interface carried.
-  - `replica_amplitude` — the amplitude of the carrier replica the device
-    wipes off with, relative to the unit-amplitude replica a host correlator
-    would use, for this channel's band (see [`correlator_gain`](@ref)). The
-    ingest divides it out.
-  - `code_amplitude` — the RMS amplitude of the *code* replica the device
-    correlates with (see [`replica_code_amplitude`](@ref)). The ingest rescales
-    to `GNSSSignals.get_code_amplitude(signal)`, so a gateware approximation
-    does not move the satellite's C/N₀.
-  - `secondary_code_mode` — `:primary_only` (the device replicates the primary
-    code and the host removes the overlay from each dump) or `:wipeoff` (the
-    device removes it, so its dumps carry none). The link asks for
-    `:primary_only` for every device and every signal — an overlay's phase is
-    not known when a channel is armed, so the host owns the removal; see
-    [`GNSSReceiver.requested_secondary_code_mode`](@ref). What `:primary_only`
-    obliges a device to is one record per primary code period, which is the
-    dump contract anyway: a record spanning several code periods has summed
-    their overlay chips inside the accumulator, where no single sign takes them
-    off again.
-  - `carrier_phase_offset` — the component's carrier phase against its band's
-    in-phase reference, in radians (`GNSSSignals.get_carrier_phase_offset`).
-    The device **must not** apply it: it mixes every component of a band
-    against one common in-phase carrier, so the ICD phase relationship survives
-    into the accumulators, which is what lets the host lock the driver
-    component on the real axis and de-rotate the others onto it. A device that
-    cannot help rotating per component must remove exactly this value again.
-  - `band_id` / `sampling_freq` — which RF band the channel lives on and the
-    sample rate its `tap_sample_shifts` and `valid_at_sample` are counted in.
-    Per-band, because gain, sample rate and replica offsets are all per-band.
-  - `rf_input` / `device_index` — which RF input of which device that band
-    arrives on ([`HardwareBandRoute`](@ref)). This is what tells a multi-band
-    front end which correlator bank to arm the channel in and which datapath to
-    tap; a single-input device sees `1`/`1` and nothing changes. **An RF input
-    is not an antenna**: the channel still despreads every antenna of its band
-    into one `SVector{N,Complex}` accumulator per tap.
-
-!!! note "`valid_at_sample` is on this band's own counter"
-
-    A multi-band device counts each band at its own rate, so the handover time
-    is converted before it is handed over: the same instant is `40 000` on a
-    4 MS/s band and `50 000` on a 5 MS/s one. Propagate it on the counter of
-    `band_id`, which is also the counter every [`CorrelatorDump`](@ref) from
-    this channel and every [`NCOUpdate`](@ref) to it is expressed on. The
-    receiver keeps its own timebase (the reference band's) and does the
-    conversion — see [`HardwareBandPlan`](@ref).
-
-Built by the link from the tracking state; a vendor package only reads it.
-"""
-struct HardwareChannelConfig{S<:AbstractGNSSSignal}
-    signal::S
-    signal_index::Int
-    group_key::Symbol
-    prn::Int
-    carrier_doppler::Float64
-    code_doppler::Float64
-    code_phase::Float64
-    valid_at_sample::Int64
-    tap_sample_shifts::Vector{Int}
-    el_sample_spacing::Int
-    replica_amplitude::Float64
-    code_amplitude::Float64
-    secondary_code_mode::Symbol
-    carrier_phase_offset::Float64
-    band_id::Symbol
-    sampling_freq::Float64
-    rf_input::Int
-    device_index::Int
-end
-
-function HardwareChannelConfig(
-    signal::AbstractGNSSSignal,
-    correlator::Tracking.AbstractCorrelator;
-    signal_index::Integer,
-    group_key::Symbol,
-    prn::Integer,
-    carrier_doppler,
-    code_doppler,
-    code_phase,
-    valid_at_sample::Integer,
-    sampling_freq,
-    replica_amplitude::Real = 1.0,
-    code_amplitude::Real = get_code_amplitude(signal),
-    secondary_code_mode::Symbol = :primary_only,
-    rf_input::Integer = 1,
-    device_index::Integer = 1,
-)
-    secondary_code_mode in (:primary_only, :wipeoff) || throw(
-        ArgumentError(
-            "secondary_code_mode must be :primary_only or :wipeoff " *
-            "(got $secondary_code_mode)",
-        ),
-    )
-    code_frequency = get_code_frequency(signal)
-    shifts = _tap_sample_shifts(correlator, sampling_freq, code_frequency)
-    HardwareChannelConfig(
-        signal,
-        Int(signal_index),
-        group_key,
-        Int(prn),
-        _hz(carrier_doppler),
-        _hz(code_doppler),
-        Float64(code_phase),
-        Int64(valid_at_sample),
-        shifts,
-        Int(
-            Tracking.get_early_late_sample_spacing(
-                correlator,
-                _hz(sampling_freq),
-                _hz(code_frequency),
-            ),
-        ),
-        Float64(replica_amplitude),
-        Float64(code_amplitude),
-        secondary_code_mode,
-        Float64(get_carrier_phase_offset(signal)),
-        get_band_id(get_band(signal)),
-        _hz(sampling_freq),
-        Int(rf_input),
-        Int(device_index),
-    )
-end
-
-# The amplitude scale the ingest divides a channel's accumulators by, so that a
-# record off this device lands where the host's own correlator would have put
-# it: the carrier replica's amplitude out, and the device's code table rescaled
-# to the one GNSSSignals models. See `replica_code_amplitude`.
-correlator_output_scale(config::HardwareChannelConfig) =
-    config.replica_amplitude * config.code_amplitude / get_code_amplitude(config.signal)

@@ -1,91 +1,67 @@
-# Tests for the hardware-correlator capability query, pre-arm validation and the
-# complete correlator configuration (issue #131).
+# Tests for the hardware-correlator capability query and the pre-arm validation
+# (issue #131).
 #
 # The hardware path shipped with #107/#129 assumed every device was the one it
 # was written against: GPS L1 C/A, three taps, a 1023-chip code. These tests pin
-# what a device is now allowed to be, what it has to declare, and what the link
-# does with the declaration — most importantly that a request the device cannot
-# serve is refused *before* a channel is armed, and that a link can carry
-# three-tap and five-tap records at the same time without inventing taps.
-#
-# `RecordingSDR`, `epl` and `EPL` come from test/hardware_correlator.jl, which
-# runtests.jl includes first.
+# what a device is now allowed to be, what it has to declare, and — most
+# importantly — that a request the device cannot serve is refused *before* a
+# channel is armed. What the loop process then does with an arm is
+# HardwareLoopCore's to test; the receiver's side of it is in
+# test/remote_hardware_loop.jl.
 
 using GNSSReceiver:
     HardwareCorrelatorCapabilities,
-    HardwareChannelConfig,
     LEGACY_GPS_L1CA_CAPABILITIES,
     check_hardware_support,
     hardware_capabilities,
     hardware_support_error,
-    num_correlator_taps,
     replica_code_amplitude,
     supports_secondary_code_wipeoff,
-    validate_hardware_configuration
+    validate_hardware_configuration,
+    wire_tap_slots
 
-using Tracking:
-    VeryEarlyPromptLateCorrelator,
-    get_correlator_outputs,
-    get_default_correlator,
-    get_num_accumulators
+using Tracking: EarlyPromptLateCorrelator, VeryEarlyPromptLateCorrelator, get_default_correlator
 
-# The five-slot wire record a device that also serves BOC signals dumps.
-vepl(very_late, late, prompt, early, very_early) = VeryEarlyPromptLateCorrelator(
-    SVector{5,ComplexF64}(very_late, late, prompt, early, very_early),
-    0.15,
-    0.6,
-)
-const VEPL = typeof(vepl(0, 0, 0, 0, 0))
+# A device that declares nothing beyond the two required methods: the legacy
+# GPS L1 C/A device every adapter written before the capability query is.
+struct LegacySDR <: AbstractHardwareCorrelatorSDR
+    raw::GNSSReceiver.SignalChannel{ComplexF64,1}
+    n_channels::Int
+end
+LegacySDR(n_channels) = LegacySDR(GNSSReceiver.SignalChannel{ComplexF64,1}(4000, 4), n_channels)
+GNSSReceiver.raw_sample_channel(sdr::LegacySDR) = sdr.raw
+GNSSReceiver.num_hardware_channels(sdr::LegacySDR) = sdr.n_channels
 
-# A device that declares what it can do, implements the *new* assignment form
-# directly (no legacy shim), and can be given per-band replica gains and
-# per-signal replica code amplitudes.
-struct CapableSDR{C} <: AbstractHardwareCorrelatorSDR
-    dumps::PipeChannel{CorrelatorDump{C}}
-    ncos::PipeChannel{NCOUpdate}
+# A device that declares what it can do and can be given per-band replica gains
+# and per-signal replica code amplitudes.
+struct CapableSDR <: AbstractHardwareCorrelatorSDR
+    raw::GNSSReceiver.SignalChannel{ComplexF64,1}
     n_channels::Int
     caps::HardwareCorrelatorCapabilities
     band_gains::Dict{Symbol,Float64}
     code_amplitudes::Dict{Symbol,Float64}
-    assigned::Vector{HardwareChannelConfig}
-    released::Vector{Int}
 end
 
 CapableSDR(
-    ::Type{C},
     n_channels,
     caps;
     band_gains = Dict{Symbol,Float64}(),
     code_amplitudes = Dict{Symbol,Float64}(),
-    capacity = 256,
-) where {C} = CapableSDR{C}(
-    PipeChannel{CorrelatorDump{C}}(capacity),
-    PipeChannel{NCOUpdate}(capacity),
+) = CapableSDR(
+    GNSSReceiver.SignalChannel{ComplexF64,1}(4000, 4),
     n_channels,
     caps,
     band_gains,
     code_amplitudes,
-    HardwareChannelConfig[],
-    Int[],
 )
 
-GNSSReceiver.correlator_dump_channel(sdr::CapableSDR) = sdr.dumps
-GNSSReceiver.nco_update_channel(sdr::CapableSDR) = sdr.ncos
+GNSSReceiver.raw_sample_channel(sdr::CapableSDR) = sdr.raw
 GNSSReceiver.num_hardware_channels(sdr::CapableSDR) = sdr.n_channels
 GNSSReceiver.hardware_capabilities(sdr::CapableSDR) = sdr.caps
-GNSSReceiver.release_channel!(sdr::CapableSDR, hw_channel) = push!(sdr.released, hw_channel)
 GNSSReceiver.correlator_gain(sdr::CapableSDR, band_id::Symbol) =
     get(sdr.band_gains, band_id, 1.0)
 GNSSReceiver.replica_code_amplitude(sdr::CapableSDR, signal::AbstractGNSSSignal) =
     get(sdr.code_amplitudes, get_signal_id(signal), get_code_amplitude(signal))
-function GNSSReceiver.assign_channel!(
-    sdr::CapableSDR,
-    hw_channel,
-    config::HardwareChannelConfig,
-)
-    push!(sdr.assigned, config)
-    nothing
-end
 
 # An L1 device that serves both the three-tap BPSK and the five-tap BOC families.
 const L1_WIDE_CAPABILITIES = HardwareCorrelatorCapabilities(;
@@ -102,7 +78,7 @@ const L1_WIDE_CAPABILITIES = HardwareCorrelatorCapabilities(;
 )
 
 @testset "A device that declares nothing is the legacy GPS L1 C/A device" begin
-    sdr = RecordingSDR(EPL, 4)
+    sdr = LegacySDR(4)
     caps = hardware_capabilities(sdr)
     @test caps === LEGACY_GPS_L1CA_CAPABILITIES
     @test caps.signals == [:GPSL1CA]
@@ -120,7 +96,7 @@ const L1_WIDE_CAPABILITIES = HardwareCorrelatorCapabilities(;
 end
 
 @testset "An unsupported signal is refused with an actionable error" begin
-    sdr = RecordingSDR(EPL, 4)
+    sdr = LegacySDR(4)
     msg = hardware_support_error(
         LEGACY_GPS_L1CA_CAPABILITIES,
         GalileoE1B(),
@@ -144,11 +120,11 @@ end
     end
     @test err isa ArgumentError
     @test occursin("GalileoE1B", err.msg)
-    @test occursin("RecordingSDR", err.msg)
+    @test occursin("LegacySDR", err.msg)
 end
 
 @testset "Configurations are validated before any channel is armed" begin
-    sdr = RecordingSDR(EPL, 4)
+    sdr = LegacySDR(4)
     # The regression baseline passes.
     @test isnothing(validate_hardware_configuration(sdr, (GPSL1CA(),), 4e6Hz))
 
@@ -159,8 +135,6 @@ end
     end
     @test err isa ArgumentError
     @test occursin("GalileoE1B", err.msg)
-    # Nothing reached the device.
-    @test isempty(sdr.assigned)
 
     # A CombinedSignal is validated component by component: the pilot is fine
     # for a three-tap L5 device, the data component too, but neither is for an
@@ -172,110 +146,50 @@ end
     )
 end
 
-@testset "receive refuses an unsupported signal before the device is touched" begin
-    sdr = SimulatedFPGA(GPSL1CA(); sampling_freq = 4e6, chunk = 4000)
+@testset "A capable device is validated against what it declares" begin
+    sdr = CapableSDR(4, L1_WIDE_CAPABILITIES)
+    @test isnothing(validate_hardware_configuration(sdr, (GPSL1CA(), GalileoE1B()), 4e6Hz))
+    # Something outside the declaration is still refused, by name.
     err = try
-        receive(sdr, GalileoE1B(), 4e6Hz; acquire_async = false)
+        validate_hardware_configuration(sdr, (GPSL5I(),), 4e6Hz)
     catch e
         e
     end
     @test err isa ArgumentError
-    @test occursin("GalileoE1B", err.msg)
-    @test isempty(sdr.handovers)
+    @test occursin("GPSL5I", err.msg)
+    @test occursin("CapableSDR", err.msg)
 end
 
-@testset "A dump record too narrow for the tracked correlator is caught up front" begin
-    # The device says it serves the five-tap family, but its dump ring carries
+@testset "A record too narrow for the tracked correlator is caught up front" begin
+    # A device that serves the five-tap family over a record format carrying
     # only three accumulator slots: the record cannot transport the correlator.
-    sdr = CapableSDR(EPL, 4, L1_WIDE_CAPABILITIES)
-    err = try
-        validate_hardware_configuration(sdr, (GalileoE1B(),), 4e6Hz)
-    catch e
-        e
-    end
-    @test err isa ArgumentError
-    @test occursin("GalileoE1B", err.msg)
-    @test occursin("3", err.msg)
-    @test occursin("slot", err.msg)
-    # The same device is fine for the three-tap signal it can carry.
-    @test isnothing(validate_hardware_configuration(sdr, (GPSL1CA(),), 4e6Hz))
-end
-
-@testset "The assignment describes the whole correlator configuration" begin
-    sdr = CapableSDR(VEPL, 4, L1_WIDE_CAPABILITIES)
-    link = HardwareCorrelatorLink(
-        sdr;
-        sampling_freq = 4e6Hz,
-        reference_signal = GPSL1CA(),
-        noise_source = :samples,
-    )
-    track_state =
-        TrackState(; signals = (GPSL1CA = (GPSL1CA(),), GalileoE1B = (GalileoE1B(),)))
-    track_state = add_satellite!(
-        track_state;
-        prn = 1,
-        group = :GPSL1CA,
-        code_phase = 0.0,
-        carrier_doppler = 0.0Hz,
-    )
-    track_state = add_satellite!(
-        track_state;
-        prn = 2,
-        group = :GalileoE1B,
-        code_phase = 0.0,
-        carrier_doppler = 0.0Hz,
-    )
-    band_systems = ((GPSL1CA(), GalileoE1B()),)
-    band_measurements =
-        (; L1 = Tracking.BandMeasurement(zeros(ComplexF64, 4000), 4e6Hz, 0.0Hz))
-    GNSSReceiver.sync_hardware_channels!(link, track_state, band_systems, band_measurements)
-
-    @test length(sdr.assigned) == 2
-    l1ca = sdr.assigned[findfirst(c -> c.prn == 1, sdr.assigned)]
-    e1b = sdr.assigned[findfirst(c -> c.prn == 2, sdr.assigned)]
-
-    # Every quantised tap offset, latest first and prompt at zero — not just the
-    # Early-to-Late distance the old interface handed over.
-    @test l1ca.tap_sample_shifts == [-2, 0, 2]
-    @test l1ca.el_sample_spacing == 4
-    @test e1b.tap_sample_shifts == [-2, -1, 0, 1, 2]
-    @test e1b.el_sample_spacing == 2
-    # …and they agree with what Tracking would quantise for the tracked
-    # correlator, which is what the DLL normalises by.
-    @test e1b.el_sample_spacing == Tracking.get_early_late_sample_spacing(
+    @test wire_tap_slots(typeof(get_default_correlator(GPSL1CA()))) == 3
+    @test wire_tap_slots(typeof(get_default_correlator(GalileoE1B()))) == 5
+    msg = hardware_support_error(
+        L1_WIDE_CAPABILITIES,
+        GalileoE1B(),
         get_default_correlator(GalileoE1B()),
-        4e6Hz,
-        get_code_frequency(GalileoE1B()),
+        4e6Hz;
+        dump_tap_slots = 3,
     )
-
-    # Signal/component identity, so a pilot/data pair is distinguishable.
-    @test l1ca.signal isa GPSL1CA
-    @test l1ca.signal_index == 1
-    @test l1ca.group_key == :GPSL1CA
-    @test e1b.signal isa GalileoE1B
-
-    # Replica amplitude / normalisation and the overlay contract.
-    @test l1ca.replica_amplitude == 1.0
-    @test l1ca.code_amplitude == get_code_amplitude(GPSL1CA())
-    @test e1b.code_amplitude == get_code_amplitude(GalileoE1B())
-    @test l1ca.secondary_code_mode === :primary_only
-    @test e1b.secondary_code_mode === :primary_only
-
-    # The component carrier-phase convention: the assignment states the
-    # component's ICD phase against the band's in-phase reference, which the
-    # device must *not* fold into the accumulators.
-    @test l1ca.carrier_phase_offset == get_carrier_phase_offset(GPSL1CA())
-    @test e1b.carrier_phase_offset == get_carrier_phase_offset(GalileoE1B())
-
-    @test l1ca.band_id === :L1
-    @test l1ca.sampling_freq == 4e6
+    @test !isnothing(msg)
+    @test occursin("GalileoE1B", msg)
+    @test occursin("3", msg)
+    @test occursin("slot", msg)
+    # The same record is fine for the three-tap signal it can carry.
+    @test isnothing(
+        hardware_support_error(
+            L1_WIDE_CAPABILITIES,
+            GPSL1CA(),
+            get_default_correlator(GPSL1CA()),
+            4e6Hz;
+            dump_tap_slots = 3,
+        ),
+    )
 end
 
-@testset "Mixed three- and five-tap dumps reach the right tracked signals" begin
-    # A five-slot wire carrying both layouts: the L1 C/A channel fills three
-    # slots and says so, the Galileo E1B channel fills five.
+@testset "Replica amplitudes are the device's to declare, per band and per signal" begin
     sdr = CapableSDR(
-        VEPL,
         4,
         L1_WIDE_CAPABILITIES;
         band_gains = Dict(:L1 => 4.0),
@@ -283,98 +197,13 @@ end
         # code amplitude is 1 where GNSSSignals' CBOC table's is ~19.9.
         code_amplitudes = Dict(:GalileoE1B => 1.0),
     )
-    link = HardwareCorrelatorLink(
-        sdr;
-        sampling_freq = 4e6Hz,
-        reference_signal = GPSL1CA(),
-        noise_source = :samples,
-    )
-    track_state =
-        TrackState(; signals = (GPSL1CA = (GPSL1CA(),), GalileoE1B = (GalileoE1B(),)))
-    track_state = add_satellite!(
-        track_state;
-        prn = 1,
-        group = :GPSL1CA,
-        code_phase = 0.0,
-        carrier_doppler = 0.0Hz,
-    )
-    track_state = add_satellite!(
-        track_state;
-        prn = 2,
-        group = :GalileoE1B,
-        code_phase = 0.0,
-        carrier_doppler = 0.0Hz,
-    )
-    band_systems = ((GPSL1CA(), GalileoE1B()),)
-    band_measurements =
-        (; L1 = Tracking.BandMeasurement(zeros(ComplexF64, 4000), 4e6Hz, 0.0Hz))
-    GNSSReceiver.sync_hardware_channels!(link, track_state, band_systems, band_measurements)
-
-    l1ca_channel = link.channel_of[GNSSReceiver.HardwareChannelAssignment(:GPSL1CA, 1, 1)]
-    e1b_channel = link.channel_of[GNSSReceiver.HardwareChannelAssignment(:GalileoE1B, 2, 1)]
-
-    # Three meaningful taps in the leading slots of the five-slot wire record.
-    three_tap = CorrelatorDump(
-        l1ca_channel,
-        1,
-        CorrelatorOutput(vepl(40, 100, 40, 0, 0), 4000, 4000),
-        NaN,
-        3,
-    )
-    five_tap = CorrelatorDump(
-        e1b_channel,
-        2,
-        CorrelatorOutput(vepl(10, 40, 100, 40, 10), 4000, 4000),
-        NaN,
-        5,
-    )
-    @test num_correlator_taps(three_tap) == 3
-    @test num_correlator_taps(five_tap) == 5
-
-    GNSSReceiver._append_dump!(link, track_state, three_tap)
-    GNSSReceiver._append_dump!(link, track_state, five_tap)
-    GNSSReceiver.flush_partial_records!(link, track_state)
-
-    l1ca_out = only(get_correlator_outputs(get_sat_state(track_state, :GPSL1CA, 1), 1))
-    e1b_out = only(get_correlator_outputs(get_sat_state(track_state, :GalileoE1B, 2), 1))
-
-    # The record is retagged with the *tracked* correlator's type and spacing —
-    # no invented taps in either direction.
-    @test l1ca_out.correlator isa EarlyPromptLateCorrelator
-    @test get_num_accumulators(l1ca_out.correlator) == 3
-    @test e1b_out.correlator isa VeryEarlyPromptLateCorrelator
-    @test get_num_accumulators(e1b_out.correlator) == 5
-    @test l1ca_out.correlator.preferred_early_late_to_prompt_code_shift == 0.5
-    @test e1b_out.correlator.preferred_early_late_to_prompt_code_shift == 0.15
-    @test e1b_out.correlator.preferred_very_early_late_to_prompt_code_shift == 0.6
-
-    # Normalisation: the band's replica gain divides out, and the device's own
-    # code amplitude is rescaled to the one GNSSSignals reports, so a prompt
-    # lands on the same amplitude scale whatever the gateware replicated.
-    @test get_accumulators(l1ca_out.correlator) ≈ SVector{3,ComplexF64}(40, 100, 40) ./ 4.0
-    e1b_scale = 4.0 * 1.0 / get_code_amplitude(GalileoE1B())
-    @test get_accumulators(e1b_out.correlator) ≈
-          SVector{5,ComplexF64}(10, 40, 100, 40, 10) ./ e1b_scale
-
-    # A record whose tap count does not match the tracked correlator is refused
-    # rather than reshaped into it.
-    mismatched = CorrelatorDump(
-        e1b_channel,
-        2,
-        CorrelatorOutput(vepl(40, 100, 40, 0, 0), 4000, 8000),
-        NaN,
-        3,
-    )
-    GNSSReceiver._append_dump!(link, track_state, mismatched)
-    GNSSReceiver.flush_partial_records!(link, track_state)
-    @test link.tap_layout_mismatches == 1
-    @test length(get_correlator_outputs(get_sat_state(track_state, :GalileoE1B, 2), 1)) == 1
-end
-
-@testset "A dump defaults to the tap count its wire record carries" begin
-    d = CorrelatorDump(1, 5, CorrelatorOutput(epl(0.4, 1.0, 0.4), 4000, 4000), NaN)
-    @test num_correlator_taps(d) == 3
-    @test isbitstype(typeof(d))
-    wide = CorrelatorDump(1, 5, CorrelatorOutput(vepl(1, 2, 3, 2, 1), 4000, 4000))
-    @test num_correlator_taps(wide) == 5
+    @test GNSSReceiver.correlator_gain(sdr, :L1) == 4.0
+    @test GNSSReceiver.correlator_gain(sdr, :L5) == 1.0
+    @test replica_code_amplitude(sdr, GalileoE1B()) == 1.0
+    @test replica_code_amplitude(sdr, GPSL1CA()) == get_code_amplitude(GPSL1CA())
+    # The defaults: unit carrier replica, the modelled code amplitude.
+    legacy = LegacySDR(4)
+    @test GNSSReceiver.correlator_gain(legacy) == 1
+    @test GNSSReceiver.correlator_gain(legacy, :L1) == 1
+    @test replica_code_amplitude(legacy, GalileoE1B()) == get_code_amplitude(GalileoE1B())
 end
