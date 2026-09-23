@@ -381,6 +381,9 @@ function plan_band_acquisition(
     sampling_freq,
     acq_doppler_resolutions;
     prns = nothing,
+    acq_min_doppler_coverage = nothing,
+    acq_coherent_integration_time = nothing,
+    acq_noncoherent_rounds::Integer = 1,
 )
     systems = as_systems(systems)
 
@@ -400,17 +403,31 @@ function plan_band_acquisition(
 
     # Coherent code periods per system from the required Doppler resolution
     # (bin spacing = 1 / (nc · T_code)), snapped to a length `plan_acquire` accepts.
+    # An explicit `acq_coherent_integration_time` overrides the derivation — for
+    # front ends whose noise or LO stability demands a specific coherent length —
+    # and is snapped the same way.
     ncoh = map(acq_systems, acq_doppler_resolutions) do system, acq_doppler_resolution
-        # `ideal` is the minimum coherent length meeting the required resolution
-        # (`ceil`, so the achieved resolution never exceeds the required maximum).
-        ideal = coherent_code_periods_for_resolution(system, acq_doppler_resolution)
+        ideal = if isnothing(acq_coherent_integration_time)
+            # The minimum coherent length meeting the required resolution
+            # (`ceil`, so the achieved resolution never exceeds the required maximum).
+            coherent_code_periods_for_resolution(system, acq_doppler_resolution)
+        else
+            code_period = get_code_length(system) / get_code_frequency(system)
+            max(1, round(Int, upreferred(acq_coherent_integration_time / code_period)))
+        end
         snap_coherent_code_periods(system, sampling_freq, ideal)
     end
 
-    # Size this band's buffer to the largest coherent plan window
-    # (nc · samples_per_code).
+    # Size this band's buffer to the largest plan window: `acq_noncoherent_rounds`
+    # noncoherent segments of nc coherent code periods each. Noncoherent rounds
+    # buy detection sensitivity (~1.5 dB per doubling) without stretching the
+    # coherent window past what the front end's phase stability supports.
     num_samples_for_acquisition = maximum(
-        map((s, nc) -> nc * samples_per_code(s, sampling_freq), acq_systems, ncoh),
+        map(
+            (s, nc) -> acq_noncoherent_rounds * nc * samples_per_code(s, sampling_freq),
+            acq_systems,
+            ncoh,
+        ),
     )
 
     # One acquisition plan per system, keyed like the tracking groups. The plan is
@@ -420,16 +437,25 @@ function plan_band_acquisition(
     acq_plans = NamedTuple{group_keys}(map(systems, acq_systems, ncoh) do system, acq_sys, nc
         # Per-GNSS candidate PRNs restricted to those that broadcast this signal.
         prns_for_system = search_prns(prns, data_signal(system))
+        # `min_doppler_coverage` is one-sided; leave `plan_acquire`'s default
+        # (±7 kHz, ample for a disciplined front end) unless the caller widened
+        # it — needed when the LO offset alone pushes the apparent Doppler far
+        # beyond the physical ±5 kHz.
+        coverage =
+            isnothing(acq_min_doppler_coverage) ? (;) :
+            (; min_doppler_coverage = acq_min_doppler_coverage)
         plan_acquire(
             acq_sys,
             float(sampling_freq),
             collect(prns_for_system);
             num_coherently_integrated_code_periods = nc,
+            num_noncoherent_accumulations = acq_noncoherent_rounds,
             # Pass our own cap rather than relying on `plan_acquire`'s default: this
             # is the same value the `acquisition_signal` chooser gates on, so the
             # selection decision and the plan's actual rotation-search cap can never
             # drift apart (Acquisition exposes no queryable constant for its default).
             max_secondary_code_rotations = MAX_SECONDARY_CODE_ROTATIONS,
+            coverage...,
         )
     end)
 
@@ -449,10 +475,13 @@ tracked and decoded, and all are fused into a single multi-GNSS PVT solution. Th
 multi-band method takes a tuple of measurement channels (one per RF band), a tuple of
 per-band system groups and a tuple of `interm_freqs`, all aligned band-by-band, and fuses
 every band into one solution with per-constellation clock biases and per-band
-inter-frequency biases. The band channels must deliver equal-length frames from one shared
-time base (e.g. a single capture split by front-end channel) so one frame per band stays
-aligned each step. The number of antenna channels in each `SignalChannel` must equal `N`
-in `num_ants`.
+inter-frequency biases. The band channels must deliver frames of equal *duration* from
+one shared time base (e.g. a single capture split by front-end channel) so one frame per
+band stays aligned each step; the **first** band is the receiver's clock. `sampling_freq`
+is one frequency for every band — the usual case of one sample clock feeding the front
+end — or a tuple aligned with the bands, for a front end whose bands genuinely run at
+different rates, in which case the frames differ in length but not in span. The number of
+antenna channels in each `SignalChannel` must equal `N` in `num_ants`.
 
 Sampled at `sampling_freq`, each chunk is processed by [`process`](@ref) in a spawned
 task; one `ReceiverDataOfInterest` is emitted per `pvt_update_interval`. Acquisition
@@ -516,6 +545,32 @@ function receive(
     # or a plain collection applied to every system. Each system's search is further
     # restricted to the PRNs that broadcast its signal (see `broadcasting_prns`).
     prns = nothing,
+    # One-sided acquisition Doppler coverage. `nothing` ⇒ Acquisition's default
+    # (±7 kHz). Widen it when the front end's LO offset shifts every satellite's
+    # apparent Doppler (e.g. a free-running TCXO putting the constellation at
+    # ±14 kHz before the physical ±5 kHz even starts).
+    acq_min_doppler_coverage = nothing,
+    # Coherent integration length for acquisition. `nothing` ⇒ derived per
+    # system from the tracking loops' pull-in range (see below); a time (e.g.
+    # `10u"ms"`) forces that many code periods, snapped to a valid plan length.
+    acq_coherent_integration_time = nothing,
+    # Noncoherent accumulation rounds for acquisition (each a full coherent
+    # window). More rounds buy detection sensitivity on marginal signals at the
+    # cost of a proportionally longer buffer and more acquisition compute.
+    acq_noncoherent_rounds::Integer = 1,
+    # Run acquisition on a worker task per band instead of inline, so a scan
+    # (seconds of CPU on an embedded host) never stalls the chunk pipeline. For
+    # *live* receivers only: results are merged a few chunks later, which is
+    # exactly what a real-time stream needs and pointless for a file replay,
+    # where the samples arrive faster than a scan completes and inline
+    # acquisition is both quicker and deterministic. Needs at least two threads.
+    # See `async_acquisition.jl`.
+    acquire_async::Bool = false,
+    # The tracking-loop estimator. `nothing` ⇒ derived from `vector_tracking`
+    # (see `doppler_estimator_for`). Override it to change the loop-filter
+    # bandwidths — e.g. a hardware-correlator loop whose feedback delay spans
+    # several epochs needs the PLL bandwidth reduced to keep `BL·τ` stable.
+    doppler_estimator = nothing,
     # Front-end full-scale, used only to auto-select and size the integer backend for
     # `Complex{Int16}` measurements; omit it to fall back to the float backend. Ignored
     # for float samples, and when `downconvert_and_correlator` is given — an explicit
@@ -536,6 +591,13 @@ function receive(
     # A `VectorTracking` enables it and configures the filter (platform dynamics,
     # oscillator stability, when to give up).
     vector_tracking::Union{Bool,VectorTracking} = false,
+    # `nothing` ⇒ correlate on the CPU. A [`RemoteHardwareLoop`](@ref) takes
+    # the correlator outputs from an FPGA instead; the
+    # `receive(::AbstractHardwareCorrelatorSDR, …)` method builds one for you.
+    correlator_source = nothing,
+    # C/N₀ below which the code lock detector declares a satellite lost.
+    # `nothing` ⇒ the per-system default.
+    code_lock_cn0_threshold = nothing,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
     pvt_approximate_year::Integer = year(now(UTC)),
@@ -544,7 +606,22 @@ function receive(
     # a custom payload — it must be read-only and return an immutable value, since the
     # `ReceiverState` it sees is mutated in place by the next chunk.
     extract = default_data_of_interest,
+    # Thread pool the chunk-processing task runs on. `:default` is right for the
+    # software receiver, whose correlate phase is itself threaded across the
+    # default pool. A hardware-correlator receiver wants `:interactive`: its
+    # per-chunk work is light, and an asynchronous `acquire!` spawns one
+    # non-yielding chunk task per default-pool thread for the length of a scan
+    # — a processing task queued there resumes only when a chunk finishes,
+    # seconds later on an embedded host, during which the device holds each
+    # channel's last NCO word (a correction sized for one epoch) and the
+    # carrier phase slews by hundreds of degrees (issue #107). Start Julia with
+    # interactive threads (`-t N,M`) for it to take effect; without any, Julia
+    # runs `:interactive` tasks on the default pool.
+    processing_threadpool::Symbol = :default,
 ) where {N}
+    processing_threadpool in (:default, :interactive) || throw(
+        ArgumentError("processing_threadpool must be :default or :interactive (got $processing_threadpool)"),
+    )
     n_bands = length(measurement_channels)
     (
         length(systems_per_band) == n_bands &&
@@ -569,16 +646,24 @@ function receive(
     # Normalise the systems band-by-band and derive each band's key up front.
     band_systems = map(as_systems, systems_per_band)
     band_keys = map(s -> get_band_id(system_band(first(s))), band_systems)
+    # One sampling frequency per band. A single frequency is every band off one
+    # sample clock — the ordinary case, and what every single-band caller
+    # passes; a tuple states them band by band, for a front end whose bands
+    # genuinely run at different rates (issue #134). The bands must still
+    # deliver frames of equal *duration*: the first band is the receiver's
+    # clock, and one frame per band is taken per step.
+    band_sampling_freqs = _per_band_values(sampling_freq, band_keys)
 
     # Acquisition Doppler resolution derived per system from the carrier loops'
     # *pull-in range* (bin = 2·margin·pull_in), so the worst-case post-acquisition
     # residual lands inside the loop's capture range; a smaller `pull_in_margin`
     # gives finer bins. The pull-in depends on `doppler_estimator` and each group's
     # ranging (driver) signal, so the estimator that sizes acquisition must be the
-    # one the receiver state below bakes in for the same `vector_tracking` mode —
-    # `VectorPLLAndDLL` under vector tracking (sized from its scalar fallback),
-    # else the conventional PLL/DLL.
-    doppler_estimator = doppler_estimator_for(vector_tracking)
+    # one the receiver state below bakes in — the caller's override when given,
+    # else `VectorPLLAndDLL` under vector tracking (sized from its scalar fallback)
+    # or the conventional PLL/DLL.
+    doppler_estimator =
+        something(doppler_estimator, doppler_estimator_for(vector_tracking))
     pull_in_margin = 0.5
     band_acq_doppler_resolutions = map(band_systems) do systems
         map(systems) do system
@@ -593,8 +678,20 @@ function receive(
 
     # Per-band acquisition plans and buffer sizes (each band is validated as
     # single-band by `plan_band_acquisition`).
-    setups = map(band_systems, band_acq_doppler_resolutions) do systems, acq_doppler_resolutions
-        plan_band_acquisition(systems, sampling_freq, acq_doppler_resolutions; prns)
+    setups = map(
+        band_systems,
+        band_acq_doppler_resolutions,
+        band_sampling_freqs,
+    ) do systems, acq_doppler_resolutions, band_sampling_freq
+        plan_band_acquisition(
+            systems,
+            band_sampling_freq,
+            acq_doppler_resolutions;
+            prns,
+            acq_min_doppler_coverage,
+            acq_coherent_integration_time,
+            acq_noncoherent_rounds,
+        )
     end
     # One acquisition-plan NamedTuple across all bands, keyed by group key (unique
     # across bands). `merge` of the per-band NamedTuples flattens them.
@@ -606,7 +703,22 @@ function receive(
         # buffer is sized in scalar samples, so unwrap to the scalar element type `T`.
         map((ch, s) -> SampleBuffer(eltype(eltype(ch)), s[3]), measurement_channels, setups),
     )
-    initial_state = ReceiverState(band_systems, buffers; num_ants, vector_tracking)
+    initial_state =
+        ReceiverState(band_systems, buffers; num_ants, vector_tracking, doppler_estimator)
+
+    # Acquisition runs inline unless the caller asked for workers. The workers
+    # take ownership of the acquisition plans (`acquire!` mutates their FFT
+    # scratch), so exactly one of the two paths uses them.
+    acquisition =
+        acquire_async ?
+        AsyncAcquisition(
+            band_keys,
+            band_systems,
+            acq_plans,
+            map(b -> eltype(b.buffer), values(buffers)),
+            interm_freqs,
+            true,   # `subsample_interpolation`, as `process` defaults it
+        ) : InlineAcquisition()
 
     # The channel carries whatever `extract` returns. Infer that type without running
     # user code where possible (`promote_op`); for the default this is a concrete
@@ -627,7 +739,7 @@ function receive(
     state_ref = Ref(initial_state)
     last_output_ref = Ref(-Inf * 1.0s)
     Base.errormonitor(
-        Threads.@spawn try
+        Threads.@spawn processing_threadpool try
             while true
                 # Take one frame from each band in lock-step; a closed stream ends
                 # the run (`InvalidStateException` from an exhausted, closed channel).
@@ -642,12 +754,15 @@ function receive(
                     acq_plans,
                     measurements,
                     band_systems,
-                    sampling_freq,
+                    band_sampling_freqs,
                     interm_freqs;
                     downconvert_and_correlator = resolved_dc,
+                    correlator_source,
+                    acquisition,
                     num_ants,
                     acquire_every,
                     acq_pfa,
+                    code_lock_cn0_threshold,
                     pvt_update_interval,
                     time_in_lock_before_calculating_pvt,
                     enable_ionospheric_correction,
@@ -687,6 +802,8 @@ function receive(
                 end
             end
         finally
+            # Ends the acquisition worker tasks (a no-op when acquisition is inline).
+            close_acquisition!(acquisition)
             # Close even when a chunk throws: consumers block in `take!` until the
             # channel closes, so leaving it open would hang them after a crash
             # (`errormonitor` only logs the failure).
