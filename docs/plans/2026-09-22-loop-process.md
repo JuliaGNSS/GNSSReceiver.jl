@@ -1,8 +1,14 @@
 # A separate, allocation-free loop process for the hardware correlator
 
 **Date:** 2026-09-22
-**Status:** Design agreed (interview of 2026-09-22); nothing implemented yet.
-Milestone 0 (the trim spike) is the first thing to build.
+**Status:** Implemented and validated on the board, 2026-09-23. This document is
+the design as agreed (interview of 2026-09-22) and is kept as written; what was
+actually built, where it differs and what it measured is in
+`2026-09-22-loop-process/` — `milestone-0-trim-spike.md`, `milestones-1-5.md`
+and `milestone-6-board-validation.md`. Two decisions below did not survive
+contact: words are committed in the pass that computes them rather than deferred,
+and the in-process link was deleted outright rather than kept as a transport for
+the same core.
 **Context:** GNSSReceiver.jl PR #129 (`hardware-correlator-12`), the review of
 2026-09-21 and its root-cause analysis of the hardware path's decode latency;
 issue #142 / PR #143 (dead-input NaN in the software receiver, found on the way).
