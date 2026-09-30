@@ -1,6 +1,8 @@
 # Changelog
 
-# [5.0.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.6.0...v5.0.0) (2026-09-29)
+## [4.6.1](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.6.0...v4.6.1) (2026-09-30)
+
+No changes to the package. Replaces the accidental 5.0.0 release.
 
 # [4.6.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.5.0...v4.6.0) (2026-09-05)
 
