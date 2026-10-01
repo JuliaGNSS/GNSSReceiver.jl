@@ -470,8 +470,8 @@ end
 
 # Keep every combined group's per-signal group delays in step with what its decoder
 # has recovered (see `group_delays`). Runs once per chunk, but writes only on a
-# *change*: `set_group_delay!` rebuilds the `TrackedSat` (and drops its pending
-# combining sums), and the values it carries are constant per satellite once the
+# *change*: `set_group_delay!` rebuilds the `TrackedSat`, and the values it carries
+# are constant per satellite once the
 # message that holds them has been decoded — so in the steady state this is a read
 # and a comparison per signal and satellite.
 #
