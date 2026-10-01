@@ -828,8 +828,8 @@ end
 # while contributing to the rate one (an unknown group delay, see
 # `signal_code_discriminator`), so the counts genuinely can disagree.
 #
-# `combining = false` fuses the driver's measurements alone. It is the group's
-# `discriminator_combining` flag, and it has to be applied here: `Tracking` accumulates
+# `combining = false` fuses the driver's measurements alone. It is whether the group
+# combines (`discriminator_combining`), and it has to be applied here: `Tracking` accumulates
 # every signal's discriminators for the navigation filter whatever that flag says, so a
 # group that does not combine would otherwise still close the two loops the filter owns
 # on both of its components — and differ from a combining one only in the carrier phase
@@ -953,7 +953,8 @@ function collect_vt_members!(
         SPEED_OF_LIGHT / ustrip(Hz, get_center_frequency(ranging))
     clock_bias_index = layout.clock_bias_index_by_group[group_key]
     ifb_index = layout.ifb_index_by_group[group_key]
-    combining = track_state.groups[group_key].discriminator_combining
+    combining =
+        discriminator_combining(system, track_state.doppler_estimator.discriminator_combining)
     for prn in prns
         tracked_sat = get_sat_state(track_state, group_key, prn)
         sat_state =

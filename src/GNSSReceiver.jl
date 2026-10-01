@@ -684,26 +684,24 @@ _negated_isc(isc::Real) = -isc * 1.0s
 _isc(_) = nothing
 _isc(isc::Real) = isc * 1.0s
 
-# Whether this system's group satisfies multi-signal discriminator combining's one
-# precondition: the estimator-driver signal — `tracking_signals`' first entry, the
-# pilot — must be the group's longest-*integrating* signal. The accumulator is consumed
-# at every driver record, so a component reporting `k` times per driver record reaches
-# the loop in one update out of `k`, throwing away most of the gain.
+# Whether this system's group can combine its signals' discriminators at all.
+# `Tracking` combines a passenger record only where it coincides with a driver record —
+# the same number of records per chunk, each ending on the same sample after the same
+# number of samples — so the components must integrate equally long. It reads the
+# lengths `Tracking` does: each signal's default number of code blocks times its primary
+# code period, which is what every signal integrates at here — this receiver never
+# raises a signal's `preferred_num_code_blocks_to_integrate` (see `CodeLockDetector`).
+# It holds for every intra-band pilot/data pair GNSSSignals defines except GPS L2 CL/CM,
+# whose components share one chip rate but not one code period.
 #
-# `Tracking` checks the same thing and *refuses* a group that violates it with combining
-# on — at group construction and again whenever a satellite joins. This receiver asks the
-# question first instead, so that such a group is built with combining off and tracks
-# (see `warn_about_uncombinable_systems`) rather than failing the whole receiver over a
-# `CombinedSignal` the caller constructed. It reads the lengths `Tracking` does: each
-# signal's default number of code blocks times its primary code period, which is what
-# every signal integrates at here — this receiver never raises a signal's
-# `preferred_num_code_blocks_to_integrate` (see `CodeLockDetector`). It holds for every
-# intra-band pilot/data pair GNSSSignals defines, all of whose components share one code
-# period.
+# A group that fails it is safe — `Tracking` checks the coincidence itself, per chunk, and
+# simply does not combine — so this only decides whether to say so
+# (`warn_about_uncombinable_systems`) and whether the vector-tracking fusion takes the
+# data component's measurements (`fuse_vt_signal_measurements`).
 combines_signals(system) = _combines_signals(tracking_signals(system))
 _combines_signals(signals::Tuple{AbstractGNSSSignal}) = true
 _combines_signals(signals::Tuple) =
-    all(s -> start_integration_time(s) <= start_integration_time(first(signals)), signals)
+    all(s -> start_integration_time(s) == start_integration_time(first(signals)), signals)
 
 start_integration_time(signal::AbstractGNSSSignal) =
     default_num_code_blocks_to_integrate(signal) * primary_code_period(signal)
@@ -796,16 +794,21 @@ vt_config(vector_tracking::VectorTracking) = vector_tracking
 # applies the navigation filter's NCO corrections), the conventional
 # FLL-assisted PLL/DLL for scalar tracking. Which of the two is not user-selectable —
 # the mode alone determines it.
-doppler_estimator_for(vector_tracking) =
-    vt_enabled(vector_tracking) ? VectorPLLAndDLL() : ConventionalAssistedPLLAndDLL()
+# `signal_combining` is the estimator's `discriminator_combining` flag (see
+# `discriminator_combining`).
+doppler_estimator_for(vector_tracking, signal_combining::Bool = true) =
+    vt_enabled(vector_tracking) ?
+    VectorPLLAndDLL(; discriminator_combining = signal_combining) :
+    ConventionalAssistedPLLAndDLL(; discriminator_combining = signal_combining)
 
-# Whether a system's tracking group combines its signals' discriminators — the group's
-# `discriminator_combining` flag, which `Tracking` reads for either estimator. With it, a
-# `CombinedSignal` group closes the loops `Tracking` still owns on the pilot *and* the data
-# component rather than on the pilot alone. `Tracking` leaves it off by default; this
-# receiver turns it on for every group whose ordering allows it (`combines_signals`),
-# which is every pair GNSSSignals defines. A data-only group is a single-signal
-# satellite, which `Tracking` leaves bit-identical either way.
+# Whether a system's tracking group combines its signals' discriminators. `Tracking` takes
+# the switch on the Doppler estimator (`discriminator_combining`, one flag for the whole
+# `TrackState`) and applies it to every group whose records coincide; this receiver turns
+# it on unless `signal_combining = false`, and a group combines when its components also
+# integrate equally long (`combines_signals`). With it, a `CombinedSignal` group closes the
+# loops `Tracking` still owns on the pilot *and* the data component rather than on the
+# pilot alone. A data-only group is a single-signal satellite, which `Tracking` leaves
+# bit-identical either way.
 #
 # The code half of the combination additionally waits on each component's group delay
 # (see `group_delays`); until both are known the data component aids the carrier loops
@@ -828,18 +831,16 @@ doppler_estimator_for(vector_tracking) =
 discriminator_combining(system, signal_combining::Bool) =
     signal_combining && combines_signals(system)
 
-# Say so once, at construction, when a group's driver is not its longest-integrating
-# signal. Such a group is built with combining off and simply tracks without it, but the
-# cost is invisible from the outside: nothing errors, no measurement is wrong, the
-# satellite is just noisier than the pair it was given could have been. Silent
-# degradation is worth one line.
+# Say so once, at construction, when a group's components do not integrate equally long.
+# Such a group simply tracks without combining, but the cost is invisible from the
+# outside: nothing errors, no measurement is wrong, the satellite is just noisier than the
+# pair it was given could have been. Silent degradation is worth one line.
 function warn_about_uncombinable_systems(systems)
     for system in systems
         combines_signals(system) && continue
         sigs = tracking_signals(system)
-        @warn "Signal pair tracks without discriminator combining: the ranging (first) " *
-              "signal must integrate longest of the group, so that it drives the loop " *
-              "at least as often as every other component" ranging =
+        @warn "Signal pair tracks without discriminator combining: its components must " *
+              "integrate equally long, so that their records coincide" ranging =
             get_signal_name(first(sigs)) others = map(get_signal_name, Base.tail(sigs))
     end
     nothing
@@ -856,7 +857,7 @@ function ReceiverState(
     vector_tracking::Union{Bool,VectorTracking} = false,
     signal_combining::Bool = true,
 )
-    doppler_estimator = doppler_estimator_for(vector_tracking)
+    doppler_estimator = doppler_estimator_for(vector_tracking, signal_combining)
     systems = _flatten_systems(band_systems)
     assert_decodable(systems)
     signal_combining && warn_about_uncombinable_systems(systems)
@@ -867,14 +868,11 @@ function ReceiverState(
     # empty satellite dictionary is typed after a template built through
     # `create_tracked_sat` — the same constructor the acquisition handover uses — so
     # acquired sats merge without a slot-type mismatch (see `create_tracked_sat`).
-    # Whether the group combines its signals' discriminators is a group property too
-    # (see `discriminator_combining`).
     groups = NamedTuple{group_keys}(map(systems) do system
         sigs = tracking_signals(system)
         template = create_tracked_sat(sigs, 0, 0.0, 0.0Hz, num_ants, doppler_estimator)
         sats = Dictionary{Int,typeof(template)}(Int[], typeof(template)[])
-        combining = discriminator_combining(system, signal_combining)
-        SignalGroup(get_band(first(sigs)), sats, sigs, num_ants, combining)
+        SignalGroup(get_band(first(sigs)), sats, sigs, num_ants)
     end)
     track_state =
         TrackState(groups, doppler_estimator, create_noise_estimators(systems, num_ants))

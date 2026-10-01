@@ -185,7 +185,7 @@ end
             num_samples_for_acquisition = 20000,
             vector_tracking,
         )
-        @test receiver_state.track_state.groups[key].discriminator_combining
+        @test receiver_state.track_state.doppler_estimator.discriminator_combining
         # The switch that makes a combined run comparable turns it off again.
         uncombined = GNSSReceiver.ReceiverState(
             ComplexF64,
@@ -194,7 +194,7 @@ end
             vector_tracking,
             signal_combining = false,
         )
-        @test !uncombined.track_state.groups[key].discriminator_combining
+        @test !uncombined.track_state.doppler_estimator.discriminator_combining
     end
 end
 
@@ -281,27 +281,24 @@ end
     ) ≈ -2.0e-9u"s"
 end
 
-@testset "combining is off for a group whose driver is not the longest" begin
-    # Combining's one precondition — the estimator-driver signal must be the group's
-    # longest-integrating one. `Tracking` refuses a group that violates it with combining
-    # on; the receiver asks first, so that such a group tracks without combining instead.
+@testset "combining is off for a group whose components integrate unequally" begin
+    # `Tracking` combines only coinciding records, so a group combines only where its
+    # components integrate equally long; a group that does not still tracks, uncombined.
     @test GNSSReceiver.combines_signals(GPSL1CA())                                 # single signal
     @test GNSSReceiver.combines_signals(GNSSReceiver.CombinedSignal(GPSL5Q(), GPSL5I()))
     @test GNSSReceiver.combines_signals(GNSSReceiver.CombinedSignal(GalileoE1C(), GalileoE1B()))
     @test GNSSReceiver.combines_signals(GNSSReceiver.CombinedSignal(GPSL1C_P(), GPSL1C_D()))
-    # L2 CL's 1.5 s primary code against CM's 20 ms — the widest margin of any pair, and
-    # the right way round.
-    @test GNSSReceiver.combines_signals(GNSSReceiver.CombinedSignal(GPSL2CL(), GPSL2CM()))
-    # A deliberately mis-ordered pair: a 4 ms pilot driving a 10 ms data component, which
-    # would reach the loop in one update out of two or three.
+    # L2 CL's 1.5 s primary code against CM's 20 ms: one chip rate, two code periods.
+    @test !GNSSReceiver.combines_signals(GNSSReceiver.CombinedSignal(GPSL2CL(), GPSL2CM()))
+    # A 4 ms pilot next to a 10 ms data component.
     mismatched = GNSSReceiver.CombinedSignal(GalileoE1C(), GPSL1C_D())
     @test !GNSSReceiver.combines_signals(mismatched)
 
-    # Such a group is built with combining off, and a satellite joins it at handoff
-    # rather than being refused; a well-ordered one keeps combining on.
+    # A satellite joins such a group at handoff and is tracked uncombined; a pair of equal
+    # integration lengths combines.
     function combining_after_handoff(system)
         key = GNSSReceiver.signal_group_key(system)
-        # A mis-ordered pair warns once here, since the loss it causes is otherwise
+        # An uncombinable pair warns once here, since the loss it causes is otherwise
         # invisible: nothing errors and no measurement is wrong.
         receiver_state = GNSSReceiver.ReceiverState(
             ComplexF64,
@@ -321,7 +318,10 @@ end
             )],
         )
         @test length(get_sat_states(track_state, key)) == 1
-        track_state.groups[key].discriminator_combining
+        GNSSReceiver.discriminator_combining(
+            system,
+            track_state.doppler_estimator.discriminator_combining,
+        )
     end
 
     @test combining_after_handoff(GNSSReceiver.CombinedSignal(GPSL5Q(), GPSL5I()))
