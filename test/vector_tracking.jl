@@ -1279,14 +1279,25 @@ end
 end
 
 @testset "Doppler estimator selection and receiver-state wiring" begin
-    # The tracking-loop estimator follows from the mode alone.
-    @test GNSSReceiver.doppler_estimator_for(false) isa ConventionalPLLAndDLL
+    # The tracking-loop estimator follows from the mode alone; scalar tracking combines
+    # by default and falls back to the conventional estimator without combining.
+    @test GNSSReceiver.doppler_estimator_for(false) isa CombiningPLLAndDLL
+    @test GNSSReceiver.doppler_estimator_for(false, false) isa ConventionalPLLAndDLL
     @test GNSSReceiver.doppler_estimator_for(true) isa VectorPLLAndDLL
+    @test GNSSReceiver.doppler_estimator_for(true).discriminator_combining
+    @test !GNSSReceiver.doppler_estimator_for(true, false).discriminator_combining
 
     # The vector estimator's scalar fallback is FLL-assisted, so the acquisition
     # pull-in range matches the conventional assisted estimator's.
     @test GNSSReceiver.carrier_doppler_pull_in_range(VectorPLLAndDLL(), GPSL1CA()) ==
           GNSSReceiver.carrier_doppler_pull_in_range(
+        ConventionalAssistedPLLAndDLL(),
+        GPSL1CA(),
+    )
+    @test GNSSReceiver.carrier_doppler_pull_in_range(
+        CombiningAssistedPLLAndDLL(),
+        GPSL1CA(),
+    ) == GNSSReceiver.carrier_doppler_pull_in_range(
         ConventionalAssistedPLLAndDLL(),
         GPSL1CA(),
     )
@@ -1308,6 +1319,7 @@ end
         vector_tracking = false,
     )
     @test isnothing(scalar_state.vt)
+    @test scalar_state.track_state.doppler_estimator isa CombiningPLLAndDLL
 
     # A `VectorTracking` in place of `true` both enables the filter and configures it, so a
     # known platform and front end can be described without editing the defaults.

@@ -791,19 +791,26 @@ vt_config(vector_tracking::VectorTracking) = vector_tracking
 
 # The tracking loops' Doppler estimator for the given mode: `Tracking`'s
 # `VectorPLLAndDLL` under vector tracking (it accumulates the discriminators and
-# applies the navigation filter's NCO corrections), the conventional
-# FLL-assisted PLL/DLL for scalar tracking. Which of the two is not user-selectable —
-# the mode alone determines it.
-# `signal_combining` is the estimator's `discriminator_combining` flag (see
-# `discriminator_combining`).
+# applies the navigation filter's NCO corrections), the FLL-assisted PLL/DLL for scalar
+# tracking — `CombiningAssistedPLLAndDLL`, which closes the loops on every signal of a
+# group, or with `signal_combining = false` `ConventionalAssistedPLLAndDLL`, which closes
+# them on the ranging signal alone. Which of the two is not user-selectable — the mode
+# alone determines it.
 doppler_estimator_for(vector_tracking, signal_combining::Bool = true) =
     vt_enabled(vector_tracking) ?
     VectorPLLAndDLL(; discriminator_combining = signal_combining) :
-    ConventionalAssistedPLLAndDLL(; discriminator_combining = signal_combining)
+    signal_combining ? CombiningAssistedPLLAndDLL() : ConventionalAssistedPLLAndDLL()
+
+# Whether the estimator combines discriminators at all — and so whether its per-satellite
+# state holds group delays to keep up to date (see `update_group_delays!`).
+combines_discriminators(::CombiningPLLAndDLL) = true
+combines_discriminators(estimator::VectorPLLAndDLL) = estimator.discriminator_combining
+combines_discriminators(::Tracking.AbstractDopplerEstimator) = false
 
 # Whether a system's tracking group combines its signals' discriminators. `Tracking` takes
-# the switch on the Doppler estimator (`discriminator_combining`, one flag for the whole
-# `TrackState`) and applies it to every group whose records coincide; this receiver turns
+# the switch on the Doppler estimator (`CombiningPLLAndDLL` versus `ConventionalPLLAndDLL`,
+# or `VectorPLLAndDLL`'s `discriminator_combining`; one choice for the whole `TrackState`)
+# and applies it to every group whose records coincide; this receiver turns
 # it on unless `signal_combining = false`, and a group combines when its components also
 # integrate equally long (`combines_signals`). With it, a `CombinedSignal` group closes the
 # loops `Tracking` still owns on the pilot *and* the data component rather than on the
@@ -916,12 +923,13 @@ of these sharing one RF band; each becomes a tracking group in a single `TrackSt
 keyed by its ranging signal's id. `num_samples_for_acquisition` sizes the acquisition
 sample buffer, and `num_ants` selects single- versus multi-antenna processing.
 `vector_tracking = true` closes the tracking loops through a navigation filter instead
-of per-satellite loop filters (the tracking-loop estimator follows from this: the
-conventional FLL-assisted PLL/DLL for scalar, `VectorPLLAndDLL` for vector tracking); pass
+of per-satellite loop filters (the tracking-loop estimator follows from this:
+`CombiningAssistedPLLAndDLL` for scalar, `VectorPLLAndDLL` for vector tracking); pass
 a [`VectorTracking`](@ref) instead of `true` to describe the platform's dynamics and the
 receiver's oscillator to that filter. `signal_combining = false` closes each group's loops
-on its ranging signal alone instead of combining its components' discriminators, and under
-vector tracking feeds the navigation filter that signal's measurements alone. One
+on its ranging signal alone instead of combining its components' discriminators (scalar
+tracking then uses `ConventionalAssistedPLLAndDLL`), and under vector tracking feeds the
+navigation filter that signal's measurements alone. One
 `ReceiverState` spans every band; pass the per-band system tuples and pre-built acquisition
 buffers to the primary constructor for the multi-band case.
 """
