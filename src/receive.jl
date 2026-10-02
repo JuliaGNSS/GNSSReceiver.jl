@@ -321,9 +321,14 @@ handover_coherent_integration_time(signal::AbstractGNSSSignal) = primary_code_pe
 # constellation's acquisition Doppler bin from this (bin = 2·margin·pull_in) so the
 # worst-case post-acquisition residual lands inside the loop's capture range. These
 # are the pull-in ranges of `Tracking`'s `ConventionalPLLAndDLL` estimator, derived
-# from the public `Tracking` / `GNSSSignals` API.
+# from the public `Tracking` / `GNSSSignals` API. `CombiningPLLAndDLL` closes the same
+# loops with the same filters and bandwidths, seeded from the same driver signal: right
+# after handover there is nothing to combine yet that would widen the capture range, so
+# it shares the bounds.
+const ScalarPLLAndDLL{CA} = Union{ConventionalPLLAndDLL{CA},CombiningPLLAndDLL{CA}}
 
-# FLL-assisted carrier loop — the `ConventionalAssistedPLLAndDLL` default, a
+# FLL-assisted carrier loop — the `CombiningAssistedPLLAndDLL` /
+# `ConventionalAssistedPLLAndDLL` default, a
 # `ThirdOrderAssistedBilinearLF`. Pull-in comes from the FLL frequency
 # discriminator `atan(cross / dot) / (2π·T)`. Its two-quadrant `atan` recovers the
 # inter-prompt phase advance `Δφ = 2π·Δf·T` unambiguously only within ±π/2; beyond
@@ -331,7 +336,7 @@ handover_coherent_integration_time(signal::AbstractGNSSSignal) = primary_code_pe
 # error only while `2π·|Δf|·T ≤ π/2`, i.e. `|Δf| ≤ 1 / (4·T)` — 250 Hz for a 1 ms
 # code (GPS L1 C/A, L5I), 62.5 Hz for Galileo E1B (4 ms), 25 Hz for L1C (10 ms).
 function carrier_doppler_pull_in_range(
-    ::ConventionalPLLAndDLL{<:Tracking.ThirdOrderAssistedBilinearLF},
+    ::ScalarPLLAndDLL{<:Tracking.ThirdOrderAssistedBilinearLF},
     signal::AbstractGNSSSignal,
 )
     T = handover_coherent_integration_time(signal)
@@ -347,7 +352,7 @@ end
 # each satellite. This is an order-of-magnitude estimate, not the crisp
 # discriminator bound of the FLL-assisted case.
 function carrier_doppler_pull_in_range(
-    estimator::ConventionalPLLAndDLL,
+    estimator::ScalarPLLAndDLL,
     signal::AbstractGNSSSignal,
 )
     B_L = something(
@@ -591,8 +596,8 @@ function receive(
     # ranging (driver) signal, so the estimator that sizes acquisition must be the
     # one the receiver state below bakes in for the same `vector_tracking` mode —
     # `VectorPLLAndDLL` under vector tracking (sized from its scalar fallback),
-    # else the conventional PLL/DLL.
-    doppler_estimator = doppler_estimator_for(vector_tracking)
+    # else the combining (or, with `signal_combining = false`, conventional) PLL/DLL.
+    doppler_estimator = doppler_estimator_for(vector_tracking, signal_combining)
     pull_in_margin = 0.5
     band_acq_doppler_resolutions = map(band_systems) do systems
         map(systems) do system

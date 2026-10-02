@@ -954,7 +954,7 @@ function collect_vt_members!(
     clock_bias_index = layout.clock_bias_index_by_group[group_key]
     ifb_index = layout.ifb_index_by_group[group_key]
     combining =
-        discriminator_combining(system, track_state.doppler_estimator.discriminator_combining)
+        discriminator_combining(system, combines_discriminators(track_state.doppler_estimator))
     for prn in prns
         tracked_sat = get_sat_state(track_state, group_key, prn)
         sat_state =

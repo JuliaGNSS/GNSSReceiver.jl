@@ -185,7 +185,7 @@ end
             num_samples_for_acquisition = 20000,
             vector_tracking,
         )
-        @test receiver_state.track_state.doppler_estimator.discriminator_combining
+        @test GNSSReceiver.combines_discriminators(receiver_state.track_state.doppler_estimator)
         # The switch that makes a combined run comparable turns it off again.
         uncombined = GNSSReceiver.ReceiverState(
             ComplexF64,
@@ -194,7 +194,7 @@ end
             vector_tracking,
             signal_combining = false,
         )
-        @test !uncombined.track_state.doppler_estimator.discriminator_combining
+        @test !GNSSReceiver.combines_discriminators(uncombined.track_state.doppler_estimator)
     end
 end
 
@@ -320,7 +320,7 @@ end
         @test length(get_sat_states(track_state, key)) == 1
         GNSSReceiver.discriminator_combining(
             system,
-            track_state.doppler_estimator.discriminator_combining,
+            GNSSReceiver.combines_discriminators(track_state.doppler_estimator),
         )
     end
 

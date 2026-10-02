@@ -478,8 +478,12 @@ end
 # Single-signal (data-only) groups are skipped outright: their only signal has no
 # other to be differenced against, so `Tracking` would store a value and never read it.
 #
+# Skipped altogether when the estimator does not combine (`signal_combining = false`):
+# nothing would read the values, and `ConventionalPLLAndDLL` holds none to write.
+#
 # Mutates `track_state` in place and returns it.
 function update_group_delays!(track_state, receiver_sat_states, systems)
+    combines_discriminators(track_state.doppler_estimator) || return track_state
     for system in systems
         data_signal_index(system) == RANGING_SIGNAL_INDEX && continue
         group_key = signal_group_key(system)
