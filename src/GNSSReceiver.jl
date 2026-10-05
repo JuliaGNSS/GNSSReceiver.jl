@@ -685,23 +685,22 @@ _isc(_) = nothing
 _isc(isc::Real) = isc * 1.0s
 
 # Whether this system's group can combine its signals' discriminators at all.
-# `Tracking` combines a passenger record only where it coincides with a driver record —
-# the same number of records per chunk, each ending on the same sample after the same
-# number of samples — so the components must integrate equally long. It reads the
-# lengths `Tracking` does: each signal's default number of code blocks times its primary
-# code period, which is what every signal integrates at here — this receiver never
-# raises a signal's `preferred_num_code_blocks_to_integrate` (see `CodeLockDetector`).
-# It holds for every intra-band pilot/data pair GNSSSignals defines except GPS L2 CL/CM,
-# whose components share one chip rate but not one code period.
+# `Tracking` combines every passenger record that ends within a driver integration into
+# that driver record, weighted by its integration time, and assumes no passenger
+# integrates longer than the driver: a longer passenger record would dominate the one
+# driver update it lands in. So the ranging signal (the pilot) has to integrate at least
+# as long as every other component. It reads the lengths `Tracking` does: each signal's
+# default number of code blocks times its primary code period, which is what every signal
+# integrates at here — this receiver never raises a signal's
+# `preferred_num_code_blocks_to_integrate` (see `CodeLockDetector`). It holds for every
+# intra-band pilot/data pair GNSSSignals defines; GPS L2 CL (1.5 s) drives CM (20 ms).
 #
-# A group that fails it is safe — `Tracking` checks the coincidence itself, per chunk, and
-# simply does not combine — so this only decides whether to say so
-# (`warn_about_uncombinable_systems`) and whether the vector-tracking fusion takes the
-# data component's measurements (`fuse_vt_signal_measurements`).
+# A group that fails it is not combined (`discriminator_combining`), and this receiver
+# says so once (`warn_about_uncombinable_systems`).
 combines_signals(system) = _combines_signals(tracking_signals(system))
 _combines_signals(signals::Tuple{AbstractGNSSSignal}) = true
 _combines_signals(signals::Tuple) =
-    all(s -> start_integration_time(s) == start_integration_time(first(signals)), signals)
+    all(s -> start_integration_time(s) <= start_integration_time(first(signals)), signals)
 
 start_integration_time(signal::AbstractGNSSSignal) =
     default_num_code_blocks_to_integrate(signal) * primary_code_period(signal)
@@ -791,45 +790,33 @@ vt_config(vector_tracking::VectorTracking) = vector_tracking
 
 # The tracking loops' Doppler estimator for the given mode: `Tracking`'s
 # `VectorPLLAndDLL` under vector tracking (it accumulates the discriminators and
-# applies the navigation filter's NCO corrections), the FLL-assisted PLL/DLL for scalar
-# tracking — `CombiningAssistedPLLAndDLL`, which closes the loops on every signal of a
-# group, or with `signal_combining = false` `ConventionalAssistedPLLAndDLL`, which closes
-# them on the ranging signal alone. Which of the two is not user-selectable — the mode
-# alone determines it.
-doppler_estimator_for(vector_tracking, signal_combining::Bool = true) =
-    vt_enabled(vector_tracking) ?
-    VectorPLLAndDLL(; discriminator_combining = signal_combining) :
-    signal_combining ? CombiningAssistedPLLAndDLL() : ConventionalAssistedPLLAndDLL()
+# applies the navigation filter's NCO corrections), the conventional
+# FLL-assisted PLL/DLL for scalar tracking. Not user-selectable — the mode alone
+# determines it. Signal combining is not the estimator's to decide but each group's
+# (`discriminator_combining`).
+doppler_estimator_for(vector_tracking) =
+    vt_enabled(vector_tracking) ? VectorPLLAndDLL() : ConventionalAssistedPLLAndDLL()
 
-# Whether the estimator combines discriminators at all — and so whether its per-satellite
-# state holds group delays to keep up to date (see `update_group_delays!`).
-combines_discriminators(::CombiningPLLAndDLL) = true
-combines_discriminators(estimator::VectorPLLAndDLL) = estimator.discriminator_combining
-combines_discriminators(::Tracking.AbstractDopplerEstimator) = false
-
-# Whether a system's tracking group combines its signals' discriminators. `Tracking` takes
-# the switch on the Doppler estimator (`CombiningPLLAndDLL` versus `ConventionalPLLAndDLL`,
-# or `VectorPLLAndDLL`'s `discriminator_combining`; one choice for the whole `TrackState`)
-# and applies it to every group whose records coincide; this receiver turns
-# it on unless `signal_combining = false`, and a group combines when its components also
-# integrate equally long (`combines_signals`). With it, a `CombinedSignal` group closes the
-# loops `Tracking` still owns on the pilot *and* the data component rather than on the
-# pilot alone. A data-only group is a single-signal satellite, which `Tracking` leaves
-# bit-identical either way.
+# Whether a system's tracking group combines its signals' discriminators: `Tracking`'s
+# `combine_signals` flag on the `SignalGroup`, which this receiver sets unless
+# `signal_combining = false`, for every group whose components allow it
+# (`combines_signals`). With it, a `CombinedSignal` group closes the loops `Tracking`
+# still owns on the pilot *and* the data component rather than on the pilot alone. A
+# data-only group is a single-signal satellite, which `Tracking` leaves bit-identical
+# either way.
 #
 # The code half of the combination additionally waits on each component's group delay
 # (see `group_delays`); until both are known the data component aids the carrier loops
 # only.
 #
 # Under `VectorPLLAndDLL` the flag's reach in `Tracking` follows `vt_on`: all three
-# loops while a satellite is still running its scalar fallback (so it pulls in with the
-# full combining gain rather than acquiring it only once the navigation filter takes
-# over), and the carrier phase loop alone once the filter owns the other two. The code
-# and carrier frequency measurements then reach the filter as one accumulator per
-# signal — whatever the flag says — and this receiver fuses them itself, being better
-# placed to weigh them than a nominal ICD power split is. It reads the same flag there:
-# a group that does not combine hands the filter its ranging signal's measurements
-# alone (see `fuse_vt_signal_measurements`).
+# loops while a satellite is still running its scalar fallback, and the carrier phase
+# loop alone once the navigation filter owns the other two. The code and carrier
+# frequency measurements then reach the filter as one accumulator per signal — whatever
+# the flag says — and this receiver fuses them itself, being better placed to weigh them
+# than a nominal ICD power split is. It reads the same flag there: a group that does not
+# combine hands the filter its ranging signal's measurements alone (see
+# `fuse_vt_signal_measurements`).
 #
 # `signal_combining = false` turns the combination off across the whole receiver, leaving
 # every group's loops closed on its ranging signal alone. That is not a tuning knob but a
@@ -838,7 +825,12 @@ combines_discriminators(::Tracking.AbstractDopplerEstimator) = false
 discriminator_combining(system, signal_combining::Bool) =
     signal_combining && combines_signals(system)
 
-# Say so once, at construction, when a group's components do not integrate equally long.
+# The flag a built tracking group carries (see `discriminator_combining`).
+combines_signals(track_state::TrackState, group_key) =
+    track_state.groups[group_key].combine_signals
+
+# Say so once, at construction, when a group's data component integrates longer than its
+# pilot.
 # Such a group simply tracks without combining, but the cost is invisible from the
 # outside: nothing errors, no measurement is wrong, the satellite is just noisier than the
 # pair it was given could have been. Silent degradation is worth one line.
@@ -846,8 +838,8 @@ function warn_about_uncombinable_systems(systems)
     for system in systems
         combines_signals(system) && continue
         sigs = tracking_signals(system)
-        @warn "Signal pair tracks without discriminator combining: its components must " *
-              "integrate equally long, so that their records coincide" ranging =
+        @warn "Signal pair tracks without discriminator combining: no component may " *
+              "integrate longer than the ranging signal" ranging =
             get_signal_name(first(sigs)) others = map(get_signal_name, Base.tail(sigs))
     end
     nothing
@@ -864,7 +856,7 @@ function ReceiverState(
     vector_tracking::Union{Bool,VectorTracking} = false,
     signal_combining::Bool = true,
 )
-    doppler_estimator = doppler_estimator_for(vector_tracking, signal_combining)
+    doppler_estimator = doppler_estimator_for(vector_tracking)
     systems = _flatten_systems(band_systems)
     assert_decodable(systems)
     signal_combining && warn_about_uncombinable_systems(systems)
@@ -879,7 +871,8 @@ function ReceiverState(
         sigs = tracking_signals(system)
         template = create_tracked_sat(sigs, 0, 0.0, 0.0Hz, num_ants, doppler_estimator)
         sats = Dictionary{Int,typeof(template)}(Int[], typeof(template)[])
-        SignalGroup(get_band(first(sigs)), sats, sigs, num_ants)
+        combine = discriminator_combining(system, signal_combining)
+        SignalGroup(get_band(first(sigs)), sats, sigs, num_ants, combine)
     end)
     track_state =
         TrackState(groups, doppler_estimator, create_noise_estimators(systems, num_ants))
@@ -923,13 +916,12 @@ of these sharing one RF band; each becomes a tracking group in a single `TrackSt
 keyed by its ranging signal's id. `num_samples_for_acquisition` sizes the acquisition
 sample buffer, and `num_ants` selects single- versus multi-antenna processing.
 `vector_tracking = true` closes the tracking loops through a navigation filter instead
-of per-satellite loop filters (the tracking-loop estimator follows from this:
-`CombiningAssistedPLLAndDLL` for scalar, `VectorPLLAndDLL` for vector tracking); pass
+of per-satellite loop filters (the tracking-loop estimator follows from this: the
+conventional FLL-assisted PLL/DLL for scalar, `VectorPLLAndDLL` for vector tracking); pass
 a [`VectorTracking`](@ref) instead of `true` to describe the platform's dynamics and the
 receiver's oscillator to that filter. `signal_combining = false` closes each group's loops
-on its ranging signal alone instead of combining its components' discriminators (scalar
-tracking then uses `ConventionalAssistedPLLAndDLL`), and under vector tracking feeds the
-navigation filter that signal's measurements alone. One
+on its ranging signal alone instead of combining its components' discriminators, and under
+vector tracking feeds the navigation filter that signal's measurements alone. One
 `ReceiverState` spans every band; pass the per-band system tuples and pre-built acquisition
 buffers to the primary constructor for the multi-band case.
 """

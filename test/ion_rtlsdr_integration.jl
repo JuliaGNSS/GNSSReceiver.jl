@@ -177,7 +177,10 @@ let
         # mapping moved the fix (+0.35, +0.29, +1.14) m against the 5.0.0 capture — the
         # mostly-vertical shift a mapping-function change produces.
         expected_position = [3.9074087926e6, 3.0683836901e5, 5.0149608655e6]   # ECEF metres
-        expected_velocity = [0.610, 0.209, 3.577]                              # m/s
+        # Velocity re-captured under Tracking's corrected carrier loop gain and FLL staging
+        # (it read [0.610, 0.209, 3.577] before): the stationary receiver's residual speed
+        # dropped from 3.6 to 0.6 m/s.
+        expected_velocity = [0.084, 0.054, 0.609]                              # m/s
         expected_time = TAIEpoch(2017, 9, 10, 22, 57, 20.697)                  # final-fix epoch (TAI)
         expected_time_correction = -2.0226547144e7                             # receiver clock bias (metres)
         expected_relative_clock_drift = 7.40e-7                                # dimensionless

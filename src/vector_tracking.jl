@@ -727,7 +727,7 @@ end
 # discriminator jitter
 #     σ_φ² = 1/(2·C/N0·T_coh)·(1 + 1/(2·C/N0·T_coh))   [rad²].
 # The filter's rate measurement is `mean_carrier_discr`, the mean of the `N` per-dump
-# discriminators in `carrier_discr_acc`. Each dump is a frequency — a phase difference over
+# discriminators in `carrier_discr_accs`. Each dump is a frequency — a phase difference over
 # one `T_coh`, `(θ_k − θ_{k-1})/(2π·T_coh)` — so the mean reduces to `(θ_N − θ_0)/(2π·T)`:
 # the interior phases cancel, leaving only the two endpoint phase estimates, giving
 #     var(mean) = 2·σ_φ² / (2π·T)²   [Hz²],
@@ -736,7 +736,7 @@ end
 # The rate rows carry no inflation factor, deliberately. Consecutive cycles are not
 # independent: Tracking chains the FLL's `previous_prompt` across cycles (each chunk's first
 # record reads the carried-over `last_fully_integrated_filtered_prompt`) while
-# `reset_carrier_discr_acc!` fires every cycle, so cycle `i` measures `(θ_N − θ_0)/(2π·T)`
+# `reset_carrier_discr_accs!` fires every cycle, so cycle `i` measures `(θ_N − θ_0)/(2π·T)`
 # and cycle `i+1` measures `(θ_2N − θ_N)/(2π·T)`. They share the boundary phase estimate
 # with opposite signs, giving
 #     cov = −σ_φ²/(2π·T)²,   var = 2·σ_φ²/(2π·T)²   ⇒   ρ(lag 1) = −1/2,
@@ -954,7 +954,7 @@ function collect_vt_members!(
     clock_bias_index = layout.clock_bias_index_by_group[group_key]
     ifb_index = layout.ifb_index_by_group[group_key]
     combining =
-        discriminator_combining(system, combines_discriminators(track_state.doppler_estimator))
+        combines_signals(track_state, group_key)
     for prn in prns
         tracked_sat = get_sat_state(track_state, group_key, prn)
         sat_state =
@@ -2249,8 +2249,8 @@ function run_vt_iteration(
     end
 
     # The navigation filter consumed this interval's discriminators.
-    reset_code_discr_acc!(track_state)
-    reset_carrier_discr_acc!(track_state)
+    reset_code_discr_accs!(track_state)
+    reset_carrier_discr_accs!(track_state)
 
     receiver_sat_states = sync_vt_flags(receiver_sat_states, track_state)
 

@@ -1101,7 +1101,7 @@ end
     # One accumulator slot per signal, so a single-signal satellite's is a 1-tuple.
     # Mean = sum / count: (2, 6 Hz) → +3 Hz, (1, −4 Hz) → −4 Hz.
     with_acc(acc) = Accessors.@set sat.doppler_estimator_state =
-        SatVectorPLLAndDLL(Tracking.get_doppler_estimator_state(sat); carrier_discr_acc = acc)
+        SatVectorPLLAndDLL(Tracking.get_doppler_estimator_state(sat); carrier_discr_accs = acc)
     @test GNSSReceiver.signal_carrier_discriminator(with_acc(((2, 6.0u"Hz"),)), 1) ≈ 3.0
     @test GNSSReceiver.signal_carrier_discriminator(with_acc(((1, -4.0u"Hz"),)), 1) ≈ -4.0
     # Nothing accumulated is `nothing`, not a zero the filter would weigh in full.
@@ -1123,7 +1123,7 @@ end
     )
     base = Tracking.get_doppler_estimator_state(sat)
     with(acc_code, acc_carrier) = Accessors.@set sat.doppler_estimator_state =
-        SatVectorPLLAndDLL(base; code_discr_acc = acc_code, carrier_discr_acc = acc_carrier)
+        SatVectorPLLAndDLL(base; code_discr_accs = acc_code, carrier_discr_accs = acc_carrier)
     wavelength = SPEED_OF_LIGHT / ustrip(u"Hz", get_center_frequency(GPSL1CA()))
 
     accumulated = with(((3, 0.06),), ((3, 6.0u"Hz"),))
@@ -1177,8 +1177,8 @@ function _vt_sat(system, code_acc, carrier_acc, delays = (0.0u"s", 0.0u"s"))
     sat = get_sat_state(track_state, key, 1)
     Accessors.@set sat.doppler_estimator_state = SatVectorPLLAndDLL(
         Tracking.get_doppler_estimator_state(sat);
-        code_discr_acc = code_acc,
-        carrier_discr_acc = carrier_acc,
+        code_discr_accs = code_acc,
+        carrier_discr_accs = carrier_acc,
     )
 end
 
@@ -1279,25 +1279,14 @@ end
 end
 
 @testset "Doppler estimator selection and receiver-state wiring" begin
-    # The tracking-loop estimator follows from the mode alone; scalar tracking combines
-    # by default and falls back to the conventional estimator without combining.
-    @test GNSSReceiver.doppler_estimator_for(false) isa CombiningPLLAndDLL
-    @test GNSSReceiver.doppler_estimator_for(false, false) isa ConventionalPLLAndDLL
+    # The tracking-loop estimator follows from the mode alone.
+    @test GNSSReceiver.doppler_estimator_for(false) isa ConventionalPLLAndDLL
     @test GNSSReceiver.doppler_estimator_for(true) isa VectorPLLAndDLL
-    @test GNSSReceiver.doppler_estimator_for(true).discriminator_combining
-    @test !GNSSReceiver.doppler_estimator_for(true, false).discriminator_combining
 
     # The vector estimator's scalar fallback is FLL-assisted, so the acquisition
     # pull-in range matches the conventional assisted estimator's.
     @test GNSSReceiver.carrier_doppler_pull_in_range(VectorPLLAndDLL(), GPSL1CA()) ==
           GNSSReceiver.carrier_doppler_pull_in_range(
-        ConventionalAssistedPLLAndDLL(),
-        GPSL1CA(),
-    )
-    @test GNSSReceiver.carrier_doppler_pull_in_range(
-        CombiningAssistedPLLAndDLL(),
-        GPSL1CA(),
-    ) == GNSSReceiver.carrier_doppler_pull_in_range(
         ConventionalAssistedPLLAndDLL(),
         GPSL1CA(),
     )
@@ -1319,7 +1308,7 @@ end
         vector_tracking = false,
     )
     @test isnothing(scalar_state.vt)
-    @test scalar_state.track_state.doppler_estimator isa CombiningPLLAndDLL
+    @test scalar_state.track_state.doppler_estimator isa ConventionalPLLAndDLL
 
     # A `VectorTracking` in place of `true` both enables the filter and configures it, so a
     # known platform and front end can be described without editing the defaults.

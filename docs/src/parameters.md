@@ -53,9 +53,9 @@ on) and the data component (whose navigation message is decoded) together in one
 
 Both components then feed the loops. Under scalar tracking the receiver enables
 `Tracking`'s multi-signal discriminator combining, which folds the data component's
-PLL/FLL/DLL discriminators into the pilot-driven loop update as a minimum-variance
-weighted mean — the pilot still sets the loop cadence, the bandwidths and the carrier
-phase reference. The **carrier** loops take that contribution from the first integration;
+PLL/FLL/DLL discriminators into the pilot-driven loop update as a mean weighted by each
+component's ICD power share and integration time — the pilot still sets the loop cadence,
+the bandwidths and the carrier phase reference. The **carrier** loops take that contribution from the first integration;
 the **code** loop waits until both components' payload group delays are known, which
 for a GPS pair means the inter-signal corrections have been decoded (`ISC_L5I5` /
 `ISC_L5Q5` from CNAV, `ISC_L1CD` / `ISC_L1CP` from CNAV-2) and for a Galileo pair is
