@@ -10,6 +10,12 @@ Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
 
 [compat]
 Documenter = "1"
+Downloads = "<0.0.1, 1.4"
+GNSSSignals = "4.1.2"
+PositionVelocityTime = "6.1.0"
+Tracking = "8.3.2"
+UnicodePlots = "3.9.0"
+Unitful = "1.29.0"
 
 [sources]
 GNSSReceiver = {path = ".."}
