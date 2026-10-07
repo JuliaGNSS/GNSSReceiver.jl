@@ -1,0 +1,169 @@
+--- a/src/sdr.jl
++++ b/src/sdr.jl
+@@ -67,6 +67,19 @@
+     # Published by the verifier and read by the Receiver on another thread.
+     const assignment_start::Vector{Threads.Atomic{Int64}}
+     const assignment_locks::Vector{ReentrantLock}
++    # NCO words accepted from the receiver but not yet due, one slot per
++    # channel (the newest supersedes). `_drain_ncos!` commits each at the first
++    # service pass at or after its `apply_at_sample`, so the word lands where
++    # the receiver's timeline says it does — up to one pass (~0.75 ms) late,
++    # rather than on arrival, ~1 ms early and jittering with the host.
++    const nco_pending::Vector{Union{Nothing,GNSSReceiver.NCOUpdate}}
++    # Diagnostics: words committed, how late they landed (samples past
++    # `apply_at_sample`; sum and max), and words dropped as stale. The loop
++    # delay as measured, not inferred; logged by `stop!`.
++    nco_commits::Int
++    nco_commit_lag_sum::Int64
++    nco_commit_lag_max::Int64
++    nco_dropped_stale::Int
+ end
+ 
+ """
+@@ -146,6 +159,11 @@
+         Union{Nothing,PendingHandover}[nothing for _ = 1:resolved_channels],
+         [Threads.Atomic{Int64}(typemax(Int64)) for _ = 1:resolved_channels],
+         [ReentrantLock() for _ = 1:resolved_channels],
++        Union{Nothing,GNSSReceiver.NCOUpdate}[nothing for _ = 1:resolved_channels],
++        0,
++        Int64(0),
++        Int64(0),
++        0,
+     )
+ end
+ 
+@@ -423,6 +441,12 @@
+     sdr.running || return sdr
+     sdr.running = false
+     enable!(sdr.bank, false)
++    if sdr.nco_commits > 0
++        @info "NCO commits: $(sdr.nco_commits) at their scheduled sample, landing " *
++              "$(round(1e3 * sdr.nco_commit_lag_sum / sdr.nco_commits / sdr.fs; digits = 3)) ms " *
++              "late on average (max $(round(1e3 * sdr.nco_commit_lag_max / sdr.fs; digits = 3)) ms); " *
++              "$(sdr.nco_dropped_stale) dropped as stale"
++    end
+     close(sdr.dumps)
+     close(sdr.ncos)
+     # Ending the recorder ends the service task's stream (EOF on the pipe).
+@@ -504,8 +528,10 @@
+             # the wait so a quiet record stream cannot delay a commit by more
+             # than a few milliseconds.
+             verify_handovers!(sdr)
+-            _drain_ncos!(sdr)
+-            _poll_readable(fd, 5) || continue
++            # Wait for DMA data no longer than the next held NCO word allows,
++            # so it lands within a millisecond of its scheduled sample.
++            wait_ms = _drain_ncos!(sdr)
++            _poll_readable(fd, wait_ms) || continue
+             n = _read_into!(fd, buf, filled)
+             n == 0 && break          # the recorder is gone
+             n < 0 && continue
+@@ -733,7 +759,7 @@
+     )
+ end
+ 
+-# Turn NCO updates into scheduled CSR commits at their named sample.
++# Turn NCO updates into CSR commits at their named sample.
+ #
+ # Latency here is loop-critical: an update scheduled `feedback_delay_epochs`
+ # (a few ms) ahead must reach the CSRs before its `apply_at_sample` passes, or
+@@ -743,24 +769,64 @@
+ # corrections apply at random delays and phase never locks (no data bits).
+ # Hence the non-blocking batch drain, called from the device service task
+ # between DMA buffers (`:dma`) or between dump polls (`:csr`).
++#
++# Updates are *held* until their `apply_at_sample` and written at the first
++# pass at or after it. The receiver's delay-aware loop
++# (`GNSSReceiver.NCOReferencedPLLAndDLL`) attributes every record to the word
++# it believes was running and sizes each correction for the sample the new word
++# lands at; a word applied on arrival — up to a millisecond before that sample,
++# by an amount that varies with host timing — is attributed to the wrong span.
++# Holding costs nothing in loop delay (the receiver chose the sample) and makes
++# the landing error one-sided and bounded by the service pass period.
++#
++# Not the gateware's staged commit (`schedule!`): that has a single staging
++# register with cancel-on-re-arm semantics, and the next update arrives before
++# the pending one matures under any host jitter, so no word would ever apply
++# (the walk-off-and-die disease). The immediate CSRs apply on the next sample
++# with no arming. The staged path remains for handovers, which need the
++# sample-exact phase load and are one-shot.
+ function _drain_ncos!(
+     sdr::M2SDRCorrelator,
+     last_carrier::Vector{Float64} = Float64[],
+     last_code::Vector{Float64} = Float64[],
+ )
++    pending = sdr.nco_pending
+     n = Base.n_avail(sdr.ncos)
+-    n == 0 && return 0
++    for _ = 1:n
++        update = take!(sdr.ncos)
++        checkbounds(Bool, pending, update.channel) || continue
++        # The newest word for a channel supersedes whatever was waiting: the
++        # receiver never schedules a later command for an earlier sample.
++        pending[update.channel] = update
++    end
++    any(!isnothing, pending) || return 5
++    now = sample_count(sdr.bank)
++    # Whole milliseconds until the earliest word still held is due, so the
++    # service loop can bound its wait for DMA data by it (see `_service_dma!`)
++    # instead of letting a word wait for the next buffer, ~2 ms at the live
++    # strobe rate. 0 makes the caller come straight back and spin on the sample
++    # counter for the remainder of the millisecond.
++    earliest = typemax(Int64)
+     # A correction computed for a sample far in the past describes a loop state
+     # that no longer exists: committing it steers the NCO with stale data and
+     # throws the loop (observed while the host catches up a start-up backlog —
+     # every satellite lost within a minute). Let the channel free-run instead
+     # (a handover-seeded NCO drifts ~0.5 Hz/s, harmless for tens of seconds)
+     # and resume with the first fresh correction.
+-    now = sample_count(sdr.bank)
+     max_stale = Int64(round(0.02 * sdr.fs))   # 20 ms
+-    for _ = 1:n
+-        update = take!(sdr.ncos)
+-        update.apply_at_sample < now - max_stale && continue
++    for i in eachindex(pending)
++        update = pending[i]
++        update === nothing && continue
++        if update.apply_at_sample > now                # not due yet: hold it
++            earliest = min(earliest, update.apply_at_sample)
++            continue
++        end
++        pending[i] = nothing
++        lag = now - update.apply_at_sample
++        if lag > max_stale
++            sdr.nco_dropped_stale += 1
++            continue
++        end
+         start = sdr.assignment_start[update.channel][]
+         start == typemax(Int64) && continue
+         update.prn == sdr.assigned_prns[update.channel] || continue
+@@ -776,16 +842,6 @@
+            kw == last_code[update.channel]
+             continue
+         end
+-        # Do NOT use the staged commit for streaming frequency updates: the
+-        # gateware has a single staging register with cancel-on-re-arm
+-        # semantics, and Tracking's apply_at (fold boundary + 1 epoch) is
+-        # ~1-2 ms in the future — the next 1 kHz update re-arms and cancels
+-        # the pending commit before it matures, so NO update ever applied and
+-        # every channel silently free-ran on its handover words (the
+-        # walk-off-and-die disease). The immediate CSRs apply on the next
+-        # sample with no arming; +-2 ms of application jitter is irrelevant
+-        # at these loop bandwidths. The staged path remains for handovers,
+-        # which need the sample-exact phase load and are one-shot.
+         write(
+             sdr.csr,
+             ch.prefix * "carrier_freq",
+@@ -800,7 +856,11 @@
+             last_carrier[update.channel] = cw
+             last_code[update.channel] = kw
+         end
++        sdr.nco_commits += 1
++        sdr.nco_commit_lag_sum += lag
++        sdr.nco_commit_lag_max = max(sdr.nco_commit_lag_max, lag)
+     end
+-    n
++    earliest == typemax(Int64) && return 5
++    clamp(Int(fld((earliest - now) * 1000, Int64(round(sdr.fs)))), 0, 5)
+ end
+ 

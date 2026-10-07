@@ -1,0 +1,12 @@
+# Environment for the loop-process trim spike (Milestone 0 of
+# docs/plans/2026-09-22-loop-process.md). Built on the target with Julia 1.13
+# and JuliaC; see run.sh.
+[deps]
+GNSSSignals = "52c80523-2a4e-5c38-8979-05588f836870"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+Tracking = "10b2438b-ffd4-5096-aa58-44041d5c8f3b"
+TrackingLoopFilters = "0814aff9-93cb-554c-9fff-9bf1cfdb5efa"
+Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
+
+[compat]
+Tracking = "8.3"
