@@ -272,10 +272,8 @@ function process(
     #
     # `BandMeasurement` promotes its two frequency arguments to a common unit, so mixing
     # units here (e.g. a `MHz` sampling frequency with an `Hz` intermediate frequency)
-    # collapses both to the SI base `s^-1`. The vector-tracking estimator's `Hz`-typed
-    # discriminator accumulator then rejects that `s^-1` value at the first loop closure
-    # (scalar tracking has no such field, so it silently tolerates the mismatch). Normalise
-    # both to `Hz` so the stored sampling frequency matches the loop filters and estimator.
+    # collapses both to the SI base `s^-1`. Normalise both to `Hz` so the stored sampling
+    # frequency matches the `Hz`-typed loop filters and estimator states.
     band_measurements = NamedTuple{band_keys}(
         map(
             (m, interm_freq) ->
@@ -289,46 +287,37 @@ function process(
     # previous `ReceiverState` each chunk, so this is safe and allocation-free.
     track_state = track!(band_measurements, track_state; downconvert_and_correlator)
 
+    # Under vector tracking the estimator runs its navigation cycles inside `track!`;
+    # a changed cycle count means a cycle ran in this chunk.
+    estimator = track_state.doppler_estimator
+    cycle = something(navigation_cycle(estimator), 0)
+    new_navigation_cycle = cycle != receiver_state.navigation_cycle
+
     receiver_sat_states = update_all_receiver_sat_states(
         receiver_sat_states,
         track_state,
         all_systems,
         signal_duration,
+        new_navigation_cycle,
     )
 
     track_state = remove_lost_satellites(receiver_sat_states, track_state)
 
-    # Run a navigation cycle once a full `pvt_update_interval` of signal time has
-    # accumulated, otherwise carry the previous solution forward. The elapsed
-    # time is the filter's integration interval; gating the cadence here lets the
-    # `update_navigation` methods assume they are only called when a cycle is due.
-    integration_time = runtime - receiver_state.last_time_pvt_ran
-    track_state, receiver_sat_states, pvt, vt, last_time_pvt_ran =
-        if integration_time >= pvt_update_interval
-            update_navigation(
-                receiver_state.vt,
-                all_systems,
-                track_state,
-                receiver_sat_states,
-                receiver_state.pvt,
-                receiver_state.pvt_sat_state_buffer,
-                sampling_freq,
-                runtime,
-                integration_time;
-                time_in_lock_before_calculating_pvt,
-                enable_ionospheric_correction,
-                enable_tropospheric_correction,
-                pvt_approximate_year,
-            )
-        else
-            (
-                track_state,
-                receiver_sat_states,
-                receiver_state.pvt,
-                receiver_state.vt,
-                receiver_state.last_time_pvt_ran,
-            )
-        end
+    pvt, last_time_pvt_ran = update_navigation(
+        estimator,
+        new_navigation_cycle,
+        all_systems,
+        track_state,
+        receiver_sat_states,
+        receiver_state.pvt,
+        runtime,
+        receiver_state.last_time_pvt_ran;
+        pvt_update_interval,
+        time_in_lock_before_calculating_pvt,
+        enable_ionospheric_correction,
+        enable_tropospheric_correction,
+        pvt_approximate_year,
+    )
 
     ReceiverState(
         track_state,
@@ -336,114 +325,83 @@ function process(
         acquisition_buffers,
         last_time_acquisition_ran,
         pvt,
-        receiver_state.pvt_sat_state_buffer,
-        vt,
+        cycle,
         runtime + signal_duration,
         last_time_pvt_ran,
     )
 end
 
-# Advance the navigation solution by one cycle, dispatched on the tracking mode.
-# Called by `process` only when a PVT cycle is due (the cadence gate lives
-# there), so both methods run unconditionally and return the new
-# `(track_state, receiver_sat_states, pvt, vt, last_time_pvt_ran)` — the pieces
-# in `ReceiverState` field order — with `last_time_pvt_ran` set to the current
-# `runtime`. `integration_time` is the elapsed signal time since the previous cycle.
+# Advance the navigation solution, dispatched on the tracking loops' Doppler
+# estimator. Returns the new `(pvt, last_time_pvt_ran)`.
 
-# Scalar receiver (`vt === nothing`): plain PVT via `update_pvt`; tracking and
-# satellite states pass through unchanged, and there is no vector-tracking state.
+# Scalar receiver: once a full `pvt_update_interval` of signal time has accumulated
+# since the last solve, solve the PVT over the satellites the receiver decoded;
+# otherwise carry the previous solution forward.
 function update_navigation(
-    ::Nothing,
+    ::AbstractDopplerEstimator,
+    new_navigation_cycle,
     all_systems,
     track_state,
     receiver_sat_states,
     pvt,
-    pvt_sat_state_buffer,
-    sampling_freq,
     runtime,
-    integration_time;
+    last_time_pvt_ran;
+    pvt_update_interval = 100ms,
     time_in_lock_before_calculating_pvt = 2s,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
     pvt_approximate_year::Integer = year(now(UTC)),
 )
+    runtime - last_time_pvt_ran >= pvt_update_interval || return pvt, last_time_pvt_ran
     pvt = update_pvt(
         all_systems,
         track_state,
         receiver_sat_states,
-        pvt,
-        pvt_sat_state_buffer;
+        pvt;
         time_in_lock_before_calculating_pvt,
         enable_ionospheric_correction,
         enable_tropospheric_correction,
         pvt_approximate_year,
     )
-    track_state, receiver_sat_states, pvt, nothing, runtime
+    pvt, runtime
 end
 
-# Vector-tracking receiver: while the vector loop is not yet running, compute
-# the scalar PVT as usual and use the first fix to initialize the navigation
-# filter; once running, each cycle is one navigation-filter iteration that also
-# closes the tracking loops (see `vector_tracking.jl`).
+# Vector-tracking receiver: the estimator decoded the satellites and ran its own
+# navigation cycle (the scalar PVT until its first fix seeds the navigation filter,
+# a filter iteration after that) on its `pvt_update_interval` grid inside `track!`.
+# Take a copy of the solution whenever a new cycle ran — the estimator reuses the
+# solution's containers in its next cycle, and the receiver emits this one. The
+# navigation keywords were baked into the estimator at construction.
 function update_navigation(
-    vt::VectorTrackingState,
+    estimator::VectorPLLAndDLL,
+    new_navigation_cycle,
     all_systems,
     track_state,
     receiver_sat_states,
     pvt,
-    pvt_sat_state_buffer,
-    sampling_freq,
     runtime,
-    integration_time;
-    time_in_lock_before_calculating_pvt = 2s,
-    enable_ionospheric_correction = true,
-    enable_tropospheric_correction = true,
-    pvt_approximate_year::Integer = year(now(UTC)),
+    last_time_pvt_ran;
+    kwargs...,
 )
-    if vt.running
-        track_state, receiver_sat_states, pvt, vt = run_vt_iteration(
-            vt,
-            all_systems,
-            track_state,
-            receiver_sat_states,
-            sampling_freq,
-            integration_time;
-            enable_ionospheric_correction,
-            enable_tropospheric_correction,
-            pvt_approximate_year,
-        )
-    else
-        previous_pvt = pvt
-        pvt = update_pvt(
-            all_systems,
-            track_state,
-            receiver_sat_states,
-            pvt,
-            pvt_sat_state_buffer;
-            time_in_lock_before_calculating_pvt,
-            enable_ionospheric_correction,
-            enable_tropospheric_correction,
-            pvt_approximate_year,
-        )
-        # A fresh fix seeds the navigation filter and starts the vector loop;
-        # `initialize_vector_tracking` no-ops when `pvt` is unchanged (a failed
-        # solve returns the previous solution).
-        track_state, receiver_sat_states, vt = initialize_vector_tracking(
-            vt,
-            all_systems,
-            track_state,
-            receiver_sat_states,
-            previous_pvt,
-            pvt,
-            sampling_freq,
-            integration_time;
-            enable_ionospheric_correction,
-            enable_tropospheric_correction,
-            pvt_approximate_year,
-        )
-    end
-    track_state, receiver_sat_states, pvt, vt, runtime
+    new_navigation_cycle || return pvt, last_time_pvt_ran
+    copy_solution(navigation_solution(estimator)), runtime
 end
+
+# An independent copy of a `PVTSolution`: its `sats` and bias containers copied, so a
+# later solve into the original's containers leaves the copy untouched.
+copy_solution(pvt::PVTSolution) = PVTSolution(
+    pvt.position,
+    pvt.velocity,
+    pvt.course_over_ground,
+    pvt.time_correction,
+    pvt.time,
+    pvt.relative_clock_drift,
+    pvt.dop,
+    copy(pvt.sats),
+    pvt.reference_system,
+    copy(pvt.inter_system_biases),
+    copy(pvt.inter_frequency_biases),
+)
 
 function remove_lost_satellites(receiver_sat_states, track_state)
     for (group_key, group_sat_states) in pairs(receiver_sat_states)
@@ -463,12 +421,11 @@ function remove_lost_satellites(receiver_sat_states, track_state)
     track_state
 end
 
-# Append the PVT-ready satellites of the given `systems` (every constellation
-# across all bands) to `states`. A satellite is ready once it is in lock, its loops have
+# Whether a satellite is ready to enter the PVT solve: it is in lock, its loops have
 # settled enough to range on (`is_ranging_ready`), and it has been in lock for
-# `time_in_lock_before_calculating_pvt` — long enough to have decoded usable data. Called by
-# the combined multi-band PVT solve (`update_pvt`); `calc_pvt` itself further filters to
-# satellites whose navigation data is fully decoded and healthy.
+# `time_in_lock_before_calculating_pvt` — long enough to have decoded usable data.
+# `calc_pvt` itself further filters to satellites whose navigation data is fully decoded
+# and healthy.
 #
 # The `is_ranging_ready` gate is what keeps the lock detectors' tolerance through the
 # acquisition → tracking handover from costing accuracy. `is_in_lock` is deliberately generous
@@ -479,67 +436,68 @@ end
 # `time_in_lock_before_calculating_pvt` alone does not cover this: it counts from the handover,
 # so it can elapse while the loops are still settling — and on a code longer than 1 ms the
 # settling takes proportionally longer while that gate stays fixed in seconds.
-function collect_pvt_sat_states!(
-    states,
-    systems,
-    receiver_sat_states,
-    track_state,
-    time_in_lock_before_calculating_pvt,
-)
-    for system in systems
-        group_key = signal_group_key(system)
-        for receiver_sat_state in receiver_sat_states[group_key]
-            if is_in_lock(receiver_sat_state) &&
-               is_ranging_ready(receiver_sat_state) &&
-               receiver_sat_state.time_in_lock > time_in_lock_before_calculating_pvt
-                # Hand PVT the *ranging* signal (the pilot, for a combined spec) as
-                # `system` and the *data* decoder separately: PVT derives the code /
-                # carrier terms and the group-delay ISC from the ranging signal (its
-                # `correct_by_group_delay` dispatches on e.g. `GPSL5Q`/`GPSL1C_P`)
-                # and the TOW / bit count from the decoder's data component. The
-                # combined `TrackedSat` carries the shared, pilot-driven code phase.
-                sat_state = SatelliteState(
-                    receiver_sat_state.decoder,
-                    ranging_signal(system),
-                    get_sat_state(track_state, group_key, receiver_sat_state.prn),
-                )
-                push!(states, sat_state)
-            end
-        end
-    end
-    states
+is_pvt_ready(receiver_sat_state, time_in_lock_before_calculating_pvt) =
+    is_in_lock(receiver_sat_state) &&
+    is_ranging_ready(receiver_sat_state) &&
+    receiver_sat_state.time_in_lock > time_in_lock_before_calculating_pvt
+
+# The decoders of one group's PVT-ready satellites, keyed by PRN as the tracking group is.
+function pvt_ready_decoders(group_sat_states, time_in_lock_before_calculating_pvt)
+    ready = filter(
+        state -> is_pvt_ready(state, time_in_lock_before_calculating_pvt),
+        group_sat_states,
+    )
+    map(state -> state.decoder, ready)
 end
 
-# Combined multi-band PVT over the single receiver state: pool every band's
-# PVT-ready satellites into one `calc_pvt`. `all_systems` is the flat tuple of
-# specs across all bands; `receiver_sat_states` and `track_state` are the
-# receiver-wide, band-spanning states. The pooled vector mixes constellations and
-# frequency bands, which is exactly what `calc_pvt` resolves (a clock column per
-# GNSS time system and an inter-frequency-bias column per extra band).
+# One epoch's measurements of the PVT-ready satellites, one
+# `PositionVelocityTime.SignalGroup` per tracking group and keyed like it. Each group
+# ranges on its *ranging* signal (the pilot, for a combined spec) — PVT derives the code /
+# carrier terms and the group-delay ISC from it (its `correct_by_group_delay` dispatches
+# on e.g. `GPSL5Q`/`GPSL1C_P`) — and reads the TOW / bit count from the decoder of the
+# *data* component; the combined `TrackedSat` carries the shared, pilot-driven code phase.
+function pvt_signal_groups(
+    all_systems,
+    track_state,
+    receiver_sat_states,
+    time_in_lock_before_calculating_pvt,
+)
+    NamedTuple{map(signal_group_key, all_systems)}(
+        map(all_systems) do system
+            group_key = signal_group_key(system)
+            PositionVelocityTime.SignalGroup(
+                track_state.groups[group_key],
+                pvt_ready_decoders(
+                    receiver_sat_states[group_key],
+                    time_in_lock_before_calculating_pvt,
+                );
+                signal = ranging_signal(system),
+            )
+        end,
+    )
+end
+
+# Combined multi-band PVT over the single receiver state: every band's PVT-ready
+# satellites in one `calc_pvt`. The groups mix constellations and frequency bands, which
+# is exactly what `calc_pvt` resolves (a clock column per GNSS time system and an
+# inter-frequency-bias column per extra band).
 function update_pvt(
     all_systems,
     track_state,
     receiver_sat_states,
-    pvt,
-    pvt_sat_state_buffer;
+    pvt;
     time_in_lock_before_calculating_pvt = 2s,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
     pvt_approximate_year::Integer = year(now(UTC)),
 )
-    # Reuse the buffer across PVT cycles: `collect_pvt_sat_states!` empties and refills it,
-    # avoiding a fresh `Vector{SatelliteState}` allocation every cycle.
-    empty!(pvt_sat_state_buffer)
-    collect_pvt_sat_states!(
-        pvt_sat_state_buffer,
-        all_systems,
-        receiver_sat_states,
-        track_state,
-        time_in_lock_before_calculating_pvt,
-    )
-
     calc_pvt(
-        pvt_sat_state_buffer,
+        pvt_signal_groups(
+            all_systems,
+            track_state,
+            receiver_sat_states,
+            time_in_lock_before_calculating_pvt,
+        ),
         pvt;
         enable_ionospheric_correction,
         enable_tropospheric_correction,
@@ -547,8 +505,15 @@ function update_pvt(
     )
 end
 
-function update_all_receiver_sat_states(receiver_sat_states, track_state, systems, signal_duration)
+function update_all_receiver_sat_states(
+    receiver_sat_states,
+    track_state,
+    systems,
+    signal_duration,
+    new_navigation_cycle = false,
+)
     group_keys = keys(receiver_sat_states)
+    estimator = track_state.doppler_estimator
     # Map over `systems` (aligned with `group_keys`) so each group carries its own
     # ranging/data signal selectors: CN0 and carrier lock are read from the ranging
     # signal, the navigation bits decoded from the data signal.
@@ -559,21 +524,24 @@ function update_all_receiver_sat_states(receiver_sat_states, track_state, system
     # values it needs, so no consumer holds a reference into this dictionary.
     new_vals = map(systems) do system
         group_key = signal_group_key(system)
-        data_idx = data_signal_index(system)
         group_states = receiver_sat_states[group_key]
         map!(group_states, group_states) do receiver_sat_state
+            prn = receiver_sat_state.prn
+            report = satellite_report(estimator, ranging_signal(system), prn)
+            in_vt_loop = is_vector_loop_member(report)
             # A satellite in the vector loop keeps decoding and updating its
             # detectors even while out of (code) lock — the navigation filter
-            # carries it through the outage and reads the detectors to manage
-            # its availability.
-            if is_in_lock(receiver_sat_state) || receiver_sat_state.in_vt_loop
-                prn = receiver_sat_state.prn
+            # carries it through the outage and decides itself when to let it go.
+            state = if is_in_lock(receiver_sat_state) || in_vt_loop
                 ReceiverSatState(
                     prn,
-                    decode(
+                    updated_decoder(
+                        estimator,
+                        report,
                         receiver_sat_state.decoder,
-                        get_soft_bits(track_state, group_key, prn, data_idx),
-                        get_num_bits(track_state, group_key, prn, data_idx),
+                        track_state,
+                        system,
+                        prn,
                     ),
                     update(
                         receiver_sat_state.code_lock_detector,
@@ -609,14 +577,53 @@ function update_all_receiver_sat_states(receiver_sat_states, track_state, system
                     receiver_sat_state.time_in_lock + signal_duration,
                     0.0s,
                     0,
-                    receiver_sat_state.in_vt_loop,
+                    in_vt_loop,
                 )
             else
-                increase_time_out_of_lock(receiver_sat_state, signal_duration)
+                increase_time_out_of_lock(@set(receiver_sat_state.in_vt_loop = false), signal_duration)
             end
+            # A satellite the navigation filter released for cause — no longer eligible, or
+            # below the horizon — is forced out of lock, so that it is removed from tracking
+            # and recovered through the normal reacquisition path. A fallback, where vector
+            # tracking stops as a whole, hands every member back to its scalar loop instead.
+            new_navigation_cycle && is_released_for_cause(report) ? force_out_of_lock(state) :
+            state
         end
     end
     NamedTuple{group_keys}(new_vals)
+end
+
+# What the vector estimator reports of a satellite, read through these so that a scalar
+# estimator — which reports `nothing` — needs no method of its own.
+is_vector_loop_member(::Nothing) = false
+is_vector_loop_member(report) = report.tracked && report.in_vector_loop
+
+is_released_for_cause(::Nothing) = false
+is_released_for_cause(report) =
+    report.release_reason == VT_INELIGIBLE || report.release_reason == VT_BELOW_HORIZON
+
+# The satellite's decoder after this chunk. Under vector tracking the estimator decodes
+# every satellite it steps, so the receiver takes its decoder over rather than decoding
+# the same bits a second time (it shares its buffers with the estimator's, which only the
+# health and data reads of this chunk see); a satellite the estimator has no record of
+# yet keeps its decoder. A scalar receiver decodes the data signal's soft bits itself.
+updated_decoder(::VectorPLLAndDLL, report, decoder, track_state, system, prn) =
+    isnothing(report) ? decoder : report.decoder
+function updated_decoder(::AbstractDopplerEstimator, report, decoder, track_state, system, prn)
+    group_key = signal_group_key(system)
+    data_idx = data_signal_index(system)
+    decode!(
+        decoder,
+        get_soft_bits(track_state, group_key, prn, data_idx),
+        get_num_bits(track_state, group_key, prn, data_idx),
+    )
+end
+
+# Trip both lock detectors, so the satellite is removed from tracking on this chunk and
+# recovered through normal reacquisition.
+function force_out_of_lock(state::ReceiverSatState)
+    state = @set state.code_lock_detector = set_out_of_lock(state.code_lock_detector)
+    @set state.carrier_lock_detector = set_out_of_lock(state.carrier_lock_detector)
 end
 
 # Build a `TrackedSat` from an acquisition result, tracking `signals` (the
@@ -674,7 +681,7 @@ function update_states_from_acquisition_results(
     new_receiver_sat_states = map(acq_res_valids) do res
         decoder =
             res.prn in keys(receiver_sat_states) ?
-            reset_decoder_state(receiver_sat_states[res.prn].decoder) :
+            reset_decoder_state!(receiver_sat_states[res.prn].decoder) :
             GNSSDecoderState(data_sys, res.prn)
         ReceiverSatState(res, decoder, code_lock_threshold)
     end

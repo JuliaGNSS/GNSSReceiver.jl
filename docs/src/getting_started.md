@@ -64,7 +64,7 @@ gnss_receiver_gui(;
     sampling_freq = 2e6u"Hz",
     chunk_time = 4u"ms",           # processing chunk length (tracking granularity)
     run_time = 40u"s",
-    num_ants = Tracking.NumAnts(1),
+    num_ants = NumAnts(1),
     dev_args = first(Devices()),   # pick the first attached device
 )
 ```

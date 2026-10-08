@@ -820,15 +820,15 @@ end
 # ---------------------------------------------------------------------------------------
 
 const NUM_PROMPTS = 100
-default_estimator() = Tracking.default_cn0_estimator(GPSL1CA(), NUM_PROMPTS)
+default_estimator() = TrackingLoops.default_cn0_estimator(GPSL1CA(), NUM_PROMPTS)
 moments_estimator() = MomentsCN0Estimator(NUM_PROMPTS)
 
 # Fold one record's prompt in. The moment ratio (like any estimator that reads the prompt
 # stream alone) takes the two-argument form; everything else gets the context the tracking
 # loop would have built for this record.
 fold_prompt(estimator::MomentsCN0Estimator, prompt, context) =
-    Tracking.update(estimator, prompt)
-fold_prompt(estimator, prompt, context) = Tracking.update(estimator, prompt, context)
+    TrackingLoops.update(estimator, prompt)
+fold_prompt(estimator, prompt, context) = TrackingLoops.update(estimator, prompt, context)
 
 function synthetic_tracked_signal(
     cn0,
@@ -843,9 +843,9 @@ function synthetic_tracked_signal(
     amplitude = sqrt(ustrip(uconvert(NoUnits, Unitful.linear(cn0) * integration_time)))
     # Unit noise power per record ⇒ a measured density of `T` (see above). Only a
     # noise-referenced estimator reads either field.
-    context = Tracking.CN0UpdateContext(
+    context = TrackingLoops.CN0UpdateContext(
         signal,
-        Tracking.get_bit_buffer(base),
+        get_bit_buffer(base),
         num_code_blocks;
         noise_density = integration_time,
         integration_time,

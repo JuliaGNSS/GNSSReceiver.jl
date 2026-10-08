@@ -7,8 +7,8 @@ every `calc_new_every` updates, recomputes the beamforming weights from the domi
 eigenvector (the estimated signal subspace) before resetting the accumulator.
 
 Construct one with [`EigenBeamformer(num_ants)`](@ref); `Tracking` reads its current
-weights through `Tracking.get_weights` and combines the correlator's per-antenna taps
-itself, and `Tracking.update` evolves it.
+weights through `TrackingLoops.get_weights` and combines the correlator's per-antenna taps
+itself, and `TrackingLoops.update` evolves it.
 """
 struct EigenBeamformer{N} <: AbstractPostCorrFilter
     covariance::SMatrix{N,N,ComplexF64}
@@ -33,7 +33,7 @@ function EigenBeamformer(num_ants, calc_new_every = 20)
     )
 end
 
-function Tracking.update(filter::EigenBeamformer{N}, prompt) where {N}
+function TrackingLoops.update(filter::EigenBeamformer{N}, prompt) where {N}
     covariance = filter.covariance + prompt * prompt'
     counter = filter.counter + 1
     beamformer = filter.beamformer
@@ -51,6 +51,6 @@ end
 # weights (`N₀ = wᴴR̂w`). The weights are the eigen-beamformer's own state, so declaring
 # them is the whole of the contract — and it is scale-free: `R̂` carries the antennas'
 # relative noise scale, so the reported C/N₀ no longer depends on the last-element
-# normalisation `Tracking.update` applies.
-Tracking.get_weights(filter::EigenBeamformer{N}, ::NumAnts{N}) where {N} =
+# normalisation `TrackingLoops.update` applies.
+TrackingLoops.get_weights(filter::EigenBeamformer{N}, ::NumAnts{N}) where {N} =
     filter.beamformer

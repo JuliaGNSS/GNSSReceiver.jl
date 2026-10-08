@@ -9,7 +9,8 @@
 # tracking pass, lock detection, the decode consumer and the PVT cadence gate
 # all execute, and nothing depends on a signal. The pipeline is specialised on
 # the system tuple, so it runs for one system, for the two default
-# constellations in one band, and for two bands in lock-step.
+# constellations in one band, for vector tracking on one system, and for two
+# bands in lock-step.
 using PrecompileTools: @setup_workload, @compile_workload
 
 function _precompile_noise_channel(T, num_samples, num_chunks)
@@ -50,6 +51,20 @@ end
             )
             collect_data(data)
         end
+        # Vector tracking on the integer front end: the receiver specialised on the
+        # vector estimator — its state, tracking pass, satellite updates and payload.
+        # Noise acquires no satellite, so no record reaches the estimator's own
+        # navigation engine; that compiles on the first tracked satellite.
+        data = receive(
+            _precompile_noise_channel(Complex{Int16}, 4000, 12),
+            GPSL1CA(),
+            4e6Hz;
+            max_meas = 2^12,
+            acquire_every = 4u"ms",
+            pvt_update_interval = 4u"ms",
+            vector_tracking = true,
+        )
+        collect_data(data)
         # Two RF bands in lock-step: L1 (GPS + Galileo) and L5, one code period
         # per 1 ms chunk at the shared sampling frequency.
         data = receive(

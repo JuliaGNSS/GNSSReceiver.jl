@@ -251,22 +251,21 @@ function build_sat_data(receiver_state)
 end
 
 # Condensed vector-tracking status for the payload: `nothing` when vector tracking is
-# disabled (`receiver_state.vt === nothing`), otherwise the [`VTStatus`](@ref). The
-# per-member report is whatever the navigation filter's latest update left on the state.
-#
-# The uncertainties are reported only while the filter is running, like `member_sats`: with
-# the scalar solve in control the covariance describes an update that did not determine the
-# reported solution (and before the first one it is still all zeros, which would read as
-# perfect certainty rather than as no information).
-function vt_status_of_interest(receiver_state)
-    vt = receiver_state.vt
-    vt === nothing && return nothing
+# disabled (a scalar estimator reports no navigation status), otherwise the
+# [`VTStatus`](@ref) of the estimator's latest navigation cycle. The per-member report is
+# copied, since the estimator refills it in its next cycle. The uncertainties are `NaN`
+# while the filter is not running, as the estimator reports them.
+vt_status_of_interest(receiver_state) =
+    vt_status_of_interest(receiver_state.track_state.doppler_estimator)
+vt_status_of_interest(::AbstractDopplerEstimator) = nothing
+function vt_status_of_interest(estimator::VectorPLLAndDLL)
+    status = navigation_status(estimator)
     VTStatus(
-        vt.running,
-        vt.member_sats,
-        (vt.running ? position_uncertainty(vt) : NaN) * m,
-        (vt.running ? clock_uncertainty(vt) : NaN) * m,
-        vt.time_with_insufficient_meas,
+        status.running,
+        copy(member_sats(estimator)),
+        status.position_std,
+        status.clock_std,
+        status.time_with_insufficient_meas,
     )
 end
 
@@ -321,7 +320,7 @@ handover_coherent_integration_time(signal::AbstractGNSSSignal) = primary_code_pe
 # constellation's acquisition Doppler bin from this (bin = 2·margin·pull_in) so the
 # worst-case post-acquisition residual lands inside the loop's capture range. These
 # are the pull-in ranges of `Tracking`'s `ConventionalPLLAndDLL` estimator, derived
-# from the public `Tracking` / `GNSSSignals` API.
+# from the public `TrackingLoops` / `GNSSSignals` API.
 
 # FLL-assisted carrier loop — the `ConventionalAssistedPLLAndDLL` default, a
 # `ThirdOrderAssistedBilinearLF`. Pull-in comes from the FLL frequency
@@ -331,7 +330,7 @@ handover_coherent_integration_time(signal::AbstractGNSSSignal) = primary_code_pe
 # error only while `2π·|Δf|·T ≤ π/2`, i.e. `|Δf| ≤ 1 / (4·T)` — 250 Hz for a 1 ms
 # code (GPS L1 C/A, L5I), 62.5 Hz for Galileo E1B (4 ms), 25 Hz for L1C (10 ms).
 function carrier_doppler_pull_in_range(
-    ::ConventionalPLLAndDLL{<:Tracking.ThirdOrderAssistedBilinearLF},
+    ::ConventionalPLLAndDLL{<:TrackingLoops.ThirdOrderAssistedBilinearLF},
     signal::AbstractGNSSSignal,
 )
     T = handover_coherent_integration_time(signal)
@@ -358,20 +357,11 @@ function carrier_doppler_pull_in_range(
     uconvert(Hz, min(B_L, 1 / (2 * T)))
 end
 
-# The vector estimator's acquisition handover runs on its scalar fallback loop
-# (the navigation filter only takes over once the satellite is locked and
-# decoded), which uses the same FLL-assisted filter and per-signal defaults as
-# the conventional estimator — so the pull-in range is the same FLL
-# discriminator bound. `VectorPLLAndDLL` is always FLL-assisted here (its
-# default, and a non-assisted carrier filter cannot close the vector carrier
-# loop), so no pure-PLL fallback method is needed.
-function carrier_doppler_pull_in_range(
-    ::VectorPLLAndDLL{<:Tracking.ThirdOrderAssistedBilinearLF},
-    signal::AbstractGNSSSignal,
-)
-    T = handover_coherent_integration_time(signal)
-    uconvert(Hz, 1 / (4 * T))
-end
+# The vector estimator's acquisition handover runs on the scalar loop it wraps (the
+# navigation filter only takes a satellite over once it is locked and decoded), so the
+# pull-in range is that loop's.
+carrier_doppler_pull_in_range(estimator::VectorPLLAndDLL, signal::AbstractGNSSSignal) =
+    carrier_doppler_pull_in_range(estimator.inner, signal)
 
 # Build the per-constellation acquisition plans and the acquisition-buffer sample
 # count for one band from the caller-supplied per-system target acquisition Doppler
@@ -467,13 +457,18 @@ solution — recomputed every `pvt_update_interval` — after
 `enable_tropospheric_correction` and `pvt_approximate_year` (which resolves the GPS
 week-number rollover for old recordings) are passed through to `calc_pvt`.
 
-Pass `vector_tracking = true` to switch to vector tracking: once a first scalar fix is
-available, a navigation Kalman filter closes every satellite's code/carrier loop
-centrally from the fused multi-GNSS solution instead of per-satellite loop filters, and
-the emitted PVT solutions come from the filter. Like the scalar solve, the filter
-estimates one clock bias per GNSS time system and one inter-frequency bias per band
-beyond a reference band, and corrects the pseudoranges for the broadcast ionospheric
-model and the tropospheric delay.
+Pass `vector_tracking = true` to switch to vector tracking, run by TrackingLoops'
+`VectorPLLAndDLL`: its navigation engine decodes every satellite, solves the scalar PVT
+and, once a first fix is available, a navigation Kalman filter closes every satellite's
+code/carrier loop centrally from the fused multi-GNSS solution instead of per-satellite
+loop filters; the emitted PVT solutions then come from the filter. Like the scalar
+solve, the filter estimates one clock bias per GNSS time system and one inter-frequency
+bias per band beyond a reference band, and corrects the pseudoranges for the broadcast
+ionospheric model and the tropospheric delay. Its navigation cycle runs every
+`pvt_update_interval`; `time_in_lock_before_calculating_pvt` does not apply, as the
+engine admits a satellite to its solve on its own lock and decoding test. Vector
+tracking drives the loops from the decoded signal, so it does not take a
+[`CombinedSignal`](@ref), whose loops are driven by the dataless pilot.
 
 Passing a [`VectorTracking`](@ref) in place of `true` enables vector tracking *and*
 configures the filter, which is worth doing whenever the platform or the front end is known:
@@ -573,17 +568,15 @@ function receive(
     # Acquisition Doppler resolution derived per system from the carrier loops'
     # *pull-in range* (bin = 2·margin·pull_in), so the worst-case post-acquisition
     # residual lands inside the loop's capture range; a smaller `pull_in_margin`
-    # gives finer bins. The pull-in depends on `doppler_estimator` and each group's
-    # ranging (driver) signal, so the estimator that sizes acquisition must be the
-    # one the receiver state below bakes in for the same `vector_tracking` mode —
-    # `VectorPLLAndDLL` under vector tracking (sized from its scalar fallback),
-    # else the conventional PLL/DLL.
-    doppler_estimator = doppler_estimator_for(vector_tracking)
+    # gives finer bins. The pull-in depends on the scalar loop a satellite runs fresh
+    # from acquisition and on each group's ranging (driver) signal; that loop is the
+    # same in both modes, since `VectorPLLAndDLL` wraps it until the navigation filter
+    # takes the satellite over.
     pull_in_margin = 0.5
     band_acq_doppler_resolutions = map(band_systems) do systems
         map(systems) do system
             2 * pull_in_margin *
-            carrier_doppler_pull_in_range(doppler_estimator, ranging_signal(system))
+            carrier_doppler_pull_in_range(SCALAR_DOPPLER_ESTIMATOR, ranging_signal(system))
         end
     end
 
@@ -606,7 +599,16 @@ function receive(
         # buffer is sized in scalar samples, so unwrap to the scalar element type `T`.
         map((ch, s) -> SampleBuffer(eltype(eltype(ch)), s[3]), measurement_channels, setups),
     )
-    initial_state = ReceiverState(band_systems, buffers; num_ants, vector_tracking)
+    initial_state = ReceiverState(
+        band_systems,
+        buffers;
+        num_ants,
+        vector_tracking,
+        pvt_update_interval,
+        enable_ionospheric_correction,
+        enable_tropospheric_correction,
+        pvt_approximate_year,
+    )
 
     # The channel carries whatever `extract` returns. Infer that type without running
     # user code where possible (`promote_op`); for the default this is a concrete

@@ -18,7 +18,6 @@ using StaticArrays,
     PositionVelocityTime,
     GNSSSignals,
     Acquisition,
-    KalmanFilters,
     Unitful,
     JLD2,
     LinearAlgebra,
@@ -28,39 +27,32 @@ using StaticArrays,
     Dictionaries,
     Dates
 
-# The documented measurement-model surface of PositionVelocityTime that the
-# vector-tracking loop consumes. The names are deliberately unexported over
-# there — solver internals rather than every user's vocabulary — and bound
-# explicitly here, at one site, as that package's API reference prescribes.
-using PositionVelocityTime:
-    SPEED_OF_LIGHT,
-    calc_corrected_time,
-    calc_satellite_clock_drift,
-    get_sat_position,
-    get_sat_velocity,
-    fold_week_crossover,
-    BiasColumns,
-    band_ifb_layout,
-    calc_ρ_hat!,
-    calc_H,
-    calc_line_of_sight,
-    calc_DOP,
-    time_scale_offset_to_gpst,
-    time_offset_available,
-    calc_steering_offset,
-    get_week,
-    system_start_epoch,
-    day_of_year,
-    select_ionospheric_correction,
-    predict_atmospheric_delays,
-    calc_course_over_ground
+# The per-record loop core — correlators, Doppler estimators, the noise and C/N₀
+# estimators — lives in TrackingLoops, and Tracking no longer re-exports it. So does
+# vector tracking: `VectorPLLAndDLL` is a Doppler estimator whose navigation engine
+# decodes every satellite, solves the PVT and closes the loops itself. Imported by
+# name rather than wholesale, because TrackingLoops' own `VTStatus` would clash with
+# the receiver's payload type of that name.
+import TrackingLoops
+using TrackingLoops:
+    NumAnts,
+    AbstractDopplerEstimator,
+    AbstractPostCorrFilter,
+    ConventionalPLLAndDLL,
+    ConventionalAssistedPLLAndDLL,
+    CorrelatorNoiseEstimator,
+    DefaultPostCorrFilter,
+    VectorPLLAndDLL,
+    VectorTracking,
+    VT_INELIGIBLE,
+    VT_BELOW_HORIZON,
+    default_carrier_loop_filter_bandwidth,
+    navigation_cycle,
+    navigation_solution,
+    navigation_status,
+    member_sats,
+    satellite_report
 
-# Length of a GNSS week in seconds — likewise unexported and bound at one site.
-# GNSSDecoder owns the definition; PositionVelocityTime reads the same one.
-using GNSSDecoder: SECONDS_PER_WEEK
-
-import Geodesy
-using Geodesy: ECEF
 using Unitful: m, s, ms, Hz, dBHz, dB, °, uconvert
 
 # Lock-free channel primitives and SoapySDR device streaming now live in their own
@@ -80,6 +72,7 @@ using SignalChannels:
 export ReceiverState,
     receive,
     VectorTracking,
+    NumAnts,
     CombinedSignal,
     read_files,
     read_uint8_iq_file,
@@ -93,7 +86,6 @@ export ReceiverState,
 include("lock_detector.jl")
 include("beamformer.jl")
 include("sample_buffer.jl")
-include("vector_tracking.jl")
 
 using GNSSReceiver.SampleBuffers
 
@@ -276,9 +268,9 @@ struct ReceiverSatState{DS<:GNSSDecoderState}
     time_out_of_lock::typeof(1.0s)
     num_unsuccessful_reacquisition::Int
     # Whether the satellite's tracking loops are closed by the vector-tracking
-    # navigation filter (see `vector_tracking.jl`). Cached from the tracking
-    # state so lock handling and reacquisition — which run without the
-    # per-satellite estimator states at hand — can consult it.
+    # navigation filter (TrackingLoops' `VectorPLLAndDLL`). Cached from the
+    # estimator's satellite report every chunk so lock handling and reacquisition
+    # — which run without the estimator at hand — can consult it.
     in_vt_loop::Bool
 end
 
@@ -383,28 +375,18 @@ end
 # `:L1`, `:L5`, …), one entry per band. `receiver_sat_states` is a NamedTuple keyed by each
 # system's group key (`get_signal_id`, the ranging signal's id, unique across
 # bands), each value a per-constellation dictionary of `ReceiverSatState` by PRN.
-struct ReceiverState{
-    TS<:TrackState,
-    RS<:NamedTuple,
-    AB<:NamedTuple,
-    LT<:NamedTuple,
-    P<:PVTSolution,
-    PB<:AbstractVector{<:SatelliteState},
-    VT<:Union{Nothing,VectorTrackingState},
-}
+#
+# Under vector tracking the navigation state — decoders, PVT and the navigation
+# filter — lives in the `TrackState`'s Doppler estimator (`VectorPLLAndDLL`), which
+# `track!` advances; `navigation_cycle` is the estimator's cycle count the receiver
+# last copied the solution of. A scalar receiver leaves it at `0`.
+struct ReceiverState{TS<:TrackState,RS<:NamedTuple,AB<:NamedTuple,LT<:NamedTuple,P<:PVTSolution}
     track_state::TS
     receiver_sat_states::RS
     acquisition_buffers::AB
     last_time_acquisition_ran::LT
     pvt::P
-    # Reused across PVT cycles: `update_pvt` refills it in place instead of allocating a
-    # fresh `Vector{SatelliteState}` each cycle. Pooling every constellation and band
-    # makes its element type the abstract `SatelliteState` when more than one signal is
-    # tracked, but reuse still saves the per-cycle allocation.
-    pvt_sat_state_buffer::PB
-    # Vector-tracking runtime state, or `nothing` for a scalar-tracking receiver
-    # (see `vector_tracking.jl`).
-    vt::VT
+    navigation_cycle::Int
     runtime::typeof(1.0s)
     last_time_pvt_ran::typeof(1.0s)
 end
@@ -419,7 +401,7 @@ get_num_ants(num_ants::NumAnts{N}) where {N} = N
 
 create_post_corr_filter(num_ants::NumAnts{N}) where {N} =
     EigenBeamformer(get_num_ants(num_ants))
-create_post_corr_filter(::NumAnts{1}) = Tracking.DefaultPostCorrFilter()
+create_post_corr_filter(::NumAnts{1}) = DefaultPostCorrFilter()
 
 # The single canonical way this receiver builds a `TrackedSat`: each signal's
 # default correlator, the beamformer injected as post-correlation filter for the
@@ -434,7 +416,7 @@ function create_tracked_sat(
     code_phase,
     carrier_doppler,
     num_ants::NumAnts,
-    doppler_estimator::Tracking.AbstractDopplerEstimator,
+    doppler_estimator::AbstractDopplerEstimator,
 )
     TrackedSat(
         signals,
@@ -657,27 +639,86 @@ vt_enabled(::VectorTracking) = true
 vt_config(vector_tracking::Bool) = VectorTracking()
 vt_config(vector_tracking::VectorTracking) = vector_tracking
 
-# The tracking loops' Doppler estimator for the given mode: `Tracking`'s
-# `VectorPLLAndDLL` under vector tracking (it accumulates the discriminators and
-# applies the navigation filter's NCO corrections), the conventional
-# FLL-assisted PLL/DLL for scalar tracking. Not user-selectable — the mode alone
-# determines it.
-doppler_estimator_for(vector_tracking) =
-    vt_enabled(vector_tracking) ? VectorPLLAndDLL() : ConventionalAssistedPLLAndDLL()
+# The scalar loop every satellite runs fresh from acquisition: the conventional
+# FLL-assisted PLL/DLL, under vector tracking too, where `VectorPLLAndDLL` wraps it
+# until the navigation filter takes the satellite over. Acquisition sizes its Doppler
+# bins from this loop's pull-in range.
+const SCALAR_DOPPLER_ESTIMATOR = ConventionalAssistedPLLAndDLL()
+
+# Vector tracking decodes the navigation data of the signal the loops are driven by.
+# A `CombinedSignal` drives its loops from the dataless pilot, which TrackingLoops'
+# vector engine cannot decode, so the two do not combine.
+function assert_vector_trackable(systems)
+    for system in systems
+        system isa CombinedSignal && throw(
+            ArgumentError(
+                "vector tracking drives the loops from the signal it decodes, but " *
+                "`CombinedSignal($(get_signal_name(system.pilot)), " *
+                "$(get_signal_name(system.data)))` drives them from its dataless pilot; " *
+                "track the data component alone (e.g. `$(get_signal_name(system.data))`) " *
+                "or use scalar tracking.",
+            ),
+        )
+    end
+    nothing
+end
+
+# The tracking loops' Doppler estimator for the given mode: the conventional
+# FLL-assisted PLL/DLL for scalar tracking, and for vector tracking TrackingLoops'
+# `VectorPLLAndDLL` over every system's ranging signal, which wraps that same scalar
+# loop and owns the whole navigation pipeline — bit sync, decoding, the scalar PVT
+# that seeds the filter and the filter itself, run once every `pvt_update_interval`.
+# Not user-selectable — the mode alone determines it.
+doppler_estimator_for(vector_tracking, systems; kwargs...) =
+    vt_enabled(vector_tracking) ? vector_doppler_estimator(vt_config(vector_tracking), systems; kwargs...) :
+    SCALAR_DOPPLER_ESTIMATOR
+
+function vector_doppler_estimator(
+    config::VectorTracking,
+    systems;
+    pvt_update_interval = 100ms,
+    enable_ionospheric_correction = true,
+    enable_tropospheric_correction = true,
+    pvt_approximate_year::Integer = year(now(UTC)),
+)
+    assert_vector_trackable(systems)
+    VectorPLLAndDLL(
+        map(ranging_signal, systems)...;
+        inner = SCALAR_DOPPLER_ESTIMATOR,
+        config,
+        cycle_time = pvt_update_interval,
+        approximate_year = pvt_approximate_year,
+        enable_ionospheric_correction,
+        enable_tropospheric_correction,
+    )
+end
 
 # Primary constructor: build one multi-band receiver state from the per-band
 # system tuples and pre-built per-band acquisition buffers (keyed by `band_key`).
 # All systems across all bands become tracking groups in a single `TrackState`,
-# keyed by their (unique) group key.
+# keyed by their (unique) group key. The navigation keywords configure the vector
+# estimator, which runs the navigation cycle itself; a scalar receiver takes them
+# per chunk in `process` instead.
 function ReceiverState(
     band_systems::Tuple,
     acquisition_buffers::NamedTuple;
     num_ants::NumAnts = NumAnts(1),
     vector_tracking::Union{Bool,VectorTracking} = false,
+    pvt_update_interval = 100ms,
+    enable_ionospheric_correction = true,
+    enable_tropospheric_correction = true,
+    pvt_approximate_year::Integer = year(now(UTC)),
 )
-    doppler_estimator = doppler_estimator_for(vector_tracking)
     systems = _flatten_systems(band_systems)
     assert_decodable(systems)
+    doppler_estimator = doppler_estimator_for(
+        vector_tracking,
+        systems;
+        pvt_update_interval,
+        enable_ionospheric_correction,
+        enable_tropospheric_correction,
+        pvt_approximate_year,
+    )
     group_keys = map(signal_group_key, systems)
     # One tracking group per system: a plain signal alone, a `CombinedSignal` as its
     # pilot (ranging driver) + data component (see `tracking_signals`). Each group
@@ -700,23 +741,13 @@ function ReceiverState(
     # One acquisition timer per band, keyed like the buffers.
     band_keys = keys(acquisition_buffers)
     last_time_acquisition_ran = NamedTuple{band_keys}(map(_ -> -Inf * 1.0s, band_keys))
-    pvt = PVTSolution()
-    pvt_sat_state_buffer = SatelliteState[]
-    # The vector-tracking clock/inter-frequency-bias layout is fixed here, from
-    # the *configured* systems, so the navigation filter's state dimension
-    # never changes mid-run. `vector_tracking` carries the filter's configuration
-    # when the caller passed one, and its defaults when they just passed `true`.
-    vt =
-        vt_enabled(vector_tracking) ?
-        VectorTrackingState(vt_config(vector_tracking), NavFilterLayout(systems)) : nothing
     ReceiverState(
         track_state,
         receiver_sat_states,
         acquisition_buffers,
         last_time_acquisition_ran,
-        pvt,
-        pvt_sat_state_buffer,
-        vt,
+        PVTSolution(),
+        0,
         0.0s,
         -Inf * 1.0s,
     )
@@ -734,23 +765,25 @@ keyed by its ranging signal's id. `num_samples_for_acquisition` sizes the acquis
 sample buffer, and `num_ants` selects single- versus multi-antenna processing.
 `vector_tracking = true` closes the tracking loops through a navigation filter instead
 of per-satellite loop filters (the tracking-loop estimator follows from this: the
-conventional FLL-assisted PLL/DLL for scalar, `VectorPLLAndDLL` for vector tracking); pass
-a [`VectorTracking`](@ref) instead of `true` to describe the platform's dynamics and the
-receiver's oscillator to that filter. One `ReceiverState` spans every band; pass the
-per-band system tuples and pre-built acquisition buffers to the primary constructor for the
-multi-band case.
+conventional FLL-assisted PLL/DLL for scalar, TrackingLoops' `VectorPLLAndDLL` for vector
+tracking); pass a [`VectorTracking`](@ref) instead of `true` to describe the platform's
+dynamics and the receiver's oscillator to that filter. The vector estimator decodes the
+satellites and solves the PVT itself, so it takes the remaining keywords —
+`pvt_update_interval` (its navigation cycle), `enable_ionospheric_correction`,
+`enable_tropospheric_correction` and `pvt_approximate_year` — here, at construction. One
+`ReceiverState` spans every band; pass the per-band system tuples and pre-built acquisition
+buffers to the primary constructor for the multi-band case.
 """
 function ReceiverState(
     ::Type{T}, # Must be the same type as the incoming signal
     systems;
     num_samples_for_acquisition,
-    num_ants::NumAnts = NumAnts(1),
-    vector_tracking::Union{Bool,VectorTracking} = false,
+    kwargs...,
 ) where {T}
     systems = as_systems(systems)
     band_key = get_band_id(system_band(first(systems)))
     buffers = NamedTuple{(band_key,)}((SampleBuffer(T, num_samples_for_acquisition),))
-    ReceiverState((systems,), buffers; num_ants, vector_tracking)
+    ReceiverState((systems,), buffers; kwargs...)
 end
 
 include("read_file.jl")

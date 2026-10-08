@@ -70,7 +70,5 @@ EigenBeamformer
 
 ```@docs
 process
-GNSSReceiver.VectorTracking
-GNSSReceiver.VectorTrackingState
 GNSSReceiver.VTStatus
 ```

@@ -14,6 +14,6 @@ gnss_receiver_gui(;
     sampling_freq = 2e6u"Hz",
     chunk_time = 4u"ms", # Duration of each processing chunk (tracking granularity / latency); the acquisition coherent-integration length is chosen internally
     run_time = 40u"s",
-    num_ants = Tracking.NumAnts(1), # Number of antenna channels
+    num_ants = NumAnts(1), # Number of antenna channels
     dev_args = first(Devices()) # Select device (e.g. first device)
 )
