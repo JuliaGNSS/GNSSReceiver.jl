@@ -58,8 +58,7 @@
         acquisition_buffers,
         last_time_acquisition_ran,
         pvt,
-        SatelliteState[],
-        nothing,
+        0,
         0.0u"s",
         -Inf * 1.0u"s",
     )
@@ -78,7 +77,7 @@
     @test length(get_sat_states(next_receiver_state.track_state)) == 1
 end
 
-# `update_pvt` is now unconditional (the cadence gate lives in `process`): with
+# `update_pvt` is unconditional (the cadence gate lives in `update_navigation`): with
 # fewer than four PVT-ready satellites it returns the previous solution unchanged.
 @testset "update_pvt returns the previous solution without enough satellites" begin
     system = GPSL1CA()
@@ -96,12 +95,11 @@ end
         receiver_state.track_state,
         receiver_state.receiver_sat_states,
         pvt,
-        receiver_state.pvt_sat_state_buffer,
     )
     @test pvt_out === pvt
 end
 
-# The PVT cadence gate lives in `process`: a navigation cycle runs (advancing
+# The scalar PVT cadence gate: a navigation cycle runs (advancing
 # `last_time_pvt_ran` to the current runtime) only once `pvt_update_interval` of
 # signal time has elapsed since the last one.
 @testset "process PVT cadence gate" begin
@@ -124,8 +122,7 @@ end
         base.acquisition_buffers,
         base.last_time_acquisition_ran,
         base.pvt,
-        base.pvt_sat_state_buffer,
-        nothing,
+        base.navigation_cycle,
         runtime,
         last_time_pvt_ran,
     )
@@ -223,8 +220,8 @@ end
 # through the acquisition → tracking handover so a converging satellite is kept rather than
 # dropped and reacquired; `is_ranging_ready` is what stops that tolerance from leaking a
 # code phase that is still walking the coarse acquisition estimate in — a pseudorange wrong
-# by metres to tens of metres — into the solve. The gate lives in `collect_pvt_sat_states!`,
-# so it is asserted there and not only on the detectors.
+# by metres to tens of metres — into the solve. The gate decides what `pvt_signal_groups`
+# hands the solve, so it is asserted there and not only on the detectors.
 # ---------------------------------------------------------------------------------------
 
 # GPS L1 C/A's code period, the reference integration time its detectors are configured in.
@@ -341,7 +338,17 @@ end
     )
 end
 
-@testset "collect_pvt_sat_states! admits only ranging-ready satellites" begin
+# The satellites `pvt_signal_groups` hands the solve for one GPS L1 C/A group.
+pvt_group_sats(system, sat_states, track_state, threshold) = collect(
+    GNSSReceiver.pvt_signal_groups(
+        (system,),
+        track_state,
+        (; get_signal_id(system) => sat_states),
+        threshold,
+    )[get_signal_id(system)].satellites,
+)
+
+@testset "pvt_signal_groups admits only ranging-ready satellites" begin
     system = GPSL1CA()
     key = get_signal_id(system)
     track_state = single_sat_track_state(system, 5)
@@ -364,23 +371,12 @@ end
     @test !GNSSReceiver.is_ranging_ready(not_ready)
     @test GNSSReceiver.is_ranging_ready(ready)
 
-    states = SatelliteState[]
-    GNSSReceiver.collect_pvt_sat_states!(
-        states,
-        (system,),
-        (; key => Dictionary([5], [not_ready])),
-        track_state,
-        time_in_lock_before_pvt,
+    @test isempty(
+        pvt_group_sats(system, Dictionary([5], [not_ready]), track_state, time_in_lock_before_pvt),
     )
-    @test isempty(states)
 
-    GNSSReceiver.collect_pvt_sat_states!(
-        states,
-        (system,),
-        (; key => Dictionary([5], [ready])),
-        track_state,
-        time_in_lock_before_pvt,
-    )
+    states =
+        pvt_group_sats(system, Dictionary([5], [ready]), track_state, time_in_lock_before_pvt)
     @test length(states) == 1
     # PVT is handed the ranging signal, and the satellite's own decoder and code phase.
     @test states[1].system == GNSSReceiver.ranging_signal(system)
@@ -389,12 +385,10 @@ end
 
     # The gate is not the time gate in disguise: readiness alone does not admit a satellite
     # that has not yet been in lock long enough to have decoded usable data.
-    empty!(states)
-    GNSSReceiver.collect_pvt_sat_states!(
-        states,
-        (system,),
-        (;
-            key => Dictionary(
+    @test isempty(
+        pvt_group_sats(
+            system,
+            Dictionary(
                 [5],
                 [
                     pvt_sat_state(
@@ -405,12 +399,11 @@ end
                         time_in_lock = 1.0u"s",
                     ),
                 ],
-            )
+            ),
+            track_state,
+            time_in_lock_before_pvt,
         ),
-        track_state,
-        time_in_lock_before_pvt,
     )
-    @test isempty(states)
 end
 
 @testset "PVT waits for the satellites' loops to settle" begin
@@ -424,30 +417,23 @@ end
     track_state = single_sat_track_state(system, 1)
     ready_code = ranging_ready_code_detector()
     ready_carrier = ranging_ready_carrier_detector()
-    settled(time_in_lock) = (;
-        key => Dictionary(
-            [1],
-            [
-                GNSSReceiver.ReceiverSatState(
-                    1,
-                    GNSSDecoderState(system, 1),
-                    ready_code,
-                    ready_carrier,
-                    time_in_lock,
-                    0.0u"s",
-                    0,
-                    false,
-                ),
-            ],
-        )
+    settled(time_in_lock) = Dictionary(
+        [1],
+        [
+            GNSSReceiver.ReceiverSatState(
+                1,
+                GNSSDecoderState(system, 1),
+                ready_code,
+                ready_carrier,
+                time_in_lock,
+                0.0u"s",
+                0,
+                false,
+            ),
+        ],
     )
-    collect_ready(time_in_lock, threshold) = GNSSReceiver.collect_pvt_sat_states!(
-        SatelliteState[],
-        (system,),
-        settled(time_in_lock),
-        track_state,
-        threshold,
-    )
+    collect_ready(time_in_lock, threshold) =
+        pvt_group_sats(system, settled(time_in_lock), track_state, threshold)
 
     @test isempty(collect_ready(0.0u"s", 2u"s"))   # just locked
     @test isempty(collect_ready(2.0u"s", 2u"s"))   # exactly at the gate — strictly greater
@@ -458,10 +444,7 @@ end
 
     # The timer counts *continuous* lock: losing lock resets it, so a satellite that
     # flickers has to earn its settling time again.
-    relocked = GNSSReceiver.increase_time_out_of_lock(
-        only(settled(5.0u"s")[key]),
-        4u"ms",
-    )
+    relocked = GNSSReceiver.increase_time_out_of_lock(only(settled(5.0u"s")), 4u"ms")
     @test relocked.time_in_lock == 0.0u"s"
 end
 

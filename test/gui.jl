@@ -94,7 +94,7 @@ function fixed_gui_data(; runtime = 10.0u"s", pvt_fresh = true)
         PVTSolution(;
             position = ECEF(4.0e6, 3.9e5, 4.9e6),
             velocity = ECEF(2.0e6, 2.9e5, 1.9e6),
-            time = TAIEpoch(2022, 10, 8),
+            time = TAITime(TAIEpoch(2022, 10, 8)),
             dop = DOP(1.0, 1.0, 1.0, 1.0, 1.0),
             sats = Dictionary(
                 sat_keys,
@@ -461,7 +461,7 @@ end
             position = ECEF(4.0e6, 3.9e5, 4.9e6),
             velocity = ECEF(2.0e6, 2.9e5, 1.9e6),
             time_correction = 4.5e6u"m",
-            time = TAIEpoch(2022, 10, 8),
+            time = TAITime(TAIEpoch(2022, 10, 8)),
             relative_clock_drift = 0.1e-6,
             dop = DOP(1.0, 1.0, 1.0, 1.0, 1.0),
             sats = Dictionary(
@@ -621,11 +621,11 @@ end
 
     pvt = PVTSolution(;
         position = ECEF(4.0e6, 3.9e5, 4.9e6),
-        time = TAIEpoch(2022, 10, 8),
+        time = TAITime(TAIEpoch(2022, 10, 8)),
         dop = DOP(2.5, 2.1, 1.3, 1.6, 0.9),
         sats,
         reference_system = GPST(),
-        inter_system_biases = Dict{GNSSSignals.TimeSystem,typeof(1.0u"m")}(GST() => 12.34u"m"),
+        inter_system_biases = Dict{SupportedTimeSystem,typeof(1.0u"m")}(GST() => 12.34u"m"),
         inter_frequency_biases =
             Dict{Symbol,InterFrequencyBias}(:L5 => InterFrequencyBias(5.67u"m", :L1)),
     )
@@ -780,7 +780,7 @@ end
     pvt = PVTSolution(;
         reference_system = GST(),
         inter_system_biases =
-            Dict{GNSSSignals.TimeSystem,typeof(1.0u"m")}(GPST() => -12.34u"m"),
+            Dict{SupportedTimeSystem,typeof(1.0u"m")}(GPST() => -12.34u"m"),
         inter_frequency_biases =
             Dict{Symbol,InterFrequencyBias}(:L5 => InterFrequencyBias(5.67u"m", :L1)),
     )
