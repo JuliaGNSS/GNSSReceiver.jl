@@ -22,7 +22,7 @@ using Tachikoma
 using UnicodePlots
 using UnicodeMaps: TileSource, worldmap
 using Dates: @dateformat_str
-using AstroTime: to_utc
+using AstroTime: TAIEpoch, to_utc
 using PositionVelocityTime: get_LLA, get_sat_enu
 using SignalChannels: consume_channel
 # `Unitful` itself (not `using Unitful`) because Tachikoma exports an easing function also
@@ -525,9 +525,10 @@ function _render_position(buf, area::Rect, gui_data, last_fix, show_diag, fresh,
     lat_hem = lla.lat >= 0 ? "N" : "S"
     lon_hem = lla.lon >= 0 ? "E" : "W"
     speed = sqrt(sum(abs2, pvt.velocity))
-    # Time solution: `pvt.time` is a TAI epoch shown as UTC (leap-aware `to_utc`) to ms,
-    # time-then-date (HH:MM:SS.sss dd.mm.yyyy).
-    utc_str = to_utc(String, pvt.time, dateformat"HH:MM:SS.sss dd.mm.yyyy")
+    # Time solution: `pvt.time` is a TAI time (PositionVelocityTime's `TAITime`, converted
+    # to an AstroTime epoch through its AstroTime extension) shown as UTC (leap-aware
+    # `to_utc`) to ms, time-then-date (HH:MM:SS.sss dd.mm.yyyy).
+    utc_str = to_utc(String, TAIEpoch(pvt.time), dateformat"HH:MM:SS.sss dd.mm.yyyy")
     heading = "$(round(ustrip(°, pvt.course_over_ground); digits = 1))°"
     low_speed = speed < MIN_SPEED_FOR_HEADING
     heading_value = low_speed ? "$heading (low speed)" : heading

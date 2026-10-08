@@ -222,8 +222,8 @@ let
         # Final-fix epoch: exact recording date (validates 1024-week rollover resolution
         # via pvt_approximate_year=2017). 1 ms tolerance covers chunk-boundary jitter in
         # when the last PVT happens to be reported.
-        @test last_pvt.time isa TAIEpoch
-        @test abs(AstroTime.value(last_pvt.time - expected_time)) < 0.001
+        @test last_pvt.time isa TAITime
+        @test abs(AstroTime.value(TAIEpoch(last_pvt.time) - expected_time)) < 0.001
 
         # Receiver clock bias (now in metres) and drift
         @test isapprox(ustrip(u"m", last_pvt.time_correction), expected_time_correction, rtol = 1e-4)
@@ -333,9 +333,9 @@ let
     @testset "ION RTL-SDR vector tracking integration test" begin
         # Deliberately in MHz (not Hz) while the IF below is in Hz: a real front end mixes
         # units this way, and `Tracking.BandMeasurement`'s `promote` then collapses both to
-        # the SI base `s^-1`. Vector tracking's `Hz`-typed discriminator accumulator rejects
-        # that, so this unit choice guards the `uconvert(Hz, …)` normalisation in `process`
-        # (regression for the VT first-fix crash). Do not "tidy" this back to Hz.
+        # the SI base `s^-1`, which the `Hz`-typed loop states reject. This unit choice
+        # guards the `uconvert(Hz, …)` normalisation in `process` (regression for the VT
+        # first-fix crash). Do not "tidy" this back to Hz.
         sampling_freq = 2.048u"MHz"
         system = GPSL1CA()
         num_samples = Int(upreferred(sampling_freq * 4u"ms"))
@@ -353,10 +353,12 @@ let
         extract = function (receiver_state)
             (
                 data = GNSSReceiver.default_data_of_interest(receiver_state),
-                vt_running = receiver_state.vt.running,
+                vt_running = TrackingLoops.navigation_status(
+                    receiver_state.track_state.doppler_estimator,
+                ).running,
                 num_vt_sats = count(
-                    GNSSReceiver.in_vt_loop,
-                    get_sat_states(receiver_state.track_state, :GPSL1CA),
+                    state -> state.in_vt_loop,
+                    receiver_state.receiver_sat_states.GPSL1CA,
                 ),
             )
         end
@@ -374,11 +376,13 @@ let
 
         num_vt_outputs = 0
         max_vt_sats = 0
+        vt_speeds = Float64[]
         last = nothing
         GNSSReceiver.consume_channel(data_channel) do out
             if out.vt_running
                 num_vt_outputs += 1
                 max_vt_sats = max(max_vt_sats, out.num_vt_sats)
+                push!(vt_speeds, norm([out.data.pvt.velocity...]))
                 last = out
             end
         end
@@ -404,13 +408,19 @@ let
         @test isapprox(pvt.position[2], expected_position[2], atol = 10.0)
         @test isapprox(pvt.position[3], expected_position[3], atol = 10.0)
 
-        # Stationary receiver: the filter's velocity is noise-level.
-        @test norm([pvt.velocity...]) < 2.0
+        # Stationary receiver: the filter's velocity is noise-level. Asserted on the median
+        # over the whole vector-tracking run, since a single epoch is one draw of that noise:
+        # on this RTL-SDR capture the speed has a median of ~1.3 m/s and a 90th percentile
+        # of ~2.7 m/s, where the final epoch may land. The final fix gets a looser bound.
+        median_speed = sort(vt_speeds)[cld(length(vt_speeds), 2)]
+        @info "Vector tracking speed" median_speed final_speed = vt_speeds[end]
+        @test median_speed < 2.0
+        @test norm([pvt.velocity...]) < 4.0
 
         # The final epoch matches the recording date to within the run length.
-        @test pvt.time isa TAIEpoch
+        @test pvt.time isa TAITime
         expected_final_time = TAIEpoch(2017, 9, 10, 22, 57, 20.697)
-        @test abs(AstroTime.value(pvt.time - expected_final_time)) < 1.0
+        @test abs(AstroTime.value(TAIEpoch(pvt.time) - expected_final_time)) < 1.0
 
         # The filter reports a full measurement geometry at the end of the run.
         @test length(pvt.sats) >= 7

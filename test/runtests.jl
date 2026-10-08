@@ -14,16 +14,21 @@ using Test,
     Dictionaries,
     LinearAlgebra,
     Scratch
-# Unexported PositionVelocityTime internals the vector-tracking tests exercise
-# directly (see "The Measurement-Model Surface" in that package's API docs).
-using PositionVelocityTime:
-    DOP, SPEED_OF_LIGHT, calc_DOP, calc_H, time_offset_available, time_scale_offset_to_gpst
+# The loop core Tracking no longer re-exports: the Doppler and C/N₀ estimators the tests
+# build and inspect. Imported by name, since TrackingLoops' wholesale exports (e.g.
+# `normalize`, `VTStatus`) would clash with names the tests use from elsewhere.
+import TrackingLoops
+using TrackingLoops:
+    ConventionalAssistedPLLAndDLL,
+    ConventionalPLLAndDLL,
+    MomentsCN0Estimator,
+    NoiseRefCN0Estimator,
+    VectorPLLAndDLL
+
+# Unexported PositionVelocityTime types the GUI tests build solutions from.
+using PositionVelocityTime: DOP, SupportedTimeSystem
 
 using JLD2: load
-
-# The navigation-filter configuration (also accepted by `receive`'s `vector_tracking`
-# keyword in place of `true`); the tests exercise its parameters directly.
-using GNSSReceiver: VectorTracking
 
 using Unitful: Hz, dBHz, ms
 

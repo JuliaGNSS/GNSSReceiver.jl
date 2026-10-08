@@ -266,16 +266,17 @@ data_channel = receive(
 ## Vector tracking
 
 By default every satellite closes its own code/carrier loops (scalar tracking).
-`vector_tracking = true` switches the receiver to vector tracking: once a first scalar
-fix is available, a navigation Kalman filter fuses all satellites' accumulated
-discriminator outputs into one position/velocity/clock solution and closes every
-tracking loop centrally from it (a vector delay/frequency lock loop, VDFLL). Weak or
-briefly obscured satellites are carried through outages by the collective solution, and
-the emitted PVT solutions come from the navigation filter (at `pvt_update_interval`).
-They carry the same per-satellite diagnostics as a scalar fix, including the post-fit
-pseudorange and range-rate residuals (`SatInfo.residual` and `SatInfo.rate_residual`) of
-every satellite in the vector loop — reported even for a satellite whose signal the loop
-is currently carrying through an outage.
+`vector_tracking = true` switches the receiver to vector tracking, run by the
+[`VectorPLLAndDLL`](https://JuliaGNSS.github.io/TrackingLoops.jl/stable/vector_tracking/)
+Doppler estimator of TrackingLoops.jl. Its navigation engine decodes every satellite's
+navigation message, solves the scalar PVT and, once a first fix is available, a navigation
+Kalman filter fuses all satellites' accumulated discriminator outputs into one
+position/velocity/clock solution and closes every tracking loop centrally from it (a vector
+delay/frequency lock loop, VDFLL). Weak or briefly obscured satellites are carried through
+outages by the collective solution, and the emitted PVT solutions come from the navigation
+filter, one per navigation cycle of `pvt_update_interval`. They carry the same
+per-satellite diagnostics as a scalar fix, including the post-fit pseudorange and
+range-rate residuals (`SatInfo.residual` and `SatInfo.rate_residual`).
 
 ```julia
 data_channel = receive(
@@ -290,17 +291,24 @@ as the scalar solve: the filter estimates one receiver clock bias per GNSS time 
 per band beyond a reference band. The pseudorange measurements are corrected for the
 broadcast ionospheric model and the Saastamoinen tropospheric delay, exactly like
 `calc_pvt` (toggled by the same `enable_ionospheric_correction` /
-`enable_tropospheric_correction` keywords).
+`enable_tropospheric_correction` keywords). The engine admits a satellite to its solution
+on its own test — bit sync, a C/N₀ above 30 dB-Hz, a decoded and healthy navigation
+message — so `time_in_lock_before_calculating_pvt` applies to scalar tracking only.
+
+The engine decodes the signal the loops are driven by, so vector tracking does not take a
+[`CombinedSignal`](@ref GNSSReceiver.CombinedSignal): its loops are driven by the dataless
+pilot. Track the data component alone (e.g. `GalileoE1B()`) under vector tracking.
 
 `vector_tracking = true` runs the filter with its default configuration. To configure it,
-pass a [`VectorTracking`](@ref GNSSReceiver.VectorTracking) instead — it both enables vector
-tracking and describes the platform and the front end, which is worth doing whenever either
-is known: the defaults assume vehicular dynamics and a TCXO-grade oscillator, and both the
-dynamics (`acceleration_noise_std`) and the oscillator stability (`h0`, `hm2`) materially
-change how the filter weighs its prediction against the measurements. The same struct also
-selects the measurement set (`use_pseudorange_rates = false` for a pseudorange-only VDLL
-instead of the default VDFLL), the motion and clock model orders, the inter-frequency-bias
-process noise and how long the filter may coast before falling back to scalar tracking:
+pass a [`VectorTracking`](https://JuliaGNSS.github.io/TrackingLoops.jl/stable/vector_tracking/)
+(re-exported from TrackingLoops.jl) instead — it both enables vector tracking and describes
+the platform and the front end, which is worth doing whenever either is known: the defaults
+assume vehicular dynamics and a TCXO-grade oscillator, and both the dynamics
+(`acceleration_noise_std`) and the oscillator stability (`h0`, `hm2`) materially change how
+the filter weighs its prediction against the measurements. The same struct also selects the
+measurement set (`use_pseudorange_rates = false` for a pseudorange-only VDLL instead of the
+default VDFLL), the motion and clock model orders, the inter-frequency-bias process noise and
+how long the filter may coast before falling back to scalar tracking:
 
 ```julia
 data_channel = receive(
