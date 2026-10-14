@@ -470,7 +470,7 @@ engine admits a satellite to its solve on its own lock and decoding test. A
 [`CombinedSignal`](@ref) ranges on its pilot and decodes its data component, as under
 scalar tracking.
 
-Passing a [`VectorTracking`](@ref) in place of `true` enables vector tracking *and*
+Passing a [`VectorTracking`](https://JuliaGNSS.github.io/TrackingLoops.jl/stable/vector_tracking/) in place of `true` enables vector tracking *and*
 configures the filter, which is worth doing whenever the platform or the front end is known:
 the defaults assume vehicular dynamics and a TCXO-grade oscillator, and both the dynamics
 (`acceleration_noise_std`) and the oscillator stability (`h0`, `hm2`) materially change how

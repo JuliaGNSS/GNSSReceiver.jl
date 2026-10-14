@@ -756,7 +756,7 @@ sample buffer, and `num_ants` selects single- versus multi-antenna processing.
 `vector_tracking = true` closes the tracking loops through a navigation filter instead
 of per-satellite loop filters (the tracking-loop estimator follows from this: the
 conventional FLL-assisted PLL/DLL for scalar, TrackingLoops' `VectorPLLAndDLL` for vector
-tracking); pass a [`VectorTracking`](@ref) instead of `true` to describe the platform's
+tracking); pass a [`VectorTracking`](https://JuliaGNSS.github.io/TrackingLoops.jl/stable/vector_tracking/) instead of `true` to describe the platform's
 dynamics and the receiver's oscillator to that filter. The vector estimator decodes the
 satellites and solves the PVT itself, so it takes the remaining keywords —
 `pvt_update_interval` (its navigation cycle), `enable_ionospheric_correction`,
