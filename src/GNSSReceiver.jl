@@ -296,14 +296,17 @@ function ReceiverSatState(
     )
 end
 
+# A fresh satellite of `system`, a plain signal or a `CombinedSignal`: the decoder runs on
+# the data component, the lock detectors on the ranging signal.
 function ReceiverSatState(
-    system::AbstractGNSSSignal,
+    system,
     prn::Int,
-    code_lock_cn0_threshold::typeof(1.0dBHz) = get_default_code_lock_cn0_threshold(system),
+    code_lock_cn0_threshold::typeof(1.0dBHz) =
+        get_default_code_lock_cn0_threshold(ranging_signal(system)),
 )
     ReceiverSatState(
         prn,
-        GNSSDecoderState(system, prn),
+        GNSSDecoderState(data_signal(system), prn),
         CodeLockDetector(;
             cn0_threshold = code_lock_cn0_threshold,
             # The detector runs on the ranging signal, so its code period is the reference.
@@ -645,28 +648,16 @@ vt_config(vector_tracking::VectorTracking) = vector_tracking
 # bins from this loop's pull-in range.
 const SCALAR_DOPPLER_ESTIMATOR = ConventionalAssistedPLLAndDLL()
 
-# Vector tracking decodes the navigation data of the signal the loops are driven by.
-# A `CombinedSignal` drives its loops from the dataless pilot, which TrackingLoops'
-# vector engine cannot decode, so the two do not combine.
-function assert_vector_trackable(systems)
-    for system in systems
-        system isa CombinedSignal && throw(
-            ArgumentError(
-                "vector tracking drives the loops from the signal it decodes, but " *
-                "`CombinedSignal($(get_signal_name(system.pilot)), " *
-                "$(get_signal_name(system.data)))` drives them from its dataless pilot; " *
-                "track the data component alone (e.g. `$(get_signal_name(system.data))`) " *
-                "or use scalar tracking.",
-            ),
-        )
-    end
-    nothing
-end
+# How a system is given to the vector estimator: a plain signal is ranged on and decoded
+# alike; a `CombinedSignal` as `pilot => data`, so the satellite ranges on the pilot that
+# drives its loops and the estimator decodes the data component.
+vector_tracking_signal(system::AbstractGNSSSignal) = system
+vector_tracking_signal(system::CombinedSignal) = system.pilot => system.data
 
 # The tracking loops' Doppler estimator for the given mode: the conventional
 # FLL-assisted PLL/DLL for scalar tracking, and for vector tracking TrackingLoops'
-# `VectorPLLAndDLL` over every system's ranging signal, which wraps that same scalar
-# loop and owns the whole navigation pipeline — bit sync, decoding, the scalar PVT
+# `VectorPLLAndDLL` over every system (see `vector_tracking_signal`), which wraps that
+# same scalar loop and owns the whole navigation pipeline — decoding, the scalar PVT
 # that seeds the filter and the filter itself, run once every `pvt_update_interval`.
 # Not user-selectable — the mode alone determines it.
 doppler_estimator_for(vector_tracking, systems; kwargs...) =
@@ -681,9 +672,8 @@ function vector_doppler_estimator(
     enable_tropospheric_correction = true,
     pvt_approximate_year::Integer = year(now(UTC)),
 )
-    assert_vector_trackable(systems)
     VectorPLLAndDLL(
-        map(ranging_signal, systems)...;
+        map(vector_tracking_signal, systems)...;
         inner = SCALAR_DOPPLER_ESTIMATOR,
         config,
         cycle_time = pvt_update_interval,
@@ -770,7 +760,9 @@ tracking); pass a [`VectorTracking`](@ref) instead of `true` to describe the pla
 dynamics and the receiver's oscillator to that filter. The vector estimator decodes the
 satellites and solves the PVT itself, so it takes the remaining keywords —
 `pvt_update_interval` (its navigation cycle), `enable_ionospheric_correction`,
-`enable_tropospheric_correction` and `pvt_approximate_year` — here, at construction. One
+`enable_tropospheric_correction` and `pvt_approximate_year` — here, at construction. A
+[`CombinedSignal`](@ref) ranges on its pilot and decodes its data component under vector
+tracking too. One
 `ReceiverState` spans every band; pass the per-band system tuples and pre-built acquisition
 buffers to the primary constructor for the multi-band case.
 """
