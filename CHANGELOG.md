@@ -1,5 +1,27 @@
 # Changelog
 
+# [5.0.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.6.1...v5.0.0) (2026-10-14)
+
+
+* feat(vt)!: vector tracking from TrackingLoops' VectorPLLAndDLL ([d93a070](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/d93a07081e0575ef18fd97874cfde310bef7d640)), closes [JuliaGNSS/TrackingLoops.jl#36](https://github.com/JuliaGNSS/TrackingLoops.jl/issues/36)
+* feat(vt)!: vector tracking on combined signals with TrackingLoops 4 ([2dfa02b](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/2dfa02b7f2af6515e2f4ddbb1c82775864c7f201))
+
+
+### Bug Fixes
+
+* **vt:** give a re-acquired satellite a fresh decoder under vector tracking ([a064b00](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/a064b0039eb6c80841fdd05923531da0d8984fcb))
+
+
+### BREAKING CHANGES
+
+* requires Tracking 10 and TrackingLoops 4. Carrier loops now run at their configured bandwidth (18 Hz by default) instead of an effective ~100 Hz, which narrows the Doppler pull-in and slows its settling (about 1.1 s instead of 0.4 s).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+* Vector tracking requires TrackingLoops 3, Tracking 9,
+GNSSDecoder 5 and PositionVelocityTime 6. `vector_tracking` no longer accepts
+a `CombinedSignal`: TrackingLoops' engine decodes the signal that drives the
+loops, and a combined signal is driven by its dataless pilot (tracked in
+
 ## [4.6.1](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.6.0...v4.6.1) (2026-09-30)
 
 No changes to the package. Replaces the accidental 5.0.0 release.
