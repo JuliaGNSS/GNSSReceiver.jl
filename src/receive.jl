@@ -466,9 +466,9 @@ solve, the filter estimates one clock bias per GNSS time system and one inter-fr
 bias per band beyond a reference band, and corrects the pseudoranges for the broadcast
 ionospheric model and the tropospheric delay. Its navigation cycle runs every
 `pvt_update_interval`; `time_in_lock_before_calculating_pvt` does not apply, as the
-engine admits a satellite to its solve on its own lock and decoding test. Vector
-tracking drives the loops from the decoded signal, so it does not take a
-[`CombinedSignal`](@ref), whose loops are driven by the dataless pilot.
+engine admits a satellite to its solve on its own lock and decoding test. A
+[`CombinedSignal`](@ref) ranges on its pilot and decodes its data component, as under
+scalar tracking.
 
 Passing a [`VectorTracking`](@ref) in place of `true` enables vector tracking *and*
 configures the filter, which is worth doing whenever the platform or the front end is known:

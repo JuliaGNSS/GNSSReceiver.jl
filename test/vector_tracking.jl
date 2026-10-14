@@ -103,30 +103,80 @@ end
     @test isnothing(TrackingLoops.satellite_report(multi_estimator, GalileoE1B(), 1))
 end
 
-@testset "Vector tracking refuses a pilot-driven combined signal" begin
-    # The vector engine decodes the signal the loops are driven by, and a `CombinedSignal`
-    # drives them from its dataless pilot. Refused up front with directions, rather than
-    # deep in TrackingLoops.
+@testset "Vector tracking ranges on a combined signal's pilot and decodes its data" begin
+    # A `CombinedSignal` is handed to the vector estimator as `pilot => data`: the
+    # satellite ranges on the pilot that drives its loops, and the engine decodes the data
+    # component.
     combined = CombinedSignal(GalileoE1C(), GalileoE1B())
-    err = try
-        GNSSReceiver.ReceiverState(
-            ComplexF64,
-            combined;
-            num_samples_for_acquisition = 20000,
-            vector_tracking = true,
-        )
-        nothing
-    catch e
-        e
-    end
-    @test err isa ArgumentError
-    @test occursin("CombinedSignal", err.msg)
-    # Scalar tracking takes it as before.
-    @test GNSSReceiver.ReceiverState(
+    # GNSSSignals' signal instances define no `==`, so compare their types.
+    @test typeof(GNSSReceiver.vector_tracking_signal(combined)) ==
+          Pair{typeof(GalileoE1C()),typeof(GalileoE1B())}
+    @test GNSSReceiver.vector_tracking_signal(combined).first === combined.pilot
+    @test GNSSReceiver.vector_tracking_signal(combined).second === combined.data
+    @test GNSSReceiver.vector_tracking_signal(combined.data) === combined.data
+
+    system = combined
+    key = GNSSReceiver.signal_group_key(system)
+    sampling_freq = 24.552e6Hz
+    receiver_state = GNSSReceiver.ReceiverState(
         ComplexF64,
-        combined;
-        num_samples_for_acquisition = 20000,
-    ).track_state.doppler_estimator isa ConventionalPLLAndDLL
+        system;
+        num_samples_for_acquisition = 100,
+        vector_tracking = true,
+    )
+    estimator = receiver_state.track_state.doppler_estimator
+    @test estimator isa VectorPLLAndDLL
+
+    # Seed one satellite and step it on noise. The estimator registers the satellite on
+    # its first records and reports it under the pilot, with the *data* component's
+    # decoder, which the receiver takes over into a satellite state typed for that
+    # decoder; a decoder of the wrong type could not be stored back.
+    prn = 11
+    track_state = merge_sats(
+        receiver_state.track_state,
+        key,
+        [GNSSReceiver.create_tracked_sat(
+            GNSSReceiver.tracking_signals(system),
+            prn,
+            0.0,
+            0.0u"Hz",
+            NumAnts(1),
+            estimator,
+        )],
+    )
+    state = ReceiverState(
+        track_state,
+        (; key => Dictionary([prn], [GNSSReceiver.ReceiverSatState(system, prn)])),
+        receiver_state.acquisition_buffers,
+        # Acquisition just ran, so no scan is due during these chunks.
+        map(_ -> 0.0u"s", receiver_state.last_time_acquisition_ran),
+        receiver_state.pvt,
+        receiver_state.navigation_cycle,
+        receiver_state.runtime,
+        receiver_state.last_time_pvt_ran,
+    )
+    acq_plans = (; key => plan_acquire(GalileoE1B(), float(sampling_freq), [prn]))
+    rng = Random.Xoshiro(3)
+    num_samples = Int(upreferred(sampling_freq * 4u"ms"))
+    for _ = 1:3
+        state = GNSSReceiver.process(
+            state,
+            acq_plans,
+            (randn(rng, ComplexF64, num_samples, 1) .* 10,),
+            ((system,),),
+            sampling_freq;
+            acq_pfa = 1e-12,
+            acquire_every = 1000u"s",
+        )
+    end
+    report = TrackingLoops.satellite_report(estimator, GalileoE1C(), prn)
+    @test !isnothing(report)
+    @test report.decoder isa GNSSReceiver.decoder_state_type(system)
+    # Reports are keyed by the driver: there is none under the data component.
+    @test isnothing(TrackingLoops.satellite_report(estimator, GalileoE1B(), prn))
+    # Still within its lock detectors' warm-up, so in lock and updated every chunk.
+    @test GNSSReceiver.is_in_lock(state.receiver_sat_states[key][prn])
+    @test state.receiver_sat_states[key][prn].decoder === report.decoder
 end
 
 @testset "Reading the vector estimator's satellite reports" begin

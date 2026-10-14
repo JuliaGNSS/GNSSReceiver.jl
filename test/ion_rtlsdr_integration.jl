@@ -177,7 +177,11 @@ let
         # mapping moved the fix (+0.35, +0.29, +1.14) m against the 5.0.0 capture — the
         # mostly-vertical shift a mapping-function change produces.
         expected_position = [3.9074087926e6, 3.0683836901e5, 5.0149608655e6]   # ECEF metres
-        expected_velocity = [0.610, 0.209, 3.577]                              # m/s
+        # Velocity re-captured under TrackingLoops 4, whose carrier loops run at their
+        # configured 18 Hz rather than the ~100 Hz effective bandwidth before: the cleaner
+        # Doppler brings the stationary receiver's final velocity from (0.61, 0.21, 3.58)
+        # to (0.11, 0.08, 0.73) m/s, and its median speed over the run to 0.4 m/s.
+        expected_velocity = [0.110, 0.078, 0.731]                              # m/s
         expected_time = TAIEpoch(2017, 9, 10, 22, 57, 20.697)                  # final-fix epoch (TAI)
         expected_time_correction = -2.0226547144e7                             # receiver clock bias (metres)
         expected_relative_clock_drift = 7.40e-7                                # dimensionless
@@ -409,9 +413,10 @@ let
         @test isapprox(pvt.position[3], expected_position[3], atol = 10.0)
 
         # Stationary receiver: the filter's velocity is noise-level. Asserted on the median
-        # over the whole vector-tracking run, since a single epoch is one draw of that noise:
-        # on this RTL-SDR capture the speed has a median of ~1.3 m/s and a 90th percentile
-        # of ~2.7 m/s, where the final epoch may land. The final fix gets a looser bound.
+        # over the whole vector-tracking run, since a single epoch is one draw of that noise,
+        # and the final fix gets a looser bound. Under TrackingLoops 4 the median speed is
+        # ~0.26 m/s and the final ~0.66 m/s; under TrackingLoops 3, whose carrier loops ran
+        # 5–6× wider, they were ~1.3 and ~2.7 m/s.
         median_speed = sort(vt_speeds)[cld(length(vt_speeds), 2)]
         @info "Vector tracking speed" median_speed final_speed = vt_speeds[end]
         @test median_speed < 2.0

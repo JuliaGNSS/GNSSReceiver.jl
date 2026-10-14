@@ -295,9 +295,9 @@ broadcast ionospheric model and the Saastamoinen tropospheric delay, exactly lik
 on its own test — bit sync, a C/N₀ above 30 dB-Hz, a decoded and healthy navigation
 message — so `time_in_lock_before_calculating_pvt` applies to scalar tracking only.
 
-The engine decodes the signal the loops are driven by, so vector tracking does not take a
-[`CombinedSignal`](@ref GNSSReceiver.CombinedSignal): its loops are driven by the dataless
-pilot. Track the data component alone (e.g. `GalileoE1B()`) under vector tracking.
+A [`CombinedSignal`](@ref GNSSReceiver.CombinedSignal) works under vector tracking as under
+scalar tracking: the satellite ranges on the dataless pilot, whose prompt has no data-bit
+transitions, and the engine decodes the data component.
 
 `vector_tracking = true` runs the filter with its default configuration. To configure it,
 pass a [`VectorTracking`](https://JuliaGNSS.github.io/TrackingLoops.jl/stable/vector_tracking/)
