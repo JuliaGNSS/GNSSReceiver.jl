@@ -647,6 +647,16 @@ tracked_sat_from_acq(
     doppler_estimator,
 )
 
+# The decoder of a re-acquired PRN. A scalar receiver owns its decoder and keeps its
+# decoded data, restarting only the sync. Under vector tracking the decoder it holds is
+# the estimator's (see `updated_decoder`), whose containers a freed slot may since have
+# handed to another satellite, so resetting it in place would wipe that satellite's
+# buffers. It takes a fresh one instead: the estimator restarts its own decoder when the
+# satellite registers, and its next report replaces this one.
+reacquired_decoder(::VectorPLLAndDLL, decoder, data_sys, prn) = GNSSDecoderState(data_sys, prn)
+reacquired_decoder(::AbstractDopplerEstimator, decoder, data_sys, prn) =
+    reset_decoder_state!(decoder)
+
 # Returns `(track_state, receiver_sat_states, acquired_prns)`. `acquired_prns`
 # lists the PRNs that passed the CFAR detector and were merged; the reacquisition
 # path uses it to distinguish a real re-lock from a detection that was rejected.
@@ -676,13 +686,16 @@ function update_states_from_acquisition_results(
 
     # Build the decoder from the *data* signal, never from `res.system`: with
     # pilot acquisition `res.system` is the dataless pilot, which has no decoder.
-    # A re-acquired PRN keeps its existing (data) decoder state.
     data_sys = data_signal(system)
     new_receiver_sat_states = map(acq_res_valids) do res
         decoder =
             res.prn in keys(receiver_sat_states) ?
-            reset_decoder_state!(receiver_sat_states[res.prn].decoder) :
-            GNSSDecoderState(data_sys, res.prn)
+            reacquired_decoder(
+                track_state.doppler_estimator,
+                receiver_sat_states[res.prn].decoder,
+                data_sys,
+                res.prn,
+            ) : GNSSDecoderState(data_sys, res.prn)
         ReceiverSatState(res, decoder, code_lock_threshold)
     end
 

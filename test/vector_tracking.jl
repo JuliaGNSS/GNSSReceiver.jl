@@ -218,6 +218,99 @@ end
           own_decoder
 end
 
+@testset "Re-acquiring a satellite leaves the vector estimator's decoders alone" begin
+    # Under vector tracking the receiver's decoder of a satellite is the one the estimator
+    # reported, and the estimator reuses a freed slot's containers for the next satellite
+    # that registers on it (`_rebind_decoder`). Satellite 5 dropped out and its slot went
+    # to satellite 7, so the decoder still held for 5 shares its soft-symbol buffer with
+    # 7's live one: re-acquiring 5 must not reset that decoder in place.
+    system = GPSL1CA()
+    key = GNSSReceiver.signal_group_key(system)
+    dropped_prn, new_prn = 5, 7
+    dropped_decoder = GNSSDecoderState(system, dropped_prn)
+    live_decoder = decode!(
+        TrackingLoops._rebind_decoder(dropped_decoder, new_prn),
+        ones(100),
+        100,
+    )
+    @test live_decoder.cache === dropped_decoder.cache
+    buffered = collect(live_decoder.cache.soft_buffer)
+    @test !isempty(buffered)
+
+    receiver_sat_states = Dictionary(
+        [dropped_prn],
+        [GNSSReceiver.ReceiverSatState(
+            dropped_prn,
+            dropped_decoder,
+            GNSSReceiver.CodeLockDetector(),
+            GNSSReceiver.CarrierLockDetector(),
+            0.0u"s",
+            1.0u"s",
+            0,
+            false,
+        )],
+    )
+    acq = Acquisition.AcquisitionResults(
+        system,
+        dropped_prn,
+        5e6u"Hz",
+        100.0u"Hz",
+        10.0,
+        nothing,
+        45.0,
+        1.0,
+        1000.0,
+        1,
+        nothing,
+        (-5000.0:1000.0:5000.0)u"Hz",
+        1,
+        5000,
+        1,
+    )
+    @test GNSSReceiver.is_detected(acq; pfa = 1e-4)
+
+    vector_state = GNSSReceiver.ReceiverState(
+        ComplexF64,
+        system;
+        num_samples_for_acquisition = 20000,
+        vector_tracking = true,
+    )
+    _, vector_sat_states, acquired = GNSSReceiver.update_states_from_acquisition_results(
+        [acq],
+        1e-4,
+        nothing,
+        vector_state.track_state,
+        receiver_sat_states,
+        system,
+        NumAnts(1),
+    )
+    @test acquired == [dropped_prn]
+    @test collect(live_decoder.cache.soft_buffer) == buffered
+    reacquired_decoder = vector_sat_states[dropped_prn].decoder
+    @test reacquired_decoder.prn == dropped_prn
+    @test reacquired_decoder.cache !== live_decoder.cache
+
+    # A scalar receiver owns its decoder, so it restarts that one's sync in place and
+    # keeps its decoded data.
+    scalar_state = GNSSReceiver.ReceiverState(
+        ComplexF64,
+        system;
+        num_samples_for_acquisition = 20000,
+        vector_tracking = false,
+    )
+    _, scalar_sat_states, _ = GNSSReceiver.update_states_from_acquisition_results(
+        [acq],
+        1e-4,
+        nothing,
+        scalar_state.track_state,
+        receiver_sat_states,
+        system,
+        NumAnts(1),
+    )
+    @test scalar_sat_states[dropped_prn].decoder.cache === dropped_decoder.cache
+    @test isempty(dropped_decoder.cache.soft_buffer)
+end
+
 @testset "Vector-loop members stay tracked through an outage" begin
     system = GPSL1CA()
     key = get_signal_id(system)
