@@ -22,8 +22,9 @@ satellite to contribute to the PVT solution.
 What `is_ranging_ready` distinguishes is the stage *within* lock: the acquisition → tracking
 handover is deliberately tolerated (the point is to keep a converging satellite rather than
 drop and reacquire it), so a satellite can be tracked and reported here for some time before
-its code phase is trustworthy enough to range on — from 680 code periods for a healthy
-signal up to 2000 for one whose evidence never comes cleanly. Without this field such a
+its code phase is trustworthy enough to range on — from 680 ms for a healthy GPS L1 C/A
+signal (longer on a code whose confirm run is longer) up to 2 s for one whose evidence never
+comes cleanly. Without this field such a
 satellite is indistinguishable from one the PVT solve is ignoring for no reason.
 
 `is_in_lock` is the other half of that picture, and it is *not* constant-true here: a

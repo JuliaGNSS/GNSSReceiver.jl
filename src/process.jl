@@ -453,10 +453,10 @@ end
 # there — the whole point is to keep a converging satellite rather than drop and reacquire it —
 # but while the loops are still walking the coarse acquisition estimate in, the code phase
 # carries a converging bias, and a pseudorange built from it is wrong by tens of metres
-# (measured on a 0.25-chip handover: 44-64 m at 200 code periods, 5-44 m at 600).
-# `time_in_lock_before_calculating_pvt` alone does not cover this: it counts from the handover,
-# so it can elapse while the loops are still settling — and on a code longer than 1 ms the
-# settling takes proportionally longer while that gate stays fixed in seconds.
+# (measured on a 0.25-chip GPS L1 C/A handover: 47-59 m after 200 ms, 6-32 m after 600 ms).
+# `time_in_lock_before_calculating_pvt` alone does not cover this: it counts from the handover
+# rather than from clean evidence, so it can elapse while the loops are still settling — a weak
+# satellite's carrier pull-in, say, that keeps the phase-lock indicator from coming up.
 is_pvt_ready(receiver_sat_state, time_in_lock_before_calculating_pvt) =
     is_in_lock(receiver_sat_state) &&
     is_ranging_ready(receiver_sat_state) &&
@@ -871,8 +871,8 @@ end
 # rate further — a re-detected sat is `is_in_lock` for its detector's warm-up, so
 # `time_out_of_lock` stays 0 and no new attempt fires while it is converging. That
 # grace is 80 primary code periods of the ranging signal, which is 20 updates only
-# on GPS L1 C/A at the default 4 ms chunk; on a 10 ms code it is 200 updates, and
-# in seconds it grows with the code period exactly as the tracking loops do.
+# on GPS L1 C/A at the default 4 ms chunk; on a 10 ms code it is 200 updates, as
+# the warm-up is counted in the records the carrier detector's averages need.
 # `reacquire_backoff` sets the base step; `max_reacquire_attempts` caps total
 # attempts before falling back to the periodic full scan (`acquire_every`).
 function should_reacquire(state; reacquire_backoff = 200ms, max_reacquire_attempts = 5)
