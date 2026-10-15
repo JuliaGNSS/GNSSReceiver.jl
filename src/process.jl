@@ -312,6 +312,7 @@ function process(
         receiver_state.pvt,
         runtime,
         receiver_state.last_time_pvt_ran;
+        sampling_freq,
         pvt_update_interval,
         time_in_lock_before_calculating_pvt,
         enable_ionospheric_correction,
@@ -334,9 +335,19 @@ end
 # Advance the navigation solution, dispatched on the tracking loops' Doppler
 # estimator. Returns the new `(pvt, last_time_pvt_ran)`.
 
-# Scalar receiver: once a full `pvt_update_interval` of signal time has accumulated
-# since the last solve, solve the PVT over the satellites the receiver decoded;
-# otherwise carry the previous solution forward.
+# Index of the `pvt_update_interval` epoch that time `t` falls in. `runtime` is summed
+# chunk by chunk in floating point and can land a hair short of an epoch boundary,
+# so `t` is snapped to the sample grid before dividing.
+pvt_epoch(t, pvt_update_interval, sampling_freq) = fld(
+    round(Int, ustrip(NoUnits, t * sampling_freq)),
+    ustrip(NoUnits, pvt_update_interval * sampling_freq),
+)
+
+# Scalar receiver: solve the PVT over the satellites the receiver decoded in the
+# first chunk of each `pvt_update_interval` epoch — the same grid the vector
+# estimator runs its cycles on — and carry the previous solution forward
+# otherwise. Gating on the elapsed time since the last solve instead would let the
+# float rounding above defer every few solves by a chunk.
 function update_navigation(
     ::AbstractDopplerEstimator,
     new_navigation_cycle,
@@ -346,13 +357,17 @@ function update_navigation(
     pvt,
     runtime,
     last_time_pvt_ran;
+    sampling_freq,
     pvt_update_interval = 100ms,
     time_in_lock_before_calculating_pvt = 2s,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
     pvt_approximate_year::Integer = year(now(UTC)),
 )
-    runtime - last_time_pvt_ran >= pvt_update_interval || return pvt, last_time_pvt_ran
+    isfinite(last_time_pvt_ran) &&
+        pvt_epoch(runtime, pvt_update_interval, sampling_freq) <=
+        pvt_epoch(last_time_pvt_ran, pvt_update_interval, sampling_freq) &&
+        return pvt, last_time_pvt_ran
     pvt = update_pvt(
         all_systems,
         track_state,

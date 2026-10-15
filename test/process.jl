@@ -100,8 +100,8 @@ end
 end
 
 # The scalar PVT cadence gate: a navigation cycle runs (advancing
-# `last_time_pvt_ran` to the current runtime) only once `pvt_update_interval` of
-# signal time has elapsed since the last one.
+# `last_time_pvt_ran` to the current runtime) in the first chunk of each
+# `pvt_update_interval` epoch.
 @testset "process PVT cadence gate" begin
     system = GPSL1CA()
     systems = (system,)
@@ -127,9 +127,9 @@ end
         last_time_pvt_ran,
     )
 
-    # Gate closed: <100 ms since the last solve ⇒ `last_time_pvt_ran` unchanged.
+    # Gate closed: still in the epoch of the last solve ⇒ `last_time_pvt_ran` unchanged.
     closed = GNSSReceiver.process(
-        with_pvt_timing(5.0u"s", 4.95u"s"),
+        with_pvt_timing(4.996u"s", 4.9u"s"),
         acq_plans,
         (measurement,),
         (systems,),
@@ -137,11 +137,12 @@ end
         (0.0u"Hz",);
         acq_pfa = 1e-12,
     )
-    @test closed.last_time_pvt_ran == 4.95u"s"
+    @test closed.last_time_pvt_ran == 4.9u"s"
 
-    # Gate open: ≥100 ms elapsed ⇒ a cycle runs and `last_time_pvt_ran` advances to runtime.
+    # Gate open: a new epoch began ⇒ a cycle runs and `last_time_pvt_ran` advances to
+    # runtime.
     opened = GNSSReceiver.process(
-        with_pvt_timing(5.0u"s", 4.8u"s"),
+        with_pvt_timing(5.0u"s", 4.9u"s"),
         acq_plans,
         (measurement,),
         (systems,),
@@ -150,6 +151,45 @@ end
         acq_pfa = 1e-12,
     )
     @test opened.last_time_pvt_ran == 5.0u"s"
+end
+
+# Over a long run the scalar solves stay on the `pvt_update_interval` grid. The
+# runtime is summed chunk by chunk in floating point, which lands a hair short of
+# some boundaries; a gate on the elapsed time since the last solve deferred those
+# solves by a chunk (every 100 ms / 104 ms with 4 ms chunks).
+@testset "Scalar PVT solves stay on the epoch grid" begin
+    system = GPSL1CA()
+    sampling_freq = 5e6Hz
+    signal_duration = 20000 / sampling_freq # 4 ms
+    state = GNSSReceiver.ReceiverState(
+        ComplexF64,
+        system;
+        num_samples_for_acquisition = 20000,
+        num_ants = NumAnts(1),
+    )
+    estimator = state.track_state.doppler_estimator
+    pvt = state.pvt
+    runtime = 0.0u"s"
+    last_time_pvt_ran = -Inf * u"s"
+    solve_times = typeof(runtime)[]
+    for _ in 1:1000
+        pvt, solved_at = GNSSReceiver.update_navigation(
+            estimator,
+            false,
+            (system,),
+            state.track_state,
+            state.receiver_sat_states,
+            pvt,
+            runtime,
+            last_time_pvt_ran;
+            sampling_freq,
+        )
+        solved_at != last_time_pvt_ran && push!(solve_times, solved_at)
+        last_time_pvt_ran = solved_at
+        runtime += signal_duration
+    end
+    @test length(solve_times) == 40
+    @test all(t -> isapprox(t, 0.1u"s"; atol = 1e-9u"s"), diff(solve_times))
 end
 
 # Helpers for the reacquisition-path tests below. A satellite is "out of lock" once

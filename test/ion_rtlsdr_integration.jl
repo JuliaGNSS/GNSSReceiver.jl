@@ -182,7 +182,9 @@ let
         # Doppler brings the stationary receiver's final velocity from (0.61, 0.21, 3.58)
         # to (0.11, 0.08, 0.73) m/s, and its median speed over the run to 0.4 m/s.
         expected_velocity = [0.110, 0.078, 0.731]                              # m/s
-        expected_time = TAIEpoch(2017, 9, 10, 22, 57, 20.697)                  # final-fix epoch (TAI)
+        # Final-fix epoch: the last scalar solve now falls on the 100 ms grid instead of a
+        # drifting 100 / 104 ms cadence, 47 ms earlier than the 20.697 s captured before.
+        expected_time = TAIEpoch(2017, 9, 10, 22, 57, 20.650)                  # final-fix epoch (TAI)
         expected_time_correction = -2.0226547144e7                             # receiver clock bias (metres)
         expected_relative_clock_drift = 7.40e-7                                # dimensionless
         expected_gdop = 1.62
