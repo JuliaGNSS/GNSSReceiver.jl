@@ -633,15 +633,6 @@ function rx_center_frequency(systems)
     get_center_frequency(ranging_signal(first(systems)))
 end
 
-# The `vector_tracking` keyword is either a switch or the navigation filter's
-# configuration: `false` disables it, `true` takes the `VectorTracking` defaults,
-# and a `VectorTracking` both enables it and describes the platform and oscillator.
-# These two reduce it to the question each caller actually asks.
-vt_enabled(vector_tracking::Bool) = vector_tracking
-vt_enabled(::VectorTracking) = true
-vt_config(vector_tracking::Bool) = VectorTracking()
-vt_config(vector_tracking::VectorTracking) = vector_tracking
-
 # The scalar loop every satellite runs fresh from acquisition: the conventional
 # FLL-assisted PLL/DLL, under vector tracking too, where `VectorPLLAndDLL` wraps it
 # until the navigation filter takes the satellite over. Acquisition sizes its Doppler
@@ -654,17 +645,20 @@ const SCALAR_DOPPLER_ESTIMATOR = ConventionalAssistedPLLAndDLL()
 vector_tracking_signal(system::AbstractGNSSSignal) = system
 vector_tracking_signal(system::CombinedSignal) = system.pilot => system.data
 
-# The tracking loops' Doppler estimator for the given mode: the conventional
-# FLL-assisted PLL/DLL for scalar tracking, and for vector tracking TrackingLoops'
-# `VectorPLLAndDLL` over every system (see `vector_tracking_signal`), which wraps that
-# same scalar loop and owns the whole navigation pipeline — decoding, the scalar PVT
-# that seeds the filter and the filter itself, run once every `pvt_update_interval`.
-# Not user-selectable — the mode alone determines it.
-doppler_estimator_for(vector_tracking, systems; kwargs...) =
-    vt_enabled(vector_tracking) ? vector_doppler_estimator(vt_config(vector_tracking), systems; kwargs...) :
+# The tracking loops' Doppler estimator for the `vector_tracking` mode, which is either
+# a switch or the navigation filter's configuration: `false` gives the conventional
+# FLL-assisted PLL/DLL for scalar tracking, `true` vector tracking with the
+# `VectorTracking` defaults, and a `VectorTracking` both enables it and describes the
+# platform and oscillator. Vector tracking runs TrackingLoops' `VectorPLLAndDLL` over
+# every system (see `vector_tracking_signal`), which wraps that same scalar loop and
+# owns the whole navigation pipeline — decoding, the scalar PVT that seeds the filter
+# and the filter itself, run once every `pvt_update_interval`. Not user-selectable —
+# the mode alone determines it.
+doppler_estimator_for(vector_tracking::Bool, systems; kwargs...) =
+    vector_tracking ? doppler_estimator_for(VectorTracking(), systems; kwargs...) :
     SCALAR_DOPPLER_ESTIMATOR
 
-function vector_doppler_estimator(
+function doppler_estimator_for(
     config::VectorTracking,
     systems;
     pvt_update_interval = 100ms,
