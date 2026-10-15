@@ -426,6 +426,19 @@ function plan_band_acquisition(
     return systems, acq_plans, num_samples_for_acquisition
 end
 
+# Whether the processing loop emits the state `process` just produced from
+# `previous_state`. Output follows the navigation solution: `process` moves
+# `last_time_pvt_ran` exactly when a new solution is available (a scalar solve, or a
+# cycle of the vector estimator), so each solution is emitted once, in the chunk
+# that produced it. A separate output timer would drift against the solution's own
+# cadence (vector tracking runs on an exact epoch grid) and emit fixes up to a full
+# interval old while skipping others. Without solutions — vector tracking runs no
+# cycle until it tracks a satellite — a timer keeps the consumers fed; it waits 1.5
+# intervals so it never fires just ahead of a solution that is on time.
+should_emit(state, previous_state, last_output, pvt_update_interval) =
+    state.last_time_pvt_ran != previous_state.last_time_pvt_ran ||
+    state.runtime - last_output >= 3 * pvt_update_interval / 2
+
 """
     receive(measurement_channel, systems, sampling_freq; num_ants = NumAnts(1), kwargs...)
     receive(measurement_channels::Tuple, systems_per_band::Tuple, sampling_freq; kwargs...)
@@ -445,7 +458,8 @@ aligned each step. The number of antenna channels in each `SignalChannel` must e
 in `num_ants`.
 
 Sampled at `sampling_freq`, each chunk is processed by [`process`](@ref) in a spawned
-task; one `ReceiverDataOfInterest` is emitted per `pvt_update_interval`. Acquisition
+task; one `ReceiverDataOfInterest` is emitted per PVT solution, in the chunk that produced
+it, and at least every 1.5 `pvt_update_interval` while there is none. Acquisition
 (Acquisition 2 FM-DBZP with CFAR) runs at most every `acquire_every`; its coherent length
 and Doppler resolution are derived per system from the tracking loop pull-in range, and
 `prns` restricts the search (`nothing` ⇒ each constellation's default range, a per-GNSS
@@ -639,8 +653,9 @@ function receive(
                     e isa InvalidStateException && break
                     rethrow(e)
                 end
+                previous_state = state_ref[]
                 state_ref[] = process(
-                    state_ref[],
+                    previous_state,
                     acq_plans,
                     measurements,
                     band_systems,
@@ -656,13 +671,12 @@ function receive(
                     enable_tropospheric_correction,
                     pvt_approximate_year,
                 )
-                # Emit one payload per PVT update: PVT is recomputed every
-                # `pvt_update_interval`, so output is produced at that same rate. Running
+                # Emit once per navigation solution rather than every frame: running
                 # `extract` and pushing every raw frame would allocate at the frame rate
                 # (~kHz), far more often than consumers — GUI, PVT solve, logger,
                 # `save_data` — need it.
                 state = state_ref[]
-                if state.runtime - last_output_ref[] >= pvt_update_interval
+                if should_emit(state, previous_state, last_output_ref[], pvt_update_interval)
                     # A closed `data_channel` means the consumers are gone (e.g. the user
                     # quit the GUI, which closes its channel and so ours): end the run
                     # quietly rather than letting the `InvalidStateException` escape as an
