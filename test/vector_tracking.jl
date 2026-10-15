@@ -32,6 +32,8 @@ end
     # The tracking-loop estimator follows from the mode alone.
     @test GNSSReceiver.doppler_estimator_for(false, (GPSL1CA(),)) isa ConventionalPLLAndDLL
     @test GNSSReceiver.doppler_estimator_for(true, (GPSL1CA(),)) isa VectorPLLAndDLL
+    @test GNSSReceiver.doppler_estimator_for(GNSSReceiver.VectorTracking(), (GPSL1CA(),)) isa
+          VectorPLLAndDLL
 
     # The vector estimator hands a fresh satellite to the scalar loop it wraps, so the
     # acquisition pull-in range is that loop's.
