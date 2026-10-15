@@ -1,5 +1,13 @@
 # Changelog
 
+## [5.0.1](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v5.0.0...v5.0.1) (2026-10-15)
+
+
+### Bug Fixes
+
+* **process:** run scalar PVT solves on the update-interval epoch grid ([6fc310f](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/6fc310f45f3e6ace80ac607a7507f191942628bb))
+* **receive:** emit each navigation solution in the chunk that produced it ([b154d96](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/b154d96cb9f437d02f664699703b5ef99e56c816))
+
 # [5.0.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v4.6.1...v5.0.0) (2026-10-14)
 
 
