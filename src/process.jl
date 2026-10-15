@@ -347,7 +347,11 @@ pvt_epoch(t, pvt_update_interval, sampling_freq) = fld(
 # first chunk of each `pvt_update_interval` epoch — the same grid the vector
 # estimator runs its cycles on — and carry the previous solution forward
 # otherwise. Gating on the elapsed time since the last solve instead would let the
-# float rounding above defer every few solves by a chunk.
+# float rounding above defer every few solves by a chunk. One `calc_pvt` covers every
+# band's PVT-ready satellites: the groups mix constellations and frequency bands, which
+# is exactly what it resolves (a clock column per GNSS time system and an
+# inter-frequency-bias column per extra band). With fewer than four PVT-ready
+# satellites it returns the previous solution.
 function update_navigation(
     ::AbstractDopplerEstimator,
     new_navigation_cycle,
@@ -368,15 +372,17 @@ function update_navigation(
         pvt_epoch(runtime, pvt_update_interval, sampling_freq) <=
         pvt_epoch(last_time_pvt_ran, pvt_update_interval, sampling_freq) &&
         return pvt, last_time_pvt_ran
-    pvt = update_pvt(
-        all_systems,
-        track_state,
-        receiver_sat_states,
+    pvt = calc_pvt(
+        pvt_signal_groups(
+            all_systems,
+            track_state,
+            receiver_sat_states,
+            time_in_lock_before_calculating_pvt,
+        ),
         pvt;
-        time_in_lock_before_calculating_pvt,
         enable_ionospheric_correction,
         enable_tropospheric_correction,
-        pvt_approximate_year,
+        approximate_year = pvt_approximate_year,
     )
     pvt, runtime
 end
@@ -489,34 +495,6 @@ function pvt_signal_groups(
                 signal = ranging_signal(system),
             )
         end,
-    )
-end
-
-# Combined multi-band PVT over the single receiver state: every band's PVT-ready
-# satellites in one `calc_pvt`. The groups mix constellations and frequency bands, which
-# is exactly what `calc_pvt` resolves (a clock column per GNSS time system and an
-# inter-frequency-bias column per extra band).
-function update_pvt(
-    all_systems,
-    track_state,
-    receiver_sat_states,
-    pvt;
-    time_in_lock_before_calculating_pvt = 2s,
-    enable_ionospheric_correction = true,
-    enable_tropospheric_correction = true,
-    pvt_approximate_year::Integer = year(now(UTC)),
-)
-    calc_pvt(
-        pvt_signal_groups(
-            all_systems,
-            track_state,
-            receiver_sat_states,
-            time_in_lock_before_calculating_pvt,
-        ),
-        pvt;
-        enable_ionospheric_correction,
-        enable_tropospheric_correction,
-        approximate_year = pvt_approximate_year,
     )
 end
 

@@ -77,9 +77,9 @@
     @test length(get_sat_states(next_receiver_state.track_state)) == 1
 end
 
-# `update_pvt` is unconditional (the cadence gate lives in `update_navigation`): with
-# fewer than four PVT-ready satellites it returns the previous solution unchanged.
-@testset "update_pvt returns the previous solution without enough satellites" begin
+# A due scalar solve with fewer than four PVT-ready satellites returns the previous
+# solution unchanged, while still recording that the solve ran.
+@testset "Scalar solve returns the previous solution without enough satellites" begin
     system = GPSL1CA()
     receiver_state = GNSSReceiver.ReceiverState(
         ComplexF64,
@@ -89,14 +89,20 @@ end
     )
     pvt = PVTSolution()
     # No satellites are in lock, so nothing is PVT-ready and the previous solution
-    # is returned as-is (same object).
-    pvt_out = GNSSReceiver.update_pvt(
+    # is returned as-is (same object). No solve has run yet, so the gate is open.
+    pvt_out, last_time_pvt_ran = GNSSReceiver.update_navigation(
+        receiver_state.track_state.doppler_estimator,
+        false,
         (system,),
         receiver_state.track_state,
         receiver_state.receiver_sat_states,
         pvt,
+        1.0u"s",
+        -Inf * u"s";
+        sampling_freq = 5e6Hz,
     )
     @test pvt_out === pvt
+    @test last_time_pvt_ran == 1.0u"s"
 end
 
 # The scalar PVT cadence gate: a navigation cycle runs (advancing
