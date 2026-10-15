@@ -249,3 +249,26 @@ end
     @test GNSSReceiver.is_sat_ranging_ready_at(coasted_states, 1)
     @test !GNSSReceiver.is_sat_in_lock_at(coasted_states, 1)
 end
+
+# The processing loop emits each navigation solution once, in the chunk that produced
+# it — not on an output timer of its own, which drifts against the solution cadence and
+# hands out stale fixes while skipping others. Only the fields the decision reads are
+# modelled.
+@testset "Output follows the navigation solution" begin
+    interval = 100u"ms"
+    state(runtime, last_time_pvt_ran) = (; runtime, last_time_pvt_ran)
+    emits(current_state, previous_state, last_output) =
+        GNSSReceiver.should_emit(current_state, previous_state, last_output, interval)
+
+    # A new solution is emitted right away, however recently the last output went out.
+    @test emits(state(0.204u"s", 0.2u"s"), state(0.2u"s", 0.1u"s"), 0.104u"s")
+    # Between solutions nothing is emitted, even once a full interval has passed since
+    # the last output — the old timer fired here and emitted a stale fix.
+    @test !emits(state(0.208u"s", 0.1u"s"), state(0.204u"s", 0.1u"s"), 0.104u"s")
+    # Without solutions (vector tracking before its first cycle) a timer still emits,
+    # 1.5 intervals after the last output.
+    @test !emits(state(0.148u"s", -Inf * u"s"), state(0.144u"s", -Inf * u"s"), 0.0u"s")
+    @test emits(state(0.152u"s", -Inf * u"s"), state(0.148u"s", -Inf * u"s"), 0.0u"s")
+    # The very first chunk is always emitted.
+    @test emits(state(0.004u"s", -Inf * u"s"), state(0.0u"s", -Inf * u"s"), -Inf * u"s")
+end
