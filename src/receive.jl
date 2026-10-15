@@ -341,19 +341,23 @@ end
 # discriminator, so there is no static frequency pull-in; fast lock-in is instead
 # governed by the carrier loop bandwidth `B_L`, capped by the coherent-integration
 # decorrelation limit `1 / (2·T)` (beyond which the prompt correlation nulls out):
-# `|Δf| ≈ min(B_L, 1 / (2·T))`. `B_L` is the estimator's configured bandwidth, or
-# the signal's default when it is auto (`nothing`) — matching how `Tracking` seeds
-# each satellite. This is an order-of-magnitude estimate, not the crisp
+# `|Δf| ≈ min(B_L, 1 / (2·T))`. The loop pulls in at its wide stage, so `B_L` is the
+# estimator's wide bandwidth, or the signal's default when it is auto (`nothing`) —
+# matching how `Tracking` seeds each satellite — capped against `T` as the loop
+# filter caps it. This is an order-of-magnitude estimate, not the crisp
 # discriminator bound of the FLL-assisted case.
 function carrier_doppler_pull_in_range(
     estimator::ConventionalPLLAndDLL,
     signal::AbstractGNSSSignal,
 )
-    B_L = something(
-        estimator.carrier_loop_filter_bandwidth,
-        default_carrier_loop_filter_bandwidth(signal),
-    )
     T = handover_coherent_integration_time(signal)
+    B_L = effective_carrier_loop_filter_bandwidth(
+        something(
+            estimator.wide_carrier_loop_filter_bandwidth,
+            default_wide_carrier_loop_filter_bandwidth(signal),
+        ),
+        T,
+    )
     uconvert(Hz, min(B_L, 1 / (2 * T)))
 end
 
