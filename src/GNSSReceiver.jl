@@ -53,7 +53,7 @@ using TrackingLoops:
     member_sats,
     satellite_report
 
-using Unitful: m, s, ms, Hz, dBHz, dB, °, uconvert
+using Unitful: m, s, ms, Hz, dBHz, dB, °, uconvert, NoUnits
 
 # Lock-free channel primitives and SoapySDR device streaming now live in their own
 # packages (they replaced the vendored `channel.jl` / `soapy_sdr_helper.jl`). The
