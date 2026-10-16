@@ -27,6 +27,10 @@ using StaticArrays,
     Dictionaries,
     Dates
 
+# The protocol a hardware correlator's loop process speaks (see
+# `hardware_loop.jl`); the loop process itself is HardwareLoopCore's.
+import HardwareLoopProtocol
+
 # The per-record loop core — correlators, Doppler estimators, the noise and C/N₀
 # estimators — lives in TrackingLoops, and Tracking no longer re-exports it. So does
 # vector tracking: `VectorPLLAndDLL` is a Doppler estimator whose navigation engine
@@ -81,7 +85,8 @@ export ReceiverState,
     get_gui_data_channel,
     write_to_file,
     gnss_receiver_gui,
-    gnss_write_to_file
+    gnss_write_to_file,
+    HardwareLoop
 
 include("lock_detector.jl")
 include("beamformer.jl")
@@ -781,6 +786,8 @@ include("gui.jl")
 include("dashboard.jl")
 using .Dashboard: gui
 include("save_data.jl")
+include("hardware_loop.jl")
+include("receive_hardware.jl")
 
 """
     gnss_receiver_gui(; system = GPSL1CA(), sampling_freq = 2e6Hz, kwargs...)
