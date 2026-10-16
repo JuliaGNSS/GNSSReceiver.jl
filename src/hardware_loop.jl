@@ -33,6 +33,9 @@ mutable struct HardwareLoop
     events::Int
     lost_events::Int
     commands_dropped::Int
+    # Held by `receive`'s task for each chunk and by `close`, so the segment is
+    # never unmapped under a chunk that is using it.
+    const lock::ReentrantLock
 end
 
 function HardwareLoop(segment_path::AbstractString; spawn::Union{Nothing,Base.AbstractCmd} = nothing,
@@ -46,7 +49,8 @@ function HardwareLoop(segment_path::AbstractString; spawn::Union{Nothing,Base.Ab
         process = run(spawn; wait = false)
     end
     segment = _wait_for_segment(path, process, Float64(attach_timeout))
-    loop = HardwareLoop(path, segment, process, HLP.channel_count(segment), HLP.band_table(segment), 0, 0, 0, 0)
+    loop = HardwareLoop(path, segment, process, HLP.channel_count(segment), HLP.band_table(segment), 0, 0, 0, 0,
+                        ReentrantLock())
     HLP.set_receiver_pid!(segment, getpid())
     HLP.receiver_heartbeat!(segment)
     for ch = 1:loop.num_channels
@@ -80,6 +84,10 @@ end
 is_alive(loop::HardwareLoop) = loop.segment.open && HLP.heartbeat_alive(loop.segment, :loop)
 
 function Base.close(loop::HardwareLoop; shutdown::Bool = !isnothing(loop.process))
+    @lock loop.lock _close(loop, shutdown)
+end
+
+function _close(loop::HardwareLoop, shutdown::Bool)
     loop.segment.open || return loop
     if shutdown
         send_command!(loop, HLP.COMMAND_SHUTDOWN, 0, HLP.ShutdownCommand())
@@ -104,30 +112,36 @@ end
     send_command!(loop, kind, channel, body) -> UInt64
 
 Publish a command on the loop's command ring and return its sequence number,
-the one the acknowledging status event echoes.
+the one the acknowledging status event echoes — or `0` if the ring was full
+and the command was not published.
 """
 function send_command!(loop::HardwareLoop, kind, channel::Integer, body)
     loop.sequence += 1
     ok = HLP.try_publish!(HLP.command_ring(loop.segment), HLP.CommandTag(kind, channel, loop.sequence), body)
-    ok || (loop.commands_dropped += 1)
+    ok || (loop.commands_dropped += 1; return UInt64(0))
     loop.sequence
 end
 
 """
-    drain_events!(f, loop)
+    drain_events!(f, loop; on_lost = ch -> nothing)
 
 Call `f(channel, tag, ring, view)` for every event the loop has published since
 the last drain, channel by channel in publication order, then commit it.
-Counts history the receiver was too slow to read in `loop.lost_events`.
+History the receiver was too slow to read is counted in `loop.lost_events`,
+and `on_lost(channel)` is called where it is missing, before the events after
+the hole.
 """
-function drain_events!(f::F, loop::HardwareLoop) where {F}
+function drain_events!(f::F, loop::HardwareLoop; on_lost::L = ch -> nothing) where {F,L}
     seg = loop.segment
     for ch = 1:loop.num_channels
         ring = HLP.event_ring(seg, ch)
         while true
             status, view, lost = HLP.peek!(ring, HLP.EventTag)
             status === :empty && break
-            status === :lost && (loop.lost_events += lost)
+            if status === :lost
+                loop.lost_events += lost
+                on_lost(ch)
+            end
             f(ch, view.tag, ring, view)
             HLP.commit!(ring, view)
             loop.events += 1

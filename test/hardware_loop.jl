@@ -85,3 +85,23 @@ using HardwareLoopProtocol: create_segment, SegmentConfig, BandEntry, loop_heart
     @test length(final.sats) >= 6
     @test loop.lost_events == 0
 end
+
+@testset "hardware loop: bits are decoded in order across a break" begin
+    system = GPSL1CA()
+    sat = GNSSReceiver.HardwareSat(system, system, 7, 1, UInt64(1), 30.0dBHz, 0.0u"s")
+    for k = 1:10
+        push!(sat.bit_samples, 1000k)
+        push!(sat.bit_values, isodd(k) ? 1.0f0 : -1.0f0)
+    end
+    GNSSReceiver.push_bit_break!(sat, 10_000)
+    for k = 11:15
+        push!(sat.bit_samples, 1000k)
+        push!(sat.bit_values, 1.0f0)
+    end
+    # Up to the break and three bits past it: the rest stays queued.
+    GNSSReceiver.decode_until!(sat, 13_000)
+    @test sat.bit_samples == [14_000, 15_000]
+    @test all(!isnan, sat.bit_values)
+    # The decoder saw no sync in this noise, and starts over at the break.
+    @test isnothing(sat.state.decoder.num_bits_after_valid_syncro_sequence)
+end

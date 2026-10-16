@@ -24,6 +24,9 @@
 # How many of a satellite's epoch states are kept for the common boundary.
 const EPOCH_HISTORY = 16
 
+# How long an arm may wait for the loop's confirmation before it is given up.
+const ARM_CONFIRM_TIMEOUT = 2.0s
+
 """
     HardwareSat
 
@@ -40,10 +43,12 @@ mutable struct HardwareSat{DS<:GNSSDecoderState,S<:AbstractGNSSSignal}
     state::ReceiverSatState{DS}
     confirmed::Bool
     rejected::Bool
-    # Bits not yet decoded, with the device sample their record ended at.
+    armed_at::typeof(1.0s)
+    # Bits not yet decoded, with the device sample their record ended at. A NaN
+    # entry is a break in the bit stream — the loop restarted the bit clock, or
+    # events were lost — where the decoder must start its sync over.
     const bit_samples::Vector{Int64}
     const bit_values::Vector{Float32}
-    bit_clock_restart::Bool
     bit_clock_restarts::Int
     # The newest epoch states, a ring keyed by boundary.
     const epoch_boundaries::Vector{Int64}
@@ -62,11 +67,11 @@ mutable struct HardwareSat{DS<:GNSSDecoderState,S<:AbstractGNSSSignal}
     last_record_runtime::typeof(1.0s)
 end
 
-function HardwareSat(system, signal, prn::Int, channel::Int, sequence::UInt64, code_lock_threshold)
+function HardwareSat(system, signal, prn::Int, channel::Int, sequence::UInt64, code_lock_threshold, runtime)
     state = ReceiverSatState(system, prn, code_lock_threshold)
     HardwareSat(
-        signal, signal_group_key(system), prn, channel, sequence, state, false, false,
-        Int64[], Float32[], false, 0,
+        signal, signal_group_key(system), prn, channel, sequence, state, false, false, runtime,
+        Int64[], Float32[], 0,
         fill(typemin(Int64), EPOCH_HISTORY), Vector{HLP.EpochStateEvent}(undef, EPOCH_HISTORY), 0,
         ComplexF64[], complex(0.0, 0.0), 0.0, 0, 0, 0, -Inf * 1.0s,
     )
@@ -88,22 +93,32 @@ function epoch_state_at(sat::HardwareSat, boundary::Int64)
     nothing
 end
 
-# Decode every queued bit that completed at or before `boundary`.
+# A break in the satellite's bit stream at device sample `sample`.
+function push_bit_break!(sat::HardwareSat, sample::Int64)
+    push!(sat.bit_samples, sample)
+    push!(sat.bit_values, NaN32)
+    sat
+end
+
+# Decode every queued bit that completed at or before `boundary`, in order,
+# starting the decoder's sync over at every break.
 function decode_until!(sat::HardwareSat, boundary::Int64)
     n = 0
     while n < length(sat.bit_samples) && sat.bit_samples[n+1] <= boundary
         n += 1
     end
-    st = sat.state
-    if sat.bit_clock_restart
-        # The loop restarted the satellite's bit clock: the bits before and after
-        # are not one continuous sequence, so the decoder starts its sync over.
-        st = @set st.decoder = reset_decoder_state!(st.decoder)
-        sat.state = st
-        sat.bit_clock_restart = false
-    end
     n == 0 && return sat
-    sat.state = @set st.decoder = decode!(st.decoder, sat.bit_values, n)
+    st = sat.state
+    decoder = st.decoder
+    first = 1
+    for k = 1:n
+        isnan(sat.bit_values[k]) || continue
+        k > first && (decoder = decode!(decoder, view(sat.bit_values, first:(k-1)), k - first))
+        decoder = reset_decoder_state!(decoder)
+        first = k + 1
+    end
+    n >= first && (decoder = decode!(decoder, view(sat.bit_values, first:n), n - first + 1))
+    sat.state = @set st.decoder = decoder
     deleteat!(sat.bit_samples, 1:n)
     deleteat!(sat.bit_values, 1:n)
     sat
@@ -147,6 +162,8 @@ mutable struct HardwareReceiverState{Sys<:Tuple,Plans<:NamedTuple,B,Sats}
     const channels::Vector{Union{Nothing,Sats}}
     noise_channel::Int
     noise_sequence::UInt64
+    noise_confirmed::Bool
+    noise_armed_at::typeof(1.0s)
     pvt::PVTSolution
     runtime::typeof(1.0s)
     host_samples::Int64
@@ -245,7 +262,7 @@ function receive(
     state = HardwareReceiverState(
         systems, acq_plans, SampleBuffer(T, num_acq_samples),
         Union{Nothing,Sats}[nothing for _ = 1:loop.num_channels],
-        0, UInt64(0), PVTSolution(), 0.0s, Int64(0), -Inf * 1.0s, nothing, -Inf * 1.0s, -Inf * 1.0s, typemin(Int64), 0, 0, 0,
+        0, UInt64(0), false, -Inf * 1.0s, PVTSolution(), 0.0s, Int64(0), -Inf * 1.0s, nothing, -Inf * 1.0s, -Inf * 1.0s, typemin(Int64), 0, 0, 0,
     )
     data_channel = Channel{ReceiverDataOfInterest{SatelliteDataOfInterest{ComplexF64}}}(16)
     origin_ref = Ref{Int64}(-1)
@@ -262,13 +279,16 @@ function receive(
                     origin_ref[] = device_sample_origin isa Integer ? Int64(device_sample_origin) :
                                    Int64(device_sample_origin())
                 end
-                new_pvt = process_hardware_chunk!(
+                loop.segment.open || break
+                new_pvt = @lock loop.lock process_hardware_chunk!(
                     state, loop, measurement, sampling_freq, origin_ref[];
                     acquire_every, pvt_update_interval, time_in_lock_before_calculating_pvt,
                     code_lock_cn0_threshold, enable_ionospheric_correction,
                     enable_tropospheric_correction, pvt_approximate_year, rf_input,
                     replica_amplitude, noise_prn, debug,
                 )
+                # The loop was closed under the run: there is nothing to track with.
+                loop.segment.open || break
                 if new_pvt || state.runtime - state.last_output >= 3 * pvt_update_interval / 2
                     try
                         push!(data_channel, hardware_data_of_interest(state))
@@ -323,14 +343,16 @@ function process_hardware_chunk!(
     state.host_samples += num_samples
     chunk_end = origin + state.host_samples          # device sample after the chunk
 
-    # The band's noise reference: the C/N₀ of every satellite is measured against it.
-    if state.noise_channel == 0
+    # The band's noise reference: the C/N₀ of every satellite is measured
+    # against it, so an arm that was rejected or never confirmed is tried again.
+    if !state.noise_confirmed && state.runtime - state.noise_armed_at > ARM_CONFIRM_TIMEOUT
         ch = loop.num_channels
         system = first(state.systems)
         state.noise_sequence = send_command!(loop, HLP.COMMAND_ARM, ch, arm_command(
             system, noise_prn; carrier_doppler = 3000.0Hz, code_phase = 0.0, valid_at_sample = chunk_end,
             sampling_freq_hz = fs, signal_index = 0, rf_input, replica_amplitude))
         state.noise_channel = ch
+        state.noise_armed_at = state.runtime
     end
 
     _acquire!(state, loop, measurement, sampling_freq, chunk_end, acquire_every; rf_input,
@@ -342,6 +364,13 @@ function process_hardware_chunk!(
         isnothing(sat) && continue
         if sat.rejected
             state.channels[ch] = nothing
+            continue
+        end
+        if !sat.confirmed && state.runtime - sat.armed_at > ARM_CONFIRM_TIMEOUT
+            # The arm (or its confirmation) went missing: free the channel.
+            send_command!(loop, HLP.COMMAND_RELEASE, ch, HLP.ReleaseCommand())
+            state.channels[ch] = nothing
+            state.releases += 1
             continue
         end
         update_lock!(sat, sampling_freq)
@@ -411,7 +440,8 @@ function _arm_acquired!(state, loop, results, valid_at, fs; rf_input, replica_am
             seq = send_command!(loop, HLP.COMMAND_ARM, ch, arm_command(
                 signal, res.prn; carrier_doppler = res.carrier_doppler, code_phase = res.code_phase,
                 valid_at_sample = valid_at, sampling_freq_hz = fs, group_key = key, rf_input, replica_amplitude))
-            state.channels[ch] = HardwareSat(system, signal, res.prn, ch, seq, threshold)
+            seq == 0 && return nothing          # the command ring is full: the next search retries
+            state.channels[ch] = HardwareSat(system, signal, res.prn, ch, seq, threshold, state.runtime)
             state.arms += 1
         end
     end
@@ -421,15 +451,25 @@ end
 # ── Events ───────────────────────────────────────────────────────────────────
 
 function _drain!(state::HardwareReceiverState, loop::HardwareLoop)
-    drain_events!(loop) do ch, tag, ring, view
+    on_lost = ch -> begin
+        sat = state.channels[ch]
+        # Bits may be among what was lost: the decoder cannot count across it.
+        isnothing(sat) || push_bit_break!(sat, isempty(sat.bit_samples) ? latest_boundary(sat) : last(sat.bit_samples))
+        nothing
+    end
+    drain_events!(loop; on_lost) do ch, tag, ring, view
         sat = state.channels[ch]
         kind = tag.kind
         if kind == HLP.EVENT_STATUS
             ev = HLP.payload(HLP.StatusEvent, ring, view)
             isnothing(ev) && return nothing
-            if ch == state.noise_channel && ev.sequence == state.noise_sequence &&
-               ev.code == HLP.STATUS_ARM_REJECTED
-                @warn "the loop process rejected the noise reference" reason = Int(ev.reason)
+            if ch == state.noise_channel && ev.sequence == state.noise_sequence
+                if ev.code == HLP.STATUS_ARMED
+                    state.noise_confirmed = true
+                elseif ev.code == HLP.STATUS_ARM_REJECTED
+                    @warn "the loop process rejected the noise reference; retrying" reason = Int(ev.reason) maxlog = 5
+                    state.noise_armed_at = -Inf * 1.0s
+                end
             end
             isnothing(sat) && return nothing
             ev.sequence == sat.arm_sequence || ev.code == HLP.STATUS_BIT_CLOCK_RESTART || return nothing
@@ -441,7 +481,9 @@ function _drain!(state::HardwareReceiverState, loop::HardwareLoop)
                 state.rejections += 1
                 @warn "the loop process rejected an arm" channel = ch prn = sat.prn reason = Int(ev.reason) maxlog = 20
             elseif ev.code == HLP.STATUS_BIT_CLOCK_RESTART
-                sat.bit_clock_restart = true
+                # In the queue where it happened: the bits before it were
+                # published before it.
+                push_bit_break!(sat, tag.device_sample)
                 sat.bit_clock_restarts += 1
             end
             return nothing
