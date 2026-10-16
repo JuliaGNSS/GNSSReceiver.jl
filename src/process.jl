@@ -405,24 +405,8 @@ function update_navigation(
     kwargs...,
 )
     new_navigation_cycle || return pvt, last_time_pvt_ran
-    copy_solution(navigation_solution(estimator)), runtime
+    copy(navigation_solution(estimator)), runtime
 end
-
-# An independent copy of a `PVTSolution`: its `sats` and bias containers copied, so a
-# later solve into the original's containers leaves the copy untouched.
-copy_solution(pvt::PVTSolution) = PVTSolution(
-    pvt.position,
-    pvt.velocity,
-    pvt.course_over_ground,
-    pvt.time_correction,
-    pvt.time,
-    pvt.relative_clock_drift,
-    pvt.dop,
-    copy(pvt.sats),
-    pvt.reference_system,
-    copy(pvt.inter_system_biases),
-    copy(pvt.inter_frequency_biases),
-)
 
 function remove_lost_satellites(receiver_sat_states, track_state)
     for (group_key, group_sat_states) in pairs(receiver_sat_states)
