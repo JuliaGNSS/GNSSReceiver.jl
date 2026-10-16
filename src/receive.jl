@@ -371,6 +371,7 @@ function plan_band_acquisition(
     sampling_freq,
     acq_doppler_resolutions;
     prns = nothing,
+    min_doppler_coverage = nothing,
 )
     systems = as_systems(systems)
 
@@ -420,11 +421,17 @@ function plan_band_acquisition(
             # selection decision and the plan's actual rotation-search cap can never
             # drift apart (Acquisition exposes no queryable constant for its default).
             max_secondary_code_rotations = MAX_SECONDARY_CODE_ROTATIONS,
+            _doppler_coverage_kwargs(min_doppler_coverage)...,
         )
     end)
 
     return systems, acq_plans, num_samples_for_acquisition
 end
+
+# `plan_acquire`'s Doppler span: its own default unless the caller widens it (a
+# front end whose oscillator is far off puts the satellites outside it).
+_doppler_coverage_kwargs(::Nothing) = (;)
+_doppler_coverage_kwargs(coverage) = (; min_doppler_coverage = coverage)
 
 # Whether the processing loop emits the state `process` just produced from
 # `previous_state`. Output follows the navigation solution: `process` moves
