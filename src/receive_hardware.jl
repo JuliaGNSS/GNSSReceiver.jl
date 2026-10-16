@@ -44,6 +44,7 @@ mutable struct HardwareSat{DS<:GNSSDecoderState,S<:AbstractGNSSSignal}
     const bit_samples::Vector{Int64}
     const bit_values::Vector{Float32}
     bit_clock_restart::Bool
+    bit_clock_restarts::Int
     # The newest epoch states, a ring keyed by boundary.
     const epoch_boundaries::Vector{Int64}
     const epoch_states::Vector{HLP.EpochStateEvent}
@@ -54,15 +55,20 @@ mutable struct HardwareSat{DS<:GNSSDecoderState,S<:AbstractGNSSSignal}
     cn0_linear::Float64
     last_integration_samples::Int64
     records::Int
+    # Device samples the records since the last lock update covered: the
+    # detectors' clock is the device's, not the arrival of raw chunks, which
+    # comes in bursts whenever this process has been held up.
+    record_samples::Int64
+    last_record_runtime::typeof(1.0s)
 end
 
 function HardwareSat(system, signal, prn::Int, channel::Int, sequence::UInt64, code_lock_threshold)
     state = ReceiverSatState(system, prn, code_lock_threshold)
     HardwareSat(
         signal, signal_group_key(system), prn, channel, sequence, state, false, false,
-        Int64[], Float32[], false,
+        Int64[], Float32[], false, 0,
         fill(typemin(Int64), EPOCH_HISTORY), Vector{HLP.EpochStateEvent}(undef, EPOCH_HISTORY), 0,
-        ComplexF64[], complex(0.0, 0.0), 0.0, 0, 0,
+        ComplexF64[], complex(0.0, 0.0), 0.0, 0, 0, 0, -Inf * 1.0s,
     )
 end
 
@@ -103,22 +109,29 @@ function decode_until!(sat::HardwareSat, boundary::Int64)
     sat
 end
 
-# The epoch states and records of one chunk into the satellite's lock detectors.
-function update_lock!(sat::HardwareSat, signal_duration, sampling_freq)
+# The records since the last update into the satellite's lock detectors, for
+# the signal time they covered.
+function update_lock!(sat::HardwareSat, sampling_freq)
     st = sat.state
-    # Nothing measured yet (the arm has not landed, or no record this chunk):
-    # the detectors wait.
+    # Nothing measured since (the arm has not landed, or no record arrived): the
+    # detectors wait — `_stale` decides when waiting has gone on too long.
     (!sat.confirmed || sat.records == 0) && return sat
+    covered = uconvert(s, sat.record_samples / sampling_freq)
     cn0 = 10 * log10(max(sat.cn0_linear, 1e-3)) * dBHz
     integration_time = sat.last_integration_samples / sampling_freq
-    code = update(st.code_lock_detector, cn0, integration_time, signal_duration)
-    carrier = update(st.carrier_lock_detector, sat.prompts, signal_duration)
-    sat.state = ReceiverSatState(st.prn, st.decoder, code, carrier, st.time_in_lock + signal_duration,
+    code = update(st.code_lock_detector, cn0, integration_time, covered)
+    carrier = update(st.carrier_lock_detector, sat.prompts, covered)
+    sat.state = ReceiverSatState(st.prn, st.decoder, code, carrier, st.time_in_lock + covered,
                                  0.0s, 0, false)
     empty!(sat.prompts)
     sat.records = 0
+    sat.record_samples = 0
     sat
 end
+
+# A confirmed satellite whose records stopped (the loop process stalled or
+# dropped it) is as good as lost.
+_stale(sat::HardwareSat, runtime) = sat.confirmed && runtime - sat.last_record_runtime > 1.0s
 
 """
     HardwareReceiverState
@@ -198,6 +211,7 @@ function receive(
     replica_amplitude::Real = 127.0,
     noise_prn::Integer = 32,
     acquisition_doppler_coverage = 20_000.0Hz,
+    debug::Bool = false,
 )
     systems = as_systems(systems)
     assert_single_band(systems)
@@ -243,7 +257,7 @@ function receive(
                     acquire_every, pvt_update_interval, time_in_lock_before_calculating_pvt,
                     code_lock_cn0_threshold, enable_ionospheric_correction,
                     enable_tropospheric_correction, pvt_approximate_year, rf_input,
-                    replica_amplitude, noise_prn,
+                    replica_amplitude, noise_prn, debug,
                 )
                 if new_pvt || state.runtime - state.last_output >= 3 * pvt_update_interval / 2
                     try
@@ -285,6 +299,7 @@ function process_hardware_chunk!(
     rf_input,
     replica_amplitude,
     noise_prn,
+    debug = false,
 )
     fs = Float64(ustrip(Hz, sampling_freq))
     num_samples = size(measurement, 1)
@@ -315,8 +330,8 @@ function process_hardware_chunk!(
             state.channels[ch] = nothing
             continue
         end
-        update_lock!(sat, signal_duration, sampling_freq)
-        if !is_in_lock(sat.state)
+        update_lock!(sat, sampling_freq)
+        if !is_in_lock(sat.state) || _stale(sat, state.runtime)
             send_command!(loop, HLP.COMMAND_RELEASE, ch, HLP.ReleaseCommand())
             state.channels[ch] = nothing
             state.releases += 1
@@ -325,7 +340,7 @@ function process_hardware_chunk!(
 
     state.runtime += signal_duration
     _navigate!(state, loop; pvt_update_interval, time_in_lock_before_calculating_pvt,
-               enable_ionospheric_correction, enable_tropospheric_correction, pvt_approximate_year)
+               enable_ionospheric_correction, enable_tropospheric_correction, pvt_approximate_year, debug)
 end
 
 # ── Acquisition ──────────────────────────────────────────────────────────────
@@ -401,12 +416,14 @@ function _drain!(state::HardwareReceiverState, loop::HardwareLoop)
             ev.sequence == sat.arm_sequence || ev.code == HLP.STATUS_BIT_CLOCK_RESTART || return nothing
             if ev.code == HLP.STATUS_ARMED
                 sat.confirmed = true
+                sat.last_record_runtime = state.runtime
             elseif ev.code == HLP.STATUS_ARM_REJECTED
                 sat.rejected = true
                 state.rejections += 1
                 @warn "the loop process rejected an arm" channel = ch prn = sat.prn reason = Int(ev.reason) maxlog = 20
             elseif ev.code == HLP.STATUS_BIT_CLOCK_RESTART
                 sat.bit_clock_restart = true
+                sat.bit_clock_restarts += 1
             end
             return nothing
         end
@@ -417,6 +434,8 @@ function _drain!(state::HardwareReceiverState, loop::HardwareLoop)
             push!(sat.prompts, ev.prompt)
             sat.last_prompt = ev.prompt
             sat.last_integration_samples = ev.integrated_samples
+            sat.record_samples += ev.integrated_samples
+            sat.last_record_runtime = state.runtime
             (ev.flags & HLP.RECORD_HAS_CN0) != 0 && (sat.cn0_linear = ev.cn0_linear_hz)
             sat.records += 1
         elseif kind == HLP.EVENT_BIT
@@ -455,7 +474,8 @@ function _common_boundary(state::HardwareReceiverState)
 end
 
 function _navigate!(state::HardwareReceiverState, loop; pvt_update_interval, time_in_lock_before_calculating_pvt,
-                    enable_ionospheric_correction, enable_tropospheric_correction, pvt_approximate_year)
+                    enable_ionospheric_correction, enable_tropospheric_correction, pvt_approximate_year,
+                    debug = false)
     B = _common_boundary(state)
     B == typemin(Int64) && return false
     # Keep every decoder current up to B.
@@ -488,6 +508,15 @@ function _navigate!(state::HardwareReceiverState, loop; pvt_update_interval, tim
     end)
     state.pvt = calc_pvt(groups, state.pvt; enable_ionospheric_correction, enable_tropospheric_correction,
                          approximate_year = pvt_approximate_year)
+    if debug && fld(state.runtime, 1.0s) != fld(state.runtime - pvt_update_interval, 1.0s)
+        for sat in state.channels
+            isnothing(sat) && continue
+            st = sat.state
+            dec = st.decoder
+            @info "hardware sat" prn = sat.prn channel = sat.channel confirmed = sat.confirmed in_lock = is_in_lock(st) ranging_ready = is_ranging_ready(st) time_in_lock = st.time_in_lock has_state_at_B = !isnothing(epoch_state_at(sat, B)) code_phase = (s = epoch_state_at(sat, B); isnothing(s) ? NaN : s.code_phase_chips) sync = (s = epoch_state_at(sat, B); isnothing(s) ? false : (s.flags & HLP.STATE_SYNC_FOUND) != 0) bits_after_sync = dec.num_bits_after_valid_syncro_sequence complete = GNSSDecoder.is_decoding_completed_for_positioning(dec.data) healthy = is_sat_healthy(dec) restarts = sat.bit_clock_restarts queued_bits = length(sat.bit_values)
+        end
+        @info "hardware pvt" B fix = !isnothing(state.pvt.time) sats = length(state.pvt.sats)
+    end
     state.last_pvt = state.runtime
     state.last_pvt_boundary = B
     true

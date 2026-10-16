@@ -62,16 +62,20 @@ using HardwareLoopProtocol: create_segment, SegmentConfig, BandEntry, loop_heart
                    replica_amplitude = 1.0)
     fixes = PVTSolution[]
     tracked = Set{Int}()
+    first_fix = nothing
     for d in data
         foreach(((_, prn),) -> push!(tracked, prn), keys(d.sat_data))
-        isnothing(d.pvt.time) || push!(fixes, d.pvt)
+        if !isnothing(d.pvt.time)
+            push!(fixes, d.pvt)
+            isnothing(first_fix) && (first_fix = d.runtime)
+        end
     end
     stop[] = true
     wait(producer)
     close(loop)
     close(seg)
 
-    @info "hardware loop" tracked = sort(collect(tracked)) fixes = length(fixes) arms = core.commands_handled lost = loop.lost_events
+    @info "hardware loop" tracked = sort(collect(tracked)) fixes = length(fixes) first_fix commands = core.commands_handled lost = loop.lost_events
     @test length(tracked) >= 8
     @test !isempty(fixes)
     # The software receiver's fix on this recording (ion_rtlsdr_integration.jl).
