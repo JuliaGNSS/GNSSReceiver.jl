@@ -316,6 +316,10 @@ function process_hardware_chunk!(
     signal_duration = num_samples / sampling_freq
     loop.segment.open || return false
     HLP.receiver_heartbeat!(loop.segment)
+    # The loop process is the only source of tracking: without it the run is over.
+    if fld(state.runtime, 1.0s) != fld(state.runtime + signal_duration, 1.0s) && !is_alive(loop)
+        error("the loop process at $(loop.path) stopped beating")
+    end
     state.host_samples += num_samples
     chunk_end = origin + state.host_samples          # device sample after the chunk
 
@@ -361,11 +365,16 @@ function _acquire!(state, loop, measurement, sampling_freq, chunk_end, acquire_e
     if !isnothing(task)
         istaskdone(task) || return nothing
         state.acquisition = nothing
+        state.last_acquisition = state.runtime
+        state.acquisition_buffer = SampleBuffers.reset(state.acquisition_buffer)
+        if istaskfailed(task)
+            # A failed search costs one interval, not the run.
+            @error "acquisition failed" exception = (task.exception, task.backtrace) maxlog = 5
+            return nothing
+        end
         results, valid_at = fetch(task)
         _arm_acquired!(state, loop, results, valid_at, Float64(ustrip(Hz, sampling_freq)); rf_input,
                        replica_amplitude, code_lock_cn0_threshold)
-        state.last_acquisition = state.runtime
-        state.acquisition_buffer = SampleBuffers.reset(state.acquisition_buffer)
         return nothing
     end
     state.runtime - state.last_acquisition >= acquire_every || return nothing
