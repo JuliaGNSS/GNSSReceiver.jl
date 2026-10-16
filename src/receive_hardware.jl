@@ -188,7 +188,10 @@ Keywords as the software receiver's where they apply — `acquire_every`,
 prompts are on the signal's scale), `noise_prn` (the decoy the band's noise
 reference starts on) and `acquisition_doppler_coverage` (the Doppler span the
 acquisition searches, wide by default because a hardware front end's
-oscillator offset adds to the satellites' Doppler).
+oscillator offset adds to the satellites' Doppler), `acquisition_doppler_resolution`
+(the Doppler bin; finer bins integrate longer and find weaker satellites; the
+software receiver's by default) and `debug` (log each satellite's state and the
+solve once a second).
 
 Limitations: one band, one antenna, plain (non-combined) signals of one type,
 scalar tracking.
@@ -211,6 +214,7 @@ function receive(
     replica_amplitude::Real = 127.0,
     noise_prn::Integer = 32,
     acquisition_doppler_coverage = 20_000.0Hz,
+    acquisition_doppler_resolution = nothing,
     debug::Bool = false,
 )
     systems = as_systems(systems)
@@ -227,7 +231,13 @@ function receive(
     band.sampling_freq_hz == fs ||
         throw(ArgumentError("the loop runs at $(band.sampling_freq_hz) Hz, the stream at $fs Hz"))
 
-    resolutions = map(s -> 2 * 0.5 * carrier_doppler_pull_in_range(SCALAR_DOPPLER_ESTIMATOR, s), systems)
+    # The software receiver's bin (half the loop's pull-in range) unless asked for
+    # finer: a finer bin integrates longer coherently, which finds weaker
+    # satellites and hands them over closer to their Doppler.
+    resolutions = map(systems) do system
+        something(acquisition_doppler_resolution,
+                  2 * 0.5 * carrier_doppler_pull_in_range(SCALAR_DOPPLER_ESTIMATOR, system))
+    end
     _, acq_plans, num_acq_samples = plan_band_acquisition(systems, sampling_freq, resolutions; prns,
                                                           min_doppler_coverage = acquisition_doppler_coverage)
     T = eltype(eltype(measurement_channel))
