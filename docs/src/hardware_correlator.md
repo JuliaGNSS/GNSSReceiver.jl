@@ -53,6 +53,11 @@ dashboard work unchanged.
    Its Doppler span (`acquisition_doppler_coverage`, 20 kHz) is wider than the
    software receiver's because a hardware front end's oscillator offset adds to
    the satellites' Doppler.
+   The search fills the default threadpool for seconds, so start Julia with an
+   interactive thread for the chunk loop (`julia -t auto,1`), which then keeps
+   up with the raw stream while it searches — and one more if the raw stream's
+   reader holds one of its own (GNSSM2SDR's does: `julia -t auto,2`).
+   `close(loop)` waits for a search still in flight.
 2. **Events**: each satellite's records feed its lock detectors — on the device's
    record time, not on the arrival of raw chunks, which comes in bursts whenever
    this process has been held up; its bits are queued with the device sample

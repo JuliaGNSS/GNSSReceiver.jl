@@ -36,6 +36,9 @@ mutable struct HardwareLoop
     # Held by `receive`'s task for each chunk and by `close`, so the segment is
     # never unmapped under a chunk that is using it.
     const lock::ReentrantLock
+    # The receiver's acquisition in flight, which `close` waits for: a process
+    # that exits under a search still in FFTW crashes on the way out.
+    acquisition::Union{Nothing,Task}
 end
 
 function HardwareLoop(segment_path::AbstractString; spawn::Union{Nothing,Base.AbstractCmd} = nothing,
@@ -50,7 +53,7 @@ function HardwareLoop(segment_path::AbstractString; spawn::Union{Nothing,Base.Ab
     end
     segment = _wait_for_segment(path, process, Float64(attach_timeout))
     loop = HardwareLoop(path, segment, process, HLP.channel_count(segment), HLP.band_table(segment), 0, 0, 0, 0,
-                        ReentrantLock())
+                        ReentrantLock(), nothing)
     HLP.set_receiver_pid!(segment, getpid())
     HLP.receiver_heartbeat!(segment)
     for ch = 1:loop.num_channels
@@ -85,6 +88,17 @@ is_alive(loop::HardwareLoop) = loop.segment.open && HLP.heartbeat_alive(loop.seg
 
 function Base.close(loop::HardwareLoop; shutdown::Bool = !isnothing(loop.process))
     @lock loop.lock _close(loop, shutdown)
+    # Outside the lock: the search holds none, and a failed one was logged by
+    # the receiver already.
+    task = loop.acquisition
+    if !isnothing(task)
+        try
+            wait(task)
+        catch e
+            e isa TaskFailedException || rethrow()
+        end
+    end
+    loop
 end
 
 function _close(loop::HardwareLoop, shutdown::Bool)

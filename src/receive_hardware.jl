@@ -266,8 +266,12 @@ function receive(
     )
     data_channel = Channel{ReceiverDataOfInterest{SatelliteDataOfInterest{ComplexF64}}}(16)
     origin_ref = Ref{Int64}(-1)
+    # On the interactive threadpool when there is one (`julia -t auto,1`, one
+    # more if the raw stream's reader holds one): the acquisition's FFT tasks
+    # fill the default pool for seconds, and a chunk loop waiting behind them
+    # lets the raw stream overflow.
     Base.errormonitor(
-        Threads.@spawn try
+        Threads.@spawn :interactive try
             while true
                 measurement = try
                     take!(measurement_channel)
@@ -416,7 +420,7 @@ function _acquire!(state, loop, measurement, sampling_freq, chunk_end, acquire_e
     tracked = Set((sat.group_key, sat.prn) for sat in state.channels if !isnothing(sat))
     plans = state.acq_plans
     systems = state.systems
-    state.acquisition = Threads.@spawn begin
+    state.acquisition = loop.acquisition = Threads.@spawn begin
         results = map(systems) do system
             key = signal_group_key(system)
             plan = plans[key]

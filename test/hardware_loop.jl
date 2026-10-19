@@ -73,6 +73,8 @@ using HardwareLoopProtocol: create_segment, SegmentConfig, BandEntry, loop_heart
     stop[] = true
     wait(producer)
     close(loop)
+    # `close` waited for the search in flight, so none outlives the loop.
+    @test isnothing(loop.acquisition) || istaskdone(loop.acquisition)
     close(seg)
 
     @info "hardware loop" tracked = sort(collect(tracked)) fixes = length(fixes) first_fix commands = core.commands_handled lost = loop.lost_events
