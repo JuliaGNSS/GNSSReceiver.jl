@@ -47,6 +47,14 @@ using HardwareLoopProtocol: create_segment, SegmentConfig, loop_heartbeat!
                     frame[i, 1] = complex(Int16(bytes[2i-1]) - Int16(128), Int16(bytes[2i]) - Int16(128))
                     samples[i] = frame[i, 1]
                 end
+                # A search in flight takes wall time the recording does not:
+                # on a board the samples arrive in real time and an arm hands
+                # over from a window at most a search old. Hold the recording
+                # while one runs, so the test does not depend on how fast this
+                # machine searches.
+                while (task = loop.acquisition; !isnothing(task) && !istaskdone(task))
+                    sleep(0.001)
+                end
                 # The device first, then the receiver: like a board, whose
                 # correlator sees a sample before the host's raw stream does.
                 correlate_chunk!(dev, samples)
