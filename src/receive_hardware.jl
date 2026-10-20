@@ -185,7 +185,7 @@ _hardware_sat_type(system) =
 
 """
     receive(loop::HardwareLoop, measurement_channel, systems, sampling_freq;
-            device_sample_origin, kwargs...)
+            device_sample_origin, replica_amplitude, kwargs...)
 
 Run the receiver over a hardware correlator: acquire from the raw samples on
 `measurement_channel`, track on the FPGA through `loop`'s process, decode and
@@ -195,14 +195,17 @@ per PVT solution, like the software [`receive`](@ref).
 `device_sample_origin` is the device's sample index of the stream's first
 sample: an integer, or a function returning it (called once the first chunk
 has arrived, so a stream that learns it from the samples can supply it).
+`replica_amplitude` is the device's carrier-table amplitude (127 for
+gnss-m2sdr's TDM correlator, 1 for HardwareLoopCore's `SimulatedDevice`), so
+the published prompts are on the signal's scale; it depends on the device, so
+there is no default.
 
 Keywords as the software receiver's where they apply — `acquire_every`,
 `prns`, `pvt_update_interval`, `time_in_lock_before_calculating_pvt`,
 `code_lock_cn0_threshold`, `enable_ionospheric_correction`,
 `enable_tropospheric_correction`, `pvt_approximate_year` — plus `rf_input`
 (the RF input the satellites are correlated on; the band table's by default),
-`replica_amplitude` (the device's carrier-table amplitude, so the published
-prompts are on the signal's scale), `noise_prn` (the decoy the band's noise
+`noise_prn` (the decoy the band's noise
 reference starts on) and `acquisition_doppler_coverage` (the Doppler span the
 acquisition searches, wide by default because a hardware front end's
 oscillator offset adds to the satellites' Doppler), `acquisition_doppler_resolution`
@@ -228,7 +231,7 @@ function receive(
     enable_tropospheric_correction = true,
     pvt_approximate_year::Integer = year(now(UTC)),
     rf_input::Integer = Int(first(loop.bands).rf_input),
-    replica_amplitude::Real = 127.0,
+    replica_amplitude::Real,
     noise_prn::Integer = 32,
     acquisition_doppler_coverage = 20_000.0Hz,
     acquisition_doppler_resolution = nothing,

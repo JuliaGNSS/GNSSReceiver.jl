@@ -28,7 +28,8 @@ using GNSSReceiver, GNSSSignals, Unitful
 
 loop = HardwareLoop("/dev/shm/gnss-loop-m2sdr0"; spawn = `gnss_loop --csr=… --antenna=2`)
 data = receive(loop, raw_channel, GPSL1CA(), 4e6u"Hz";
-               device_sample_origin = () -> origin_of(raw_channel))
+               device_sample_origin = () -> origin_of(raw_channel),
+               replica_amplitude = 127)     # the device's carrier-table amplitude
 for d in data
     isnothing(d.pvt.time) || println(d.pvt.position)
 end
