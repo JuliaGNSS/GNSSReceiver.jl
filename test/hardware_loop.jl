@@ -115,3 +115,13 @@ end
     # The decoder saw no sync in this noise, and starts over at the break.
     @test isnothing(sat.state.decoder.num_bits_after_valid_syncro_sequence)
 end
+
+@testset "hardware loop: an output the consumers are behind on is dropped" begin
+    ch = Channel{Int}(2)
+    @test GNSSReceiver._offer!(ch, 1) && GNSSReceiver._offer!(ch, 2)
+    @test !GNSSReceiver._offer!(ch, 3)             # full: dropped, not blocked
+    @test take!(ch) == 1 && GNSSReceiver._offer!(ch, 4)
+    @test collect(Iterators.take(ch, 2)) == [2, 4]
+    close(ch)
+    @test_throws InvalidStateException GNSSReceiver._offer!(ch, 5)
+end

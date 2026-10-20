@@ -175,6 +175,8 @@ mutable struct HardwareReceiverState{Sys<:Tuple,Plans<:NamedTuple,B,Sats}
     arms::Int
     rejections::Int
     releases::Int
+    # Outputs dropped because the consumers were behind.
+    outputs_dropped::Int
 end
 
 # One satellite type for every group: the receiver's systems share one signal
@@ -190,7 +192,8 @@ _hardware_sat_type(system) =
 Run the receiver over a hardware correlator: acquire from the raw samples on
 `measurement_channel`, track on the FPGA through `loop`'s process, decode and
 solve the PVT here. Returns a channel of [`ReceiverDataOfInterest`](@ref), one
-per PVT solution, like the software [`receive`](@ref).
+per PVT solution, like the software [`receive`](@ref). Unlike it, a consumer
+that falls 16 outputs behind misses outputs rather than holding up tracking.
 
 `device_sample_origin` is the device's sample index of the stream's first
 sample: an integer, or a function returning it (called once the first chunk
@@ -265,7 +268,7 @@ function receive(
     state = HardwareReceiverState(
         systems, acq_plans, SampleBuffer(T, num_acq_samples),
         Union{Nothing,Sats}[nothing for _ = 1:loop.num_channels],
-        0, UInt64(0), false, -Inf * 1.0s, PVTSolution(), 0.0s, Int64(0), -Inf * 1.0s, nothing, -Inf * 1.0s, -Inf * 1.0s, typemin(Int64), 0, 0, 0,
+        0, UInt64(0), false, -Inf * 1.0s, PVTSolution(), 0.0s, Int64(0), -Inf * 1.0s, nothing, -Inf * 1.0s, -Inf * 1.0s, typemin(Int64), 0, 0, 0, 0,
     )
     data_channel = Channel{ReceiverDataOfInterest{SatelliteDataOfInterest{ComplexF64}}}(16)
     origin_ref = Ref{Int64}(-1)
@@ -298,7 +301,8 @@ function receive(
                 loop.segment.open || break
                 if new_pvt || state.runtime - state.last_output >= 3 * pvt_update_interval / 2
                     try
-                        push!(data_channel, hardware_data_of_interest(state))
+                        _offer!(data_channel, hardware_data_of_interest(state)) ||
+                            (state.outputs_dropped += 1)
                     catch e
                         e isa InvalidStateException || rethrow(e)
                         break
@@ -312,6 +316,19 @@ function receive(
         end
     )
     data_channel
+end
+
+# Hand `d` to the consumers unless they are behind: a full channel would block
+# the chunk loop, and with it the heartbeat and the draining of the event rings,
+# so a slow GUI would lose tracking history. A dropped output is superseded by
+# the next. Throws `InvalidStateException` once the consumers have closed it.
+function _offer!(ch::Channel, d)
+    @lock ch begin
+        isopen(ch) || throw(InvalidStateException("Channel is closed.", :closed))
+        Base.n_avail(ch) < ch.sz_max || return false
+        put!(ch, d)
+    end
+    true
 end
 
 """
