@@ -73,7 +73,8 @@ dashboard work unchanged.
 ## Limitations
 
 - One band, one antenna, plain (non-combined) signals of one type for now, and
-  scalar tracking (vector tracking in the loop process is HardwareLoopCore#15).
+  scalar tracking: the receiver does not read the solution a loop process
+  running vector tracking publishes on its nav ring yet.
 - The loop's tap layout is the default correlator's for each signal.
 
 ## API

@@ -420,12 +420,15 @@ function _acquire!(state, loop, measurement, sampling_freq, chunk_end, acquire_e
     tracked = Set((sat.group_key, sat.prn) for sat in state.channels if !isnothing(sat))
     plans = state.acq_plans
     systems = state.systems
+    # The band's samples put zero Doppler at its IF; the Dopplers found are
+    # relative to it, as the loop's are.
+    interm_freq = first(loop.bands).intermediate_frequency_hz * Hz
     state.acquisition = loop.acquisition = Threads.@spawn begin
         results = map(systems) do system
             key = signal_group_key(system)
             plan = plans[key]
             prns = [p for p in plan.avail_prns if !((key, p) in tracked)]
-            isempty(prns) ? Any[] : acquire!(plan, window, prns)
+            isempty(prns) ? Any[] : acquire!(plan, window, prns; interm_freq)
         end
         results, valid_at
     end

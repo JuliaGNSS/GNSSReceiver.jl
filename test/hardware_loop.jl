@@ -8,7 +8,7 @@
 # the recording into the same scratch space.
 
 using HardwareLoopCore
-using HardwareLoopProtocol: create_segment, SegmentConfig, BandEntry, loop_heartbeat!
+using HardwareLoopProtocol: create_segment, SegmentConfig, loop_heartbeat!
 
 @testset "hardware loop: the ION recording through a simulated correlator" begin
     dat_file = joinpath(@get_scratch!("rtl_sdr_test_data"), "RTLSDR_Bands-L1.uint8")
@@ -24,7 +24,7 @@ using HardwareLoopProtocol: create_segment, SegmentConfig, BandEntry, loop_heart
     dev = SimulatedDevice(GPSL1CA(); sampling_freq = fs, num_channels)
     seg = create_segment(path, SegmentConfig(;
         channel_count = num_channels,
-        bands = [BandEntry(:L1, fs)],
+        bands = driver_capabilities(dev).bands,
         event_capacity = 1 << 16,
     ))
     core = LoopCore(dev, (GPSL1CA(),), seg)

@@ -50,7 +50,7 @@ using TrackingLoops:
     VectorTracking,
     VT_INELIGIBLE,
     VT_BELOW_HORIZON,
-    default_carrier_loop_filter_bandwidth,
+    default_wide_carrier_loop_filter_bandwidth,
     navigation_cycle,
     navigation_solution,
     navigation_status,
