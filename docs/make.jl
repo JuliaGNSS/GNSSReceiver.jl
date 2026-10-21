@@ -28,6 +28,7 @@ makedocs(
         "Worked Example (Real Data)" => "example.md",
         "Custom Receiver Output" => "custom_output.md",
         "Graphical User Interface" => "gui.md",
+        "Hardware Correlator" => "hardware_correlator.md",
         "API Reference" => "api.md",
     ],
     checkdocs = :exports,

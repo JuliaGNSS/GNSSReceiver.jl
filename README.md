@@ -38,3 +38,6 @@ single multi-GNSS PVT solution:
   — emit your own per-chunk data.
 - [Graphical User Interface](https://JuliaGNSS.github.io/GNSSReceiver.jl/dev/gui/) — the
   live terminal GUI.
+- [Hardware Correlator](https://JuliaGNSS.github.io/GNSSReceiver.jl/dev/hardware_correlator/)
+  — track on an FPGA, with the loops closed in a separate allocation-free process
+  (e.g. the LiteX-M2SDR through [GNSSM2SDR.jl](https://github.com/JuliaGNSS/GNSSM2SDR.jl)).
