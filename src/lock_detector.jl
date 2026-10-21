@@ -15,14 +15,14 @@ timers.
 The detectors' timings answer two different questions, and they scale differently.
 
 **Evidence counts** — the warm-up, the clean run that confirms the handover is over, and the
-steady-state out-of-lock dwells — measure how much of a detector's own statistic it has seen.
-Both statistics are built record by record (the C/N0 of each record; the phase-lock
-indicator's averages over records), and a record is one primary code period `T`, so these are
-counts of `T`: the same count then means the same amount of evidence on every signal, and the
-GPS L1 C/A values are reproduced exactly (`T = 1 ms`, so 200 code periods *is* 200 ms). In
-seconds they would not: the 200 ms dwell this receiver once allowed was only 50 records on
-Galileo E1B and 20 on GPS L1C-D, which is why lock detection failed on the slower signals
-while GPS L1 C/A looked fine.
+steady-state out-of-lock dwells — measure how much of a detector's own statistic it has
+seen. Both statistics are built record by record (the C/N0 of each record; the phase-lock
+indicator's averages, which TrackingLoops advances once per record), and a record is one
+primary code period `T`, so these are counts of `T`: the same count then means the same
+amount of evidence on every signal, and the GPS L1 C/A values are reproduced exactly
+(`T = 1 ms`, so 200 code periods *is* 200 ms). In seconds they would not: the 200 ms dwell
+this receiver once allowed was only 50 records on Galileo E1B and 20 on GPS L1C-D, which is why
+lock detection failed on the slower signals while GPS L1 C/A looked fine.
 
 **Handover settling** — how long the pull-in stage lasts, how much out-of-lock time it
 tolerates, and when a satellite may be ranged on — waits for the tracking loops to walk the
@@ -77,8 +77,8 @@ threshold it grows — 0.51 s on GPS L1C-D at 31 dBHz, and up to 320 ms on GPS L
 for the satellites the loop holds at all (its wide, FLL-assisted pull-in loses about half of
 those handovers outright) — which is more than the 200 ms steady-state dwell GPS L1 C/A gets,
 so a single un-staged dwell would drop them. The carrier detector's demand is larger, up to
-1.6 s on GPS L1 C/A at 34 dBHz and 0.2 s at 38, because the FLL has to pull in the residual
-Doppler before `cos(2φ)` stops averaging to zero; on the longer codes it stays under 50 ms.
+1.6 s on GPS L1 C/A at 34 dBHz and 0.23 s at 38, because the FLL has to pull in the residual
+Doppler before `cos(2φ)` stops averaging to zero; on the longer codes it stays under 25 ms.
 
 So the dwell has two stages:
 
@@ -150,7 +150,7 @@ overshoots once the carrier has settled — 0.07 to 0.11 chip (20 to 32 m) at 2 
 not tuned against that swing, which the loops leave behind whatever the gate.
 
 Being conservative is close to free: the earliest the bar can fire is the warm-up plus one
-clean run, 680 ms on GPS L1 C/A, and measured on synthetic handovers it lands at 0.77 to 2 s
+clean run, 680 ms on GPS L1 C/A, and measured on synthetic handovers it lands at 0.8 to 2 s
 there — the carrier loop has its own residual Doppler to pull in before the phase-lock
 indicator stops resetting the run — so still inside `receive`'s own 2 s
 `time_in_lock_before_calculating_pvt` gate. On slower signals the extra time is dwarfed by
@@ -205,7 +205,8 @@ where it is floored at their 2.8 s.
 Before `warm_up_time_threshold` no evidence is accumulated at all. Under the noise-reference
 estimator an unmeasured channel reads `-Inf dBHz` and so *fails* the CN0 test rather than
 passing it, so the warm-up is not there to hide an estimator's cold bias — it is there for the
-carrier detector's own moving averages, which start empty (see [`CarrierLockDetector`](@ref)).
+carrier detector, whose indicator TrackingLoops only reports once its averages span 0.1 s (see
+[`CarrierLockDetector`](@ref)).
 
 `resets_on_lock` selects how favourable evidence is credited. `false` pays the accumulated time
 back one `signal_duration` at a time. `true` clears it outright, which is the "optimistic"
@@ -678,132 +679,84 @@ set_out_of_lock(dwell::LockDwell) =
     @set dwell.out_of_lock_time = current_out_of_lock_time_threshold(dwell)
 set_out_of_lock(lock_detector::AbstractLockDetector) =
     @set lock_detector.dwell = set_out_of_lock(lock_detector.dwell)
-
 """
     CarrierLockDetector <: AbstractLockDetector
 
-Declares carrier lock from the prompt correlator using the Van Dierendonck
-narrowband-difference / narrowband-power phase-lock indicator
+Declares carrier lock when the satellite's carrier loop reports itself phase-locked
+(`TrackingLoops.phase_locked`), read off its Doppler-estimator state once per processing
+chunk. A scalar loop is phase-locked while the phase-lock indicator its carrier-loop staging
+keeps (`TrackingLoops.phase_lock_indicator`) reads at least 0.5:
 
 ```
-PLI = Σ(Iₖ² − Qₖ²) / Σ(Iₖ² + Qₖ²)
+PLI = ⟨I² − Q²⟩ / A²,    A² = √(2·M₂² − M₄),    Mₖ = ⟨|P|ᵏ⟩
 ```
 
-accumulated over every prompt the tracking loops produce. For a prompt of amplitude `A`
-in noise of total variance `σ²` — post-integration SNR `ρ = A²/σ² = CN0·T` — at carrier
-phase error `φ`,
+averaged exponentially over every prompt the loop produced, with a time constant of 0.1 s
+and at least 25 records. `⟨I² − Q²⟩` is Van Dierendonck's narrowband difference, and for a
+prompt of amplitude `A` at carrier phase error `φ` its expectation is `A²·cos(2φ)`. The signal
+power it is normalised with comes from the prompt's second and fourth moments, from which the
+noise cancels, so `E[PLI] ≈ cos(2φ)` whatever the C/N0: 1 in phase lock, 0 for a spinning
+phase. Lock is declared while the loop is phase-locked; its [`LockDwell`](@ref) clears
+outright on any favourable chunk (`resets_on_lock`), so declaring loss needs a *consecutive*
+run of failures. Its default `out_of_lock_code_periods` of 4000 is 4 s on GPS L1 C/A,
+matching both this receiver's historical value and Ward's `L0 = 240 × 20 ms = 4.8 s`. Because
+`pull_in_out_of_lock_time` is floored at that, both stages are equal and the carrier detector
+is deliberately unstaged — its dwell already asks for a consecutive run of failures far longer
+than any handover transient.
 
-```
-E[Iₖ² − Qₖ²] = A²·cos(2φ)      E[Iₖ² + Qₖ²] = A² + σ²
-```
+This replaces the receiver's own `Σ(I² − Q²) / Σ(I² + Q²)` over a 200-record moving average of
+Tracking's filtered prompts. The tracking loops already compute the indicator for their
+staging, so reading theirs saves recomputing it from every prompt, and it is the better
+statistic: normalised with the total power `A² + σ²`, the old one saturated at
+`ρ/(ρ+1)` (`ρ = CN0·T`), 0.5 at 30 dBHz over a 1 ms record. Its threshold therefore had to sit
+at 0.25 and mixed an SNR test into the phase test. Reading the loops' own indicator also means
+the receiver's carrier lock and the staging's — which drops the FLL and narrows the loop on
+the same indicator crossing the same 0.5 — answer the same question. A satellite in the
+vector loop is phase-locked by the residual PLL's own decision instead, which also asks that
+the C/N0 its rotated prompts read be no more than 6 dB below the vector loop's lock
+threshold, since the indicator alone reads lock on bare noise now and then.
 
-so `E[PLI] = cos(2φ)·ρ/(ρ+1)`. Lock is declared while `PLI ≥ phase_lock_threshold`; its
-[`LockDwell`](@ref) clears outright on any favourable chunk (`resets_on_lock`), so declaring
-loss needs a *consecutive* run of failures. Its default `out_of_lock_code_periods` of 4000 is
-4 s on GPS L1 C/A, matching both this receiver's historical value and Ward's
-`L0 = 240 × 20 ms = 4.8 s`. Because `pull_in_out_of_lock_time` is floored at that,
-both stages are equal and the carrier detector is deliberately unstaged — its dwell already
-asks for a consecutive run of failures far longer than any handover transient.
+The threshold of 0.5 is an RMS phase error of about 30°. Measured on synthetic prompts at
+one reading per 4 ms chunk, a phase-locked GPS L1 C/A signal reads below it 1% of the time
+at 30 dBHz, 0.03% at 32 dBHz and never from 35 dBHz up; Galileo E1B and GPS L1C-D, averaging
+over longer records, do better still. A phase spinning at 2 Hz reads above it 0.1% of the
+time, and from 10 Hz up never.
 
-This replaces a low-pass-filtered `|I|`-versus-`|Q|` amplitude comparison
-(`lowpass(|I|)/K2 > lowpass(|Q|)` with `K1 = 0.0247`, `K2 = 1.5` — the detector of
-Kaplan & Hegarty §5.11.2). Three concrete reasons:
+The indicator is *not* a noise detector. On noise alone `A²` estimates zero, so the ratio is
+heavy-tailed, and a noise-only channel reads above 0.5 on 3% of GPS L1 C/A chunks and 6% of
+Galileo E1B records — enough that, under `resets_on_lock`, the carrier detector alone would
+never declare it lost. It does not have to: the [`CodeLockDetector`](@ref)'s C/N0 test drops a
+noise-only channel within its 200-code-period dwell, and this detector is left to judge phase
+on a satellite whose power is there. The same holds for a carrier loop that has run away: on
+synthetic GPS L1 C/A handovers at 30 and 32 dBHz whose Doppler ran off by kHz, this indicator
+passed on 1 to 9% of chunks and so never completed the 4 s run, where the old one did from
+4.1 s — but the code detector had dropped every one of them first, from 0.7 s.
 
-  * **It sees every prompt.** The old detector was fed one prompt per processing chunk,
-    discarding three of every four at the receiver's 4 ms chunk over a 1 ms code period.
-  * **Its averaging is continuous.** The old filter state was reset every 80 ms block, so
-    the value actually tested had only reached ~39% of its asymptote — `K1 = 0.0247` is
-    specified for 20 ms epochs and gives a 40-epoch time constant, which the 20-update
-    block truncated.
-  * **Its expectation is known in closed form**, so a threshold maps to an explicit phase
-    error at a given C/N0. The old comparison only approaches a phase test at high SNR;
-    at low SNR it degenerates into an implicit SNR test (at perfect phase lock it flips at
-    `ρ ≈ 0.54`, i.e. ~27.4 dBHz over a 1 ms record), and that crossover is a consequence of
-    `K2` rather than something you can read off it.
-
-`phase_lock_threshold` defaults to `0.25`, matching PocketSDR's `THRES_PLI`. Because the
-indicator saturates at `ρ/(ρ+1)`, a threshold has to be read together with the C/N0 one: at
-the default 30 dBHz over a 1 ms record `ρ = 1`, so even perfect phase lock reads only `0.5`,
-and `0.25` demands `cos(2φ) ≥ 0.5` — `|φ| ≤ 30°`, comparable to the 33.7° `K2 = 1.5`
-implied. A threshold above `0.5` would be unreachable at the C/N0 the code detector still
-accepts. Read as a pure sensitivity floor the default is `ρ ≥ 1/3`, i.e. 25.2 dBHz at a 1 ms
-record, so — as before — the code detector's 30 dBHz stays the binding limit and the carrier
-detector is left to judge phase.
-
-The two sums are tracked as exponential moving averages sharing one gain, so the indicator
-is continuous. `smoothing_records` sets the averaging window; the default of 200 keeps the
-noise-only indicator's median at 0.00 and its 99th percentile at 0.12 — both well clear of
-the 0.25 threshold — while a 36 dBHz signal reads 0.78 against its 0.80 asymptote.
-
-The window is counted in **records, not code periods**, unlike the dwell's timings: the gain
-is applied once per prompt, and a prompt is one record spanning
-`get_last_fully_integrated_num_code_blocks` code blocks. The timings stay honest because they
-are driven by `signal_duration`, which is real elapsed time; this
-average has no access to that. The two coincide today only because Tracking's
-`preferred_num_code_blocks_to_integrate` is 1 and this receiver never raises it (see
-[`CodeLockDetector`](@ref)) — once that is plumbed through, a 200-record window will be
-200·N code periods long.
-
-Those noise-only figures are **asymptotic**, and the 80-code-period warm-up is shorter than
-the 200-record window, so the first judgement is made on an average that has not converged.
-Measured over 4000 noise realizations at the default window, the p99 settles at 0.12 but is
-0.17 at 200 records, 0.26 at 80 (max 0.38) and 0.35 at 40 — i.e. at the moment the warm-up
-ends a noise-only channel is above threshold 1.2% of the time. The warm-up is deliberately
-*not* lengthened to match: clearing the dwell on any favourable chunk, together with the
-4000-code-period dwell, means declaring loss needs a consecutive run of failures, so an
-early excursion in either direction is absorbed. In the other direction the early window is
-already tight enough: at the code-lock threshold (`ρ = 1`, perfect phase lock) the indicator
-is below 0.25 for 0.1% of realizations at 80 records and none at 200.
+The indicator is `NaN` until its averages span one time constant — 100 ms on GPS L1 C/A and
+Galileo E1B, 250 ms on GPS L1C-D — and again for as long after a release from the vector
+loop, which restarts the staging. TrackingLoops reports a `NaN` reading as not phase-locked,
+as a non-finite indicator always must count (a dead correlator poisons the averages
+permanently): GPS L1 C/A's 80 ms warm-up ends 20 ms before the first reading, which those 20
+ms of the 4 s dwell absorb, and the longer codes' warm-ups outlast it. A chunk too short to
+complete a record leaves the reading where it was, so the dwell repeats the previous verdict
+rather than inventing one.
 """
 struct CarrierLockDetector <: AbstractLockDetector
-    # Exponential moving averages of I² − Q² and I² + Q², sharing `smoothing_gain`. The gain
-    # is applied once per *record*, so — unlike the two timings below — the window it implies
-    # is a count of records rather than of code periods.
-    filtered_coherent_power::Float64
-    filtered_total_power::Float64
-    smoothing_gain::Float64
-    phase_lock_threshold::Float64
+    # TrackingLoops' phase-lock indicator as of the latest chunk, `NaN` before the first.
+    phase_lock_indicator::Float64
+    # Whether the carrier loop reported itself phase-locked as of the latest chunk.
+    phase_locked::Bool
     dwell::LockDwell
 end
 
 function CarrierLockDetector(;
     reference_integration_time = 1ms,
-    phase_lock_threshold = 0.25,
-    smoothing_records = 200,
     out_of_lock_code_periods = 4000,
     dwell_kwargs...,
 )
-    # A window shorter than one record gives a gain above 1, which makes the "moving average"
-    # overshoot every sample; a window of 0 gives an infinite gain, which turns both averages
-    # into `NaN` on the first prompt. `is_below_phase_lock_threshold` reads a non-finite
-    # average as out of lock — correctly, for a dead correlator — so the channel would then be
-    # silently dead from construction rather than loudly misconfigured.
-    isfinite(smoothing_records) && smoothing_records >= 1 || throw(
-        ArgumentError(
-            "smoothing_records is the averaging window in records and sets the moving " *
-            "averages' gain to 1/smoothing_records, so it must be a finite number ≥ 1, " *
-            "got $smoothing_records",
-        ),
-    )
-    # The indicator is `cos(2φ)·ρ/(ρ+1)`, so it lives in `[-1, 1]`: a threshold at or above 1
-    # is unreachable at any C/N0 and holds the channel permanently out of lock, one at or
-    # below −1 is met by anything and never reports loss. In practice the ceiling is lower
-    # still — the indicator saturates at `ρ/(ρ+1)`, which is 0.5 at the 30 dBHz the code
-    # detector accepts over a one-block record — but that bound moves with the record length,
-    # so only the mathematical one is enforced.
-    isfinite(phase_lock_threshold) && -1 < phase_lock_threshold < 1 || throw(
-        ArgumentError(
-            "phase_lock_threshold is compared against cos(2φ)·ρ/(ρ+1) ∈ [-1, 1], so it " *
-            "must be strictly inside that range (and below ρ/(ρ+1) ≈ 0.5 at the code " *
-            "detector's own 30 dBHz over a one-block record to be reachable at all), got " *
-            "$phase_lock_threshold",
-        ),
-    )
     CarrierLockDetector(
-        0.0,
-        0.0,
-        1 / smoothing_records,
-        phase_lock_threshold,
+        NaN,
+        false,
         LockDwell(;
             reference_integration_time,
             out_of_lock_code_periods,
@@ -816,62 +769,34 @@ end
 """
     phase_lock_indicator(lock_detector::CarrierLockDetector)
 
-The smoothed phase-lock indicator, or `NaN` before any prompt has been folded in.
+TrackingLoops' phase-lock indicator as of the latest chunk, or `NaN` before the first reading
+(and while TrackingLoops' own averages are still filling).
 """
-phase_lock_indicator(lock_detector::CarrierLockDetector) =
-    lock_detector.filtered_total_power > 0 ?
-    lock_detector.filtered_coherent_power / lock_detector.filtered_total_power : NaN
+phase_lock_indicator(lock_detector::CarrierLockDetector) = lock_detector.phase_lock_indicator
 
-function is_below_phase_lock_threshold(lock_detector::CarrierLockDetector)
-    # A non-finite moving average means a non-finite prompt reached the detector — a dead or
-    # saturated correlator channel. That has to fail *closed*, exactly as a non-finite CN0
-    # does in `is_below_cn0_threshold`: `NaN` poisons both averages permanently, and since
-    # `NaN > 0` is `false` it would otherwise look like "nothing measured yet" forever and
-    # hold the channel in lock indefinitely.
-    (
-        isfinite(lock_detector.filtered_total_power) &&
-        isfinite(lock_detector.filtered_coherent_power)
-    ) || return true
-    # Genuinely nothing folded in yet: the warm-up owns that window, so not out of lock.
-    lock_detector.filtered_total_power > 0 || return false
-    # Negated `>=` so any remaining non-finite indicator counts as out of lock too.
-    !(phase_lock_indicator(lock_detector) >= lock_detector.phase_lock_threshold)
-end
+is_out_of_phase_lock(lock_detector::CarrierLockDetector) = !lock_detector.phase_locked
 
 """
-    update(lock_detector::CarrierLockDetector, prompts, signal_duration)
-
-Fold every prompt of one processing chunk into the indicator, then advance the dwell once by
-`signal_duration`.
-
-`prompts` is the whole sequence of filtered prompt correlator values the chunk produced
-(Tracking's `get_filtered_prompts`), not just the last one: at the receiver's default 4 ms
-chunk over a 1 ms code period, reading only `get_last_fully_integrated_filtered_prompt`
-would discard three of every four. A lone prompt is accepted too, for callers that have
-only one. An empty sequence — a chunk too short to complete a record — advances the timers
-without inventing evidence.
-"""
-function update(lock_detector::CarrierLockDetector, prompts, signal_duration)
-    coherent = lock_detector.filtered_coherent_power
-    total = lock_detector.filtered_total_power
-    K = lock_detector.smoothing_gain
-    for prompt in prompts
-        inphase_power, quadrature_power = real(prompt)^2, imag(prompt)^2
-        coherent += K * (inphase_power - quadrature_power - coherent)
-        total += K * (inphase_power + quadrature_power - total)
-    end
-    # The verdict is read off the *updated* averages, so a chunk is judged on everything it
-    # contributed rather than on the state that preceded it.
-    measured = CarrierLockDetector(
-        coherent,
-        total,
-        K,
-        lock_detector.phase_lock_threshold,
-        lock_detector.dwell,
+    update(
+        lock_detector::CarrierLockDetector,
+        phase_lock_indicator,
+        phase_locked,
+        signal_duration,
     )
-    @set measured.dwell =
-        update(lock_detector.dwell, is_below_phase_lock_threshold(measured), signal_duration)
-end
 
-update(lock_detector::CarrierLockDetector, prompt::Complex, signal_duration) =
-    update(lock_detector, (prompt,), signal_duration)
+Judge one processing chunk on TrackingLoops' `phase_locked` of the satellite's
+Doppler-estimator state after it, keep its `phase_lock_indicator` for inspection, and
+advance the dwell by `signal_duration`.
+"""
+function update(
+    lock_detector::CarrierLockDetector,
+    phase_lock_indicator::Real,
+    phase_locked::Bool,
+    signal_duration,
+)
+    CarrierLockDetector(
+        Float64(phase_lock_indicator),
+        phase_locked,
+        update(lock_detector.dwell, !phase_locked, signal_duration),
+    )
+end

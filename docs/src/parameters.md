@@ -101,18 +101,21 @@ float backend with no full-scale value. See [Getting Started](@ref).
 
 ## Lock detection
 
-A satellite contributes to the PVT solution only while it is *in lock*. Lock is declared
-per satellite by a [`CodeLockDetector`](@ref GNSSReceiver.CodeLockDetector) — a threshold on
-the post-integration SNR — **and** a
-[`CarrierLockDetector`](@ref GNSSReceiver.CarrierLockDetector) — the narrowband
-difference/power phase-lock indicator `Σ(I²−Q²)/Σ(I²+Q²)`, fed every prompt the tracking
-loops produce. Both track elapsed signal time, so their behaviour is independent of how the
-signal is chunked. Both count the evidence they weigh in the ranging signal's primary code
-periods, so it means the same thing on every signal, and time the acquisition handover in
-seconds, as the tracking loops settle (see [Which timings scale with the code period](@ref)).
+A satellite contributes to the PVT solution only while it is *in lock*. Lock is declared per
+satellite by a [`CodeLockDetector`](@ref GNSSReceiver.CodeLockDetector) — a threshold on the
+post-integration SNR — **and** a
+[`CarrierLockDetector`](@ref GNSSReceiver.CarrierLockDetector) — the carrier loop's own
+phase-lock verdict: for a scalar loop a threshold on the phase-lock indicator
+`⟨I²−Q²⟩/A²` that TrackingLoops keeps for its carrier-loop staging, an estimate of `cos 2φ`
+normalised by a noise-free estimate of the signal power `A²`; in the vector loop the
+residual PLL's lock. Both track elapsed signal
+time, so their behaviour is independent of how the signal is chunked. Both count the
+evidence they weigh in the ranging signal's primary code periods, so it means the same thing
+on every signal, and time the acquisition handover in seconds, as the tracking loops settle
+(see [Which timings scale with the code period](@ref)).
 
-The detector thresholds and timings (the code-lock CN0 threshold, the carrier phase-lock
-threshold and its smoothing window, and the out-of-lock and warm-up windows) are set at
+The detector thresholds and timings (the code-lock CN0 threshold and the out-of-lock and
+warm-up windows) are set at
 detector construction from per-signal defaults; see their docstrings in the
 [API Reference](@ref).
 
@@ -225,7 +228,7 @@ The detector timings come in two kinds, and only one of them scales with the ran
 ² Floored at the earliest the evidence path can fire.
 
 "Ranging ready" is the evidence path — the warm-up plus an uninterrupted run — so it is a
-floor rather than a typical value: measured on synthetic handovers it lands at 0.77 to 2 s on
+floor rather than a typical value: measured on synthetic handovers it lands at 0.8 to 2 s on
 GPS L1 C/A from 34 dB-Hz up, because the carrier loop has its own Doppler pull-in to do before
 the phase-lock indicator stops resetting the run. On Galileo E1B and GPS L1C-D the loops have
 settled well before the floor: their residual code phase is under 0.008 and 0.03 chip by
