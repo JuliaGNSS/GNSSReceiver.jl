@@ -61,6 +61,7 @@
         0,
         0.0u"s",
         -Inf * 1.0u"s",
+        nothing,
     )
 
     next_receiver_state = GNSSReceiver.process(
@@ -131,6 +132,7 @@ end
         base.navigation_cycle,
         runtime,
         last_time_pvt_ran,
+        base.code_lock_cn0_threshold,
     )
 
     # Gate closed: still in the epoch of the last solve ⇒ `last_time_pvt_ran` unchanged.
@@ -585,6 +587,59 @@ end
     @test tracked_sat isa eltype(get_sat_states(empty_track_state))
     merged = merge_sats(empty_track_state, get_signal_id(system), [tracked_sat])
     @test length(get_sat_states(merged)) == 1
+end
+
+# The code-lock threshold is set once, on the state: `process` carries it from chunk to
+# chunk, and a satellite it acquires gets a code lock detector built with it.
+@testset "process judges code lock by the state's threshold" begin
+    system = GPSL1CA()
+    key = get_signal_id(system)
+    sampling_freq = 5e6Hz
+    receiver_state = GNSSReceiver.ReceiverState(
+        ComplexF64,
+        system;
+        num_samples_for_acquisition = 20000,
+        code_lock_cn0_threshold = 25.0u"dBHz",
+    )
+    @test receiver_state.code_lock_cn0_threshold == 25.0u"dBHz"
+    acq_plans = (; key => plan_acquire(system, float(sampling_freq), collect(1:32)))
+    next_receiver_state = GNSSReceiver.process(
+        receiver_state,
+        acq_plans,
+        (randn(ComplexF64, 20000, 1),),
+        ((system,),),
+        sampling_freq;
+        acq_pfa = 1e-12,
+    )
+    @test next_receiver_state.code_lock_cn0_threshold == 25.0u"dBHz"
+
+    acq = Acquisition.AcquisitionResults(
+        system,
+        5,
+        5e6u"Hz",
+        100.0u"Hz",
+        10.0,
+        nothing,
+        45.0,
+        1.0,
+        1000.0,
+        1,
+        nothing,
+        (-5000.0:1000.0:5000.0)u"Hz",
+        1,
+        5000,
+        1,
+    )
+    _, receiver_sat_states, _ = GNSSReceiver.update_states_from_acquisition_results(
+        [acq],
+        1e-4,
+        next_receiver_state.code_lock_cn0_threshold,
+        next_receiver_state.track_state,
+        next_receiver_state.receiver_sat_states[key],
+        system,
+        NumAnts(1),
+    )
+    @test receiver_sat_states[5].code_lock_detector.cn0_threshold == 25.0u"dBHz"
 end
 
 @testset "update_states_from_acquisition_results is a no-op without detections" begin

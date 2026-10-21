@@ -107,9 +107,9 @@ the post-integration SNR — **and** a
 [`CarrierLockDetector`](@ref GNSSReceiver.CarrierLockDetector) — the narrowband
 difference/power phase-lock indicator `Σ(I²−Q²)/Σ(I²+Q²)`, fed every prompt the tracking
 loops produce. Both track elapsed signal time, so their behaviour is independent of how the
-signal is chunked, and both take their timings as counts of the ranging signal's primary
-code period rather than in seconds, so they mean the same thing on every signal (see
-[Timings scale with the code period](@ref)).
+signal is chunked. Both count the evidence they weigh in the ranging signal's primary code
+periods, so it means the same thing on every signal, and time the acquisition handover in
+seconds, as the tracking loops settle (see [Which timings scale with the code period](@ref)).
 
 The detector thresholds and timings (the code-lock CN0 threshold, the carrier phase-lock
 threshold and its smoothing window, and the out-of-lock and warm-up windows) are set at
@@ -139,9 +139,11 @@ acquired channel drops out of lock promptly rather than clearing a 30 dB-Hz thre
 true CN0: on the ION reference recording it reads a median 1.0 dB above what the
 narrowband/wideband ratio (Tracking 6's default) reported, and up to 2.4 dB on the least
 steadily tracked satellite, whose loop phase noise that coherent estimator charged to the
-signal. The threshold is not a `receive` keyword: it comes from the per-signal default
-(`GNSSReceiver.get_default_code_lock_cn0_threshold`, 30 dB-Hz) that each satellite's
-`CodeLockDetector` is constructed with, which is where sensitivity would have to be traded.
+signal. The threshold defaults per signal (`GNSSReceiver.get_default_code_lock_cn0_threshold`,
+30 dB-Hz), and each satellite's `CodeLockDetector` is constructed with it; `receive` and
+`ReceiverState` take `code_lock_cn0_threshold` to trade sensitivity against it. The
+receiver state holds the one value, so under vector tracking the navigation filter's lock
+test uses the same number.
 The estimate is also what `sat_data[…].cn0` reports and what the GUI plots.
 
 ### Two stages: handover, then steady state
@@ -157,20 +159,19 @@ Both detectors therefore run a **pull-in stage** with a generous out-of-lock all
 latching permanently into a tighter **steady state** once the satellite has either strung
 together enough good evidence to count as converged or exhausted its pull-in window. This buys
 handover tolerance without making a genuine signal loss slower to notice. Measured on
-synthetic handovers at this receiver's own worst-case residual, the peak accumulated
-out-of-lock time a satellite the receiver should keep demands is 292 code periods — more than
-the 200-code-period steady-state dwell tolerates, which is why a single un-staged dwell drops
-it.
+synthetic handovers at this receiver's own worst-case residual, a satellite with a few dB of
+margin barely draws on it — at most 28 ms on GPS L1 C/A from 34 dB-Hz up — but nearer the
+30 dB-Hz threshold the demand reaches 320 ms on GPS L1 C/A at 32 dB-Hz, more than the 200 ms
+steady-state dwell tolerates, which is why a single un-staged dwell drops it.
 
 Ranging is gated separately from tracking, and on a *later* criterion. A satellite in its
 pull-in stage is still *kept* — that is the point — but it does not contribute to the PVT
 solution until its loops have settled, because a code phase that is still converging produces
-a pseudorange biased by tens of metres: measured at a 0.25-chip handover, the residual is 0.15
-to 0.22 chip (44 to 64 m) after 200 code periods of clean evidence and 0.018 to 0.15 chip (5
-to 44 m) after 600. `time_in_lock_before_calculating_pvt` alone would not achieve this: it
-counts from the handover, so it can elapse while the loops are still settling — and on a code
-longer than 1 ms the settling takes proportionally longer while that gate stays fixed in
-seconds.
+a pseudorange biased by tens of metres: measured at a 0.25-chip GPS L1 C/A handover, the
+residual is 0.16 to 0.20 chip (47 to 59 m) after 200 ms of clean evidence and 0.02 to 0.11
+chip (6 to 32 m) after 600 ms. `time_in_lock_before_calculating_pvt` alone would not achieve
+this: it counts from the handover rather than from clean evidence, so it can elapse while the
+loops are still settling.
 
 Ranging readiness needs a **timer** as well as an evidence path, for the same reason the
 pull-in stage does: the evidence clock is reset by any out-of-lock verdict, so an uninterrupted
@@ -179,9 +180,9 @@ converged, and silently absent from the PVT solve forever. Since PVT needs four 
 that trades a degraded fix for no fix. Under Tracking's default noise-reference estimator the
 code detector rarely blocks the run (measured steady-state per-chunk out-of-lock rates are 0.58
 at the 30 dB-Hz threshold itself, 0.10 one dB above it and 0.00 from two dB up), but the
-carrier detector does: its phase-lock indicator takes 460 to 590 code periods to come up
-through the handover. And against any disturbance recurring on a period shorter than the run
-the evidence path never fires at all, at any C/N0. The backstop admits such a satellite once
+carrier detector does: its phase-lock indicator takes up to 1.6 s to come up through the
+handover on GPS L1 C/A at 34 dB-Hz. And against any disturbance recurring on a period
+shorter than the run the evidence path never fires at all, at any C/N0. The backstop admits such a satellite once
 enough signal has *elapsed* — two code-loop time constants — with its out-of-lock clock paid
 down to zero. What it shortens is the *length* of the clean run it asks for, not the
 requirement that the channel be clean: a channel failing steadily enough never to pay its debt
@@ -190,7 +191,7 @@ extra code-phase thermal jitter (1σ of 0.039 chip, 11 m, at 30 dB-Hz against 0.
 1.2 m, at 45), not a converging handover bias.
 
 One residual case is left open deliberately: a satellite whose accumulated out-of-lock time
-parks *between* the steady-state and pull-in allowances — 200 to 600 code periods — never
+parks *between* the steady-state and pull-in allowances — 200 to 600 ms on GPS L1 C/A — never
 leaves the pull-in stage, and so never becomes ranging-ready either. Reaching it takes a burst
 of failures followed by a sustained near-50% duty cycle; under a stochastic signal the clock
 random-walks out of that band, either down to zero (whereupon it latches) or up past the
@@ -198,42 +199,53 @@ pull-in allowance (whereupon lock is lost and the satellite is reacquired). Clos
 mean letting the pull-in stage latch while its clock is still above the steady-state threshold,
 which is exactly the discontinuity the latch guard exists to prevent.
 
-### Timings scale with the code period
+### Which timings scale with the code period
 
-Every detector timing is configured as a multiple of the ranging signal's **primary code
-period** rather than in seconds, because that is what the tracking loops' time constants
-scale with: Tracking sizes its default bandwidths at `B_L·T ≈ 0.018`, so a 1 ms code gets an
-18 Hz carrier / 1 Hz code loop while a 10 ms code gets 1.8 Hz / 0.1 Hz — every `1/B_L` is a
-fixed number of code periods.
+The detector timings come in two kinds, and only one of them scales with the ranging signal's
+**primary code period** `T`:
 
-| Signal | Code period | Warm-up (80 `T`) | Code dwell (200 `T`) | Pull-in allowance (600 `T`) | Ranging ready (≥ 680 `T`) | Ranging backstop (2000 `T`) |
+- **Evidence counts** — the warm-up, the clean run that ends the pull-in stage, and the
+  steady-state dwells — count how much of a detector's statistic it has seen, and both
+  statistics are built record by record, one record per code period. So they are counts of
+  `T`, and the same count means the same evidence on every signal.
+- **Handover timings** — the pull-in window and allowance, the clean run that admits a
+  satellite to ranging, and the ranging backstop — wait for the tracking loops to settle.
+  TrackingLoops sets the loop bandwidths in hertz: the code loop runs at 1 Hz on every signal,
+  the carrier loop pulls in at 50 Hz (capped at 22.5 Hz on a 4 ms code and 9 Hz on a 10 ms
+  one) and narrows to 18 Hz once locked. So these are durations, the same on every signal
+  unless an evidence count they are floored at is longer.
+
+| Signal | Code period | Warm-up (80 `T`) | Code dwell (200 `T`) | Pull-in allowance (600 ms) | Ranging ready (≥ 80 `T` + max(200 `T`, 600 ms)) | Ranging backstop (2 s) |
 |---|---|---|---|---|---|---|
 | GPS L1 C/A | 1 ms | 80 ms | 200 ms | 600 ms | ≥ 680 ms | 2 s |
-| Galileo E1B | 4 ms | 320 ms | 800 ms | 2.4 s | ≥ 2.7 s | 8 s |
-| GPS L1C-D | 10 ms | 800 ms | 2 s | 6 s | ≥ 6.8 s | 20 s |
+| Galileo E1B | 4 ms | 320 ms | 800 ms | 800 ms¹ | ≥ 1.12 s | 2 s |
+| GPS L1C-D | 10 ms | 800 ms | 2 s | 2 s¹ | ≥ 2.8 s | 2.8 s² |
 
-"Ranging ready" is the evidence path — the warm-up plus an uninterrupted 600-code-period run,
-so 680 `T` is a floor rather than a typical value: measured on real handovers it lands at 760
-to 1500 code periods on GPS L1 C/A, because the carrier loop has its own Doppler pull-in to do
-before the phase-lock indicator stops resetting the run. "Ranging backstop" is the timer that
-bounds the wait for a satellite whose evidence never comes cleanly. The carrier
-detector's own dwell is 4000 `T` (4 s on GPS L1 C/A) and, being floored at that, is unstaged:
-it clears outright on any favourable chunk, so declaring loss already needs a consecutive run
-of failures far longer than any handover transient.
+¹ Floored at the code dwell, so on these signals the code detector is effectively unstaged.
+² Floored at the earliest the evidence path can fire.
 
-A dwell fixed in seconds means something different on every signal: the 200 ms this receiver
-used to allow is 200 code periods on GPS L1 C/A — the signal it was tuned against, and where
-it is correct — but only 50 on Galileo E1B and 20 on GPS L1C-D, against loops that are four
-and ten times slower. That is why lock detection failed on the slower signals while GPS
-L1 C/A looked fine. The GPS L1 C/A warm-up and dwell are unchanged.
+"Ranging ready" is the evidence path — the warm-up plus an uninterrupted run — so it is a
+floor rather than a typical value: measured on synthetic handovers it lands at 0.77 to 2 s on
+GPS L1 C/A from 34 dB-Hz up, because the carrier loop has its own Doppler pull-in to do before
+the phase-lock indicator stops resetting the run. On Galileo E1B and GPS L1C-D the loops have
+settled well before the floor: their residual code phase is under 0.008 and 0.03 chip by
+0.5 s. "Ranging backstop" is the timer that bounds the wait for a satellite whose evidence
+never comes cleanly. The carrier detector's own dwell is 4000 `T` (4 s on GPS L1 C/A) and,
+being floored at that, is unstaged: it clears outright on any favourable chunk, so declaring
+loss already needs a consecutive run of failures far longer than any handover transient.
 
-One consequence worth stating outright: on codes longer than 1 ms these timings, not
-`time_in_lock_before_calculating_pvt`, are what actually decide when a satellite joins the
-solve. A healthy GPS L1 C/A satellite is ranging-ready between 0.76 s and 1.5 s depending on
-its C/N0, so the 2 s default still binds there. On Galileo E1B (2.7 s at best) and GPS L1C-D
-(6.8 s) it no longer does, and lowering it below those figures has no effect at all. The extra
-seconds are in practice dwarfed by the tens of seconds of subframe decoding that set time to
-first fix.
+Counted the other way round, each kind goes wrong. A dwell fixed in seconds means something
+different on every signal: the 200 ms this receiver used to allow is 200 records on GPS L1 C/A
+but only 50 on Galileo E1B and 20 on GPS L1C-D, which is why lock detection once failed on the
+slower signals while GPS L1 C/A looked fine. And a handover timing counted in code periods
+made a Galileo E1B satellite wait 2.7 s and a GPS L1C-D one 6.8 s for ranging, long after
+their loops had settled — a cost left over from when TrackingLoops sized every loop bandwidth
+as `0.018 / T`. The GPS L1 C/A timings are the same either way.
+
+A healthy satellite is therefore ranging-ready within `receive`'s default 2 s
+`time_in_lock_before_calculating_pvt` on GPS L1 C/A and Galileo E1B, so that gate still binds
+there; on GPS L1C-D the evidence path's 2.8 s binds instead. Either way the extra time is
+dwarfed by the tens of seconds of subframe decoding that set time to first fix.
 
 The counts themselves are set at detector construction; see the
 [`CodeLockDetector`](@ref GNSSReceiver.CodeLockDetector) and
@@ -292,15 +304,17 @@ per band beyond a reference band. The pseudorange measurements are corrected for
 broadcast ionospheric model and the Saastamoinen tropospheric delay, exactly like
 `calc_pvt` (toggled by the same `enable_ionospheric_correction` /
 `enable_tropospheric_correction` keywords). The engine admits a satellite to its solution
-on its own test — bit sync, a C/N₀ above 30 dB-Hz, a decoded and healthy navigation
-message — so `time_in_lock_before_calculating_pvt` applies to scalar tracking only.
+on its own test — bit sync, a C/N₀ above the receiver's code-lock threshold (30 dB-Hz,
+see the lock detectors above; `receive` and `ReceiverState` take `code_lock_cn0_threshold`
+to change it), a decoded and healthy navigation message — so `time_in_lock_before_calculating_pvt`
+applies to scalar tracking only.
 
 A [`CombinedSignal`](@ref GNSSReceiver.CombinedSignal) works under vector tracking as under
 scalar tracking: the satellite ranges on the dataless pilot, whose prompt has no data-bit
 transitions, and the engine decodes the data component.
 
 `vector_tracking = true` runs the filter with its default configuration. To configure it,
-pass a [`VectorTracking`](https://JuliaGNSS.github.io/TrackingLoops.jl/stable/vector_tracking/)
+pass a [`NavigationFilterConfig`](https://JuliaGNSS.github.io/TrackingLoops.jl/stable/vector_tracking/)
 (re-exported from TrackingLoops.jl) instead — it both enables vector tracking and describes
 the platform and the front end, which is worth doing whenever either is known: the defaults
 assume vehicular dynamics and a TCXO-grade oscillator, and both the dynamics
@@ -313,7 +327,7 @@ how long the filter may coast before falling back to scalar tracking:
 ```julia
 data_channel = receive(
     measurement_channel, (GPSL1CA(), GalileoE1B()), 2.048e6u"Hz";
-    vector_tracking = VectorTracking(;
+    vector_tracking = NavigationFilterConfig(;
         acceleration_noise_std = 1.0u"m/s^2",   # pedestrian dynamics
         insufficient_meas_timeout = 30.0u"s",
     ),

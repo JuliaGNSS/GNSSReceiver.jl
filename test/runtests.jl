@@ -16,7 +16,7 @@ using Test,
     Scratch
 # The loop core Tracking no longer re-exports: the Doppler and C/N₀ estimators the tests
 # build and inspect. Imported by name, since TrackingLoops' wholesale exports (e.g.
-# `normalize`, `VTStatus`) would clash with names the tests use from elsewhere.
+# `normalize`) would clash with names the tests use from elsewhere.
 import TrackingLoops
 using TrackingLoops:
     ConventionalAssistedPLLAndDLL,

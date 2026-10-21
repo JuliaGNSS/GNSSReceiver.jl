@@ -31,8 +31,8 @@ using StaticArrays,
 # estimators — lives in TrackingLoops, and Tracking no longer re-exports it. So does
 # vector tracking: `VectorPLLAndDLL` is a Doppler estimator whose navigation engine
 # decodes every satellite, solves the PVT and closes the loops itself. Imported by
-# name rather than wholesale, because TrackingLoops' own `VTStatus` would clash with
-# the receiver's payload type of that name.
+# name rather than wholesale, so that TrackingLoops' wholesale exports (e.g.
+# `normalize`) cannot clash with the receiver's own names.
 import TrackingLoops
 using TrackingLoops:
     NumAnts,
@@ -43,15 +43,16 @@ using TrackingLoops:
     CorrelatorNoiseEstimator,
     DefaultPostCorrFilter,
     VectorPLLAndDLL,
-    VectorTracking,
+    NavigationFilterConfig,
     VT_INELIGIBLE,
     VT_BELOW_HORIZON,
-    default_carrier_loop_filter_bandwidth,
+    default_wide_carrier_loop_filter_bandwidth,
+    effective_carrier_loop_filter_bandwidth,
     navigation_cycle,
     navigation_solution,
     navigation_status,
-    member_sats,
-    satellite_report
+    satellite_report,
+    vector_loop_members
 
 using Unitful: m, s, ms, Hz, dBHz, dB, °, uconvert, NoUnits
 
@@ -71,7 +72,7 @@ using SignalChannels:
 
 export ReceiverState,
     receive,
-    VectorTracking,
+    NavigationFilterConfig,
     NumAnts,
     CombinedSignal,
     read_files,
@@ -383,7 +384,19 @@ end
 # filter — lives in the `TrackState`'s Doppler estimator (`VectorPLLAndDLL`), which
 # `track!` advances; `navigation_cycle` is the estimator's cycle count the receiver
 # last copied the solution of. A scalar receiver leaves it at `0`.
-struct ReceiverState{TS<:TrackState,RS<:NamedTuple,AB<:NamedTuple,LT<:NamedTuple,P<:PVTSolution}
+#
+# `code_lock_cn0_threshold` is the C/N₀ a satellite must hold to be in lock, fixed at
+# construction: `process` builds every satellite's code lock detector with it and the
+# vector loop was built with it, so the two judge lock by the same number. `nothing`
+# takes each signal's `get_default_code_lock_cn0_threshold`.
+struct ReceiverState{
+    TS<:TrackState,
+    RS<:NamedTuple,
+    AB<:NamedTuple,
+    LT<:NamedTuple,
+    P<:PVTSolution,
+    C<:Union{Nothing,typeof(1.0dBHz)},
+}
     track_state::TS
     receiver_sat_states::RS
     acquisition_buffers::AB
@@ -392,6 +405,7 @@ struct ReceiverState{TS<:TrackState,RS<:NamedTuple,AB<:NamedTuple,LT<:NamedTuple
     navigation_cycle::Int
     runtime::typeof(1.0s)
     last_time_pvt_ran::typeof(1.0s)
+    code_lock_cn0_threshold::C
 end
 
 # Flatten a tuple of per-band system tuples into one flat tuple of systems.
@@ -648,29 +662,41 @@ vector_tracking_signal(system::CombinedSignal) = system.pilot => system.data
 # The tracking loops' Doppler estimator for the `vector_tracking` mode, which is either
 # a switch or the navigation filter's configuration: `false` gives the conventional
 # FLL-assisted PLL/DLL for scalar tracking, `true` vector tracking with the
-# `VectorTracking` defaults, and a `VectorTracking` both enables it and describes the
-# platform and oscillator. Vector tracking runs TrackingLoops' `VectorPLLAndDLL` over
-# every system (see `vector_tracking_signal`), which wraps that same scalar loop and
-# owns the whole navigation pipeline — decoding, the scalar PVT that seeds the filter
-# and the filter itself, run once every `pvt_update_interval`. Not user-selectable —
-# the mode alone determines it.
+# `NavigationFilterConfig` defaults, and a `NavigationFilterConfig` both enables it and
+# describes the platform and oscillator. Vector tracking runs TrackingLoops'
+# `VectorPLLAndDLL` over every system (see `vector_tracking_signal`), which wraps that
+# same scalar loop and owns the whole navigation pipeline — decoding, the scalar PVT that
+# seeds the filter and the filter itself, run once every `pvt_update_interval`. Not
+# user-selectable — the mode alone determines it.
 doppler_estimator_for(vector_tracking::Bool, systems; kwargs...) =
-    vector_tracking ? doppler_estimator_for(VectorTracking(), systems; kwargs...) :
+    vector_tracking ? doppler_estimator_for(NavigationFilterConfig(), systems; kwargs...) :
     SCALAR_DOPPLER_ESTIMATOR
 
+# The vector loop's lock threshold — the C/N₀ a satellite must hold to count as in lock to
+# the navigation filter, and its residual PLL's reference — is the receiver's code-lock
+# threshold, so the vector loop and the code lock detectors judge the same C/N₀ against the
+# same number. `nothing` takes the per-signal default; the vector loop has one threshold
+# for every signal, so the lowest of them, which never asks more of a satellite than its
+# own code lock detector does.
 function doppler_estimator_for(
-    config::VectorTracking,
+    filter_config::NavigationFilterConfig,
     systems;
     pvt_update_interval = 100ms,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
     pvt_approximate_year::Integer = year(now(UTC)),
+    code_lock_cn0_threshold = nothing,
 )
+    lock_cn0_threshold = something(
+        code_lock_cn0_threshold,
+        minimum(system -> get_default_code_lock_cn0_threshold(ranging_signal(system)), systems),
+    )
     VectorPLLAndDLL(
         map(vector_tracking_signal, systems)...;
         inner = SCALAR_DOPPLER_ESTIMATOR,
-        config,
-        cycle_time = pvt_update_interval,
+        filter_config,
+        vt_update_interval = pvt_update_interval,
+        lock_cn0_threshold,
         approximate_year = pvt_approximate_year,
         enable_ionospheric_correction,
         enable_tropospheric_correction,
@@ -687,11 +713,12 @@ function ReceiverState(
     band_systems::Tuple,
     acquisition_buffers::NamedTuple;
     num_ants::NumAnts = NumAnts(1),
-    vector_tracking::Union{Bool,VectorTracking} = false,
+    vector_tracking::Union{Bool,NavigationFilterConfig} = false,
     pvt_update_interval = 100ms,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
     pvt_approximate_year::Integer = year(now(UTC)),
+    code_lock_cn0_threshold::Union{Nothing,typeof(1.0dBHz)} = nothing,
 )
     systems = _flatten_systems(band_systems)
     assert_decodable(systems)
@@ -702,6 +729,7 @@ function ReceiverState(
         enable_ionospheric_correction,
         enable_tropospheric_correction,
         pvt_approximate_year,
+        code_lock_cn0_threshold,
     )
     group_keys = map(signal_group_key, systems)
     # One tracking group per system: a plain signal alone, a `CombinedSignal` as its
@@ -734,6 +762,7 @@ function ReceiverState(
         0,
         0.0s,
         -Inf * 1.0s,
+        code_lock_cn0_threshold,
     )
 end
 
@@ -750,11 +779,15 @@ sample buffer, and `num_ants` selects single- versus multi-antenna processing.
 `vector_tracking = true` closes the tracking loops through a navigation filter instead
 of per-satellite loop filters (the tracking-loop estimator follows from this: the
 conventional FLL-assisted PLL/DLL for scalar, TrackingLoops' `VectorPLLAndDLL` for vector
-tracking); pass a [`VectorTracking`](https://JuliaGNSS.github.io/TrackingLoops.jl/stable/vector_tracking/) instead of `true` to describe the platform's
+tracking); pass a [`NavigationFilterConfig`](https://JuliaGNSS.github.io/TrackingLoops.jl/stable/vector_tracking/) instead of `true` to describe the platform's
 dynamics and the receiver's oscillator to that filter. The vector estimator decodes the
 satellites and solves the PVT itself, so it takes the remaining keywords —
 `pvt_update_interval` (its navigation cycle), `enable_ionospheric_correction`,
-`enable_tropospheric_correction` and `pvt_approximate_year` — here, at construction. A
+`enable_tropospheric_correction` and `pvt_approximate_year` — here, at construction, and
+`code_lock_cn0_threshold` sets the C/N₀ a satellite must hold to be in lock, both to its
+code lock detector and to the navigation filter (`nothing`, the default, takes
+`GNSSReceiver.get_default_code_lock_cn0_threshold`); the state carries it, so `process`
+judges every satellite by the threshold the vector loop does. A
 [`CombinedSignal`](@ref) ranges on its pilot and decodes its data component under vector
 tracking too. One
 `ReceiverState` spans every band; pass the per-band system tuples and pre-built acquisition
