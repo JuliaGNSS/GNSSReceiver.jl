@@ -400,18 +400,7 @@ function process_hardware_chunk!(
     state.host_samples += num_samples
     chunk_end = origin + state.host_samples          # device sample after the chunk
 
-    # The band's noise reference: the C/N₀ of every satellite is measured
-    # against it, so an arm that was rejected or never confirmed is tried again.
-    if !state.noise_confirmed && state.runtime - state.noise_armed_at > ARM_CONFIRM_TIMEOUT
-        ch = loop.num_channels
-        system = first(state.systems)
-        state.noise_sequence = send_command!(loop, HLP.COMMAND_ARM, ch, arm_command(
-            system, noise_prn; carrier_doppler = 3000.0Hz, code_phase = 0.0, valid_at_sample = chunk_end,
-            sampling_freq_hz = fs, signal_index = 0, rf_input, replica_amplitude))
-        state.noise_channel = ch
-        state.noise_armed_at = state.runtime
-    end
-
+    _arm_noise_reference!(state, loop, chunk_end, fs; rf_input, replica_amplitude, noise_prn)
     _acquire!(state, loop, measurement, sampling_freq, chunk_end, acquire_every; rf_input,
               replica_amplitude, code_lock_cn0_threshold)
     _drain!(state, loop)
@@ -438,6 +427,22 @@ function process_hardware_chunk!(
     state.runtime += signal_duration
     _navigate!(state, loop; pvt_update_interval, time_in_lock_before_calculating_pvt,
                enable_ionospheric_correction, enable_tropospheric_correction, pvt_approximate_year, debug)
+end
+
+# The band's noise reference: the C/N₀ of every satellite is measured against
+# it, so an arm that was rejected or never confirmed is tried again — the
+# receiver's own, and the decoys the loop re-arms it onto by itself.
+function _arm_noise_reference!(state::HardwareReceiverState, loop::HardwareLoop, valid_at::Integer, fs::Float64;
+                               rf_input, replica_amplitude, noise_prn)
+    state.noise_confirmed && return state
+    state.runtime - state.noise_armed_at > ARM_CONFIRM_TIMEOUT || return state
+    ch = loop.num_channels
+    state.noise_sequence = send_command!(loop, HLP.COMMAND_ARM, ch, arm_command(
+        first(state.systems), noise_prn; carrier_doppler = 3000.0Hz, code_phase = 0.0, valid_at_sample = valid_at,
+        sampling_freq_hz = fs, signal_index = 0, rf_input, replica_amplitude))
+    state.noise_channel = ch
+    state.noise_armed_at = state.runtime
+    state
 end
 
 # Free hardware channel `ch`: release it on the loop, unless the loop freed it
@@ -539,7 +544,11 @@ function _drain!(state::HardwareReceiverState, loop::HardwareLoop)
                 if ev.code == HLP.STATUS_ARMED
                     state.noise_confirmed = true
                 elseif ev.code == HLP.STATUS_ARM_REJECTED
+                    # The receiver's arm, or one of the loop's own re-arms onto a
+                    # fresh decoy, which the device could not commit: either way
+                    # the loop freed the channel, and it is armed again.
                     @warn "the loop process rejected the noise reference; retrying" reason = Int(ev.reason) maxlog = 5
+                    state.noise_confirmed = false
                     state.noise_armed_at = -Inf * 1.0s
                 end
             end

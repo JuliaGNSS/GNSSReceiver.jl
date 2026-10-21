@@ -225,6 +225,38 @@ end
     end
 end
 
+@testset "hardware loop: a noise reference the loop rejects later is armed again" begin
+    with_test_loop() do loop, seg
+        system = GPSL1CA()
+        state = GNSSReceiver.HardwareReceiverState((system,), NamedTuple(), nothing, loop.num_channels)
+        arm!() = GNSSReceiver._arm_noise_reference!(state, loop, 0, 2.048e6;
+                                                   rf_input = 1, replica_amplitude = 1.0, noise_prn = 32)
+        ch = loop.num_channels
+        answer!(code, reason, sequence) = HLP.publish!(HLP.event_ring(seg, ch), HLP.EventTag(HLP.EVENT_STATUS, ch, 0),
+                                                       HLP.StatusEvent(code, reason, 0, sequence))
+        arm!()
+        armed = state.noise_sequence
+        @test state.noise_channel == ch && armed != 0
+
+        answer!(HLP.STATUS_ARMED, HLP.REJECT_NONE, armed)
+        GNSSReceiver._drain!(state, loop)
+        @test state.noise_confirmed
+        arm!()
+        @test state.noise_sequence == armed            # confirmed: nothing to do
+
+        # The loop re-arms the reference onto fresh decoys by itself, under the
+        # receiver's sequence, and answers one the device could not commit with a
+        # rejection, freeing the channel.
+        answer!(HLP.STATUS_ARM_REJECTED, HLP.REJECT_DEVICE_ERROR, armed)
+        Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+            GNSSReceiver._drain!(state, loop)
+        end
+        @test !state.noise_confirmed
+        arm!()
+        @test state.noise_sequence > armed
+    end
+end
+
 @testset "hardware loop: an output the consumers are behind on is dropped" begin
     ch = Channel{Int}(2)
     @test GNSSReceiver._offer!(ch, 1) && GNSSReceiver._offer!(ch, 2)
