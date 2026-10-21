@@ -65,7 +65,8 @@ dashboard work unchanged.
    has been held up, so a burst is judged as the records it holds; its bits are queued with the device sample
    they completed at; its epoch states are kept.
 3. **Lock**: a satellite whose detectors lose it, or whose records stop for a
-   second, is released and reacquired later. One hardware channel per band is
+   second, is released and reacquired later — keeping what it decoded, so only
+   its sync and time of week start over. One hardware channel per band is
    the loop's noise reference, which every C/N₀ is measured against.
 4. **Navigation**: every `pvt_update_interval` the decoders are brought up to a
    fold boundary B that every channel has passed — every bit that completed by B

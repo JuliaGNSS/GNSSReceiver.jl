@@ -9,6 +9,32 @@
 
 using HardwareLoopCore
 using HardwareLoopProtocol: create_segment, SegmentConfig, loop_heartbeat!
+import HardwareLoopProtocol as HLP
+
+# A segment whose loop side has just beaten, and the receiver's handle on it: for
+# the tests of the receiver's own bookkeeping, which command a loop that never
+# answers unless the test answers for it.
+function with_test_loop(f; num_channels = 4, fs = 2.048e6)
+    path = joinpath(mktempdir(), "gnss-loop-unit")
+    dev = SimulatedDevice(GPSL1CA(); sampling_freq = fs, num_channels)
+    seg = create_segment(path, SegmentConfig(;
+        channel_count = num_channels,
+        bands = driver_capabilities(dev).bands,
+        event_capacity = 1 << 10,
+    ))
+    loop_heartbeat!(seg)
+    loop = HardwareLoop(path)
+    try
+        f(loop, seg)
+    finally
+        close(loop)
+        close(seg)
+    end
+end
+
+# An acquisition result the receiver takes as a detection.
+detected(system, prn; fs = 2.048e6Hz) = Acquisition.AcquisitionResults(
+    system, prn, fs, 1000.0Hz, 100.0, nothing, 45.0, 1.0, 1e6, 1, nothing, -5000.0Hz:100.0Hz:5000.0Hz, 1, 2048, 1)
 
 @testset "hardware loop: the ION recording through a simulated correlator" begin
     dat_file = joinpath(@get_scratch!("rtl_sdr_test_data"), "RTLSDR_Bands-L1.uint8")
@@ -157,6 +183,46 @@ end
     # latest one rather than reading as no signal.
     GNSSReceiver.push_record!(batched, prompt, 4000, nothing)
     @test only(batched.record_cn0s) == linear(29)
+end
+
+@testset "hardware loop: a satellite acquired again keeps what it decoded" begin
+    with_test_loop() do loop, _
+        system = GPSL1CA()
+        key = GNSSReceiver.signal_group_key(system)
+        fs = 2.048e6
+        state = GNSSReceiver.HardwareReceiverState((system,), NamedTuple(), nothing, loop.num_channels)
+        arm!(prn) = GNSSReceiver._arm_acquired!(state, loop, ([detected(system, prn)],), 0, fs;
+                                               rf_input = 1, replica_amplitude = 1.0, code_lock_cn0_threshold = nothing)
+        arm!(7)
+        ch = findfirst(s -> !isnothing(s) && s.prn == 7, state.channels)
+        sat = state.channels[ch]
+        # Its ephemeris decoded, and the time of week.
+        decoder = sat.state.decoder
+        decoder = GNSSDecoderState(decoder;
+            raw_data = GNSSDecoder.GPSL1CAData(decoder.raw_data; WN = 2391, sqrt_A = 5153.6, TOW = 345_600))
+        st = sat.state
+        sat.state = @set st.decoder = decoder
+
+        GNSSReceiver._free_channel!(state, loop, ch)
+        @test all(isnothing, state.channels)
+        @test state.releases == 1
+        @test haskey(state.decoders, (key, 7))
+
+        arm!(7)
+        again = state.channels[findfirst(!isnothing, state.channels)]
+        @test again.prn == 7
+        @test again.state.decoder.raw_data.WN == 2391
+        @test again.state.decoder.raw_data.sqrt_A == 5153.6
+        # Only the sync starts over: the time of week comes with the next subframe.
+        @test isnothing(again.state.decoder.raw_data.TOW)
+        @test isnothing(again.state.decoder.num_bits_after_valid_syncro_sequence)
+        @test isempty(state.decoders)
+
+        # A satellite never tracked before starts from scratch.
+        arm!(9)
+        fresh = state.channels[findfirst(s -> !isnothing(s) && s.prn == 9, state.channels)]
+        @test isnothing(fresh.state.decoder.raw_data.WN)
+    end
 end
 
 @testset "hardware loop: an output the consumers are behind on is dropped" begin

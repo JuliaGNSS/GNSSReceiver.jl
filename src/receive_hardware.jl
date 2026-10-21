@@ -67,8 +67,11 @@ mutable struct HardwareSat{DS<:GNSSDecoderState,S<:AbstractGNSSSignal}
     last_record_runtime::typeof(1.0s)
 end
 
-function HardwareSat(system, signal, prn::Int, channel::Int, sequence::UInt64, code_lock_threshold, runtime)
+function HardwareSat(system, signal, prn::Int, channel::Int, sequence::UInt64, code_lock_threshold, runtime;
+                     decoder = nothing)
     state = ReceiverSatState(system, prn, code_lock_threshold)
+    # A satellite tracked before keeps what it decoded; only its sync starts over.
+    isnothing(decoder) || (state = @set state.decoder = reset_decoder_state!(decoder))
     HardwareSat(
         signal, signal_group_key(system), prn, channel, sequence, state, false, false, runtime,
         Int64[], Float32[], 0,
@@ -175,11 +178,15 @@ What `receive` keeps over a loop process between chunks: the satellites by
 hardware channel, the noise reference per band, the acquisition plans and
 buffer, the latest PVT solution and the clocks.
 """
-mutable struct HardwareReceiverState{Sys<:Tuple,Plans<:NamedTuple,B,Sats}
+mutable struct HardwareReceiverState{Sys<:Tuple,Plans<:NamedTuple,B,Sats,DS<:GNSSDecoderState}
     const systems::Sys
     const acq_plans::Plans
     acquisition_buffer::B
     const channels::Vector{Union{Nothing,Sats}}
+    # The decoders of satellites whose channels were freed, by group and PRN: a
+    # satellite acquired again keeps what it decoded, as in the software
+    # receiver, and only has its sync start over.
+    const decoders::Dict{Tuple{Symbol,Int},DS}
     noise_channel::Int
     noise_sequence::UInt64
     noise_confirmed::Bool
@@ -197,6 +204,17 @@ mutable struct HardwareReceiverState{Sys<:Tuple,Plans<:NamedTuple,B,Sats}
     releases::Int
     # Outputs dropped because the consumers were behind.
     outputs_dropped::Int
+end
+
+function HardwareReceiverState(systems::Tuple, acq_plans::NamedTuple, acquisition_buffer, num_channels::Integer)
+    system = first(systems)
+    HardwareReceiverState(
+        systems, acq_plans, acquisition_buffer,
+        Union{Nothing,_hardware_sat_type(system)}[nothing for _ = 1:num_channels],
+        Dict{Tuple{Symbol,Int},decoder_state_type(system)}(),
+        0, UInt64(0), false, -Inf * 1.0s, PVTSolution(), 0.0s, Int64(0), -Inf * 1.0s, nothing, -Inf * 1.0s,
+        -Inf * 1.0s, typemin(Int64), 0, 0, 0, 0,
+    )
 end
 
 # One satellite type for every group: the receiver's systems share one signal
@@ -284,12 +302,7 @@ function receive(
     _, acq_plans, num_acq_samples = plan_band_acquisition(systems, sampling_freq, resolutions; prns,
                                                           min_doppler_coverage = acquisition_doppler_coverage)
     T = eltype(eltype(measurement_channel))
-    Sats = _hardware_sat_type(first(systems))
-    state = HardwareReceiverState(
-        systems, acq_plans, SampleBuffer(T, num_acq_samples),
-        Union{Nothing,Sats}[nothing for _ = 1:loop.num_channels],
-        0, UInt64(0), false, -Inf * 1.0s, PVTSolution(), 0.0s, Int64(0), -Inf * 1.0s, nothing, -Inf * 1.0s, -Inf * 1.0s, typemin(Int64), 0, 0, 0, 0,
-    )
+    state = HardwareReceiverState(systems, acq_plans, SampleBuffer(T, num_acq_samples), loop.num_channels)
     data_channel = Channel{ReceiverDataOfInterest{SatelliteDataOfInterest{ComplexF64}}}(16)
     origin_ref = Ref{Int64}(-1)
     # On the interactive threadpool when there is one (`julia -t auto,1`, one
@@ -407,27 +420,38 @@ function process_hardware_chunk!(
     for (ch, sat) in pairs(state.channels)
         isnothing(sat) && continue
         if sat.rejected
-            state.channels[ch] = nothing
+            # The loop freed the channel itself.
+            _free_channel!(state, loop, ch; release = false)
             continue
         end
         if !sat.confirmed && state.runtime - sat.armed_at > ARM_CONFIRM_TIMEOUT
             # The arm (or its confirmation) went missing: free the channel.
-            send_command!(loop, HLP.COMMAND_RELEASE, ch, HLP.ReleaseCommand())
-            state.channels[ch] = nothing
-            state.releases += 1
+            _free_channel!(state, loop, ch)
             continue
         end
         update_lock!(sat, sampling_freq)
         if !is_in_lock(sat.state) || _stale(sat, state.runtime)
-            send_command!(loop, HLP.COMMAND_RELEASE, ch, HLP.ReleaseCommand())
-            state.channels[ch] = nothing
-            state.releases += 1
+            _free_channel!(state, loop, ch)
         end
     end
 
     state.runtime += signal_duration
     _navigate!(state, loop; pvt_update_interval, time_in_lock_before_calculating_pvt,
                enable_ionospheric_correction, enable_tropospheric_correction, pvt_approximate_year, debug)
+end
+
+# Free hardware channel `ch`: release it on the loop, unless the loop freed it
+# itself, and keep its satellite's decoder for when the satellite is acquired
+# again.
+function _free_channel!(state::HardwareReceiverState, loop::HardwareLoop, ch::Integer; release::Bool = true)
+    sat = state.channels[ch]
+    if release
+        send_command!(loop, HLP.COMMAND_RELEASE, ch, HLP.ReleaseCommand())
+        state.releases += 1
+    end
+    state.decoders[(sat.group_key, sat.prn)] = sat.state.decoder
+    state.channels[ch] = nothing
+    state
 end
 
 # ── Acquisition ──────────────────────────────────────────────────────────────
@@ -488,7 +512,8 @@ function _arm_acquired!(state, loop, results, valid_at, fs; rf_input, replica_am
                 signal, res.prn; carrier_doppler = res.carrier_doppler, code_phase = res.code_phase,
                 valid_at_sample = valid_at, sampling_freq_hz = fs, group_key = key, rf_input, replica_amplitude))
             seq == 0 && return nothing          # the command ring is full: the next search retries
-            state.channels[ch] = HardwareSat(system, signal, res.prn, ch, seq, threshold, state.runtime)
+            state.channels[ch] = HardwareSat(system, signal, res.prn, ch, seq, threshold, state.runtime;
+                                             decoder = pop!(state.decoders, (key, res.prn), nothing))
             state.arms += 1
         end
     end
