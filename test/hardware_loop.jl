@@ -257,6 +257,23 @@ end
     end
 end
 
+@testset "hardware loop: a loop process that stops beating fails the consumers" begin
+    with_test_loop() do loop, _
+        chunk = 2048                              # 1 ms
+        raw = GNSSReceiver.SignalChannel{Complex{Int16},1}(chunk, 2000)
+        foreach(_ -> put!(raw, zeros(Complex{Int16}, chunk, 1)), 1:1500)
+        close(raw)
+        # The loop side beat once, when the segment was made; let it go stale.
+        sleep(0.6)
+        Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+            data = receive(loop, raw, GPSL1CA(), 2.048e6Hz; device_sample_origin = 0, replica_amplitude = 1.0,
+                           prns = [1])
+            # Not a quiet end of the stream: the consumers see why.
+            @test_throws "stopped beating" foreach(identity, data)
+        end
+    end
+end
+
 @testset "hardware loop: an output the consumers are behind on is dropped" begin
     ch = Channel{Int}(2)
     @test GNSSReceiver._offer!(ch, 1) && GNSSReceiver._offer!(ch, 2)

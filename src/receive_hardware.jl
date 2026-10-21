@@ -343,8 +343,15 @@ function receive(
                     state.last_output = state.runtime
                 end
             end
+        catch e
+            # The run failed — the loop process stopped beating, say. Closing the
+            # channel quietly would end the consumers' loop as if the stream had
+            # ended; with the exception, their next `take!` throws it.
+            close(data_channel, e)
+            rethrow()
         finally
-            close(data_channel)
+            # Not over a failure's exception: a plain `close` would replace it.
+            isopen(data_channel) && close(data_channel)
             close(measurement_channel)
         end
     )
