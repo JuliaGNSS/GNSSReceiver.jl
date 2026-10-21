@@ -22,8 +22,9 @@ satellite to contribute to the PVT solution.
 What `is_ranging_ready` distinguishes is the stage *within* lock: the acquisition → tracking
 handover is deliberately tolerated (the point is to keep a converging satellite rather than
 drop and reacquire it), so a satellite can be tracked and reported here for some time before
-its code phase is trustworthy enough to range on — from 680 code periods for a healthy
-signal up to 2000 for one whose evidence never comes cleanly. Without this field such a
+its code phase is trustworthy enough to range on — from 680 ms for a healthy GPS L1 C/A
+signal (longer on a code whose confirm run is longer) up to 2 s for one whose evidence never
+comes cleanly. Without this field such a
 satellite is indistinguishable from one the PVT solve is ignoring for no reason.
 
 `is_in_lock` is the other half of that picture, and it is *not* constant-true here: a
@@ -117,8 +118,8 @@ place of a `VTStatus` means vector tracking is disabled (pure scalar tracking).
   that were measured, and it is `nothing` altogether on an epoch carried by the dynamics —
   where these two are the only quality figures left.
 - `time_with_insufficient_meas`: how long the filter has been coasting on epochs it could
-  not solve, counted against `VectorTracking`'s `insufficient_meas_timeout`, at which point
-  vector tracking is abandoned. Nonzero means the loop is on its way out; it is paid back
+  not solve, counted against `NavigationFilterConfig`'s `insufficient_meas_timeout`, at
+  which point vector tracking is abandoned. Nonzero means the loop is on its way out; it is paid back
   down (at half rate) by solvable epochs.
 
 `pvt.sats` holds the members the update actually *measured*; `member_sats` holds those and
@@ -262,7 +263,7 @@ function vt_status_of_interest(estimator::VectorPLLAndDLL)
     status = navigation_status(estimator)
     VTStatus(
         status.running,
-        copy(member_sats(estimator)),
+        copy(vector_loop_members(estimator)),
         status.position_std,
         status.clock_std,
         status.time_with_insufficient_meas,
@@ -341,19 +342,23 @@ end
 # discriminator, so there is no static frequency pull-in; fast lock-in is instead
 # governed by the carrier loop bandwidth `B_L`, capped by the coherent-integration
 # decorrelation limit `1 / (2·T)` (beyond which the prompt correlation nulls out):
-# `|Δf| ≈ min(B_L, 1 / (2·T))`. `B_L` is the estimator's configured bandwidth, or
-# the signal's default when it is auto (`nothing`) — matching how `Tracking` seeds
-# each satellite. This is an order-of-magnitude estimate, not the crisp
+# `|Δf| ≈ min(B_L, 1 / (2·T))`. The loop pulls in at its wide stage, so `B_L` is the
+# estimator's wide bandwidth, or the signal's default when it is auto (`nothing`) —
+# matching how `Tracking` seeds each satellite — capped against `T` as the loop
+# filter caps it. This is an order-of-magnitude estimate, not the crisp
 # discriminator bound of the FLL-assisted case.
 function carrier_doppler_pull_in_range(
     estimator::ConventionalPLLAndDLL,
     signal::AbstractGNSSSignal,
 )
-    B_L = something(
-        estimator.carrier_loop_filter_bandwidth,
-        default_carrier_loop_filter_bandwidth(signal),
-    )
     T = handover_coherent_integration_time(signal)
+    B_L = effective_carrier_loop_filter_bandwidth(
+        something(
+            estimator.wide_carrier_loop_filter_bandwidth,
+            default_wide_carrier_loop_filter_bandwidth(signal),
+        ),
+        T,
+    )
     uconvert(Hz, min(B_L, 1 / (2 * T)))
 end
 
@@ -465,7 +470,9 @@ and Doppler resolution are derived per system from the tracking loop pull-in ran
 `prns` restricts the search (`nothing` ⇒ each constellation's default range, a per-GNSS
 `NamedTuple`/`Dict` keyed by `get_constellation_id`, or a plain collection applied to
 every system). A satellite is declared locked from its CN0 — referred to a one-code-block
-record, so an `N`-block record locks at `10·log10(N)` dB less — and contributes to the PVT
+record, so an `N`-block record locks at `10·log10(N)` dB less — against
+`code_lock_cn0_threshold` (`nothing` ⇒ each signal's
+`GNSSReceiver.get_default_code_lock_cn0_threshold`, 30 dB-Hz), and contributes to the PVT
 solution — recomputed every `pvt_update_interval` — after
 `time_in_lock_before_calculating_pvt`. `enable_ionospheric_correction`,
 `enable_tropospheric_correction` and `pvt_approximate_year` (which resolves the GPS
@@ -484,7 +491,7 @@ engine admits a satellite to its solve on its own lock and decoding test. A
 [`CombinedSignal`](@ref) ranges on its pilot and decodes its data component, as under
 scalar tracking.
 
-Passing a [`VectorTracking`](https://JuliaGNSS.github.io/TrackingLoops.jl/stable/vector_tracking/) in place of `true` enables vector tracking *and*
+Passing a [`NavigationFilterConfig`](https://JuliaGNSS.github.io/TrackingLoops.jl/stable/vector_tracking/) in place of `true` enables vector tracking *and*
 configures the filter, which is worth doing whenever the platform or the front end is known:
 the defaults assume vehicular dynamics and a TCXO-grade oscillator, and both the dynamics
 (`acceleration_noise_std`) and the oscillator stability (`h0`, `hm2`) materially change how
@@ -542,9 +549,12 @@ function receive(
     time_in_lock_before_calculating_pvt = 2s,
     # Vector tracking: `true` closes the tracking loops through a navigation filter
     # once a first scalar fix is available; `false` (the default) keeps scalar tracking.
-    # A `VectorTracking` enables it and configures the filter (platform dynamics,
+    # A `NavigationFilterConfig` enables it and configures the filter (platform dynamics,
     # oscillator stability, when to give up).
-    vector_tracking::Union{Bool,VectorTracking} = false,
+    vector_tracking::Union{Bool,NavigationFilterConfig} = false,
+    # The C/N₀ a satellite must hold to be in lock; `nothing` ⇒ each signal's
+    # `get_default_code_lock_cn0_threshold`.
+    code_lock_cn0_threshold = nothing,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
     pvt_approximate_year::Integer = year(now(UTC)),
@@ -622,6 +632,7 @@ function receive(
         enable_ionospheric_correction,
         enable_tropospheric_correction,
         pvt_approximate_year,
+        code_lock_cn0_threshold,
     )
 
     # The channel carries whatever `extract` returns. Infer that type without running

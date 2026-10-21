@@ -32,8 +32,10 @@ end
     # The tracking-loop estimator follows from the mode alone.
     @test GNSSReceiver.doppler_estimator_for(false, (GPSL1CA(),)) isa ConventionalPLLAndDLL
     @test GNSSReceiver.doppler_estimator_for(true, (GPSL1CA(),)) isa VectorPLLAndDLL
-    @test GNSSReceiver.doppler_estimator_for(GNSSReceiver.VectorTracking(), (GPSL1CA(),)) isa
-          VectorPLLAndDLL
+    @test GNSSReceiver.doppler_estimator_for(
+        GNSSReceiver.NavigationFilterConfig(),
+        (GPSL1CA(),),
+    ) isa VectorPLLAndDLL
 
     # The vector estimator hands a fresh satellite to the scalar loop it wraps, so the
     # acquisition pull-in range is that loop's.
@@ -65,10 +67,10 @@ end
     @test scalar_state.track_state.doppler_estimator isa ConventionalPLLAndDLL
     @test isnothing(TrackingLoops.navigation_cycle(scalar_state.track_state.doppler_estimator))
 
-    # A `VectorTracking` in place of `true` both enables the filter and configures it, and
-    # the navigation keywords configure the estimator's cycle: the vector engine runs the
-    # navigation itself, so it takes them at construction.
-    config = VectorTracking(;
+    # A `NavigationFilterConfig` in place of `true` both enables the filter and configures
+    # it, and the navigation keywords configure the estimator's cycle: the vector engine
+    # runs the navigation itself, so it takes them at construction.
+    config = NavigationFilterConfig(;
         h0 = 1.3e-22,
         hm2 = 2e-22,
         acceleration_noise_std = 1.0u"m/s^2",
@@ -85,8 +87,22 @@ end
     )
     navigation = configured_state.track_state.doppler_estimator.navigation
     @test configured_state.track_state.doppler_estimator isa VectorPLLAndDLL
-    @test navigation.config === config
-    @test navigation.cycle_time == 0.2u"s"
+    @test navigation.filter_config === config
+    @test navigation.vt_update_interval == 0.2u"s"
+    # The vector loop's lock threshold is the receiver's code-lock threshold: the per-signal
+    # default unless the state is given one.
+    @test navigation.lock_cn0_threshold_dbhz ==
+          ustrip(GNSSReceiver.get_default_code_lock_cn0_threshold(GPSL1CA()))
+    lowered_state = GNSSReceiver.ReceiverState(
+        ComplexF64,
+        GPSL1CA();
+        num_samples_for_acquisition = 20000,
+        vector_tracking = true,
+        code_lock_cn0_threshold = 25.0u"dBHz",
+    )
+    @test lowered_state.track_state.doppler_estimator.navigation.lock_cn0_threshold_dbhz == 25.0
+    # The state keeps the same threshold for the code lock detectors `process` builds.
+    @test lowered_state.code_lock_cn0_threshold == 25.0u"dBHz"
     # The scalar loop each satellite runs until the filter takes it over is the receiver's
     # scalar loop.
     @test configured_state.track_state.doppler_estimator.inner ==
@@ -156,6 +172,7 @@ end
         receiver_state.navigation_cycle,
         receiver_state.runtime,
         receiver_state.last_time_pvt_ran,
+        receiver_state.code_lock_cn0_threshold,
     )
     acq_plans = (; key => plan_acquire(GalileoE1B(), float(sampling_freq), [prn]))
     rng = Random.Xoshiro(3)
@@ -441,7 +458,7 @@ end
     @test isnan(status.position_std)
     @test isnan(status.clock_std)
     # The per-member report is a copy, not the estimator's own container.
-    @test status.member_sats !== TrackingLoops.member_sats(vt_state.track_state.doppler_estimator)
+    @test status.member_sats !== TrackingLoops.vector_loop_members(vt_state.track_state.doppler_estimator)
 end
 
 @testset "set_out_of_lock lock detectors" begin
