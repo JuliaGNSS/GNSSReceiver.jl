@@ -116,6 +116,49 @@ end
     @test isnothing(sat.state.decoder.num_bits_after_valid_syncro_sequence)
 end
 
+@testset "hardware loop: a burst of records is judged record by record" begin
+    system = GPSL1CA()
+    fs = 4e6u"Hz"
+    linear(cn0_dBHz) = 10^(cn0_dBHz / 10)
+    prompt = complex(1.0, 0.1)                    # phase-locked
+    function settled_sat()
+        sat = GNSSReceiver.HardwareSat(system, system, 7, 1, UInt64(1), 30.0dBHz, 0.0u"s")
+        sat.confirmed = true
+        # 3 s of 1 ms records at 33 dB-Hz, one lock update each: past the pull-in
+        # stage, so 200 ms out of lock loses the satellite.
+        for _ = 1:3000
+            GNSSReceiver.push_record!(sat, prompt, 4000, linear(33))
+            GNSSReceiver.update_lock!(sat, fs)
+        end
+        @test GNSSReceiver.has_pulled_in(sat.state.code_lock_detector)
+        sat
+    end
+    # 300 ms of records, as a chunk drains them after this process was held up:
+    # all at 33 dB-Hz but the last, at 29.
+    burst = [(prompt, 4000, linear(k == 300 ? 29 : 33)) for k = 1:300]
+
+    batched = settled_sat()
+    foreach(r -> GNSSReceiver.push_record!(batched, r...), burst)
+    GNSSReceiver.update_lock!(batched, fs)
+    # One weak record is 1 ms out of lock, not the burst's 300 ms.
+    @test GNSSReceiver.is_in_lock(batched.state)
+
+    one_by_one = settled_sat()
+    for r in burst
+        GNSSReceiver.push_record!(one_by_one, r...)
+        GNSSReceiver.update_lock!(one_by_one, fs)
+    end
+    @test batched.state.code_lock_detector === one_by_one.state.code_lock_detector
+    @test batched.state.carrier_lock_detector === one_by_one.state.carrier_lock_detector
+    @test batched.state.time_in_lock ≈ one_by_one.state.time_in_lock
+    @test isempty(batched.prompts) && isempty(batched.record_cn0s) && isempty(batched.record_samples)
+
+    # A record without a C/N₀ (the noise reference not measured yet) carries the
+    # latest one rather than reading as no signal.
+    GNSSReceiver.push_record!(batched, prompt, 4000, nothing)
+    @test only(batched.record_cn0s) == linear(29)
+end
+
 @testset "hardware loop: an output the consumers are behind on is dropped" begin
     ch = Channel{Int}(2)
     @test GNSSReceiver._offer!(ch, 1) && GNSSReceiver._offer!(ch, 2)

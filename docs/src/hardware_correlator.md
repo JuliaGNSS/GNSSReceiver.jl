@@ -59,9 +59,10 @@ dashboard work unchanged.
    up with the raw stream while it searches — and one more if the raw stream's
    reader holds one of its own (GNSSM2SDR's does: `julia -t auto,2`).
    `close(loop)` waits for a search still in flight.
-2. **Events**: each satellite's records feed its lock detectors — on the device's
-   record time, not on the arrival of raw chunks, which comes in bursts whenever
-   this process has been held up; its bits are queued with the device sample
+2. **Events**: each satellite's records feed its lock detectors one by one, each
+   with the C/N₀ the loop published with it and for the device time it covered —
+   not on the arrival of raw chunks, which comes in bursts whenever this process
+   has been held up, so a burst is judged as the records it holds; its bits are queued with the device sample
    they completed at; its epoch states are kept.
 3. **Lock**: a satellite whose detectors lose it, or whose records stop for a
    second, is released and reacquired later. One hardware channel per band is

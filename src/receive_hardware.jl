@@ -54,16 +54,16 @@ mutable struct HardwareSat{DS<:GNSSDecoderState,S<:AbstractGNSSSignal}
     const epoch_boundaries::Vector{Int64}
     const epoch_states::Vector{HLP.EpochStateEvent}
     epoch_head::Int
-    # This chunk's records.
+    # The records since the last lock update, one entry each: the prompt, the
+    # C/N₀ the loop published with it (the latest one where it published none)
+    # and the device samples it integrated. The detectors run on these, record
+    # by record: their clock is the device's, not the arrival of raw chunks,
+    # which comes in bursts whenever this process has been held up.
     const prompts::Vector{ComplexF64}
+    const record_cn0s::Vector{Float64}
+    const record_samples::Vector{Int64}
     last_prompt::ComplexF64
     cn0_linear::Float64
-    last_integration_samples::Int64
-    records::Int
-    # Device samples the records since the last lock update covered: the
-    # detectors' clock is the device's, not the arrival of raw chunks, which
-    # comes in bursts whenever this process has been held up.
-    record_samples::Int64
     last_record_runtime::typeof(1.0s)
 end
 
@@ -73,8 +73,20 @@ function HardwareSat(system, signal, prn::Int, channel::Int, sequence::UInt64, c
         signal, signal_group_key(system), prn, channel, sequence, state, false, false, runtime,
         Int64[], Float32[], 0,
         fill(typemin(Int64), EPOCH_HISTORY), Vector{HLP.EpochStateEvent}(undef, EPOCH_HISTORY), 0,
-        ComplexF64[], complex(0.0, 0.0), 0.0, 0, 0, 0, -Inf * 1.0s,
+        ComplexF64[], Float64[], Int64[], complex(0.0, 0.0), 0.0, -Inf * 1.0s,
     )
+end
+
+# One record of the satellite's, for the next lock update. `cn0_linear` is
+# `nothing` where the loop published no C/N₀ with it (its noise reference not
+# measured yet): the latest one stands in.
+function push_record!(sat::HardwareSat, prompt, integrated_samples, cn0_linear)
+    isnothing(cn0_linear) || (sat.cn0_linear = cn0_linear)
+    push!(sat.prompts, prompt)
+    push!(sat.record_cn0s, sat.cn0_linear)
+    push!(sat.record_samples, integrated_samples)
+    sat.last_prompt = prompt
+    sat
 end
 
 function _push_epoch_state!(sat::HardwareSat, boundary::Int64, ev::HLP.EpochStateEvent)
@@ -124,23 +136,31 @@ function decode_until!(sat::HardwareSat, boundary::Int64)
     sat
 end
 
-# The records since the last update into the satellite's lock detectors, for
-# the signal time they covered.
+# The records since the last update into the satellite's lock detectors, one at
+# a time, each with its own C/N₀ for the signal time it covered. However many
+# records a chunk drains — hundreds after this process was held up — the
+# detectors end where they would have record by record: a burst is not judged
+# by its last C/N₀ alone, charged with the whole burst's duration.
 function update_lock!(sat::HardwareSat, sampling_freq)
     st = sat.state
     # Nothing measured since (the arm has not landed, or no record arrived): the
     # detectors wait — `_stale` decides when waiting has gone on too long.
-    (!sat.confirmed || sat.records == 0) && return sat
-    covered = uconvert(s, sat.record_samples / sampling_freq)
-    cn0 = 10 * log10(max(sat.cn0_linear, 1e-3)) * dBHz
-    integration_time = sat.last_integration_samples / sampling_freq
-    code = update(st.code_lock_detector, cn0, integration_time, covered)
-    carrier = update(st.carrier_lock_detector, sat.prompts, covered)
+    (!sat.confirmed || isempty(sat.prompts)) && return sat
+    code = st.code_lock_detector
+    carrier = st.carrier_lock_detector
+    covered = 0.0s
+    for k in eachindex(sat.prompts)
+        duration = uconvert(s, sat.record_samples[k] / sampling_freq)
+        cn0 = 10 * log10(max(sat.record_cn0s[k], 1e-3)) * dBHz
+        code = update(code, cn0, duration, duration)
+        carrier = update(carrier, sat.prompts[k], duration)
+        covered += duration
+    end
     sat.state = ReceiverSatState(st.prn, st.decoder, code, carrier, st.time_in_lock + covered,
                                  0.0s, 0, false)
     empty!(sat.prompts)
-    sat.records = 0
-    sat.record_samples = 0
+    empty!(sat.record_cn0s)
+    empty!(sat.record_samples)
     sat
 end
 
@@ -519,13 +539,9 @@ function _drain!(state::HardwareReceiverState, loop::HardwareLoop)
         if kind == HLP.EVENT_RECORD
             ev = HLP.payload(HLP.RecordEvent, ring, view)
             isnothing(ev) && return nothing
-            push!(sat.prompts, ev.prompt)
-            sat.last_prompt = ev.prompt
-            sat.last_integration_samples = ev.integrated_samples
-            sat.record_samples += ev.integrated_samples
+            push_record!(sat, ev.prompt, ev.integrated_samples,
+                         (ev.flags & HLP.RECORD_HAS_CN0) != 0 ? ev.cn0_linear_hz : nothing)
             sat.last_record_runtime = state.runtime
-            (ev.flags & HLP.RECORD_HAS_CN0) != 0 && (sat.cn0_linear = ev.cn0_linear_hz)
-            sat.records += 1
         elseif kind == HLP.EVENT_BIT
             ev = HLP.payload(HLP.BitEvent, ring, view)
             isnothing(ev) && return nothing
