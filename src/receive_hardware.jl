@@ -24,8 +24,14 @@
 # How many of a satellite's epoch states are kept for the common boundary.
 const EPOCH_HISTORY = 16
 
-# How long an arm may wait for the loop's confirmation before it is given up.
-const ARM_CONFIRM_TIMEOUT = 2.0s
+# How long, in seconds of wall time, an arm may wait for the loop's
+# confirmation before it is given up, and a confirmed satellite's records may
+# stop before it is let go. The loop confirms arms and publishes records in real
+# time, while the raw samples this process runs on can arrive faster — a
+# backlog after it was held up, at its start say — so these are not measured on
+# the signal's clock, which runs ahead in such a burst.
+const ARM_CONFIRM_TIMEOUT = 2.0
+const RECORDS_STALE_AFTER = 1.0
 
 """
     HardwareSat
@@ -43,7 +49,9 @@ mutable struct HardwareSat{DS<:GNSSDecoderState,S<:AbstractGNSSSignal}
     state::ReceiverSatState{DS}
     confirmed::Bool
     rejected::Bool
-    armed_at::typeof(1.0s)
+    # When the arm was sent and the latest record came, in wall time (`time()`).
+    armed_at::Float64
+    last_record_at::Float64
     # Bits not yet decoded, with the device sample their record ended at. A NaN
     # entry is a break in the bit stream — the loop restarted the bit clock, or
     # events were lost — where the decoder must start its sync over.
@@ -64,19 +72,18 @@ mutable struct HardwareSat{DS<:GNSSDecoderState,S<:AbstractGNSSSignal}
     const record_samples::Vector{Int64}
     last_prompt::ComplexF64
     cn0_linear::Float64
-    last_record_runtime::typeof(1.0s)
 end
 
-function HardwareSat(system, signal, prn::Int, channel::Int, sequence::UInt64, code_lock_threshold, runtime;
+function HardwareSat(system, signal, prn::Int, channel::Int, sequence::UInt64, code_lock_threshold, now::Float64;
                      decoder = nothing)
     state = ReceiverSatState(system, prn, code_lock_threshold)
     # A satellite tracked before keeps what it decoded; only its sync starts over.
     isnothing(decoder) || (state = @set state.decoder = reset_decoder_state!(decoder))
     HardwareSat(
-        signal, signal_group_key(system), prn, channel, sequence, state, false, false, runtime,
+        signal, signal_group_key(system), prn, channel, sequence, state, false, false, now, -Inf,
         Int64[], Float32[], 0,
         fill(typemin(Int64), EPOCH_HISTORY), Vector{HLP.EpochStateEvent}(undef, EPOCH_HISTORY), 0,
-        ComplexF64[], Float64[], Int64[], complex(0.0, 0.0), 0.0, -Inf * 1.0s,
+        ComplexF64[], Float64[], Int64[], complex(0.0, 0.0), 0.0,
     )
 end
 
@@ -169,7 +176,10 @@ end
 
 # A confirmed satellite whose records stopped (the loop process stalled or
 # dropped it) is as good as lost.
-_stale(sat::HardwareSat, runtime) = sat.confirmed && runtime - sat.last_record_runtime > 1.0s
+_stale(sat::HardwareSat, now) = sat.confirmed && now - sat.last_record_at > RECORDS_STALE_AFTER
+
+# An arm the loop has not confirmed in time went missing, or its confirmation did.
+_arm_timed_out(sat::HardwareSat, now) = !sat.confirmed && now - sat.armed_at > ARM_CONFIRM_TIMEOUT
 
 """
     HardwareReceiverState
@@ -190,7 +200,7 @@ mutable struct HardwareReceiverState{Sys<:Tuple,Plans<:NamedTuple,B,Sats,DS<:GNS
     noise_channel::Int
     noise_sequence::UInt64
     noise_confirmed::Bool
-    noise_armed_at::typeof(1.0s)
+    noise_armed_at::Float64             # wall time, as a satellite's arm
     pvt::PVTSolution
     runtime::typeof(1.0s)
     host_samples::Int64
@@ -212,7 +222,7 @@ function HardwareReceiverState(systems::Tuple, acq_plans::NamedTuple, acquisitio
         systems, acq_plans, acquisition_buffer,
         Union{Nothing,_hardware_sat_type(system)}[nothing for _ = 1:num_channels],
         Dict{Tuple{Symbol,Int},decoder_state_type(system)}(),
-        0, UInt64(0), false, -Inf * 1.0s, PVTSolution(), 0.0s, Int64(0), -Inf * 1.0s, nothing, -Inf * 1.0s,
+        0, UInt64(0), false, -Inf, PVTSolution(), 0.0s, Int64(0), -Inf * 1.0s, nothing, -Inf * 1.0s,
         -Inf * 1.0s, typemin(Int64), 0, 0, 0, 0,
     )
 end
@@ -394,6 +404,7 @@ function process_hardware_chunk!(
     replica_amplitude,
     noise_prn,
     debug = false,
+    now = time(),
 )
     fs = Float64(ustrip(Hz, sampling_freq))
     num_samples = size(measurement, 1)
@@ -407,10 +418,12 @@ function process_hardware_chunk!(
     state.host_samples += num_samples
     chunk_end = origin + state.host_samples          # device sample after the chunk
 
-    _arm_noise_reference!(state, loop, chunk_end, fs; rf_input, replica_amplitude, noise_prn)
     _acquire!(state, loop, measurement, sampling_freq, chunk_end, acquire_every; rf_input,
-              replica_amplitude, code_lock_cn0_threshold)
-    _drain!(state, loop)
+              replica_amplitude, code_lock_cn0_threshold, now)
+    _drain!(state, loop, now)
+    # After the drain: a confirmation that came while this process was held up
+    # is read before the arm is given up on.
+    _arm_noise_reference!(state, loop, chunk_end, fs; rf_input, replica_amplitude, noise_prn, now)
 
     # Lock, and the satellites it lets go.
     for (ch, sat) in pairs(state.channels)
@@ -420,13 +433,13 @@ function process_hardware_chunk!(
             _free_channel!(state, loop, ch; release = false)
             continue
         end
-        if !sat.confirmed && state.runtime - sat.armed_at > ARM_CONFIRM_TIMEOUT
+        if _arm_timed_out(sat, now)
             # The arm (or its confirmation) went missing: free the channel.
             _free_channel!(state, loop, ch)
             continue
         end
         update_lock!(sat, sampling_freq)
-        if !is_in_lock(sat.state) || _stale(sat, state.runtime)
+        if !is_in_lock(sat.state) || _stale(sat, now)
             _free_channel!(state, loop, ch)
         end
     end
@@ -440,15 +453,15 @@ end
 # it, so an arm that was rejected or never confirmed is tried again — the
 # receiver's own, and the decoys the loop re-arms it onto by itself.
 function _arm_noise_reference!(state::HardwareReceiverState, loop::HardwareLoop, valid_at::Integer, fs::Float64;
-                               rf_input, replica_amplitude, noise_prn)
+                               rf_input, replica_amplitude, noise_prn, now = time())
     state.noise_confirmed && return state
-    state.runtime - state.noise_armed_at > ARM_CONFIRM_TIMEOUT || return state
+    now - state.noise_armed_at > ARM_CONFIRM_TIMEOUT || return state
     ch = loop.num_channels
     state.noise_sequence = send_command!(loop, HLP.COMMAND_ARM, ch, arm_command(
         first(state.systems), noise_prn; carrier_doppler = 3000.0Hz, code_phase = 0.0, valid_at_sample = valid_at,
         sampling_freq_hz = fs, signal_index = 0, rf_input, replica_amplitude))
     state.noise_channel = ch
-    state.noise_armed_at = state.runtime
+    state.noise_armed_at = now
     state
 end
 
@@ -469,7 +482,7 @@ end
 # ── Acquisition ──────────────────────────────────────────────────────────────
 
 function _acquire!(state, loop, measurement, sampling_freq, chunk_end, acquire_every; rf_input,
-                   replica_amplitude, code_lock_cn0_threshold)
+                   replica_amplitude, code_lock_cn0_threshold, now = time())
     task = state.acquisition
     if !isnothing(task)
         istaskdone(task) || return nothing
@@ -483,7 +496,7 @@ function _acquire!(state, loop, measurement, sampling_freq, chunk_end, acquire_e
         end
         results, valid_at = fetch(task)
         _arm_acquired!(state, loop, results, valid_at, Float64(ustrip(Hz, sampling_freq)); rf_input,
-                       replica_amplitude, code_lock_cn0_threshold)
+                       replica_amplitude, code_lock_cn0_threshold, now)
         return nothing
     end
     state.runtime - state.last_acquisition >= acquire_every || return nothing
@@ -511,7 +524,8 @@ function _acquire!(state, loop, measurement, sampling_freq, chunk_end, acquire_e
     nothing
 end
 
-function _arm_acquired!(state, loop, results, valid_at, fs; rf_input, replica_amplitude, code_lock_cn0_threshold)
+function _arm_acquired!(state, loop, results, valid_at, fs; rf_input, replica_amplitude, code_lock_cn0_threshold,
+                        now = time())
     for (system, group_results) in zip(state.systems, results)
         key = signal_group_key(system)
         threshold = something(code_lock_cn0_threshold, get_default_code_lock_cn0_threshold(ranging_signal(system)))
@@ -524,7 +538,7 @@ function _arm_acquired!(state, loop, results, valid_at, fs; rf_input, replica_am
                 signal, res.prn; carrier_doppler = res.carrier_doppler, code_phase = res.code_phase,
                 valid_at_sample = valid_at, sampling_freq_hz = fs, group_key = key, rf_input, replica_amplitude))
             seq == 0 && return nothing          # the command ring is full: the next search retries
-            state.channels[ch] = HardwareSat(system, signal, res.prn, ch, seq, threshold, state.runtime;
+            state.channels[ch] = HardwareSat(system, signal, res.prn, ch, seq, threshold, now;
                                              decoder = pop!(state.decoders, (key, res.prn), nothing))
             state.arms += 1
         end
@@ -534,7 +548,7 @@ end
 
 # ── Events ───────────────────────────────────────────────────────────────────
 
-function _drain!(state::HardwareReceiverState, loop::HardwareLoop)
+function _drain!(state::HardwareReceiverState, loop::HardwareLoop, now = time())
     on_lost = ch -> begin
         sat = state.channels[ch]
         # Bits may be among what was lost: the decoder cannot count across it.
@@ -556,14 +570,14 @@ function _drain!(state::HardwareReceiverState, loop::HardwareLoop)
                     # the loop freed the channel, and it is armed again.
                     @warn "the loop process rejected the noise reference; retrying" reason = Int(ev.reason) maxlog = 5
                     state.noise_confirmed = false
-                    state.noise_armed_at = -Inf * 1.0s
+                    state.noise_armed_at = -Inf
                 end
             end
             isnothing(sat) && return nothing
             ev.sequence == sat.arm_sequence || ev.code == HLP.STATUS_BIT_CLOCK_RESTART || return nothing
             if ev.code == HLP.STATUS_ARMED
                 sat.confirmed = true
-                sat.last_record_runtime = state.runtime
+                sat.last_record_at = now
             elseif ev.code == HLP.STATUS_ARM_REJECTED
                 sat.rejected = true
                 state.rejections += 1
@@ -582,7 +596,7 @@ function _drain!(state::HardwareReceiverState, loop::HardwareLoop)
             isnothing(ev) && return nothing
             push_record!(sat, ev.prompt, ev.integrated_samples,
                          (ev.flags & HLP.RECORD_HAS_CN0) != 0 ? ev.cn0_linear_hz : nothing)
-            sat.last_record_runtime = state.runtime
+            sat.last_record_at = now
         elseif kind == HLP.EVENT_BIT
             ev = HLP.payload(HLP.BitEvent, ring, view)
             isnothing(ev) && return nothing

@@ -124,7 +124,7 @@ end
 
 @testset "hardware loop: bits are decoded in order across a break" begin
     system = GPSL1CA()
-    sat = GNSSReceiver.HardwareSat(system, system, 7, 1, UInt64(1), 30.0dBHz, 0.0u"s")
+    sat = GNSSReceiver.HardwareSat(system, system, 7, 1, UInt64(1), 30.0dBHz, 0.0)
     for k = 1:10
         push!(sat.bit_samples, 1000k)
         push!(sat.bit_values, isodd(k) ? 1.0f0 : -1.0f0)
@@ -148,7 +148,7 @@ end
     linear(cn0_dBHz) = 10^(cn0_dBHz / 10)
     prompt = complex(1.0, 0.1)                    # phase-locked
     function settled_sat()
-        sat = GNSSReceiver.HardwareSat(system, system, 7, 1, UInt64(1), 30.0dBHz, 0.0u"s")
+        sat = GNSSReceiver.HardwareSat(system, system, 7, 1, UInt64(1), 30.0dBHz, 0.0)
         sat.confirmed = true
         # 3 s of 1 ms records at 33 dB-Hz, one lock update each: past the pull-in
         # stage, so 200 ms out of lock loses the satellite.
@@ -271,6 +271,58 @@ end
             # Not a quiet end of the stream: the consumers see why.
             @test_throws "stopped beating" foreach(identity, data)
         end
+    end
+end
+
+@testset "hardware loop: a burst of samples does not time out the loop" begin
+    # Two channels: the satellite's and the noise reference's, so no search runs.
+    with_test_loop(; num_channels = 2) do loop, seg
+        system = GPSL1CA()
+        fs = 2.048e6
+        state = GNSSReceiver.HardwareReceiverState((system,), NamedTuple(), nothing, loop.num_channels)
+        t0 = time()
+        GNSSReceiver._arm_acquired!(state, loop, ([detected(system, 7)],), 0, fs; rf_input = 1,
+                                    replica_amplitude = 1.0, code_lock_cn0_threshold = nothing, now = t0)
+        sat = state.channels[1]
+        chunk = zeros(Complex{Int16}, 2048, 1)        # 1 ms
+        process!(now) = GNSSReceiver.process_hardware_chunk!(state, loop, chunk, fs * Hz, 0;
+            acquire_every = 10u"s", pvt_update_interval = 100ms, time_in_lock_before_calculating_pvt = 2u"s",
+            code_lock_cn0_threshold = nothing, enable_ionospheric_correction = true,
+            enable_tropospheric_correction = true, pvt_approximate_year = 2026, rf_input = 1,
+            replica_amplitude = 1.0, noise_prn = 32, now)
+        function burst!(seconds, now)
+            for _ = 1:round(Int, seconds * 1000)
+                loop_heartbeat!(seg)
+                process!(now)
+            end
+        end
+
+        # 2.5 s of samples in a burst, as the raw stream's backlog arrives after
+        # this process was held up: the loop has had no time to confirm the arm.
+        burst!(2.5, t0 + 0.1)
+        @test state.runtime > 2u"s"
+        @test state.channels[1] === sat
+
+        # Confirmed, then another burst without a record in between.
+        HLP.publish!(HLP.event_ring(seg, 1), HLP.EventTag(HLP.EVENT_STATUS, 1, 0; prn = 7),
+                     HLP.StatusEvent(HLP.STATUS_ARMED, HLP.REJECT_NONE, 0, sat.arm_sequence))
+        process!(t0 + 0.2)
+        @test sat.confirmed
+        burst!(2.5, t0 + 0.3)
+        @test state.channels[1] === sat
+
+        # Only when its records have really stopped for a second is it let go.
+        process!(t0 + 1.3)
+        @test isnothing(state.channels[1])
+
+        # And an arm the loop really leaves unconfirmed is given up after 2 s.
+        GNSSReceiver._arm_acquired!(state, loop, ([detected(system, 9)],), 0, fs; rf_input = 1,
+                                    replica_amplitude = 1.0, code_lock_cn0_threshold = nothing, now = t0 + 2.0)
+        process!(t0 + 3.9)
+        @test state.channels[1].prn == 9
+        process!(t0 + 4.1)
+        @test isnothing(state.channels[1])
+        @test haskey(state.decoders, (GNSSReceiver.signal_group_key(system), 9))
     end
 end
 
