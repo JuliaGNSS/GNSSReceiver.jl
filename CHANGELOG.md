@@ -1,5 +1,37 @@
 # Changelog
 
+# [6.0.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v5.0.1...v6.0.0) (2026-10-21)
+
+
+* feat!: support Tracking 11.1 and TrackingLoops 6 ([f9f37be](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/f9f37be39dd9e2f14fb0d23acae31cecab34bce2))
+* feat(lock)!: judge carrier lock on the carrier loop's own phase-lock verdict ([43cf7f0](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/43cf7f0d16e4d12297d037099ea7dd01c9a1172d))
+
+
+### BREAKING CHANGES
+
+* CarrierLockDetector no longer takes phase_lock_threshold
+or smoothing_records: it judges the carrier loop's own verdict.
+update(::CarrierLockDetector, ...) takes the loop's phase-lock indicator
+and its phase_locked verdict in place of the chunk's prompts:
+update(detector, phase_lock_indicator, phase_locked, signal_duration).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+* requires Tracking 11.1 and TrackingLoops 6. The carrier
+loop now pulls in at 50 Hz FLL-assisted and narrows to 18 Hz on phase
+lock, so tracking results differ. GNSSReceiver re-exports
+NavigationFilterConfig instead of VectorTracking: pass vector_tracking =
+NavigationFilterConfig(; ...) where VectorTracking(; ...) was passed;
+the keywords and defaults are unchanged. LockDwell, CodeLockDetector and
+CarrierLockDetector take pull_in_time, pull_in_out_of_lock_time,
+ranging_confirm_time and ranging_pull_in_time as durations in place of
+pull_in_code_periods, pull_in_out_of_lock_code_periods,
+ranging_confirm_code_periods and ranging_pull_in_code_periods. process
+no longer takes code_lock_cn0_threshold: pass it to ReceiverState or
+receive. ReceiverState gains a code_lock_cn0_threshold field, so its
+positional constructor takes it last.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
 ## [5.0.1](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v5.0.0...v5.0.1) (2026-10-15)
 
 
