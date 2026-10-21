@@ -304,13 +304,11 @@ end
 
 function ranging_ready_carrier_detector(; max_updates = 10_000)
     detector = fresh_carrier_detector()
-    # A strongly in-phase prompt: the phase-lock indicator converges to cos(0)·ρ/(ρ+1),
-    # far above the 0.25 threshold. Four per chunk, as a 4 ms chunk over a 1 ms code
-    # period really produces.
-    prompts = ntuple(_ -> complex(10.0, 0.1), 4)
+    # TrackingLoops' indicator estimates cos(2φ), so phase lock reads 1, which the loop
+    # judges phase-locked.
     updates = 0
     while !GNSSReceiver.is_ranging_ready(detector)
-        detector = GNSSReceiver.update(detector, prompts, 4u"ms")
+        detector = GNSSReceiver.update(detector, 1.0, true, 4u"ms")
         updates += 1
         @assert updates <= max_updates "carrier detector never reported ranging readiness"
     end
@@ -547,6 +545,49 @@ end
     )
     @test updated[key][5].time_out_of_lock == 4u"ms"
     @test !GNSSReceiver.is_in_lock(updated[key][5])
+end
+
+@testset "update_all_receiver_sat_states reads TrackingLoops' phase lock" begin
+    # The carrier detector judges the carrier loop's own phase-lock verdict and keeps the
+    # indicator it rests on rather than recomputing one from the prompts, so after every
+    # chunk both have to be exactly the tracked satellite's. Noise only, which leaves the
+    # satellite in lock through the code detector's warm-up and dwell; 40 chunks of 4 ms run
+    # past the indicator's 100 ms time constant, before which it is `NaN` on both sides.
+    system = GPSL1CA()
+    key = get_signal_id(system)
+    bk = get_band_id(GNSSReceiver.system_band(system))
+    sampling_freq = 5e6u"Hz"
+    num_samples = 20000
+    track_state = single_sat_track_state(system, 5)
+    receiver_sat_states =
+        (; key => Dictionary([5], [GNSSReceiver.ReceiverSatState(system, 5)]))
+    carrier_detector_of(states) = states[key][5].carrier_lock_detector
+    rng = Random.Xoshiro(1)
+    for _ = 1:40
+        measurement = randn(rng, ComplexF64, num_samples)
+        band_measurements = NamedTuple{(bk,)}((
+            Tracking.BandMeasurement(measurement, sampling_freq, 0.0u"Hz"),
+        ))
+        track_state = track!(band_measurements, track_state)
+        receiver_sat_states = GNSSReceiver.update_all_receiver_sat_states(
+            receiver_sat_states,
+            track_state,
+            (system,),
+            num_samples / sampling_freq,
+        )
+        @test GNSSReceiver.is_in_lock(receiver_sat_states[key][5])
+        doppler_estimator_state =
+            get_doppler_estimator_state(get_sat_state(track_state, key, 5))
+        @test isequal(
+            GNSSReceiver.phase_lock_indicator(carrier_detector_of(receiver_sat_states)),
+            TrackingLoops.phase_lock_indicator(doppler_estimator_state),
+        )
+        @test carrier_detector_of(receiver_sat_states).phase_locked ==
+              TrackingLoops.phase_locked(doppler_estimator_state)
+    end
+    @test isfinite(
+        GNSSReceiver.phase_lock_indicator(carrier_detector_of(receiver_sat_states)),
+    )
 end
 
 @testset "tracked_sat_from_acq builds a matching tracked-sat slot ($i antennas)" for i in [1, 4]

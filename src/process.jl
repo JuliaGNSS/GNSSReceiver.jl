@@ -510,6 +510,8 @@ function update_all_receiver_sat_states(
             # detectors even while out of (code) lock — the navigation filter
             # carries it through the outage and decides itself when to let it go.
             state = if is_in_lock(receiver_sat_state) || in_vt_loop
+                sat_state = get_sat_state(track_state, group_key, prn)
+                doppler_estimator_state = get_doppler_estimator_state(sat_state)
                 ReceiverSatState(
                     prn,
                     updated_decoder(
@@ -522,33 +524,24 @@ function update_all_receiver_sat_states(
                     ),
                     update(
                         receiver_sat_state.code_lock_detector,
-                        estimate_cn0(track_state, group_key, prn, RANGING_SIGNAL_INDEX),
+                        estimate_cn0(sat_state, RANGING_SIGNAL_INDEX),
                         # Every Tracking CN0 estimator normalizes by this same integration
                         # time, so the detector's `CN0 · T` test recovers the record's raw
                         # post-integration SNR — independent of which estimator produced
                         # the CN0 and of how it normalized.
                         get_last_fully_integrated_integration_time(
-                            track_state,
-                            group_key,
-                            prn,
+                            sat_state,
                             RANGING_SIGNAL_INDEX,
                         ),
                         signal_duration,
                     ),
                     update(
                         receiver_sat_state.carrier_lock_detector,
-                        # Every prompt this chunk produced, not just the last one: the
-                        # phase-lock indicator averages over records, and a 4 ms chunk over
-                        # a 1 ms code period completes four of them. Tracking clears this
-                        # buffer at the start of each `track!`, so it holds exactly the
-                        # records of the chunk just processed — and it is the live vector,
-                        # so it must not be retained past this call.
-                        get_filtered_prompts(
-                            track_state,
-                            group_key,
-                            prn,
-                            RANGING_SIGNAL_INDEX,
-                        ),
+                        # The indicator the carrier loop's staging reads, which the loop
+                        # folds every record of the chunk into, and the loop's own verdict
+                        # on it.
+                        TrackingLoops.phase_lock_indicator(doppler_estimator_state),
+                        TrackingLoops.phase_locked(doppler_estimator_state),
                         signal_duration,
                     ),
                     receiver_sat_state.time_in_lock + signal_duration,
