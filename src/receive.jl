@@ -498,6 +498,14 @@ the defaults assume vehicular dynamics and a TCXO-grade oscillator, and both the
 the filter weighs its prediction against the measurements. Each payload then reports what the
 filter is doing through its [`VTStatus`](@ref).
 
+Set `write_rinex = true` to additionally stream RINEX 3.05 observation and navigation files
+to disk while receiving — pseudorange, carrier phase, Doppler and C/N0 per epoch, plus the
+decoded broadcast ephemerides — named by the RINEX long filename convention. It is off by
+default; `write_rinex = RinexConfig(...)` configures the directory and names, the epoch
+interval and the header metadata (see [`RinexConfig`](@ref)), and [`RinexLogger`](@ref)
+documents how epochs are timed. RINEX output is independent of `extract`, so a custom
+payload does not disturb it.
+
 The downconvert-and-correlator backend is auto-selected from the sample element type:
 `Complex{Int16}` inputs use Tracking's fast integer backend when `max_meas` (the front-end
 full-scale, e.g. `2^11` for a 12-bit ADC) is given, and otherwise fall back to the float
@@ -563,6 +571,10 @@ function receive(
     # a custom payload — it must be read-only and return an immutable value, since the
     # `ReceiverState` it sees is mutated in place by the next chunk.
     extract = default_data_of_interest,
+    # RINEX 3.05 observation and navigation output: `false` (no files), `true` (the
+    # `RinexConfig` defaults) or a `RinexConfig`. Independent of `extract` — the files are
+    # written from the receiver state itself, so a custom payload does not disturb them.
+    write_rinex::Union{Bool,RinexConfig} = false,
 ) where {N}
     n_bands = length(measurement_channels)
     (
@@ -647,6 +659,22 @@ function receive(
     # write takes.
     data_channel = Channel{payload_type}(16)
 
+    # RINEX output is driven from the receiver state rather than from `data_channel`, so it
+    # is independent of whatever `extract` emits. Constructed here (not in the loop task) so
+    # an unwritable output path is reported to the caller of `receive`.
+    rinex_logger = let config = rinex_config(write_rinex)
+        isnothing(config) ? nothing :
+        RinexLogger(
+            config,
+            band_systems,
+            interm_freqs,
+            sampling_freq;
+            approximate_year = pvt_approximate_year,
+            # How long a clock solution may be carried on to the chunks after it.
+            pvt_update_interval,
+        )
+    end
+
     # `state` and `last_output` are updated every frame. Captured in a reassigned
     # closure variable Julia would lower each to an untyped `Core.Box`, making every
     # field access dynamic; a typed `Ref` captured once (only its contents change)
@@ -682,6 +710,11 @@ function receive(
                     enable_tropospheric_correction,
                     pvt_approximate_year,
                 )
+                # RINEX runs on every frame, not on the emission cadence below: the
+                # continuous carrier phase is accumulated frame by frame (that is what keeps
+                # its cycle count exact), and the logger decides for itself which frames
+                # become observation epochs.
+                isnothing(rinex_logger) || log_rinex!(rinex_logger, state_ref[])
                 # Emit once per navigation solution rather than every frame: running
                 # `extract` and pushing every raw frame would allocate at the frame rate
                 # (~kHz), far more often than consumers — GUI, PVT solve, logger,
@@ -714,6 +747,9 @@ function receive(
                 end
             end
         finally
+            # Finish the RINEX files before releasing the consumers below, so a caller that
+            # returns once `data_channel` closes finds them complete on disk.
+            isnothing(rinex_logger) || close(rinex_logger)
             # Close even when a chunk throws: consumers block in `take!` until the
             # channel closes, so leaving it open would hang them after a crash
             # (`errormonitor` only logs the failure).

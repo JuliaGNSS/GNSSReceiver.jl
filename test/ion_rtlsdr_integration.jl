@@ -91,6 +91,10 @@ let
         @info "Using cached signal file: $dat_file ($(filesize(dat_file)) bytes)"
     end
 
+    # The scalar float run and the vector-tracking run both write RINEX observations here,
+    # so the vector-tracking testset can hold its file against the scalar one.
+    rinex_dir = mktempdir()
+
     # Run the full acquire→track→decode→PVT pipeline for both sample element types
     # and assert against the SAME baseline. `receive` auto-selects the float CPU
     # backend for `ComplexF32` and Tracking's fast integer backend for
@@ -127,6 +131,11 @@ let
             interm_freq = 0.0u"Hz",
             max_meas = 2^7,
             pvt_approximate_year = 2017,
+            write_rinex = type == ComplexF32 ?
+                          RinexConfig(;
+                obs_file = joinpath(rinex_dir, "scalar.obs"),
+                nav_file = nothing,
+            ) : false,
         )
 
         max_sats_seen = 0
@@ -381,6 +390,10 @@ let
             pvt_approximate_year = 2017,
             vector_tracking = true,
             extract,
+            write_rinex = RinexConfig(;
+                obs_file = joinpath(rinex_dir, "vector.obs"),
+                nav_file = nothing,
+            ),
         )
 
         num_vt_outputs = 0
@@ -437,6 +450,93 @@ let
         # The filter reports a full measurement geometry at the end of the run.
         @test length(pvt.sats) >= 7
         @test !isnothing(pvt.dop)
+
+        # RINEX under vector tracking: the navigation filter counts its clock bias from its
+        # own reference time and dates its solution on its cycle grid, a chunk before the
+        # code and carrier are read. Epochs built from either as if they were the scalar
+        # PVT's put every pseudorange off by milliseconds of light travel (hundreds to
+        # thousands of km). The pseudoranges match the scalar run's epoch by epoch to its
+        # code noise, and the carrier phase — the replica's plus the residual PLL's
+        # correction — follows the code without drifting off it.
+        λ = 299792458.0 / 1.57542e9
+        # (pseudorange, carrier phase, its loss-of-lock indicator) per (epoch, satellite).
+        observations(file) = begin
+            lines = readlines(file)
+            header_end = findfirst(line -> occursin("END OF HEADER", line), lines)
+            records = Dict{Tuple{String,String},Tuple{Float64,Float64,Int}}()
+            epoch = ""
+            for line in lines[(header_end+1):end]
+                startswith(line, ">") && (epoch = line[3:29]; continue)
+                records[(epoch, line[1:3])] = (
+                    parse(Float64, line[4:17]),
+                    parse(Float64, line[20:33]),
+                    line[34] == ' ' ? 0 : parse(Int, line[34]),
+                )
+            end
+            records
+        end
+        scalar = observations(joinpath(rinex_dir, "scalar.obs"))
+        vector = observations(joinpath(rinex_dir, "vector.obs"))
+        common = intersect(keys(scalar), keys(vector))
+        @test length(common) > 100
+        differences = [first(vector[key]) - first(scalar[key]) for key in common]
+        @info "Vector against scalar RINEX pseudoranges" mean_difference =
+            sum(differences) / length(differences) max_difference = maximum(abs, differences)
+        @test abs(sum(differences) / length(differences)) < 15.0
+        @test maximum(abs, differences) < 60.0
+        # In both runs, as the phase is corrected by the oscillator's drift and the code by the
+        # solution's clock: on this front end, whose sample clock and oscillator are not
+        # locked, correcting the phase by the solution's clock offset instead would make the
+        # two drift apart at 15 m/s.
+        for run in (scalar, vector), prn in unique(key[2] for key in keys(run))
+            code_minus_carrier =
+                [λ * (code / λ - phase) for (key, (code, phase, _)) in run if key[2] == prn]
+            spread = code_minus_carrier .- sum(code_minus_carrier) / length(code_minus_carrier)
+            @test maximum(abs, spread) < 30.0
+        end
+
+        # Both runs measure the same carrier at the same chunk, each with an ambiguity of
+        # whole cycles, so between two satellites the vector run's phase differs from the
+        # scalar run's by whole cycles — not by half of one, which is what a Costas
+        # half-cycle resolved one way in one run and the other way in the other would give,
+        # and not by fractions, which is what a wrong residual-PLL correction would. Both
+        # runs know the carrier's polarity on every epoch.
+        @test all(record -> iszero(record[3] & 2), values(scalar))
+        @test all(record -> iszero(record[3] & 2), values(vector))
+        epochs = sort!(unique(key[1] for key in common))
+        reference = argmax(
+            prn -> count(key -> key[2] == prn, common),
+            unique(key[2] for key in common),
+        )
+        fractions = Float64[]
+        for (epoch, prn) in common
+            prn == reference && continue
+            (epoch, reference) in common || continue
+            double_difference =
+                (vector[(epoch, prn)][2] - scalar[(epoch, prn)][2]) -
+                (vector[(epoch, reference)][2] - scalar[(epoch, reference)][2])
+            push!(fractions, double_difference - round(double_difference))
+        end
+        @info "Vector against scalar RINEX carrier phase" num_double_differences =
+            length(fractions) max_fraction = maximum(abs, fractions)
+        @test length(fractions) > 50
+        @test maximum(abs, fractions) < 0.05
+
+        # The written phase is the measured one: between two satellites it changes smoothly
+        # from epoch to epoch, its third difference at the phase noise of a few hundredths of
+        # a cycle. Carrying it from a solution half a second off the epoch with the loops'
+        # instantaneous Doppler would make it cycles.
+        for prn in unique(key[2] for key in keys(scalar))
+            prn == reference && continue
+            series = [
+                scalar[(epoch, prn)][2] - scalar[(epoch, reference)][2] for
+                epoch in epochs if haskey(scalar, (epoch, prn)) &&
+                haskey(scalar, (epoch, reference))
+            ]
+            length(series) >= 8 || continue
+            third_difference = diff(diff(diff(series)))
+            @test maximum(abs, third_difference) < 0.5
+        end
 
         # `SatInfo.residual` is the POST-fit pseudorange residual — the same
         # quantity the scalar `calc_pvt` reports, in the same observed − computed

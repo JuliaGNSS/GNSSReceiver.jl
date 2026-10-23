@@ -7,10 +7,12 @@ using Test,
     Geodesy,
     AstroTime,
     PositionVelocityTime,
+    RINEXParser,
     StaticArrays,
     Random,
     Accessors,
     Acquisition,
+    Dates,
     Dictionaries,
     LinearAlgebra,
     Scratch
@@ -28,6 +30,7 @@ using TrackingLoops:
 # Unexported PositionVelocityTime types the GUI tests build solutions from.
 using PositionVelocityTime: DOP, SupportedTimeSystem
 
+using InteractiveUtils: subtypes
 using JLD2: load
 
 using Unitful: Hz, dBHz, ms
@@ -42,6 +45,7 @@ include("vector_tracking.jl")
 include("prn_selection.jl")
 include("gui.jl")
 include("save_data.jl")
+include("rinex.jl")
 include("receive.jl")
 include("sample_buffer.jl")
 include("ion_rtlsdr_integration.jl")
