@@ -1,5 +1,12 @@
 # Changelog
 
+## [6.1.1](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v6.1.0...v6.1.1) (2026-10-23)
+
+
+### Bug Fixes
+
+* **prn:** search PRN 13 for GPS L5 ([0d0099a](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/0d0099a031ee4504cf82860bfc9a2e9f8c0eb829))
+
 # [6.1.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v6.0.0...v6.1.0) (2026-10-23)
 
 
