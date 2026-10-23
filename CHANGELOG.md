@@ -1,5 +1,12 @@
 # Changelog
 
+# [6.1.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v6.0.0...v6.1.0) (2026-10-23)
+
+
+### Features
+
+* RINEX 3.05 observation and navigation output ([3f64441](https://github.com/JuliaGNSS/GNSSReceiver.jl/commit/3f644414ffc63d7444f11a0fe48081ce9b59a00a))
+
 # [6.0.0](https://github.com/JuliaGNSS/GNSSReceiver.jl/compare/v5.0.1...v6.0.0) (2026-10-21)
 
 
