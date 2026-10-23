@@ -241,12 +241,12 @@ default_prns(::AbstractBeiDouSignal) = 1:63
 # satellites that cannot carry the signal (the GPS L5 search drops from 32 PRNs to
 # ~20). `nothing` means "no restriction — search all requested PRNs".
 #
-# The block membership is from the Wikipedia "List of GPS satellites"; PRN↔satellite
-# assignments change as satellites are launched and retired, so this reflects the
-# constellation at time of writing. Pass an explicit `prns` list to override for a
-# historical capture.
+# The block membership is from the USCG NAVCEN constellation status (checked
+# October 2026); PRN↔satellite assignments change as satellites are launched and
+# retired, so this reflects the constellation at time of writing. Pass an explicit
+# `prns` list to override for a historical capture.
 const GPS_L5_PRNS =
-    [1, 3, 4, 6, 8, 9, 10, 11, 14, 18, 20, 21, 23, 24, 25, 26, 27, 28, 30, 32]
+    [1, 3, 4, 6, 8, 9, 10, 11, 13, 14, 18, 20, 21, 23, 24, 25, 26, 27, 28, 30, 32]
 const GPS_L2C_PRNS = sort(union(GPS_L5_PRNS, [5, 7, 12, 15, 17, 29, 31]))
 
 # BeiDou splits the same way, and one generation further: B1I and B3I are carried by every

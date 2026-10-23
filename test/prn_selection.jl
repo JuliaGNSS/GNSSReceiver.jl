@@ -28,13 +28,13 @@
 
     # L1 C/A: no capability restriction ⇒ full GPS request, order preserved.
     @test G.search_prns(prns, GPSL1CA()) == gps
-    # L5: request restricted to L5-capable PRNs (drops IIR/IIR-M PRNs 7,13,17,19).
+    # L5: request restricted to L5-capable PRNs (drops IIR/IIR-M PRNs 7,17,19).
     l5 = G.search_prns(prns, GPSL5I())
-    @test l5 == [1, 4, 8, 9, 11, 18, 28, 30]
-    @test !any(in([7, 13, 17, 19]), l5)
+    @test l5 == [1, 4, 8, 9, 11, 13, 18, 28, 30]
+    @test !any(in([7, 17, 19]), l5)
     # L2C (data signal L2CM) additionally keeps the IIR-M PRNs 7 and 17.
     l2c = G.search_prns(prns, GPSL2CM())
-    @test l2c == [1, 4, 7, 8, 9, 11, 17, 18, 28, 30]
+    @test l2c == [1, 4, 7, 8, 9, 11, 13, 17, 18, 28, 30]
     @test issubset(l5, l2c)
     # Galileo lists apply unchanged to both Galileo signals.
     @test G.search_prns(prns, GalileoE1B()) == gal
