@@ -265,15 +265,10 @@ const GPS_L2C_PRNS = sort(union(GPS_L5_PRNS, [5, 7, 12, 15, 17, 29, 31]))
 const BEIDOU_BDS3_MEO_IGSO_PRNS = 19:50
 
 broadcasting_prns(::AbstractGNSSSignal) = nothing
-broadcasting_prns(::GPSL5I) = GPS_L5_PRNS
-broadcasting_prns(::GPSL5Q) = GPS_L5_PRNS
-broadcasting_prns(::GPSL2CM) = GPS_L2C_PRNS
-broadcasting_prns(::GPSL2CL) = GPS_L2C_PRNS
-broadcasting_prns(::BeiDouB1C_D) = BEIDOU_BDS3_MEO_IGSO_PRNS
-broadcasting_prns(::BeiDouB1C_P) = BEIDOU_BDS3_MEO_IGSO_PRNS
-broadcasting_prns(::BeiDouB2aI) = BEIDOU_BDS3_MEO_IGSO_PRNS
-broadcasting_prns(::BeiDouB2aQ) = BEIDOU_BDS3_MEO_IGSO_PRNS
-broadcasting_prns(::BeiDouB2bI) = BEIDOU_BDS3_MEO_IGSO_PRNS
+broadcasting_prns(::Union{GPSL5I,GPSL5Q}) = GPS_L5_PRNS
+broadcasting_prns(::Union{GPSL2CM,GPSL2CL}) = GPS_L2C_PRNS
+broadcasting_prns(::Union{BeiDouB1C_D,BeiDouB1C_P,BeiDouB2aI,BeiDouB2aQ,BeiDouB2bI}) =
+    BEIDOU_BDS3_MEO_IGSO_PRNS
 
 # The candidate PRNs the caller asked to search for `system`. `prns` may be:
 #   * `nothing`                       ⇒ the constellation default (`default_prns`);
