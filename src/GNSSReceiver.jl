@@ -276,9 +276,7 @@ broadcasting_prns(::Union{BeiDouB1C_D,BeiDouB1C_P,BeiDouB2aI,BeiDouB2aQ,BeiDouB2
 #     (`:GPS`, …), falling back to the default for a constellation not listed;
 #   * any other collection            ⇒ used for every system (backwards compatible).
 requested_prns(::Nothing, system) = default_prns(system)
-requested_prns(prns::NamedTuple, system) =
-    get(prns, get_constellation_id(system), default_prns(system))
-requested_prns(prns::AbstractDict, system) =
+requested_prns(prns::Union{NamedTuple,AbstractDict}, system) =
     get(prns, get_constellation_id(system), default_prns(system))
 requested_prns(prns, system) = prns
 
