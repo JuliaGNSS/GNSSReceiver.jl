@@ -98,10 +98,10 @@ using RINEXParser:
     nav_satellite_system,
     gnss_time_system,
     epoch_time
-# The constants and time-scale helpers `rinex/` works in are unexported where they are
-# defined, so they are bound here by name.
+# The constants and the week fold `rinex/` works in are unexported where they are defined,
+# so they are bound here by name.
 using PositionVelocityTime: SPEED_OF_LIGHT
-using GNSSDecoder: SECONDS_PER_WEEK
+using GNSSSignals: SECONDS_PER_WEEK, fold_week_crossover
 
 using PipeChannels: PipeChannel
 using SignalChannels:

@@ -22,20 +22,6 @@ struct ObsEpochTiming
     propagation::Float64
 end
 
-"""
-    receive_time_of_week(time::TAITime, time_system) -> Float64
-
-The time of week of the solution epoch `time` on the count of `time_system`, to the
-precision of `time`. The whole weeks come off in integer seconds before any floating point:
-the absolute count, around 1.2e9 s, would leave a `Float64` only 0.2 µs — 70 m of
-pseudorange.
-"""
-function receive_time_of_week(time::TAITime, time_system)
-    origin = gps_time_origin()
-    mod(time.second - origin.second, SECONDS_PER_WEEK) +
-    (time.fraction - origin.fraction) +
-    ustrip(s, get_leap_second_offset(GNSSSignals.GPST(), time_system))
-end
 
 # The receiver time [s, on the run's sample grid] the solution's epoch was measured at: the
 # end of the chunk for the scalar PVT, which solves on the chunk it is handed, and the
@@ -77,15 +63,13 @@ function obs_epoch_timing(logger::RinexLogger, receiver_state)
     # (too few satellites) is not carried on for long.
     span = runtime - steering.solution_runtime
     span > steering.max_solution_age && return nothing
+    # The epoch's week and time of week on the file's time system, the whole weeks taken
+    # off in integer seconds (`get_time_of_week`): the absolute count, around 1.2e9 s, would
+    # leave a `Float64` only 0.2 µs, 70 m of pseudorange.
+    week = get_week(logger.time_system, pvt.time)
     receive_time =
-        receive_time_of_week(pvt.time, logger.time_system) +
+        get_time_of_week(logger.time_system, pvt.time) +
         span * (1 - relative_clock_drift(pvt))
-    # The week comes from the reported epoch, which needs only coarse precision for that:
-    # the absolute count minus the time of week is a whole number of weeks by construction.
-    # Counted from the time system's own origin, as the time of week is.
-    week =
-        round(Int, (gps_seconds(pvt.time) - receive_time) / SECONDS_PER_WEEK) -
-        week_offset(logger.time_system)
     if receive_time >= SECONDS_PER_WEEK
         week += 1
         receive_time -= SECONDS_PER_WEEK
@@ -113,7 +97,7 @@ function obs_epoch_timing(logger::RinexLogger, receiver_state)
         week,
         time_of_week,
         receive_time,
-        week_difference(time_of_week, receive_time),
+        fold_week_crossover(time_of_week - receive_time),
     )
 end
 
@@ -159,7 +143,7 @@ function build_obs_epoch(logger::RinexLogger, receiver_state, timing::ObsEpochTi
         # range to tens of metres.
         transmit_time =
             uncorrected_transmit_time(decoder, layout.signal, sat_state, logger.time_system)
-        range = week_difference(timing.receive_time, transmit_time) * SPEED_OF_LIGHT
+        range = fold_week_crossover(timing.receive_time - transmit_time) * SPEED_OF_LIGHT
         # Carried onto the steered epoch at its own rate, `-λ·f_d`.
         pseudorange = range - wavelength(layout) * doppler * propagation
 

@@ -377,16 +377,6 @@ end
 end
 
 @testset "The receive time of a solution epoch" begin
-    # The time of week comes off in whole seconds first, so a solution epoch keeps its
-    # precision: at present-day weeks the absolute count in one Float64 would round it to a
-    # fifth of a microsecond.
-    origin = GNSSReceiver.gps_time_origin()
-    time = TAITime(origin.second + _GPS_WEEK * 604800 + 82596, 0.123456789123)
-    @test GNSSReceiver.receive_time_of_week(time, GNSSSignals.GPST()) ≈ 82596.123456789123 atol =
-        1e-12
-    # On BDT's count, 14 s behind GPS Time.
-    @test GNSSReceiver.receive_time_of_week(time, GNSSSignals.BDT()) ≈ 82582.123456789123 atol =
-        1e-12
     # The scalar PVT's solution is dated at the end of the chunk it solved on.
     @test GNSSReceiver.solution_runtime(ConventionalPLLAndDLL(), 34.504) == 34.504
 end
@@ -404,26 +394,6 @@ end
 end
 
 @testset "RINEX epoch and time helpers" begin
-    # Times of week are differenced across the week boundary: a satellite that transmitted
-    # just before the roll-over still yields a sane travel time.
-    @test GNSSReceiver.week_difference(0.5, 604799.93) ≈ 0.57
-    @test GNSSReceiver.week_difference(604799.93, 0.5) ≈ -0.57
-    @test GNSSReceiver.week_difference(82621.7, 82621.63) ≈ 0.07
-
-    # The week count of each time system starts this many GPS weeks in.
-    @test GNSSReceiver.week_offset(GNSSSignals.GPST()) == 0
-    @test GNSSReceiver.week_offset(GNSSSignals.GST()) == 1024
-    @test GNSSReceiver.week_offset(GNSSSignals.BDT()) == 1356
-
-    # The PVT solution reports its epoch on the atomic scale; the round trip back to GPS
-    # system-time seconds is what recovers the week the epoch falls in.
-    total = _GPS_WEEK * 604800 + _GPS_TOW + 0.25
-    origin = GNSSReceiver.gps_time_origin()
-    epoch = TAITime(floor(Int, total) + origin.second, total - floor(total))
-    @test GNSSReceiver.gps_seconds(epoch) ≈ total
-    @test round(Int, (GNSSReceiver.gps_seconds(epoch) - (_GPS_TOW + 0.25)) / 604800) ==
-          _GPS_WEEK
-
     # Signal-strength indicator: the spec's 1-9 scale in 6 dB-Hz steps, and blank for a CN0
     # estimate that has not converged, whichever non-finite value it holds.
     @test signal_strength_indicator(45.0) == 7
@@ -503,7 +473,7 @@ function _rinex_receiver_state(;
         time = TAITime(
             _GPS_WEEK * 604800 +
             floor(Int, receive_time) +
-            GNSSReceiver.gps_time_origin().second,
+            get_week_start_epoch(GNSSSignals.GPST(), 0).second,
             receive_time - floor(receive_time),
         ),
         satellites = Dictionary(
@@ -677,8 +647,8 @@ end
         (
             ((BeiDouB1I(),),),
             5.0 - 82596.0,
-            2124 - 1356,
-            -9.0,
+            2124 - 1356 - 1,
+            604791.0,
             DateTime(2020, 9, 19, 23, 59, 51),
         ),
     )
