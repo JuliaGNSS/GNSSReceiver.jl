@@ -493,7 +493,7 @@ post-integration SNR, not by CN0 on its own.
 Anchoring to the primary code period rather than to the symbol period keeps
 `cn0_threshold` meaning exactly what it meant for one-block records (the default
 tracking cadence), and needs no data rate — so it is also defined for pilot signals,
-where `get_data_frequency` is 0 Hz.
+where `get_bit_rate` is 0 Hz.
 
 `coherence_limit` caps the credited `T`, and defaults to `Inf·s` — uncapped — because
 Tracking already bounds a record at the coherent limit itself: post-sync it integrates

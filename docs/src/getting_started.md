@@ -33,7 +33,8 @@ processes samples as they arrive. A data-channel snapshot carries:
   `(signal_id, prn)` (e.g. `(:GPSL1CA, 5)`), to its
   [`SatelliteDataOfInterest`](@ref GNSSReceiver.SatelliteDataOfInterest) (carrier-to-noise
   ratio, prompt correlator value, health flag). Keying by `(signal_id, prn)` lets the same
-  PRN appear on several constellations or bands without colliding, and matches `pvt.sats`;
+  PRN appear on several constellations or bands without colliding, and matches
+  `pvt.satellites`;
 - `pvt` — the current PVT solution (position, velocity, time, DOP, …);
 - `runtime` — the elapsed *signal* time.
 

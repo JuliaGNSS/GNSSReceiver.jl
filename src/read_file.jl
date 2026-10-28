@@ -156,10 +156,11 @@ function read_uint8_iq_file(
     end
 end
 
-# Seconds of signal in one `num_samples` chunk at `sample_rate`, used to pace real-time
-# replay. `nothing` (no `sample_rate`) means "no pacing — push as fast as possible".
+# Seconds of signal in one `num_samples` chunk at `sampling_freq`, used to pace real-time
+# replay. `nothing` (no sampling frequency) means "no pacing — push as fast as possible".
 _replay_chunk_period(_, ::Nothing) = nothing
-_replay_chunk_period(num_samples, sample_rate) = ustrip(s, upreferred(num_samples / sample_rate))
+_replay_chunk_period(num_samples, sampling_freq) =
+    ustrip(s, upreferred(num_samples / sampling_freq))
 
 # Sleep until the next chunk is due and return the deadline for the chunk after it.
 #

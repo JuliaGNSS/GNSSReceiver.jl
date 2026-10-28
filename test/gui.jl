@@ -96,12 +96,12 @@ function fixed_gui_data(; runtime = 10.0u"s", pvt_fresh = true)
             velocity = ECEF(2.0e6, 2.9e5, 1.9e6),
             time = TAITime(TAIEpoch(2022, 10, 8)),
             dop = DOP(1.0, 1.0, 1.0, 1.0, 1.0),
-            sats = Dictionary(
+            satellites = Dictionary(
                 sat_keys,
                 [
-                    SatInfo(
+                    SatelliteInfo(
                         ECEF(5e6 + 1e5 * i, 3e6 - 1e5 * i, 1e6 + 2e5 * i),
-                        0.0,
+                        0.0u"s",
                         0.0u"m",
                         0.0u"m/s",
                     ) for i in eachindex(sat_keys)
@@ -232,9 +232,9 @@ end
     @test occursin("VT armed", out)
     @test !occursin("VT running", out)
 
-    # Running: "VT running (measured/loop sats)". The measured count comes from `pvt.sats` —
-    # empty in this fixture — so the badge must not report the loop size alone, which would
-    # claim satellites the solution did not use.
+    # Running: "VT running (measured/loop sats)". The measured count comes from
+    # `pvt.satellites` — empty in this fixture — so the badge must not report the loop size
+    # alone, which would claim satellites the solution did not use.
     out = header(GNSSReceiver.VTStatus(true))
     @test occursin("VT running", out) && occursin("0/6 sats", out)
 end
@@ -250,10 +250,11 @@ end
         (:GPSL1CA, 9) => GNSSReceiver.SatelliteDataOfInterest(44.0dBHz, z, true, false),
         (:GPSL1CA, 12) => GNSSReceiver.SatelliteDataOfInterest(42.0dBHz, z, true, false),
     ))
-    # `pvt.sats` — the satellites that determined the fix — is a different set from the loop.
-    info() = SatInfo(ECEF(5e6, 3e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s")
+    # `pvt.satellites` — the satellites that determined the fix — is a different set from
+    # the loop.
+    info() = SatelliteInfo(ECEF(5e6, 3e6, 1e6), 0.0u"s", 0.0u"m", 0.0u"m/s")
     pvt = PVTSolution(;
-        sats = Dictionary([(:GPSL1CA, 3), (:GPSL1CA, 9)], [info(), info()]),
+        satellites = Dictionary([(:GPSL1CA, 3), (:GPSL1CA, 9)], [info(), info()]),
     )
     render_vt(vt; solution = pvt) = render_gui_text(
         gui_model(GNSSReceiver.GUIData(sats, solution, 5.0u"s", true, vt)),
@@ -460,11 +461,11 @@ end
         PVTSolution(;
             position = ECEF(4.0e6, 3.9e5, 4.9e6),
             velocity = ECEF(2.0e6, 2.9e5, 1.9e6),
-            time_correction = 4.5e6u"m",
+            clock_bias = 4.5e6u"m",
             time = TAITime(TAIEpoch(2022, 10, 8)),
-            relative_clock_drift = 0.1e-6,
+            clock_drift = 30.0u"m/s",
             dop = DOP(1.0, 1.0, 1.0, 1.0, 1.0),
-            sats = Dictionary(
+            satellites = Dictionary(
                 [
                     (:GPSL1CA, 3),
                     (:GPSL1CA, 12),
@@ -472,10 +473,10 @@ end
                     (:GPSL1CA, 10),
                 ],
                 [
-                    SatInfo(ECEF(5e6, 3e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s"),
-                    SatInfo(ECEF(3e6, 3e6, 2e6), 0.0, 0.0u"m", 0.0u"m/s"),
-                    SatInfo(ECEF(2e6, 5e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s"),
-                    SatInfo(ECEF(3e6, 1e6, 1e6), 0.0, 0.0u"m", 0.0u"m/s"),
+                    SatelliteInfo(ECEF(5e6, 3e6, 1e6), 0.0u"s", 0.0u"m", 0.0u"m/s"),
+                    SatelliteInfo(ECEF(3e6, 3e6, 2e6), 0.0u"s", 0.0u"m", 0.0u"m/s"),
+                    SatelliteInfo(ECEF(2e6, 5e6, 1e6), 0.0u"s", 0.0u"m", 0.0u"m/s"),
+                    SatelliteInfo(ECEF(3e6, 1e6, 1e6), 0.0u"s", 0.0u"m", 0.0u"m/s"),
                 ],
             ),
         ),
@@ -617,17 +618,21 @@ end
     ]
     sat_positions = [ECEF(5e6 + 1e5 * i, 3e6 - 1e5 * i, 1e6 + 2e5 * i) for i in eachindex(keys_)]
     # All residuals 2.0 m ⇒ overall and per-signal RMS are exactly 2.0 m.
-    sats = Dictionary(keys_, [SatInfo(p, 0.0, 2.0u"m", 0.0u"m/s") for p in sat_positions])
+    satellites = Dictionary(
+        keys_,
+        [SatelliteInfo(p, 0.0u"s", 2.0u"m", 0.0u"m/s") for p in sat_positions],
+    )
 
     pvt = PVTSolution(;
         position = ECEF(4.0e6, 3.9e5, 4.9e6),
         time = TAITime(TAIEpoch(2022, 10, 8)),
-        dop = DOP(2.5, 2.1, 1.3, 1.6, 0.9),
-        sats,
+        dop = DOP(2.5, 2.1, 1.6, 1.3, 0.9),
+        satellites,
         reference_system = GPST(),
-        inter_system_biases = Dict{SupportedTimeSystem,typeof(1.0u"m")}(GST() => 12.34u"m"),
+        inter_system_biases =
+            Dictionary{SupportedTimeSystem,typeof(1.0u"m")}([GST()], [12.34u"m"]),
         inter_frequency_biases =
-            Dict{Symbol,InterFrequencyBias}(:L5 => InterFrequencyBias(5.67u"m", :L1)),
+            Dictionary([:L5], [InterFrequencyBias(5.67u"m", :L1)]),
     )
 
     gd = GNSSReceiver.GUIData(
@@ -642,6 +647,7 @@ end
 
     @test occursin("run time", out) && occursin("42.0 s", out)
     @test occursin("DOP", out) && occursin("2.5", out)          # GDOP
+    @test occursin("HDOP: 1.6", out) && occursin("VDOP: 1.3", out)
     @test occursin("Inter-system biases", out) && occursin("GST", out) && occursin("12.34", out)
     # Inter-frequency bias names its reference band explicitly ("L5 (vs L1)").
     @test occursin("Inter-frequency biases", out) && occursin("L5", out) && occursin("5.67", out)
@@ -780,9 +786,9 @@ end
     pvt = PVTSolution(;
         reference_system = GST(),
         inter_system_biases =
-            Dict{SupportedTimeSystem,typeof(1.0u"m")}(GPST() => -12.34u"m"),
+            Dictionary{SupportedTimeSystem,typeof(1.0u"m")}([GPST()], [-12.34u"m"]),
         inter_frequency_biases =
-            Dict{Symbol,InterFrequencyBias}(:L5 => InterFrequencyBias(5.67u"m", :L1)),
+            Dictionary([:L5], [InterFrequencyBias(5.67u"m", :L1)]),
     )
     lines = GNSSReceiver.pvt_details_lines(pvt)
     # Anchor and rows both use `get_time_system_id`. The heading is then exactly the 30

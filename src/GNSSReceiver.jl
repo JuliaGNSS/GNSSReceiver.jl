@@ -100,7 +100,7 @@ using RINEXParser:
     epoch_time
 # The constants and time-scale helpers `rinex/` works in are unexported where they are
 # defined, so they are bound here by name.
-using PositionVelocityTime: SPEED_OF_LIGHT, time_scale_offset_to_gpst
+using PositionVelocityTime: SPEED_OF_LIGHT
 using GNSSDecoder: SECONDS_PER_WEEK
 
 using PipeChannels: PipeChannel
@@ -136,31 +136,31 @@ using GNSSReceiver.SampleBuffers
 
 # Throughout the receiver, a constellation is identified by GNSSSignals'
 # `get_signal_id` (e.g. `:GPSL1CA`, `:GalileoE1B`) — the same per-signal symbol
-# `PositionVelocityTime` keys its `pvt.sats` by, so one key addresses a satellite
+# `PositionVelocityTime` keys its `pvt.satellites` by, so one key addresses a satellite
 # across tracking, decoding and PVT.
 
 # Duration of one primary code period of `signal`. Defined for every signal — unlike a
 # symbol period, it needs no data rate — which is why the code-lock detector anchors its
 # CN0 threshold to it (see `CodeLockDetector`).
 primary_code_period(signal::AbstractGNSSSignal) =
-    uconvert(s, get_code_length(signal) / get_code_frequency(signal))
+    uconvert(s, get_code_length(signal) / get_chip_rate(signal))
 
 # Number of samples spanning one primary code period of `system` at `sampling_freq`.
 # Uses the same `ceil` convention as Acquisition's `plan_acquire`, so buffer sizing
 # matches the plan's sample requirement exactly.
 samples_per_code(system::AbstractGNSSSignal, sampling_freq) =
-    ceil(Int, get_code_length(system) * upreferred(sampling_freq / get_code_frequency(system)))
+    ceil(Int, get_code_length(system) * upreferred(sampling_freq / get_chip_rate(system)))
 
 # Code periods per navigation data bit, matching Acquisition's `plan_acquire`.
 # `nothing` for dataless (pilot) signals, which carry no bit-period constraint.
 function code_periods_per_data_bit(system::AbstractGNSSSignal, sampling_freq)
-    data_freq = get_data_frequency(system)
-    (isfinite(ustrip(data_freq)) && ustrip(data_freq) > 0) || return nothing
-    ceil(Int, upreferred(sampling_freq / data_freq)) ÷ samples_per_code(system, sampling_freq)
+    bit_rate = get_bit_rate(system)
+    (isfinite(ustrip(bit_rate)) && ustrip(bit_rate) > 0) || return nothing
+    ceil(Int, upreferred(sampling_freq / bit_rate)) ÷ samples_per_code(system, sampling_freq)
 end
 
 # Is a coherent window of `nc` code periods a length `plan_acquire` accepts? A
-# window spanning ≥ one data bit must cover whole bits, and (for tiered/pilot
+# window spanning ≥ one navigation bit must cover whole bits, and (for tiered/pilot
 # signals) whole secondary-code periods; sub-bit windows are unconstrained. This
 # mirrors the divisibility constraints `plan_acquire` enforces — it validates
 # these rather than deriving them, so the caller must land on a valid `nc`.
@@ -175,7 +175,7 @@ end
 
 # Coherent code-period count needed to reach a requested acquisition Doppler
 # resolution. The Doppler bin spacing of a coherent integration is 1 / (nc · T_code)
-# = get_code_frequency / (nc · get_code_length), so nc = get_code_frequency /
+# = get_chip_rate / (nc · get_code_length), so nc = get_chip_rate /
 # (Δf · get_code_length), rounded UP (Δf is treated as a maximum). A `nothing`
 # resolution means "no constraint" ⇒ a single code period. This is set by the
 # coherent integration *time* alone and is independent of the carrier frequency
@@ -189,17 +189,17 @@ function coherent_code_periods_for_resolution(system::AbstractGNSSSignal, acq_do
         ceil(
             Int,
             upreferred(
-                get_code_frequency(system) / (acq_doppler_resolution * get_code_length(system)),
+                get_chip_rate(system) / (acq_doppler_resolution * get_code_length(system)),
             ),
         ),
     )
 end
 
 # Wall-clock duration of a coherent integration of `nc` code periods of `system`
-# (nc · T_code = nc · get_code_length / get_code_frequency). Used to compare the
+# (nc · T_code = nc · get_code_length / get_chip_rate). Used to compare the
 # pilot's and data component's acquisition windows on the same (time) axis.
 coherent_integration_time(system::AbstractGNSSSignal, nc::Integer) =
-    nc * get_code_length(system) / get_code_frequency(system)
+    nc * get_code_length(system) / get_chip_rate(system)
 
 # Snap a resolution-derived coherent code-period count UP to the smallest value
 # `plan_acquire` accepts (see `is_valid_coherent_length`). Rounding up (never down)
@@ -315,17 +315,17 @@ end
 function ReceiverSatState(
     acq::Acquisition.AcquisitionResults,
     decoder::GNSSDecoderState,
-    code_lock_cn0_threshold::typeof(1.0dBHz) = get_default_code_lock_cn0_threshold(acq.system),
+    code_lock_cn0_threshold::typeof(1.0dBHz) = get_default_code_lock_cn0_threshold(acq.signal),
 )
     ReceiverSatState(
         acq.prn,
         decoder,
         CodeLockDetector(;
             cn0_threshold = code_lock_cn0_threshold,
-            reference_integration_time = primary_code_period(acq.system),
+            reference_integration_time = primary_code_period(acq.signal),
         ),
         CarrierLockDetector(;
-            reference_integration_time = primary_code_period(acq.system),
+            reference_integration_time = primary_code_period(acq.signal),
         ),
         0.0s,
         0.0s,
@@ -612,9 +612,9 @@ data_signal_index(system) = length(tracking_signals(system))
 
 # Tracking-group key / `sat_data` key for a system: the id of the signal the loops
 # range on — the pilot for a `CombinedSignal`, and the signal itself (its data
-# component) for a plain signal. This is exactly what PVT keys `pvt.sats` by (we hand
+# component) for a plain signal. This is exactly what PVT keys `pvt.satellites` by (we hand
 # `calc_pvt` the ranging signal), so tracking groups, `receiver_sat_states`, acq
-# plans, `sat_data` and `pvt.sats` all share one `(signal, prn)` namespace. Decoding
+# plans, `sat_data` and `pvt.satellites` all share one `(signal, prn)` namespace. Decoding
 # still runs on the group's data component regardless of the key.
 signal_group_key(system) = get_signal_id(ranging_signal(system))
 

@@ -654,8 +654,8 @@ function update_states_from_acquisition_results(
     acquired_prns = map(res -> res.prn, acq_res_valids)
     isempty(acq_res_valids) && return track_state, receiver_sat_states, acquired_prns
 
-    # Build the decoder from the *data* signal, never from `res.system`: with
-    # pilot acquisition `res.system` is the dataless pilot, which has no decoder.
+    # Build the decoder from the *data* signal, never from `res.signal`: with
+    # pilot acquisition `res.signal` is the dataless pilot, which has no decoder.
     data_sys = data_signal(system)
     new_receiver_sat_states = map(acq_res_valids) do res
         decoder =
@@ -771,7 +771,8 @@ end
 # receiver: acquire, advance the detected code phases to the current frame, then
 # update the tracking and satellite states. Shared by the periodic scan and fast
 # reacquisition, which differ only in how they select `prns` and what they do
-# with the returned `acquired_prns`.
+# with the returned `acquired_prns`. Each of the group's plans searches the PRNs among
+# `prns` it was built for; a recursion over the plans' tuple keeps it type-stable.
 function acquire_and_update_states(
     track_state,
     receiver_sat_states,
@@ -825,12 +826,15 @@ function correct_code_phases(acq_res, acquisition_buffer, num_samples)
 end
 
 function advance_code_phase(acq_res::Acquisition.AcquisitionResults, num_samples)
+    signal = acq_res.signal
+    # The replica's code frequency: the nominal chip rate plus the carrier Doppler scaled
+    # onto the code.
+    code_frequency =
+        get_chip_rate(signal) +
+        acq_res.carrier_doppler * get_chip_rate_to_center_frequency_ratio(signal)
     advanced_code_phase = mod(
-        (
-            get_code_frequency(acq_res.system) +
-            acq_res.carrier_doppler * get_code_center_frequency_ratio(acq_res.system)
-        ) * num_samples / acq_res.sampling_frequency + acq_res.code_phase,
-        get_code_length(acq_res.system),
+        code_frequency * num_samples / acq_res.sampling_frequency + acq_res.code_phase,
+        get_code_length(signal),
     )
     # AcquisitionResults gained fields in Acquisition v2; copy all of them and only
     # override the advanced code phase instead of reconstructing positionally.

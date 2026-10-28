@@ -23,9 +23,9 @@ fake_report(;
     # the fix here.
     m = zeros(Complex{Int16}, 8, 1)
     raw = Tracking.BandMeasurement(m, 2.048u"MHz", 0.0u"Hz")
-    @test Unitful.unit(Tracking.get_sampling_frequency(raw)) == u"s^-1"        # the trap
+    @test Unitful.unit(raw.sampling_frequency) == u"s^-1"        # the trap
     fixed = Tracking.BandMeasurement(m, uconvert(u"Hz", 2.048u"MHz"), uconvert(u"Hz", 0.0u"Hz"))
-    @test Unitful.unit(Tracking.get_sampling_frequency(fixed)) == u"Hz"        # the normalisation
+    @test Unitful.unit(fixed.sampling_frequency) == u"Hz"        # the normalisation
 end
 
 @testset "Doppler estimator selection and receiver-state wiring" begin
@@ -39,8 +39,10 @@ end
 
     # The vector estimator hands a fresh satellite to the scalar loop it wraps, so the
     # acquisition pull-in range is that loop's.
-    @test GNSSReceiver.carrier_doppler_pull_in_range(VectorPLLAndDLL(GPSL1CA()), GPSL1CA()) ==
-          GNSSReceiver.carrier_doppler_pull_in_range(
+    @test GNSSReceiver.carrier_doppler_pull_in_range(
+        VectorPLLAndDLL(GPSL1CA(); approximate_year = 2017),
+        GPSL1CA(),
+    ) == GNSSReceiver.carrier_doppler_pull_in_range(
         ConventionalAssistedPLLAndDLL(),
         GPSL1CA(),
     )
@@ -74,7 +76,7 @@ end
         h0 = 1.3e-22,
         hm2 = 2e-22,
         acceleration_noise_std = 1.0u"m/s^2",
-        insufficient_meas_timeout = 25.0u"s",
+        insufficient_measurements_timeout = 25.0u"s",
     )
     configured_state = GNSSReceiver.ReceiverState(
         ComplexF64,
@@ -224,7 +226,7 @@ end
     system = GPSL1CA()
     own_decoder = GNSSDecoderState(system, 3)
     engine_decoder = GNSSDecoderState(system, 3)
-    estimator = VectorPLLAndDLL(system)
+    estimator = VectorPLLAndDLL(system; approximate_year = 2017)
     @test GNSSReceiver.updated_decoder(
         estimator,
         fake_report(; decoder = engine_decoder),
@@ -240,15 +242,16 @@ end
 @testset "Re-acquiring a satellite leaves the vector estimator's decoders alone" begin
     # Under vector tracking the receiver's decoder of a satellite is the one the estimator
     # reported, and the estimator reuses a freed slot's containers for the next satellite
-    # that registers on it (`_rebind_decoder`). Satellite 5 dropped out and its slot went
-    # to satellite 7, so the decoder still held for 5 shares its soft-symbol buffer with
-    # 7's live one: re-acquiring 5 must not reset that decoder in place.
+    # that registers on it (`reset_decoder_state!(decoder, prn)`, which keeps the buffers).
+    # Satellite 5 dropped out and its slot went to satellite 7, so the decoder still held
+    # for 5 shares its soft-symbol buffer with 7's live one: re-acquiring 5 must not reset
+    # that decoder in place.
     system = GPSL1CA()
     key = GNSSReceiver.signal_group_key(system)
     dropped_prn, new_prn = 5, 7
     dropped_decoder = GNSSDecoderState(system, dropped_prn)
     live_decoder = decode!(
-        TrackingLoops._rebind_decoder(dropped_decoder, new_prn),
+        reset_decoder_state!(dropped_decoder, new_prn),
         ones(100),
         100,
     )
@@ -430,8 +433,8 @@ end
     @test last_time_pvt_ran == 3.0u"s"
     @test pvt !== solution
     @test pvt.position == solution.position
-    @test pvt.sats == solution.sats
-    @test pvt.sats !== solution.sats
+    @test pvt.satellites == solution.satellites
+    @test pvt.satellites !== solution.satellites
     @test pvt.inter_system_biases !== solution.inter_system_biases
     @test pvt.inter_frequency_biases !== solution.inter_frequency_biases
 end

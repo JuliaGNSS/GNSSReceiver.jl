@@ -291,7 +291,7 @@ delay/frequency lock loop, VDFLL). Weak or briefly obscured satellites are carri
 outages by the collective solution, and the emitted PVT solutions come from the navigation
 filter, one per navigation cycle of `pvt_update_interval`. They carry the same
 per-satellite diagnostics as a scalar fix, including the post-fit pseudorange and
-range-rate residuals (`SatInfo.residual` and `SatInfo.rate_residual`).
+range-rate residuals (`SatelliteInfo.residual` and `SatelliteInfo.rate_residual`).
 
 ```julia
 data_channel = receive(
@@ -332,7 +332,7 @@ data_channel = receive(
     measurement_channel, (GPSL1CA(), GalileoE1B()), 2.048e6u"Hz";
     vector_tracking = NavigationFilterConfig(;
         acceleration_noise_std = 1.0u"m/s^2",   # pedestrian dynamics
-        insufficient_meas_timeout = 30.0u"s",
+        insufficient_measurements_timeout = 30.0u"s",
     ),
 )
 ```

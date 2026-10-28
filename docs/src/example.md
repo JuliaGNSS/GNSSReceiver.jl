@@ -109,15 +109,15 @@ Ephemeris decoding takes about half a minute, so the first PVT solution appears 
 35 seconds into the recording. Here is the final fix:
 
 ```@example iondata
-using PositionVelocityTime: get_LLA
+using PositionVelocityTime: get_lla
 
-lla = get_LLA(final.pvt)
+lla = get_lla(final.pvt)
 
 println("Time (TAI):        ", final.pvt.time)
 println("Latitude:          ", lla.lat)
 println("Longitude:         ", lla.lon)
 println("Altitude:          ", round(lla.alt; digits = 1), " m")
-println("Satellites in fix: ", length(final.pvt.sats))
+println("Satellites in fix: ", length(final.pvt.satellites))
 println("Position DOP:      ", round(final.pvt.dop.PDOP; digits = 2))
 ```
 
@@ -138,7 +138,7 @@ without any extra work:
 ```@example iondata
 pvt = final.pvt
 println("Velocity (ECEF):     ", round.(pvt.velocity; digits = 2), " m/s")
-println("Clock drift:         ", pvt.relative_clock_drift)
+println("Clock drift:         ", pvt.clock_drift)
 println("GDOP / HDOP / VDOP:  ", round(pvt.dop.GDOP; digits = 2), " / ",
         round(pvt.dop.HDOP; digits = 2), " / ", round(pvt.dop.VDOP; digits = 2))
 # `sat_data` is keyed by (signal_id, prn):

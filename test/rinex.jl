@@ -59,13 +59,13 @@ _gps_lnav_data(; kwargs...) = GNSSDecoder.GPSL1CAData(;
 )
 
 # A decoder state holding `data` as validated navigation data. A freshly constructed decoder
-# reports no bit count until it has synchronised; zero puts the transmit time exactly on the
-# decoded time of week, which is what makes the expected pseudoranges below exact.
+# reports no bit count until it has synchronised; zero puts the transmit time exactly on
+# the decoded time of week, which is what makes the expected pseudoranges below exact.
 _decoder_with(system, prn, data) = GNSSDecoder.GNSSDecoderState(
     GNSSDecoderState(system, prn);
     data,
     raw_data = data,
-    num_bits_after_valid_syncro_sequence = 0,
+    num_bits_since_sync = 0,
 )
 
 @testset "RINEX observation-header layout" begin
@@ -369,7 +369,7 @@ end
     )
     _, layouts = GNSSReceiver.rinex_layout(((system,),), (0.0Hz,), 2.048e6Hz)
     decoder = GNSSDecoder.GNSSDecoderState(GalileoE1B(), 11)
-    @test isnothing(decoder.num_bits_after_valid_syncro_sequence)
+    @test isnothing(decoder.num_bits_since_sync)
     polarity(state) = GNSSReceiver.carrier_polarity(state, key, 11, layouts[key], decoder)
     @test polarity(synced(true, 1)) == 1
     @test polarity(synced(true, -1)) == -1
@@ -394,12 +394,13 @@ end
 @testset "BeiDou observations are differenced on one time scale" begin
     # BDT runs 14 s behind GPS Time, and PositionVelocityTime leaves every transmit time
     # on its own constellation's scale. Differencing them as they come would put 14 s —
-    # 4.2 million metres — into a BeiDou pseudorange.
-    @test GNSSReceiver.time_scale_offset(GNSSSignals.GPST(), GNSSSignals.BDT()) == 14.0
-    @test GNSSReceiver.time_scale_offset(GNSSSignals.BDT(), GNSSSignals.GPST()) == -14.0
+    # 4.2 million metres — into a BeiDou pseudorange, so `uncorrected_transmit_time` adds
+    # the leap seconds from the signal's count to the file's: this direction.
+    leap_seconds(from, to) = ustrip(u"s", get_leap_second_offset(from, to))
+    @test leap_seconds(GNSSSignals.BDT(), GNSSSignals.GPST()) == 14
     # GPS and Galileo both count TAI - 19 s, which is why a receiver of those two alone
     # never had to correct anything.
-    @test GNSSReceiver.time_scale_offset(GNSSSignals.GPST(), GNSSSignals.GST()) == 0.0
+    @test leap_seconds(GNSSSignals.GST(), GNSSSignals.GPST()) == 0
 end
 
 @testset "RINEX epoch and time helpers" begin
@@ -449,7 +450,7 @@ function _rinex_receiver_state(;
     travel_time = 0.07,
     receive_offset = 0.0,
     doppler = 0.0Hz,
-    clock_drift = 0.0,
+    relative_clock_drift = 0.0,
     phase_locked = true,
     data = _gps_lnav_data(),
 )
@@ -487,30 +488,30 @@ function _rinex_receiver_state(;
         # filter's. RINEX reads the measurements either way.
         false,
     )
-    # `calc_pvt` references its pseudoranges to the latest satellite transmit time, so with a
-    # single satellite that reference is its own transmission and the whole travel time is
-    # carried by the estimated clock bias — exactly the large, negative bias a real solution
-    # reports. Giving the satellite no clock error makes its corrected transmit time equal
-    # the raw one, so the expected pseudorange is simply `travel_time · c`.
+    # `calc_pvt` references its pseudoranges to its reference measurement's transmit time,
+    # so with a single satellite that reference is its own transmission and the whole travel
+    # time is carried by the estimated clock bias — exactly the large, negative bias a real
+    # solution reports. Giving the satellite no clock error makes its corrected transmit
+    # time equal the raw one, so the expected pseudorange is simply `travel_time · c`.
     reference_time = _TRANSMIT_TOW + receive_offset
     receive_time = reference_time + travel_time
     # The receive instant in whole and fractional seconds, as a solver builds it: one
     # Float64 of the absolute count would round it to a fifth of a microsecond.
     pvt = PositionVelocityTime.PVTSolution(;
         position = Geodesy.ECEF(4.1e6, 6.0e5, 4.8e6),
-        time_correction = -travel_time * 299792458.0 * u"m",
+        clock_bias = -travel_time * 299792458.0 * u"m",
         time = TAITime(
             _GPS_WEEK * 604800 +
             floor(Int, receive_time) +
             GNSSReceiver.gps_time_origin().second,
             receive_time - floor(receive_time),
         ),
-        sats = Dictionary(
+        satellites = Dictionary(
             [(key, prn)],
             [
-                PositionVelocityTime.SatInfo(
+                PositionVelocityTime.SatelliteInfo(
                     Geodesy.ECEF(1.5e7, 1.2e7, 1.8e7),
-                    reference_time,
+                    reference_time * u"s",
                     0.1u"m",
                     # Post-fit range-rate residual, which RINEX output never reads: the
                     # Doppler it writes comes from the tracking loops, not the fit.
@@ -518,7 +519,7 @@ function _rinex_receiver_state(;
                 ),
             ],
         ),
-        relative_clock_drift = clock_drift,
+        clock_drift = relative_clock_drift * 299792458.0 * u"m/s",
         reference_system = GNSSSignals.GPST(),
     )
     ReceiverState(
@@ -935,7 +936,7 @@ end
     )
     GNSSReceiver.log_rinex!(
         logger,
-        _rinex_receiver_state(; doppler = -3991.437Hz, clock_drift = drift),
+        _rinex_receiver_state(; doppler = -3991.437Hz, relative_clock_drift = drift),
     )
     close(logger)
 
@@ -972,7 +973,7 @@ end
     synced(bits, runtime) = GNSSReceiver.note_decoder_sync!(
         logger,
         (:GPSL1CA, 13),
-        GNSSDecoder.GNSSDecoderState(decoder; num_bits_after_valid_syncro_sequence = bits),
+        GNSSDecoder.GNSSDecoderState(decoder; num_bits_since_sync = bits),
         runtime,
     )
     @test synced(nothing, 1.0) == -Inf
@@ -994,13 +995,13 @@ end
     @test clock.phase == 0.0
     GNSSReceiver.update_clock_phase!(
         clock,
-        (; time = 1, relative_clock_drift = 2.0e-7),
+        (; time = 1, clock_drift = 2.0e-7 * 299792458.0u"m/s"),
         1.0,
     )
     @test clock.phase ≈ 2.0e-7 * 0.5
     GNSSReceiver.update_clock_phase!(
         clock,
-        (; time = 1, relative_clock_drift = 4.0e-7),
+        (; time = 1, clock_drift = 4.0e-7 * 299792458.0u"m/s"),
         2.0,
     )
     @test clock.phase ≈ 2.0e-7 * 0.5 + 3.0e-7 * 1.0
@@ -1018,14 +1019,17 @@ end
     )
     drift = 7.4e-7
     at(state, runtime) = @set state.runtime = runtime * u"s"
-    GNSSReceiver.log_rinex!(logger, at(_rinex_receiver_state(; clock_drift = drift), 1.0))
+    GNSSReceiver.log_rinex!(
+        logger,
+        at(_rinex_receiver_state(; relative_clock_drift = drift), 1.0),
+    )
     # Out of phase lock for half a second: the first arc ends.
     GNSSReceiver.log_rinex!(
         logger,
         at(
             _rinex_receiver_state(;
                 receive_offset = 0.5,
-                clock_drift = drift,
+                relative_clock_drift = drift,
                 phase_locked = false,
             ),
             1.5,
@@ -1034,7 +1038,10 @@ end
     @test isempty(logger.accumulators)
     GNSSReceiver.log_rinex!(
         logger,
-        at(_rinex_receiver_state(; receive_offset = 1.0, clock_drift = drift), 2.0),
+        at(
+            _rinex_receiver_state(; receive_offset = 1.0, relative_clock_drift = drift),
+            2.0,
+        ),
     )
     close(logger)
     lines = readlines(obs_file)
@@ -1131,7 +1138,7 @@ end
     drift = 1.0e-6
     timings = []
     # The chunk before the first fix, which bounds the first fix's chunk.
-    state = _rinex_receiver_state(; receive_offset = 0.5, clock_drift = drift)
+    state = _rinex_receiver_state(; receive_offset = 0.5, relative_clock_drift = drift)
     unsolved = @set state.pvt.time = nothing
     @test isnothing(GNSSReceiver.obs_epoch_timing(logger, @set unsolved.runtime = 0.0u"s"))
     for chunk = 1:1000
@@ -1141,7 +1148,7 @@ end
         if chunk % 25 == 1
             state = _rinex_receiver_state(;
                 receive_offset = 0.5 + runtime * (1 - drift),
-                clock_drift = drift,
+                relative_clock_drift = drift,
             )
         end
         state = @set state.runtime = runtime * u"s"

@@ -9,10 +9,10 @@ vector-tracking navigation filter (`in_vt_loop`; always `false` when VT is disab
 whether those loops have settled enough to range on (`is_ranging_ready`) and whether the
 lock detectors currently declare it locked (`is_in_lock`).
 
-Loop membership is not the same as having determined the solution: a member coasting
-through an obscuration stays `in_vt_loop` and keeps being steered by the filter, but
-withholds its discriminators. Which satellites were *measured* is `pvt.sats`, under vector
-and scalar tracking alike — see [`VTStatus`](@ref) for the coasted ones.
+Loop membership is not the same as having determined the solution: a member coasting through
+an obscuration stays `in_vt_loop` and keeps being steered by the filter, but withholds its
+discriminators. Which satellites were *measured* is `pvt.satellites`, under vector and
+scalar tracking alike — see [`VTStatus`](@ref) for the coasted ones.
 
 `is_healthy` and `is_ranging_ready` are independent, and neither implies the other:
 `is_healthy` is what the *satellite* says about itself in its navigation message, while
@@ -108,23 +108,23 @@ place of a `VTStatus` means vector tracking is disabled (pure scalar tracking).
 # Fields
 - `running::Bool`: whether the navigation filter is currently closing the tracking loops.
   It starts with the first scalar fix and falls back on prolonged measurement starvation.
-- `member_sats::Dictionary{Tuple{Symbol,Int},SatInfo}`: every member of the loop as of the
-  filter's latest update, keyed exactly as `pvt.sats` is, each with the position, transmit
-  time and post-fit residuals that update produced for it. Empty while the scalar solve is
-  in control (nothing was filtered), so it never carries a stale report.
+- `member_sats::Dictionary{Tuple{Symbol,Int},SatelliteInfo}`: every member of the loop as of
+  the filter's latest update, keyed exactly as `pvt.satellites` is, each with the position,
+  transmit time and post-fit residuals that update produced for it. Empty while the scalar
+  solve is in control (nothing was filtered), so it never carries a stale report.
 - `position_std`, `clock_std`: the filter's own uncertainty in its position (the root sum of
   the three position variances) and in the reported clock bias. `NaN * m` while the filter
   is not running. This is what `pvt.dop` cannot say: DOP is the *geometry* of the satellites
   that were measured, and it is `nothing` altogether on an epoch carried by the dynamics —
   where these two are the only quality figures left.
-- `time_with_insufficient_meas`: how long the filter has been coasting on epochs it could
-  not solve, counted against `NavigationFilterConfig`'s `insufficient_meas_timeout`, at
-  which point vector tracking is abandoned. Nonzero means the loop is on its way out; it is paid back
-  down (at half rate) by solvable epochs.
+- `time_with_insufficient_measurements`: how long the filter has been coasting on epochs it
+  could not solve, counted against `NavigationFilterConfig`'s
+  `insufficient_measurements_timeout`, at which point vector tracking is abandoned. Nonzero
+  means the loop is on its way out; it is paid back down (at half rate) by solvable epochs.
 
-`pvt.sats` holds the members the update actually *measured*; `member_sats` holds those and
-the coasted ones together, so `setdiff(keys(member_sats), keys(pvt.sats))` is what the
-filter predicted through an obscuration. A coasted member's residual is the divergence
+`pvt.satellites` holds the members the update actually *measured*; `member_sats` holds those
+and the coasted ones together, so `setdiff(keys(member_sats), keys(pvt.satellites))` is what
+the filter predicted through an obscuration. A coasted member's residual is the divergence
 indicator: it reduces to the code discriminator for a well-steered member and grows without
 bound for one drifting away, which is why it is reported rather than dropped.
 
@@ -136,16 +136,16 @@ longer flagged. Count the flags where you need the size of the loop.
 """
 struct VTStatus
     running::Bool
-    member_sats::Dictionary{Tuple{Symbol,Int},SatInfo}
+    member_sats::Dictionary{Tuple{Symbol,Int},SatelliteInfo}
     position_std::typeof(1.0m)
     clock_std::typeof(1.0m)
-    time_with_insufficient_meas::typeof(1.0s)
+    time_with_insufficient_measurements::typeof(1.0s)
 end
 
 # Convenience: a status carrying only the loop state — no per-member report and no
 # uncertainties, as a filter that has not updated yet has neither.
 VTStatus(running) =
-    VTStatus(running, Dictionary{Tuple{Symbol,Int},SatInfo}(), NaN * m, NaN * m, 0.0s)
+    VTStatus(running, Dictionary{Tuple{Symbol,Int},SatelliteInfo}(), NaN * m, NaN * m, 0.0s)
 
 """
     ReceiverDataOfInterest
@@ -157,7 +157,7 @@ tracking is disabled). This is the element type produced by [`receive`](@ref).
 
 `sat_data` is a `Dictionaries.Dictionary` (GNSSReceiver.jl PR #96) keyed by
 `(signal_id, prn)` — the ranging signal's id and PRN — so the same PRN can appear on
-several constellations and bands without colliding, and the key matches `pvt.sats`
+several constellations and bands without colliding, and the key matches `pvt.satellites`
 (which `PositionVelocityTime` keys by the same ranging signal).
 """
 struct ReceiverDataOfInterest{S<:SatelliteDataOfInterest}
@@ -266,7 +266,7 @@ function vt_status_of_interest(estimator::VectorPLLAndDLL)
         copy(vector_loop_members(estimator)),
         status.position_std,
         status.clock_std,
-        status.time_with_insufficient_meas,
+        status.time_with_insufficient_measurements,
     )
 end
 
@@ -313,7 +313,7 @@ end
 # Start-of-tracking coherent integration time of `signal`: the loop update period
 # the carrier discriminator sees at the acquisition→tracking handover. Before
 # bit/secondary-code sync the loops integrate a single primary code block, so this
-# is one primary-code period (get_code_length / get_code_frequency).
+# is one primary-code period (get_code_length / get_chip_rate).
 handover_coherent_integration_time(signal::AbstractGNSSSignal) = primary_code_period(signal)
 
 # Carrier-Doppler pull-in range: the largest carrier-Doppler error the tracking

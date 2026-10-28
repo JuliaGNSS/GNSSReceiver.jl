@@ -255,7 +255,7 @@ offset instead, which differs from this integral alike for every satellite.
 function update_clock_phase!(clock::ReceiverClockPhase, pvt, runtime)
     isnan(clock.first_runtime) && (clock.first_runtime = runtime)
     if !isnothing(pvt.time)
-        drift = pvt.relative_clock_drift
+        drift = relative_clock_drift(pvt)
         clock.phase +=
             isnan(clock.drift) ? drift * (runtime - clock.first_runtime) :
             0.5 * (clock.drift + drift) * (runtime - clock.runtime)

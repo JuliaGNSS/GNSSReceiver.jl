@@ -23,7 +23,7 @@ using UnicodePlots
 using UnicodeMaps: TileSource, worldmap
 using Dates: @dateformat_str
 using AstroTime: TAIEpoch, to_utc
-using PositionVelocityTime: get_LLA, get_sat_enu
+using PositionVelocityTime: get_lla, calc_elevation_and_azimuth
 using SignalChannels: consume_channel
 # `Unitful` itself (not `using Unitful`) because Tachikoma exports an easing function also
 # named `linear`, which would make the bare name ambiguous here.
@@ -205,10 +205,10 @@ function view(m::ReceiverModel, f::Frame)
     # Vector-tracking badge, coloured by state: green while the navigation filter is closing
     # the loops, yellow while enabled but not yet running ("armed"), and nothing at all when
     # VT is disabled. The count reads measured/loop — the satellites whose measurements
-    # determined this solution (`pvt.sats`, the same set the fix-quality table counts) out of
-    # the loop's total membership (the `in_vt_loop` flags of this same frame), the difference
-    # being members coasted through an obscuration. One number for both would hide exactly
-    # that.
+    # determined this solution (`pvt.satellites`, the same set the fix-quality table counts)
+    # out of the loop's total membership (the `in_vt_loop` flags of this same frame), the
+    # difference being members coasted through an obscuration. One number for both would
+    # hide exactly that.
     vt = gui_data === nothing ? nothing : gui_data.vt
     if vt !== nothing
         num_members = count(sat -> sat.in_vt_loop, gui_data.sat_data)
@@ -217,12 +217,12 @@ function view(m::ReceiverModel, f::Frame)
         # navigation state and pays it back at half rate afterwards, so it is an "unsolvable
         # for about this long" figure rather than a stopwatch — shown only while it is running
         # up, and dropped from the badge as soon as it is back to zero.
-        coasting = vt.time_with_insufficient_meas > 0.0s ?
-            ", propagating $(round(ustrip(s, vt.time_with_insufficient_meas); digits = 1)) s" :
-            ""
+        starved = vt.time_with_insufficient_measurements
+        coasting =
+            starved > 0.0s ? ", propagating $(round(ustrip(s, starved); digits = 1)) s" : ""
         badge, badge_style = vt.running ?
             (
-                "  │  VT running ($(length(gui_data.pvt.sats))/$(num_members) sats$(coasting))",
+                "  │  VT running ($(length(gui_data.pvt.satellites))/$(num_members) sats$(coasting))",
                 isempty(coasting) ? tstyle(:success, bold = true) : tstyle(:warning, bold = true),
             ) :
             ("  │  VT armed", tstyle(:warning))
@@ -306,13 +306,15 @@ _sat_bar_color(sat) =
 
 function _render_cn0(buf, area::Rect, gui_data, num_dots)
     # One marker column carries both memberships, which are different sets: the vector loop
-    # (`in_vt_loop`) and the satellites whose measurements determined this fix (`pvt.sats`).
-    # A loop member missing from `pvt.sats` was coasted through this update — the case worth
-    # seeing — so it gets its own glyph rather than sharing `*`. Without VT only the fix
-    # membership is left to show. Legends ride in the panel title and appear only once some
-    # satellite carries the mark, so a quiet receiver adds no chrome.
+    # (`in_vt_loop`) and the satellites whose measurements determined this fix
+    # (`pvt.satellites`). A loop member missing from `pvt.satellites` was coasted through
+    # this update — the case worth seeing — so it gets its own glyph rather than sharing
+    # `*`. Without VT only the fix membership is left to show. Legends ride in the panel
+    # title and appear only once some satellite carries the mark, so a quiet receiver adds
+    # no chrome.
     vt_on = gui_data !== nothing && gui_data.vt !== nothing
-    in_fix = gui_data === nothing ? Set{Tuple{Symbol,Int}}() : Set(keys(gui_data.pvt.sats))
+    in_fix =
+        gui_data === nothing ? Set{Tuple{Symbol,Int}}() : Set(keys(gui_data.pvt.satellites))
     title = if vt_on && any(sd -> sd.in_vt_loop, values(gui_data.sat_data))
         CN0_PANEL_TITLE_SHORT * "  (* VT+fix, ∘ VT coasted, · fix)"
     elseif !isempty(in_fix)
@@ -427,18 +429,20 @@ function _render_skyplot(buf, area::Rect, gui_data, num_dots)
     # (e.g. Galileo E1B + E5a) shares an az/el, so key by (constellation, PRN) — not
     # (signal, PRN) — to stop the duplicates piling onto each other. Colour by constellation.
     seen = Set{Tuple{Symbol,Int}}()
-    azs = Float64[]
+    angles = Float64[]
     els_deg = Float64[]
     prns = Int[]
     point_colors = Symbol[]
-    for (key, info) in pairs(pvt.sats)
+    for (key, info) in pairs(pvt.satellites)
         signal_id, prn = key
         system = constellation_of(signal_id)
         (system, prn) in seen && continue
         push!(seen, (system, prn))
-        enu = get_sat_enu(pvt.position, info.position)
-        push!(azs, enu.θ)
-        push!(els_deg, enu.ϕ * 180 / π)
+        elevation, azimuth = calc_elevation_and_azimuth(pvt.position, info.position)
+        # `polarplot` measures its angle counter-clockwise from East (+x), the azimuth
+        # clockwise from North.
+        push!(angles, π / 2 - azimuth)
+        push!(els_deg, elevation * 180 / π)
         push!(prns, prn)
         push!(point_colors, get(CONSTELLATION_COLORS, system, :white))
     end
@@ -457,14 +461,14 @@ function _render_skyplot(buf, area::Rect, gui_data, num_dots)
     # distance, which is not what a GNSS user expects, so they are suppressed
     # (`num_rad_lab = 0`) and the rings are annotated with elevation below.
     zenith_dists = 90 .- els_deg
-    doa_plot = polarplot(azs, zenith_dists; rlim = (0, 90), scatter = true,
+    doa_plot = polarplot(angles, zenith_dists; rlim = (0, 90), scatter = true,
         marker = :circle, color = point_colors, border = :none,
         num_rad_lab = 0, width = wcanvas, height = hcanvas)
     # Label each satellite with its PRN number (coloured by constellation) placed exactly
-    # on its point. `polarplot` plots θ (az) counter-clockwise from +x at radius r, so the
-    # point's Cartesian position is (r·cos az, r·sin az) — annotate there.
-    for (az, r, prn, col) in zip(azs, zenith_dists, prns, point_colors)
-        annotate!(doa_plot, r * cos(az), r * sin(az), string(prn); color = col)
+    # on its point. `polarplot` plots θ counter-clockwise from +x at radius r, so the
+    # point's Cartesian position is (r·cos θ, r·sin θ) — annotate there.
+    for (θ, r, prn, col) in zip(angles, zenith_dists, prns, point_colors)
+        annotate!(doa_plot, r * cos(θ), r * sin(θ), string(prn); color = col)
     end
     # Elevation rings, labelled along the same π/4 diagonal `polarplot` uses for its own
     # radial labels, and — like those — as bare numbers: the `°` is reserved for the azimuth
@@ -484,7 +488,7 @@ function _render_skyplot(buf, area::Rect, gui_data, num_dots)
     label!(doa_plot, :l, mid_row, "270°"; color = grid_color)
     _paint_plot!(buf, plotarea, string(doa_plot; color = true))
     # Legend: a coloured ● per present constellation, matching the point colours exactly.
-    present = sort(unique(constellation_of(first(key)) for key in keys(pvt.sats)))
+    present = sort(unique(constellation_of(first(key)) for key in keys(pvt.satellites)))
     _paint_plot!(buf, Rect(inner.x + 1, bottom(inner), inner.width - 1, 1),
         _legend_ansi(present))
     return
@@ -521,11 +525,11 @@ function _render_position(buf, area::Rect, gui_data, last_fix, show_diag, fresh,
         return
     end
     pvt = fix.pvt
-    lla = get_LLA(pvt)
+    lla = get_lla(pvt)
     lat_hem = lla.lat >= 0 ? "N" : "S"
     lon_hem = lla.lon >= 0 ? "E" : "W"
     speed = sqrt(sum(abs2, pvt.velocity))
-    # Time solution: `pvt.time` is a TAI time (PositionVelocityTime's `TAITime`, converted
+    # Time solution: `pvt.time` is a TAI time (GNSSSignals' `TAITime`, converted
     # to an AstroTime epoch through its AstroTime extension) shown as UTC (leap-aware
     # `to_utc`) to ms, time-then-date (HH:MM:SS.sss dd.mm.yyyy).
     utc_str = to_utc(String, TAIEpoch(pvt.time), dateformat"HH:MM:SS.sss dd.mm.yyyy")
@@ -579,7 +583,7 @@ end
 # background task has cached; until that arrives — and whenever it cannot be fetched at all
 # (no network) — the panel falls back to the coordinates and a Google Maps link.
 #
-# `get_LLA` is called unguarded, exactly as in `_render_position`: both panels convert the
+# `get_lla` is called unguarded, exactly as in `_render_position`: both panels convert the
 # same `pvt`, so swallowing a failure here would only blank this panel while the PVT panel
 # above still crashed the frame.
 function _render_map(m::ReceiverModel, buf, area::Rect, last_fix, num_dots)
@@ -590,7 +594,7 @@ function _render_map(m::ReceiverModel, buf, area::Rect, last_fix, num_dots)
             tstyle(:text_dim); max_x = right(inner))
         return
     end
-    lla = get_LLA(last_fix.pvt)
+    lla = get_lla(last_fix.pvt)
     zoom, dlon, dlat = @lock m.lk (m.map_zoom, m.map_dlon, m.map_dlat)
     lat, lon = round(lla.lat + dlat; digits = 5), round(lla.lon + dlon; digits = 5)
     ansi = if inner.width < MAP_MIN_WIDTH || inner.height < MAP_MIN_HEIGHT

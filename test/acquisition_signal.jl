@@ -74,13 +74,13 @@
     @test G.acquisition_signal(b1i, fs, 100Hz) === b1i
 end
 
-@testset "signal_group_key uses the ranging signal (matches pvt.sats)" begin
+@testset "signal_group_key uses the ranging signal (matches pvt.satellites)" begin
     G = GNSSReceiver
     # Plain signal: ranging == data == itself, so the key is the signal's own id.
     @test G.signal_group_key(GPSL1CA()) == get_signal_id(GPSL1CA())
     @test G.signal_group_key(GPSL5I()) == get_signal_id(GPSL5I())
     # CombinedSignal: keyed by the pilot (ranging) id, NOT the data id — matching what
-    # PVT keys `pvt.sats` by (`calc_pvt` is handed the ranging signal).
+    # PVT keys `pvt.satellites` by (`calc_pvt` is handed the ranging signal).
     l5 = G.CombinedSignal(GPSL5Q(), GPSL5I())
     e1 = G.CombinedSignal(GalileoE1C(), GalileoE1B())
     @test G.signal_group_key(l5) == get_signal_id(GPSL5Q()) == get_signal_id(G.ranging_signal(l5))

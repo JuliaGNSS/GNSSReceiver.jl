@@ -142,7 +142,8 @@ let
         got_pvt = false
         last_pvt = nothing
         last_sat_data = nothing
-        # sat_data / pvt.sats are keyed by (get_signal_id, prn); reduce to bare PRNs here.
+        # sat_data / pvt.satellites are keyed by (get_signal_id, prn); reduce to bare PRNs
+        # here.
         acquired_prns = Set{Int}()
         healthy_prns = Set{Int}()
 
@@ -197,8 +198,12 @@ let
         # Final-fix epoch: the last scalar solve now falls on the 100 ms grid instead of a
         # drifting 100 / 104 ms cadence, 47 ms earlier than the 20.697 s captured before.
         expected_time = TAIEpoch(2017, 9, 10, 22, 57, 20.650)                  # final-fix epoch (TAI)
-        expected_time_correction = -2.0226547144e7                             # receiver clock bias (metres)
-        expected_relative_clock_drift = 7.40e-7                                # dimensionless
+        # Re-captured under PositionVelocityTime 8, whose clock bias counts from the
+        # reference measurement's transmit time rather than the latest one: 1.86e6 m
+        # (6.2 ms, that satellite's lead) below the -2.0226547144e7 m of the earlier
+        # convention.
+        expected_clock_bias = -2.208414971072839e7                             # m
+        expected_clock_drift = 7.40e-7 * 299792458.0                           # m/s
         expected_gdop = 1.62
         expected_pdop = 1.45
         expected_hdop = 0.91
@@ -243,9 +248,9 @@ let
         @test last_pvt.time isa TAITime
         @test abs(AstroTime.value(TAIEpoch(last_pvt.time) - expected_time)) < 0.001
 
-        # Receiver clock bias (now in metres) and drift
-        @test isapprox(ustrip(u"m", last_pvt.time_correction), expected_time_correction, rtol = 1e-4)
-        @test isapprox(last_pvt.relative_clock_drift, expected_relative_clock_drift, rtol = 0.05)
+        # Receiver clock bias (m) and drift (m/s)
+        @test isapprox(ustrip(u"m", last_pvt.clock_bias), expected_clock_bias, rtol = 1e-4)
+        @test isapprox(ustrip(u"m/s", last_pvt.clock_drift), expected_clock_drift, rtol = 0.05)
 
         # DOPs depend only on satellite geometry; reproducible to ~1%.
         @test isapprox(last_pvt.dop.GDOP, expected_gdop, rtol = 0.05)
@@ -255,7 +260,7 @@ let
         @test isapprox(last_pvt.dop.TDOP, expected_tdop, rtol = 0.05)
 
         # All 11 healthy sats should be in the fix.
-        @test length(last_pvt.sats) == 11
+        @test length(last_pvt.satellites) == 11
 
         # Per-satellite CN0 at the time of the final PVT fix: ±1 dB-Hz catches sensitivity
         # regressions in the correlator/post-corr filter and in the noise reference the
@@ -418,7 +423,8 @@ let
         @test !isnothing(last)
 
         pvt = last.data.pvt
-        @info "Vector tracking final fix" pvt.time pvt.position num_sats = length(pvt.sats)
+        @info "Vector tracking final fix" pvt.time pvt.position num_satellites =
+            length(pvt.satellites)
 
         # The same receiver location as the scalar baseline (Sep 10, 2017,
         # Oegstgeest, NL). The navigation filter's pseudoranges are atmosphere-
@@ -448,7 +454,7 @@ let
         @test abs(AstroTime.value(TAIEpoch(pvt.time) - expected_final_time)) < 1.0
 
         # The filter reports a full measurement geometry at the end of the run.
-        @test length(pvt.sats) >= 7
+        @test length(pvt.satellites) >= 7
         @test !isnothing(pvt.dop)
 
         # RINEX under vector tracking: the navigation filter counts its clock bias from its
@@ -538,7 +544,7 @@ let
             @test maximum(abs, third_difference) < 0.5
         end
 
-        # `SatInfo.residual` is the POST-fit pseudorange residual — the same
+        # `SatelliteInfo.residual` is the POST-fit pseudorange residual — the same
         # quantity the scalar `calc_pvt` reports, in the same observed − computed
         # orientation — so a vector-tracking solution is directly comparable with a
         # scalar one. Reporting the filter's pre-fit innovation here instead would
@@ -554,14 +560,14 @@ let
         # unaffected — but it does inflate the reported residual RMS relative to
         # a scalar solve. Tracked as an open issue; asserted loosely here so a
         # regression in the per-satellite part is still caught.
-        residuals = [ustrip(u"m", info.residual) for info in pvt.sats]
+        residuals = [ustrip(u"m", info.residual) for info in pvt.satellites]
         @test all(isfinite, residuals)
         common_mode = sum(residuals) / length(residuals)
         scatter = sqrt(sum(abs2, residuals .- common_mode) / length(residuals))
         @test scatter < 15.0
         @test abs(common_mode) < 80.0
 
-        # `SatInfo.rate_residual` is the range-rate counterpart, formed from the
+        # `SatelliteInfo.rate_residual` is the range-rate counterpart, formed from the
         # carrier-Doppler (FLL) measurements the VDFLL fuses alongside the
         # pseudoranges. It is the independent half of the diagnostic: a satellite
         # can carry a clean pseudorange residual and still disagree with the
@@ -575,7 +581,7 @@ let
         # measurement quality itself, not a vector-loop artefact. Bounded with
         # headroom so a real regression — a sign flip, a wavelength/Hz mix-up, or a
         # missing FLL contribution — still shows up.
-        rate_residuals = [ustrip(u"m/s", info.rate_residual) for info in pvt.sats]
+        rate_residuals = [ustrip(u"m/s", info.rate_residual) for info in pvt.satellites]
         @test all(isfinite, rate_residuals)
         rate_common_mode = sum(rate_residuals) / length(rate_residuals)
         rate_scatter =

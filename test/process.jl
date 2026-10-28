@@ -425,7 +425,7 @@ pvt_group_sats(system, sat_states, track_state, threshold) = collect(
         pvt_group_sats(system, Dictionary([5], [ready]), track_state, time_in_lock_before_pvt)
     @test length(states) == 1
     # PVT is handed the ranging signal, and the satellite's own decoder and code phase.
-    @test states[1].system == GNSSReceiver.ranging_signal(system)
+    @test states[1].signal == GNSSReceiver.ranging_signal(system)
     @test states[1].code_phase == get_code_phase(get_sat_state(track_state, key, 5))
     @test states[1].decoder === ready.decoder
 

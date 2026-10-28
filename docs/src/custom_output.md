@@ -54,7 +54,7 @@ end
 ```
 
 Key any per-satellite payload by `(group_key, prn)` — the same key `sat_data` and
-`pvt.sats` use, so a satellite lines up across constellations and bands.
+`pvt.satellites` use, so a satellite lines up across constellations and bands.
 
 ## Example
 

@@ -34,7 +34,7 @@ function receive_time_of_week(time::TAITime, time_system)
     origin = gps_time_origin()
     mod(time.second - origin.second, SECONDS_PER_WEEK) +
     (time.fraction - origin.fraction) +
-    time_scale_offset(time_system, GNSSSignals.GPST())
+    ustrip(s, get_leap_second_offset(GNSSSignals.GPST(), time_system))
 end
 
 # The receiver time [s, on the run's sample grid] the solution's epoch was measured at: the
@@ -63,7 +63,7 @@ function obs_epoch_timing(logger::RinexLogger, receiver_state)
         warn_interval_below_chunk(logger)
     pvt = receiver_state.pvt
     isnothing(pvt.time) && return nothing
-    isempty(pvt.sats) && return nothing
+    isempty(pvt.satellites) && return nothing
     # The solution's epoch is the receive time it solved for, clock bias applied, where the
     # solver measured (see `solution_runtime`).
     if pvt.time != steering.last_pvt_time
@@ -79,7 +79,7 @@ function obs_epoch_timing(logger::RinexLogger, receiver_state)
     span > steering.max_solution_age && return nothing
     receive_time =
         receive_time_of_week(pvt.time, logger.time_system) +
-        span * (1 - pvt.relative_clock_drift)
+        span * (1 - relative_clock_drift(pvt))
     # The week comes from the reported epoch, which needs only coarse precision for that:
     # the absolute count minus the time of week is a whole number of weeks by construction.
     # Counted from the time system's own origin, as the time of week is.
@@ -140,7 +140,7 @@ function build_obs_epoch(logger::RinexLogger, receiver_state, timing::ObsEpochTi
     satellites = Dict{Tuple{Char,Int},Vector{Pair{String,ObsValue}}}()
     # The satellites of the PVT solution are exactly those with a decoded time of week, and
     # so the only ones a transmit time — and hence a pseudorange — exists for.
-    for (group_key, prn) in keys(receiver_state.pvt.sats)
+    for (group_key, prn) in keys(receiver_state.pvt.satellites)
         layout = get(logger.layouts, group_key, nothing)
         isnothing(layout) && continue
         sat_state = get_sat_state(track_state, group_key, prn)
@@ -149,7 +149,7 @@ function build_obs_epoch(logger::RinexLogger, receiver_state, timing::ObsEpochTi
         # epochs, pseudoranges and phases are.
         doppler =
             ustrip(Hz, get_carrier_doppler(sat_state)) +
-            receiver_state.pvt.relative_clock_drift * layout.carrier_frequency
+            relative_clock_drift(receiver_state.pvt) * layout.carrier_frequency
         # In dB-Hz, the unit of the S observable. An estimate that has not converged is not
         # finite, which RINEXParser writes blank.
         cn0 = ustrip(estimate_cn0(sat_state, RANGING_SIGNAL_INDEX))

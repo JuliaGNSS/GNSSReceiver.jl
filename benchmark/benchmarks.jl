@@ -63,7 +63,7 @@ const STAGE_LABEL = "$(uconvert(u"s", N_1S * CHUNK / SAMPLING_FREQ)) signal"
 # `acquire!` cost, so it goes in the acquisition benchmark's label. Derived from
 # the system's code length / chip rate rather than hard-coded.
 const COHERENT_INTEGRATION =
-    uconvert(u"ms", ACQ_CODE_CYCLES * get_code_length(SYSTEM) / get_code_frequency(SYSTEM))
+    uconvert(u"ms", ACQ_CODE_CYCLES * get_code_length(SYSTEM) / _chip_rate(SYSTEM))
 
 const DC = Tracking.CPUThreadedDownconvertAndCorrelator()
 
@@ -84,8 +84,12 @@ const DC_INT16_NOTHREAD = Tracking.Int16DownconvertAndCorrelator(2^7)
 # acquisition-plan NamedTuple keyed by the group's signal id, and the PVT year
 # keyword is `pvt_approximate_year` (was `approximate_year`). Lets
 # `benchpkg --bench-on=head` compute a real base-vs-head ratio across this
-# API-breaking bump.
+# API-breaking bump. On GNSSSignals 5, the chip rate is `get_chip_rate`.
 const _IS_MULTIBAND = isdefined(GNSSReceiver, :CombinedSignal)
+const _IS_GNSSSIGNALS_5 = isdefined(GNSSSignals, :get_chip_rate)
+_chip_rate(signal) =
+    _IS_GNSSSIGNALS_5 ? GNSSSignals.get_chip_rate(signal) :
+    GNSSSignals.get_code_frequency(signal)
 
 _process(rs, acq_plans, meas, dc; kwargs...) =
     if _IS_MULTIBAND
@@ -118,7 +122,7 @@ _process(rs, acq_plans, meas, dc; kwargs...) =
 function make_receiver_and_plan(::Type{T}) where {T}
     nacq = round(
         Int,
-        get_code_length(SYSTEM) * upreferred(SAMPLING_FREQ / get_code_frequency(SYSTEM)) *
+        get_code_length(SYSTEM) * upreferred(SAMPLING_FREQ / _chip_rate(SYSTEM)) *
         ACQ_CODE_CYCLES,
     )
     rs = ReceiverState(T, SYSTEM; num_ants = NumAnts(1), num_samples_for_acquisition = nacq)

@@ -137,8 +137,8 @@ const CONSTELLATION_NAMES =
 
 # Constellation of a `get_signal_id` symbol, used to group, order and colour satellites in
 # the CN0 bars and the DOA plot. Keyed by symbol because that is what `sat_data` and
-# `pvt.sats` carry — the signal *type* is long gone by the time the GUI runs. A signal the
-# GUI does not know (e.g. one defined downstream) falls into `:Other`, which the letter,
+# `pvt.satellites` carry — the signal *type* is long gone by the time the GUI runs. A signal
+# the GUI does not know (e.g. one defined downstream) falls into `:Other`, which the letter,
 # order and colour tables all carry an entry for, so the GUI degrades instead of erroring.
 constellation_of(signal_id::Symbol) = get(SIGNAL_CONSTELLATIONS, signal_id, :Other)
 
@@ -213,9 +213,10 @@ function ifbs_vs_lowest_band(pvt)
     isempty(pvt.inter_frequency_biases) && return out
     # Difference graph: an undirected edge band—reference weighted by bias[band] - bias[ref].
     adj = Dict{Symbol,Vector{Tuple{Symbol,typeof(1.0m)}}}()
-    for (band, ifb) in pvt.inter_frequency_biases
-        push!(get!(() -> Tuple{Symbol,typeof(1.0m)}[], adj, band), (ifb.reference, ifb.value))
-        push!(get!(() -> Tuple{Symbol,typeof(1.0m)}[], adj, ifb.reference), (band, -ifb.value))
+    for (band, ifb) in pairs(pvt.inter_frequency_biases)
+        reference = ifb.reference_band
+        push!(get!(() -> Tuple{Symbol,typeof(1.0m)}[], adj, band), (reference, ifb.value))
+        push!(get!(() -> Tuple{Symbol,typeof(1.0m)}[], adj, reference), (band, -ifb.value))
     end
     rank(b) = get(BAND_ORDER, b, 99)
     visited = Set{Symbol}()
@@ -253,7 +254,7 @@ function isbs_vs_lowest_system(pvt)
     out = Tuple{Any,typeof(1.0m),Any}[]
     isempty(pvt.inter_system_biases) && return out
     bias = Dict{Any,typeof(1.0m)}(pvt.reference_system => 0.0m)
-    for (sys, v) in pvt.inter_system_biases
+    for (sys, v) in pairs(pvt.inter_system_biases)
         bias[sys] = v
     end
     rank(s) = get(TIME_SYSTEM_ORDER, get_time_system_id(s), 99)
@@ -404,16 +405,17 @@ function pvt_details_lines(pvt)
         end
     end
 
-    if !isempty(pvt.sats)
-        n = length(pvt.sats)
+    if !isempty(pvt.satellites)
+        n = length(pvt.satellites)
         # Estimated unknowns: 3 position + one clock per time system (reference +
         # each inter-system bias) + one per extra band.
         num_unknowns = 3 + (1 + length(pvt.inter_system_biases)) + length(pvt.inter_frequency_biases)
         # Range and range-rate residuals side by side: the rate column is the Doppler-domain
         # counterpart, so a satellite consistent in range but not in rate (a cycle slip, or a
         # replica the loop is dragging) shows up as a rate RMS out of scale with the range one.
-        residuals = [ustrip(m, info.residual) for info in values(pvt.sats)]
-        rate_residuals = [ustrip(m/s, info.rate_residual) for info in values(pvt.sats)]
+        satellites = values(pvt.satellites)
+        residuals = [ustrip(m, info.residual) for info in satellites]
+        rate_residuals = [ustrip(m/s, info.rate_residual) for info in satellites]
         # Table rows (label, RMS, rate RMS, count): overall first, then one per signal.
         rows = Tuple{String,Float64,Float64,Int}[
             ("overall", _rms(residuals), _rms(rate_residuals), n),
@@ -421,9 +423,9 @@ function pvt_details_lines(pvt)
         # Drawn as children of the `overall` row above, so the table reads as one figure and
         # its breakdown — the per-signal counts sum to the overall `n` — rather than as a
         # column of unrelated numbers where `overall` is just the widest label.
-        sigs = unique(first(key) for key in keys(pvt.sats))
+        sigs = unique(first(key) for key in keys(pvt.satellites))
         for (i, sig) in enumerate(sigs)
-            sig_keys = [key for key in keys(pvt.sats) if first(key) == sig]
+            sig_keys = [key for key in keys(pvt.satellites) if first(key) == sig]
             # Label each per-signal row by its band abbreviation (e.g. `GalileoE1C_BOC11`
             # → "E1"), falling back to the raw id for an unlisted signal.
             push!(
@@ -431,8 +433,10 @@ function pvt_details_lines(pvt)
                 (
                     (i == lastindex(sigs) ? "└ " : "├ ") *
                     get(BAND_ABBREVIATIONS, sig, string(sig)),
-                    _rms([ustrip(m, pvt.sats[key].residual) for key in sig_keys]),
-                    _rms([ustrip(m/s, pvt.sats[key].rate_residual) for key in sig_keys]),
+                    _rms([ustrip(m, pvt.satellites[key].residual) for key in sig_keys]),
+                    _rms([
+                        ustrip(m/s, pvt.satellites[key].rate_residual) for key in sig_keys
+                    ]),
                     length(sig_keys),
                 ),
             )

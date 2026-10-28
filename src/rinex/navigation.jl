@@ -2,7 +2,7 @@
 # records broadcast alongside them. Turning a decoded message into a RINEX record — units,
 # issue-of-data and health words, the week counts — is RINEXParser's, through its GNSSDecoder
 # extension (`rinex_ephemeris`, `add_header_records!`); this side only picks the decoders and
-# supplies the continuous week.
+# supplies the observation's year.
 
 # Every tracked satellite's current ephemeris, plus the navigation header assembled from
 # whatever ionosphere, time-system and leap-second records have been decoded so far.
@@ -23,15 +23,14 @@ function build_nav_records(logger::RinexLogger, receiver_state)
                 continue
             end
             is_decoding_completed_for_positioning(decoder) || continue
-            # The continuous week on the constellation's own count, the GPS L1 C/A
-            # rollover resolved the way the PVT solution resolves it, so a written
-            # ephemeris and the fix never disagree about the cycle a recording is in.
-            week = PositionVelocityTime.get_week(
-                decoder;
-                approximate_year = logger.approximate_year,
-            )
-            push!(ephemerides, rinex_ephemeris(decoder; week))
-            add_header_records!(header, decoder; week)
+            # The record's week is the decoder's (GNSSDecoder's `get_week`), the GPS L1 C/A
+            # rollover resolved against the observation's year as for the PVT solution, so
+            # a written ephemeris and the fix never disagree about the cycle a recording is
+            # in. A message that has not decoded its week yet has no record.
+            (; approximate_year) = logger
+            ephemeris = rinex_ephemeris(decoder; approximate_year)
+            isnothing(ephemeris) || push!(ephemerides, ephemeris)
+            add_header_records!(header, decoder; approximate_year)
         end
     end
     ephemerides, header

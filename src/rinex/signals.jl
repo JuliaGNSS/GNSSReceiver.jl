@@ -101,7 +101,7 @@ function rinex_layout(band_systems::Tuple, interm_freqs::Tuple, sampling_freq)
         for system in systems
             # We range on the ranging signal (the pilot of a `CombinedSignal`), so that is
             # the signal the observables belong to — and its id is the group key that
-            # addresses the satellite in `track_state` and in `pvt.sats`.
+            # addresses the satellite in `track_state` and in `pvt.satellites`.
             signal = ranging_signal(system)
             codes = ranging_obs_codes(signal)
             system_char = RINEXParser.satellite_system(signal)

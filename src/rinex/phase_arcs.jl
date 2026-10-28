@@ -22,15 +22,15 @@ the known overlay. Otherwise it is the decoder's bit polarity times the sign the
 sync locked at, as the bits the decoder is fed already carry that sign; both have to be
 known. In the vector loop the prompts are decoded on the replica plus the residual PLL's
 correction, so the same rule holds for the beat phase that includes it. The convention is
-GNSSDecoder's, a positive symbol for a 0 bit.
+GNSSDecoder's, a positive soft bit for a 0 bit.
 """
 function carrier_polarity(track_state, group_key, prn, layout::RinexSignalLayout, decoder)
     if is_dataless_with_secondary_code(layout.signal)
         pilot = get_bit_buffer(track_state, group_key, prn, RANGING_SIGNAL_INDEX)
         return pilot.found ? Int8(pilot.polarity) : Int8(0)
     end
-    isnothing(decoder.num_bits_after_valid_syncro_sequence) && return Int8(0)
-    isnothing(get_time_of_week(decoder)) && return Int8(0)
+    isnothing(decoder.num_bits_since_sync) && return Int8(0)
+    isnothing(get_broadcast_time_of_week(decoder)) && return Int8(0)
     bit_buffer = get_bit_buffer(track_state, group_key, prn, layout.data_index)
     bit_buffer.found || return Int8(0)
     Int8(bit_buffer.polarity * (decoder.is_shifted_by_180_degrees ? -1 : 1))
@@ -52,7 +52,7 @@ arc_polarity(polarity, layout, synced_at, arc_start) =
 # A decoder first seen synchronised counts as synchronising now; one not synchronised has
 # none.
 function note_decoder_sync!(logger, key, decoder, runtime)
-    bits = decoder.num_bits_after_valid_syncro_sequence
+    bits = decoder.num_bits_since_sync
     if isnothing(bits)
         delete!(logger.decoder_syncs, key)
         return -Inf
@@ -142,11 +142,11 @@ function update_carrier_phases!(logger::RinexLogger, receiver_state, runtime)
             )
             measurable || continue
 
-            # `get_carrier_phase` reports the replica phase in radians, wrapped into one
-            # cycle; the accumulator works in cycles, as RINEX does. In the vector loop the
-            # replica's phase is the NCO's, which the navigation filter sets; the correction
-            # brings it onto the carrier.
-            fractional = get_carrier_phase(sat_state) / 2π
+            # `get_carrier_phase` reports the replica phase in cycles, wrapped into one cycle,
+            # as the accumulator and RINEX count it. In the vector loop the replica's phase is
+            # the NCO's, which the navigation filter sets; the correction, in cycles too, brings
+            # it onto the carrier.
+            fractional = get_carrier_phase(sat_state)
             doppler = ustrip(Hz, get_carrier_doppler(sat_state))
             correction =
                 get_carrier_phase_correction(
@@ -154,7 +154,7 @@ function update_carrier_phases!(logger::RinexLogger, receiver_state, runtime)
                     group_key,
                     prn,
                     layout.sampling_frequency,
-                ) / 2π
+                )
             polarity = carrier_polarity(track_state, group_key, prn, layout, decoder)
 
             arc_start = isnothing(previous) ? runtime : previous.start_runtime
