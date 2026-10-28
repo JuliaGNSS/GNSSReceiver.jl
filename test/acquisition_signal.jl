@@ -86,3 +86,27 @@ end
     @test G.signal_group_key(l5) != get_signal_id(G.data_signal(l5))
     @test G.signal_group_key(e1) == get_signal_id(GalileoE1C())
 end
+
+@testset "BeiDou GEO satellites are acquired on a plan of their own" begin
+    # A BeiDou B1I or B3I GEO satellite (PRN 1-5, 59-63) broadcasts D2 bits of 2 code
+    # periods without the NH20 overlay, where the other satellites' D1 bits span 20; one
+    # plan holds one bit count, so the GEO PRNs get a plan of their own.
+    G = GNSSReceiver
+    geo = [1, 2, 3, 4, 5, 59, 60, 61, 62, 63]
+    for (signal, sampling_freq) in ((BeiDouB1I(), 4e6Hz), (BeiDouB3I(), 24.552e6Hz))
+        _, plans, num_samples = G.plan_band_acquisition((signal,), sampling_freq, (250Hz,))
+        d1, d2 = plans[get_signal_id(signal)]
+        @test d1.avail_prns == setdiff(1:63, geo)
+        @test d2.avail_prns == geo
+        # The D1 window spans the overlay; the D2 one the shortest whole number of bits
+        # that meets the resolution, 4 ms for 250 Hz.
+        @test d1.num_coherently_integrated_code_periods == 20
+        @test d2.num_coherently_integrated_code_periods == 4
+        @test num_samples == 20 * G.samples_per_code(signal, sampling_freq)
+    end
+    # Without a GEO PRN to search, and on every other signal, one plan serves them all.
+    _, plans, _ = G.plan_band_acquisition((BeiDouB1I(),), 4e6Hz, (250Hz,); prns = 6:58)
+    @test length(plans.BeiDouB1I) == 1
+    _, plans, _ = G.plan_band_acquisition((GPSL1CA(),), 4e6Hz, (250Hz,))
+    @test length(plans.GPSL1CA) == 1
+end

@@ -402,33 +402,65 @@ function plan_band_acquisition(
         snap_coherent_code_periods(system, ideal)
     end
 
+    # The acquisition plans of each system, keyed like the tracking groups: one per bit
+    # period its PRNs broadcast at (see `plan_system_acquisition`). The plans are built for
+    # (and PRNs restricted by) the acquisition signal; the group key is the ranging
+    # signal's id.
+    group_keys = map(signal_group_key, systems)
+    plans_and_lengths =
+        map(systems, acq_systems, ncoh, acq_doppler_resolutions) do system, acq_sys, nc, res
+            # Per-GNSS candidate PRNs restricted to those that broadcast this signal.
+            prns_for_system = collect(search_prns(prns, data_signal(system)))
+            plan_system_acquisition(acq_sys, sampling_freq, prns_for_system, nc, res)
+        end
+    acq_plans = NamedTuple{group_keys}(map(first, plans_and_lengths))
+
     # Size this band's buffer to the largest coherent plan window
     # (nc · samples_per_code).
     num_samples_for_acquisition = maximum(
-        map((s, nc) -> nc * samples_per_code(s, sampling_freq), acq_systems, ncoh),
+        map(
+            (s, (_, ncs)) -> maximum(ncs) * samples_per_code(s, sampling_freq),
+            acq_systems,
+            plans_and_lengths,
+        ),
     )
 
-    # One acquisition plan per system, keyed like the tracking groups. The plan is
-    # built for (and PRNs restricted by) the acquisition signal; the group key is
-    # the ranging signal's id.
-    group_keys = map(signal_group_key, systems)
-    acq_plans = NamedTuple{group_keys}(map(systems, acq_systems, ncoh) do system, acq_sys, nc
-        # Per-GNSS candidate PRNs restricted to those that broadcast this signal.
-        prns_for_system = search_prns(prns, data_signal(system))
-        plan_acquire(
-            acq_sys,
-            float(sampling_freq),
-            collect(prns_for_system);
-            num_coherently_integrated_code_periods = nc,
-            # Pass our own cap rather than relying on `plan_acquire`'s default: this
-            # is the same value the `acquisition_signal` chooser gates on, so the
-            # selection decision and the plan's actual rotation-search cap can never
-            # drift apart (Acquisition exposes no queryable constant for its default).
-            max_secondary_code_rotations = MAX_SECONDARY_CODE_ROTATIONS,
-        )
-    end)
-
     return systems, acq_plans, num_samples_for_acquisition
+end
+
+# The acquisition plans of one system and their coherent lengths, as two tuples: one plan
+# per bit period among `prns` (`get_code_blocks_per_bit(signal, prn)`). One plan holds one
+# bit count, so satellites whose bits differ in length are planned apart. That is one plan
+# on every signal but BeiDou B1I and B3I, whose GEO satellites broadcast D2 bits ten times
+# shorter than the others' D1 and carry no NH20 overlay. The signal's own satellites keep
+# `nc`; the others are planned without the overlay search (their overlay columns are
+# no-ops), on the shortest whole number of their bits that meets the resolution.
+function plan_system_acquisition(acq_sys, sampling_freq, prns, nc, acq_doppler_resolution)
+    own_code_blocks_per_bit = get_code_blocks_per_bit(acq_sys)
+    plan(prns, nc; kwargs...) = plan_acquire(
+        acq_sys,
+        float(sampling_freq),
+        prns;
+        num_coherently_integrated_code_periods = nc,
+        # Pass our own cap rather than relying on `plan_acquire`'s default: this
+        # is the same value the `acquisition_signal` chooser gates on, so the
+        # selection decision and the plan's actual rotation-search cap can never
+        # drift apart (Acquisition exposes no queryable constant for its default).
+        max_secondary_code_rotations = MAX_SECONDARY_CODE_ROTATIONS,
+        kwargs...,
+    )
+    code_blocks_per_bit(prn) = get_code_blocks_per_bit(acq_sys, prn)
+    own_prns = filter(prn -> code_blocks_per_bit(prn) == own_code_blocks_per_bit, prns)
+    other_prns = setdiff(prns, own_prns)
+    isempty(other_prns) && return (plan(prns, nc),), (nc,)
+    other_code_blocks_per_bit = only(unique(map(code_blocks_per_bit, other_prns)))
+    other_nc = snap_coherent_code_periods(
+        coherent_code_periods_for_resolution(acq_sys, acq_doppler_resolution),
+        1,
+        other_code_blocks_per_bit,
+    )
+    plans = (plan(own_prns, nc), plan(other_prns, other_nc; use_secondary_code = false))
+    plans, (nc, other_nc)
 end
 
 # Whether the processing loop emits the state `process` just produced from

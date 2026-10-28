@@ -156,13 +156,21 @@ samples_per_code(system::AbstractGNSSSignal, sampling_freq) =
 # signals) whole secondary-code periods; sub-bit windows are unconstrained. This
 # mirrors the divisibility constraints `plan_acquire` enforces — it validates
 # these rather than deriving them, so the caller must land on a valid `nc`. A dataless
-# pilot spans no bits (`get_code_blocks_per_bit` is 0) and has no bit constraint.
-function is_valid_coherent_length(system::AbstractGNSSSignal, nc::Int)
+# pilot spans no bits (`get_code_blocks_per_bit` is 0) and has no bit constraint. The
+# second form takes the secondary-code length and the code periods per bit directly, for a
+# plan whose satellites differ from the signal in either (BeiDou GEO; see
+# `plan_band_acquisition`).
+is_valid_coherent_length(system::AbstractGNSSSignal, nc::Int) = is_valid_coherent_length(
+    nc,
+    get_secondary_code_length(system),
+    get_code_blocks_per_bit(system),
+)
+function is_valid_coherent_length(nc::Int, secondary_code_length, code_blocks_per_bit)
     nc <= 1 && return nc == 1
-    L = get_secondary_code_length(system)
-    (L > 1 && nc % L != 0) && return false
-    blocks = get_code_blocks_per_bit(system)
-    spans_partial_bit = !iszero(blocks) && nc >= blocks && nc % blocks != 0
+    (secondary_code_length > 1 && nc % secondary_code_length != 0) && return false
+    spans_partial_bit =
+        !iszero(code_blocks_per_bit) && nc >= code_blocks_per_bit &&
+        nc % code_blocks_per_bit != 0
     !spans_partial_bit
 end
 
@@ -200,10 +208,16 @@ coherent_integration_time(system::AbstractGNSSSignal, nc::Integer) =
 # `acq_doppler_resolution` is treated as a maximum, so snapping must not coarsen it.
 # A valid length always exists above `ideal` (multiples of the secondary-code /
 # bit period), so the search terminates.
-function snap_coherent_code_periods(system::AbstractGNSSSignal, ideal::Int)
+snap_coherent_code_periods(system::AbstractGNSSSignal, ideal::Int) =
+    snap_coherent_code_periods(
+        ideal,
+        get_secondary_code_length(system),
+        get_code_blocks_per_bit(system),
+    )
+function snap_coherent_code_periods(ideal::Int, secondary_code_length, code_blocks_per_bit)
     ideal <= 1 && return 1
     nc = ideal
-    while !is_valid_coherent_length(system, nc)
+    while !is_valid_coherent_length(nc, secondary_code_length, code_blocks_per_bit)
         nc += 1
     end
     nc

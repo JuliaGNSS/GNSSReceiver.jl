@@ -736,7 +736,7 @@ function acquire_satellites(
         missing_satellites = vcat(
             filter(
                 prn -> !(prn in keys(receiver_sat_states)),
-                collect(acq_plan.avail_prns),
+                searched_prns(acq_plan),
             ),
             collect(
                 keys(
@@ -767,6 +767,13 @@ function acquire_satellites(
     track_state, receiver_sat_states
 end
 
+# A group's acquisition plans: one, or one per bit period its PRNs broadcast at (see
+# `plan_system_acquisition`), each searching the PRNs it was built for.
+acquisition_plans(plan::Acquisition.AcquisitionPlan) = (plan,)
+acquisition_plans(plans::Tuple) = plans
+searched_prns(acq_plan) =
+    reduce(vcat, map(plan -> collect(plan.avail_prns), acquisition_plans(acq_plan)))
+
 # One acquisition pass over `prns` on the buffered window, merged back into the
 # receiver: acquire, advance the detected code phases to the current frame, then
 # update the tracking and satellite states. Shared by the periodic scan and fast
@@ -774,6 +781,65 @@ end
 # with the returned `acquired_prns`. Each of the group's plans searches the PRNs among
 # `prns` it was built for; a recursion over the plans' tuple keeps it type-stable.
 function acquire_and_update_states(
+    track_state,
+    receiver_sat_states,
+    system,
+    acq_plan,
+    acquisition_buffer,
+    prns,
+    args...,
+)
+    acquire_on_plans(
+        track_state,
+        receiver_sat_states,
+        Int[],
+        acquisition_plans(acq_plan),
+        system,
+        acquisition_buffer,
+        prns,
+        args,
+    )
+end
+
+acquire_on_plans(track_state, receiver_sat_states, acquired_prns, ::Tuple{}, _, _, _, _) =
+    track_state, receiver_sat_states, acquired_prns
+function acquire_on_plans(
+    track_state,
+    receiver_sat_states,
+    acquired_prns,
+    plans::Tuple,
+    system,
+    acquisition_buffer,
+    prns,
+    args,
+)
+    plan = first(plans)
+    plan_prns = filter(in(plan.avail_prns), prns)
+    if !isempty(plan_prns)
+        track_state, receiver_sat_states, plan_acquired_prns = acquire_with_plan(
+            track_state,
+            receiver_sat_states,
+            system,
+            plan,
+            acquisition_buffer,
+            plan_prns,
+            args...,
+        )
+        append!(acquired_prns, plan_acquired_prns)
+    end
+    acquire_on_plans(
+        track_state,
+        receiver_sat_states,
+        acquired_prns,
+        Base.tail(plans),
+        system,
+        acquisition_buffer,
+        prns,
+        args,
+    )
+end
+
+function acquire_with_plan(
     track_state,
     receiver_sat_states,
     system,
