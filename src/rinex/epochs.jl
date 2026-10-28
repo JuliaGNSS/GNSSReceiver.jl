@@ -133,7 +133,7 @@ function build_obs_epoch(logger::RinexLogger, receiver_state, timing::ObsEpochTi
         # epochs, pseudoranges and phases are.
         doppler =
             ustrip(Hz, get_carrier_doppler(sat_state)) +
-            relative_clock_drift(receiver_state.pvt) * layout.carrier_frequency
+            relative_clock_drift(receiver_state.pvt) * layout.carrier_freq
         # In dB-Hz, the unit of the S observable. An estimate that has not converged is not
         # finite, which RINEXParser writes blank.
         cn0 = ustrip(estimate_cn0(sat_state, RANGING_SIGNAL_INDEX))
@@ -181,7 +181,7 @@ end
 # steered epoch at its own rate, `-f_d`.
 function carrier_phase!(accumulator, logger, layout, range, doppler, propagation)
     beat_phase =
-        carrier_beat_phase(accumulator) + layout.carrier_frequency * logger.clock.phase
+        carrier_beat_phase(accumulator) + layout.carrier_freq * logger.clock.phase
     isnan(accumulator.anchor) &&
         (accumulator.anchor = round(range / wavelength(layout) + beat_phase))
     carrier_phase =

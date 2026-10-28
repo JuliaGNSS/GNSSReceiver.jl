@@ -153,7 +153,7 @@ function update_carrier_phases!(logger::RinexLogger, receiver_state, runtime)
                     track_state,
                     group_key,
                     prn,
-                    layout.sampling_frequency,
+                    layout.sampling_freq,
                 )
             polarity = carrier_polarity(track_state, group_key, prn, layout, decoder)
 

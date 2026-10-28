@@ -458,9 +458,10 @@ end
 # One epoch's measurements of the PVT-ready satellites, one
 # `PositionVelocityTime.SignalGroup` per tracking group and keyed like it. Each group
 # ranges on its *ranging* signal (the pilot, for a combined spec) — PVT derives the code /
-# carrier terms and the group-delay ISC from it (its `correct_by_group_delay` dispatches
-# on e.g. `GPSL5Q`/`GPSL1C_P`) — and reads the TOW / bit count from the decoder of the
-# *data* component; the combined `TrackedSat` carries the shared, pilot-driven code phase.
+# carrier terms from it, and the group-delay ISC through GNSSDecoder's `get_group_delay`,
+# which dispatches on e.g. `GPSL5Q`/`GPSL1C_P` — and reads the TOW / bit count from the
+# decoder of the *data* component; the combined `TrackedSat` carries the shared,
+# pilot-driven code phase.
 function pvt_signal_groups(
     all_systems,
     track_state,
@@ -525,10 +526,10 @@ function update_all_receiver_sat_states(
                     update(
                         receiver_sat_state.code_lock_detector,
                         estimate_cn0(sat_state, RANGING_SIGNAL_INDEX),
-                        # Every Tracking CN0 estimator normalizes by this same integration
+                        # Every Tracking CN0 estimator normalises by this same integration
                         # time, so the detector's `CN0 · T` test recovers the record's raw
                         # post-integration SNR — independent of which estimator produced
-                        # the CN0 and of how it normalized.
+                        # the CN0 and of how it normalised.
                         get_last_fully_integrated_integration_time(
                             sat_state,
                             RANGING_SIGNAL_INDEX,

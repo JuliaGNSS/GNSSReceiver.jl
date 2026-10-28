@@ -28,7 +28,7 @@ using StaticArrays,
     Dates
 
 # The per-record loop core — correlators, Doppler estimators, the noise and C/N₀
-# estimators — lives in TrackingLoops, and Tracking no longer re-exports it. So does
+# estimators — lives in TrackingLoops, and Tracking does not re-export it. So does
 # vector tracking: `VectorPLLAndDLL` is a Doppler estimator whose navigation engine
 # decodes every satellite, solves the PVT and closes the loops itself. Imported by
 # name rather than wholesale, so that TrackingLoops' wholesale exports (e.g.
@@ -134,13 +134,10 @@ include("sample_buffer.jl")
 
 using GNSSReceiver.SampleBuffers
 
-# Throughout the receiver, a constellation is identified by GNSSSignals'
-# `get_signal_id` (e.g. `:GPSL1CA`, `:GalileoE1B`) — the same per-signal symbol
-# `PositionVelocityTime` keys its `pvt.satellites` by, so one key addresses a satellite
-# across tracking, decoding and PVT.
+# Throughout the receiver, a satellite is keyed `(signal_id, prn)`; see `signal_group_key`.
 
 # Duration of one primary code period of `signal`. Defined for every signal — unlike a
-# symbol period, it needs no data rate — which is why the code-lock detector anchors its
+# bit period, it needs no bit rate — which is why the code-lock detector anchors its
 # CN0 threshold to it (see `CodeLockDetector`).
 primary_code_period(signal::AbstractGNSSSignal) =
     uconvert(s, get_code_length(signal) / get_chip_rate(signal))

@@ -55,7 +55,7 @@ on) and the data component (whose navigation message is decoded) together in one
 
 Acquisition is the search that finds which satellites are visible and gives a first
 estimate of their code phase and Doppler. It re-runs at most every `acquire_every` of
-signal time. Its **coherent integration length and Doppler resolution are no longer user
+signal time. Its **coherent integration length and Doppler resolution are not user
 knobs** — they are derived internally, per system, from the tracking loop's carrier-Doppler
 *pull-in range*, so that the worst-case post-acquisition residual always lands inside the
 loop's capture range. A detection is accepted purely on a CFAR test (constant false-alarm
@@ -123,9 +123,9 @@ The CN0 threshold is referred to a record spanning **one primary code period**, 
 decides detectability is the post-integration SNR `CN0 · T` rather than CN0 on its own.
 When tracking integrates over `N` code blocks per record, a satellite therefore holds lock
 at `10·log10(N)` dB less CN0 — 3 dB at two blocks — since the longer coherent integration
-recovers exactly that much. Anchoring to the code period rather than to the symbol period
+recovers exactly that much. Anchoring to the code period rather than to the bit period
 keeps the number meaning the same thing for the default one-block cadence and stays
-defined for pilot signals, which have no data rate.
+defined for pilot signals, which have no bit rate.
 
 The CN0 itself is estimated by Tracking, whose default estimator is the measured noise
 reference (`NoiseRefCN0Estimator`) as of Tracking 7: it divides each record's prompt power

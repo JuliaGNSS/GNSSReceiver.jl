@@ -42,7 +42,7 @@ function read_files(
     read_measurement! = read_measurement!,
     sampling_frequency = nothing,
 )
-    # Normalize a single path to a one-element vector so `open.(files)` yields a
+    # Normalise a single path to a one-element vector so `open.(files)` yields a
     # vector of streams (a bare `String` broadcasts to a scalar `IOStream`, which
     # `read_measurement!` does not accept).
     files isa AbstractVector || (files = [files])

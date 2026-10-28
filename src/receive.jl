@@ -155,7 +155,7 @@ to its [`SatelliteDataOfInterest`](@ref), `pvt` is the current PVT solution, `ru
 is the elapsed signal time and `vt` is the [`VTStatus`](@ref) (or `nothing` when vector
 tracking is disabled). This is the element type produced by [`receive`](@ref).
 
-`sat_data` is a `Dictionaries.Dictionary` (GNSSReceiver.jl PR #96) keyed by
+`sat_data` is a `Dictionaries.Dictionary` keyed by
 `(signal_id, prn)` — the ranging signal's id and PRN — so the same PRN can appear on
 several constellations and bands without colliding, and the key matches `pvt.satellites`
 (which `PositionVelocityTime` keys by the same ranging signal).

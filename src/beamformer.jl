@@ -50,7 +50,7 @@ end
 # that the C/N₀ path can reduce the signal's measured noise covariance through the same
 # weights (`N₀ = wᴴR̂w`). The weights are the eigen-beamformer's own state, so declaring
 # them is the whole of the contract — and it is scale-free: `R̂` carries the antennas'
-# relative noise scale, so the reported C/N₀ no longer depends on the last-element
+# relative noise scale, so the reported C/N₀ does not depend on the last-element
 # normalisation `TrackingLoops.update` applies.
 TrackingLoops.get_weights(filter::EigenBeamformer{N}, ::NumAnts{N}) where {N} =
     filter.beamformer

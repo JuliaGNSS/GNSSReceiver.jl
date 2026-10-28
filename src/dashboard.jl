@@ -271,13 +271,13 @@ function _paint_plot!(buf, area::Rect, str::AbstractString)
     return
 end
 
-# CN0 in dBHz as a plain rounded number, floored at the 0 dB (1 Hz) baseline — the same
-# reference an `Inf` CN0 got in the old GUI. `barplot` throws on anything negative or
-# non-finite ("all values have to be ≥ 0"), and both are reachable for a satellite the
-# detectors are still holding: Tracking's CN0 estimator reports `-Inf dBHz` for "no
-# detectable signal" and a negative dBHz figure just above that (any CN0 under 1 Hz),
-# while `Inf`/`NaN` come from a degenerate prompt buffer. Such a satellite draws an empty
-# bar instead of taking the whole panel — and with it the dashboard — down.
+# CN0 in dBHz as a plain rounded number, floored at the 0 dB (1 Hz) baseline. `barplot`
+# throws on anything negative or non-finite ("all values have to be ≥ 0"), and both are
+# reachable for a satellite the detectors are still holding: Tracking's CN0 estimator
+# reports `-Inf dBHz` for "no detectable signal" and a negative dBHz figure just above that
+# (any CN0 under 1 Hz), while `Inf`/`NaN` come from a degenerate prompt buffer. Such a
+# satellite draws an empty bar instead of taking the whole panel — and with it the dashboard
+# — down.
 function _cn0_db(cn0)
     db = 10 * log10(Unitful.linear(cn0) / Hz)
     isfinite(db) ? max(round(db; digits = 1), 0.0) : 0.0
@@ -435,16 +435,16 @@ function _render_skyplot(buf, area::Rect, gui_data, num_dots)
     point_colors = Symbol[]
     for (key, info) in pairs(pvt.satellites)
         signal_id, prn = key
-        system = constellation_of(signal_id)
-        (system, prn) in seen && continue
-        push!(seen, (system, prn))
+        constellation = constellation_of(signal_id)
+        (constellation, prn) in seen && continue
+        push!(seen, (constellation, prn))
         elevation, azimuth = calc_elevation_and_azimuth(pvt.position, info.position)
         # `polarplot` measures its angle counter-clockwise from East (+x), the azimuth
         # clockwise from North.
         push!(angles, π / 2 - azimuth)
         push!(els_deg, elevation * 180 / π)
         push!(prns, prn)
-        push!(point_colors, get(CONSTELLATION_COLORS, system, :white))
+        push!(point_colors, get(CONSTELLATION_COLORS, constellation, :white))
     end
     # Reserve one row for the legend below the plot.
     plotarea = Rect(inner.x, inner.y, inner.width, max(1, inner.height - 1))

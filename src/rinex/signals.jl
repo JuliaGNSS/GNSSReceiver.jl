@@ -46,17 +46,18 @@ struct RinexSignalLayout
     # The signal the group ranges on. Needed to rebuild the transmit time of a satellite from
     # its tracking state, whose code and carrier terms scale with this signal's frequencies.
     signal::AbstractGNSSSignal
-    carrier_frequency::Float64
-    # Receiver intermediate frequency of this signal's band: the tracked carrier phase
+    # [Hz]
+    carrier_freq::Float64
+    # Receiver intermediate frequency [Hz] of this signal's band: the tracked carrier phase
     # advances at `carrier_doppler + interm_freq`, so the IF ramp has to come back out to
     # leave the Doppler-only phase RINEX wants.
     interm_freq::Float64
     # Index of the data signal among the group's tracked signals: its bit buffer and the
     # decoder fed from it resolve the Costas half-cycle of the carrier phase.
     data_index::Int
-    # Sampling frequency of this signal's band, which reading the vector loop's carrier
-    # phase correction takes (`get_carrier_phase_correction`).
-    sampling_frequency::typeof(1.0Hz)
+    # Sampling frequency of this signal's band, with its unit, as reading the vector loop's
+    # carrier phase correction takes it (`get_carrier_phase_correction`).
+    sampling_freq::typeof(1.0Hz)
     # The correction [cycles] that aligns the phase with its band's reference signal,
     # `nothing` where it needs none (`rinex_phase_shift`).
     phase_shift::Union{Nothing,Float64}
@@ -73,7 +74,7 @@ rinex_phase_shifts(layouts) = sort!(
 
 # Metres per cycle of a signal's carrier — what converts between the range and phase
 # observables, and between the Doppler and the range rate.
-wavelength(layout::RinexSignalLayout) = SPEED_OF_LIGHT / layout.carrier_frequency
+wavelength(layout::RinexSignalLayout) = SPEED_OF_LIGHT / layout.carrier_freq
 
 # The observation codes of the signal the receiver ranges on, or RINEXParser's reason why the
 # format cannot name it, with what to do about it here.

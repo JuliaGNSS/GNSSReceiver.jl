@@ -490,17 +490,17 @@ demanded over `reference_integration_time` — one primary code period. A record
 the longer coherent integration genuinely buys: detectability is set by the
 post-integration SNR, not by CN0 on its own.
 
-Anchoring to the primary code period rather than to the symbol period keeps
+Anchoring to the primary code period rather than to the bit period keeps
 `cn0_threshold` meaning exactly what it meant for one-block records (the default
-tracking cadence), and needs no data rate — so it is also defined for pilot signals,
+tracking cadence), and needs no bit rate — so it is also defined for pilot signals,
 where `get_bit_rate` is 0 Hz.
 
 `coherence_limit` caps the credited `T`, and defaults to `Inf·s` — uncapped — because
 Tracking already bounds a record at the coherent limit itself: post-sync it integrates
-`clamp(preferred_num_code_blocks_to_integrate, 1, blocks_per_symbol)` blocks, where a
-symbol is the data-bit period, or the secondary-code period for a pilot. That bound is
-generous for a long overlay (GPS L1C-P's is 1800 blocks), so set `coherence_limit` when
-crediting a full symbol is more than the loop should be trusted with.
+`clamp(preferred_num_code_blocks_to_integrate, 1, blocks_per_bit)` blocks, where a bit is
+the navigation-bit period as tracked, or the secondary-code period for a pilot. That bound
+is generous for a long overlay (GPS L1C-P's is 1800 blocks), so set `coherence_limit` when
+crediting a full bit is more than the loop should be trusted with.
 
 Note that Tracking's `preferred_num_code_blocks_to_integrate` defaults to 1 and this
 receiver never raises it, so every record is currently one code block and the credit is

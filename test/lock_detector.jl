@@ -797,7 +797,7 @@ end
     # hard-coded 1 ms: GPS L1 C/A's code period is 1 ms, Galileo E1B's is 4 ms.
     @test GNSSReceiver.primary_code_period(GPSL1CA()) ≈ 1u"ms"
     @test GNSSReceiver.primary_code_period(GalileoE1B()) ≈ 4u"ms"
-    # Also defined for a pilot, which has no data rate to derive a symbol period from.
+    # Also defined for a pilot, which has no bit rate to derive a bit period from.
     @test GNSSReceiver.primary_code_period(GPSL5Q()) ≈ 1u"ms"
 
     state = GNSSReceiver.ReceiverSatState(GPSL1CA(), 1)

@@ -75,7 +75,7 @@ _decoder_with(system, prn, data) = GNSSDecoder.GNSSDecoderState(
     @test layouts[:GPSL1CA].system == 'G'
     @test layouts[:GPSL1CA].codes == (C = "C1C", L = "L1C", D = "D1C", S = "S1C")
     @test layouts[:GPSL1CA].interm_freq == 0.0
-    @test layouts[:GPSL1CA].carrier_frequency == 1.57542e9
+    @test layouts[:GPSL1CA].carrier_freq == 1.57542e9
     # The wavelength the phase and range-rate conversions use.
     @test GNSSReceiver.wavelength(layouts[:GPSL1CA]) ≈ 0.1902936728 atol = 1e-9
 
