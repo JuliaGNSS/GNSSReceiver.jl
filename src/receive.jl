@@ -483,16 +483,15 @@ should_emit(state, previous_state, last_output, pvt_update_interval) =
 Run the full acquire → track → decode → PVT pipeline over the samples arriving on
 `measurement_channel` and return a channel of per-chunk [`ReceiverDataOfInterest`](@ref).
 
-`systems` is a single GNSS system, a [`CombinedSignal`](@ref) pilot+data pair, or a tuple
-of these that share one RF band and sample stream; every constellation is acquired,
-tracked and decoded, and all are fused into a single multi-GNSS PVT solution. The
-multi-band method takes a tuple of measurement channels (one per RF band), a tuple of
-per-band system groups and a tuple of `interm_freqs`, all aligned band-by-band, and fuses
-every band into one solution with per-constellation clock biases and per-band
-inter-frequency biases. The band channels must deliver equal-length frames from one shared
-time base (e.g. a single capture split by front-end channel) so one frame per band stays
-aligned each step. The number of antenna channels in each `SignalChannel` must equal `N`
-in `num_ants`.
+`systems` is a single GNSS system, a [`CombinedSignal`](@ref) pilot+data pair, or a tuple of
+these that share one RF band and sample stream; every constellation is acquired, tracked and
+decoded, and all are fused into a single multi-GNSS PVT solution. The multi-band method
+takes a tuple of measurement channels (one per RF band), a tuple of per-band system groups
+and a tuple of `intermediate_frequencies`, all aligned band-by-band, and fuses every band
+into one solution with per-constellation clock biases and per-band inter-frequency biases.
+The band channels must deliver equal-length frames from one shared time base (e.g. a single
+capture split by front-end channel) so one frame per band stays aligned each step. The
+number of antenna channels in each `SignalChannel` must equal `N` in `num_ants`.
 
 Sampled at `sampling_freq`, each chunk is processed by [`process`](@ref) in a spawned
 task; one `ReceiverDataOfInterest` is emitted per PVT solution, in the chunk that produced
@@ -506,9 +505,11 @@ record, so an `N`-block record locks at `10·log10(N)` dB less — against
 `code_lock_cn0_threshold` (`nothing` ⇒ each signal's
 `GNSSReceiver.get_default_code_lock_cn0_threshold`, 30 dB-Hz), and contributes to the PVT
 solution — recomputed every `pvt_update_interval` — after
-`time_in_lock_before_calculating_pvt`. `enable_ionospheric_correction`,
-`enable_tropospheric_correction` and `pvt_approximate_year` (which resolves the GPS
-week-number rollover for old recordings) are passed through to `calc_pvt`.
+`time_in_lock_before_calculating_pvt`. `enable_ionospheric_correction` and
+`enable_tropospheric_correction` are passed through to `calc_pvt`. `approximate_year`, the
+year the signals were received, resolves the GPS L1 C/A week-number rollover wherever a
+decoder's week is read: for the PVT solution, the vector estimator and the RINEX
+ephemerides. Pass it for old recordings; it defaults to the current year.
 
 Pass `vector_tracking = true` to switch to vector tracking, run by TrackingLoops'
 `VectorPLLAndDLL`: its navigation engine decodes every satellite, solves the scalar PVT
@@ -548,14 +549,14 @@ function receive(
     measurement_channel::SignalChannel,
     systems,
     sampling_freq;
-    interm_freq = 0.0Hz,
+    intermediate_frequency = 0.0Hz,
     kwargs...,
 )
     receive(
         (measurement_channel,),
         (systems,),
         sampling_freq;
-        interm_freqs = (interm_freq,),
+        intermediate_frequencies = (intermediate_frequency,),
         kwargs...,
     )
 end
@@ -565,7 +566,7 @@ function receive(
     systems_per_band::Tuple,
     sampling_freq;
     num_ants::NumAnts{N} = NumAnts(1),
-    interm_freqs::Tuple = map(_ -> 0.0Hz, measurement_channels),
+    intermediate_frequencies::Tuple = map(_ -> 0.0Hz, measurement_channels),
     acquire_every = 10s,
     # PRNs to acquire. `nothing` ⇒ each constellation's default range; a per-GNSS
     # `NamedTuple`/`Dict` keyed by `get_constellation_id` (`(GPS = …, Galileo = …)`);
@@ -597,7 +598,7 @@ function receive(
     code_lock_cn0_threshold = nothing,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
-    pvt_approximate_year::Integer = year(now(UTC)),
+    approximate_year::Integer = year(now(UTC)),
     # Per-chunk payload builder run inside the tracking loop; see
     # [`default_data_of_interest`](@ref). Pass your own `extract(receiver_state)` to emit
     # a custom payload — it must be read-only and return an immutable value, since the
@@ -611,10 +612,11 @@ function receive(
     n_bands = length(measurement_channels)
     (
         length(systems_per_band) == n_bands &&
-        length(interm_freqs) == n_bands
+        length(intermediate_frequencies) == n_bands
     ) || throw(
         ArgumentError(
-            "measurement_channels, systems_per_band and interm_freqs must have equal length",
+            "measurement_channels, systems_per_band and intermediate_frequencies must " *
+            "have equal length",
         ),
     )
     all(ch -> num_antenna_channels(ch) == N, measurement_channels) ||
@@ -675,7 +677,7 @@ function receive(
         pvt_update_interval,
         enable_ionospheric_correction,
         enable_tropospheric_correction,
-        pvt_approximate_year,
+        approximate_year,
         code_lock_cn0_threshold,
     )
 
@@ -699,9 +701,9 @@ function receive(
         RinexLogger(
             config,
             band_systems,
-            interm_freqs,
+            intermediate_frequencies,
             sampling_freq;
-            approximate_year = pvt_approximate_year,
+            approximate_year,
             # How long a clock solution may be carried on to the chunks after it.
             pvt_update_interval,
         )
@@ -731,7 +733,7 @@ function receive(
                     measurements,
                     band_systems,
                     sampling_freq,
-                    interm_freqs;
+                    intermediate_frequencies;
                     downconvert_and_correlator = resolved_dc,
                     num_ants,
                     acquire_every,
@@ -740,7 +742,7 @@ function receive(
                     time_in_lock_before_calculating_pvt,
                     enable_ionospheric_correction,
                     enable_tropospheric_correction,
-                    pvt_approximate_year,
+                    approximate_year,
                 )
                 # RINEX runs on every frame, not on the emission cadence below: the
                 # continuous carrier phase is accumulated frame by frame (that is what keeps

@@ -117,7 +117,7 @@ let
             _ion_produce!(ch, type, dat_file, num_samples, num_ants)
         end
 
-        # `pvt_approximate_year = 2017` resolves the GPS L1 1024-week rollover for this
+        # `approximate_year = 2017` resolves the GPS L1 1024-week rollover for this
         # 2017-09-10 recording (without it, the default `year(now(UTC))` picks the wrong
         # cycle and reports a date offset by ~19.6 years).
         # `max_meas = 2^7`: the 8-bit offset-binary samples recentred on 128 have
@@ -128,9 +128,9 @@ let
             system,
             sampling_freq;
             num_ants = NumAnts(num_ants),
-            interm_freq = 0.0u"Hz",
+            intermediate_frequency = 0.0u"Hz",
             max_meas = 2^7,
-            pvt_approximate_year = 2017,
+            approximate_year = 2017,
             write_rinex = type == ComplexF32 ?
                           RinexConfig(;
                 obs_file = joinpath(rinex_dir, "scalar.obs"),
@@ -243,7 +243,7 @@ let
         @test isapprox(last_pvt.velocity[3], expected_velocity[3], atol = 1.0)
 
         # Final-fix epoch: exact recording date (validates 1024-week rollover resolution
-        # via pvt_approximate_year=2017). 1 ms tolerance covers chunk-boundary jitter in
+        # via approximate_year=2017). 1 ms tolerance covers chunk-boundary jitter in
         # when the last PVT happens to be reported.
         @test last_pvt.time isa TAITime
         @test abs(AstroTime.value(TAIEpoch(last_pvt.time) - expected_time)) < 0.001
@@ -318,8 +318,8 @@ let
             system,
             sampling_freq;
             num_ants = NumAnts(1),
-            interm_freq = 0.0u"Hz",
-            pvt_approximate_year = 2017,
+            intermediate_frequency = 0.0u"Hz",
+            approximate_year = 2017,
         )
 
         # `receive` emits one snapshot per `pvt_update_interval` (100 ms), not per
@@ -391,8 +391,8 @@ let
             system,
             sampling_freq;
             num_ants = NumAnts(1),
-            interm_freq = 0.0u"Hz",
-            pvt_approximate_year = 2017,
+            intermediate_frequency = 0.0u"Hz",
+            approximate_year = 2017,
             vector_tracking = true,
             extract,
             write_rinex = RinexConfig(;

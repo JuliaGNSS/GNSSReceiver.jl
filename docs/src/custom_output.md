@@ -109,7 +109,7 @@ data_channel = receive(
     read_uint8_iq_file(file, num_samples; center = 127.5, type = ComplexF32),
     system,
     sampling_freq;
-    pvt_approximate_year = 2017,
+    approximate_year = 2017,
     extract = tracking_details,
 )
 

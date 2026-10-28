@@ -54,7 +54,7 @@ using GNSSReceiver, GNSSSignals, Tracking, SoapySDR, Unitful
 
 gnss_receiver_gui(;
     system = GPSL1CA(),
-    sampling_freq = 2e6u"Hz",
+    sampling_frequency = 2e6u"Hz",
     chunk_time = 4u"ms",
     run_time = 40u"s",
     num_ants = NumAnts(1),
@@ -76,11 +76,11 @@ measurement_channel = read_uint8_iq_file(
     Int(upreferred(2.048e6u"Hz" * 4u"ms"));
     center = 127.5,
     type = ComplexF32,
-    sample_rate = 2.048e6u"Hz",    # replay in real time so the dashboard is watchable
+    sampling_frequency = 2.048e6u"Hz",   # replay in real time for a watchable dashboard
 )
 data_channel = receive(
     measurement_channel, GPSL1CA(), 2.048e6u"Hz";
-    pvt_approximate_year = 2017,   # this recording is from 2017 (GPS week rollover)
+    approximate_year = 2017,   # this recording is from 2017 (GPS week rollover)
 )
 
 GNSSReceiver.gui(get_gui_data_channel(data_channel))   # press `q` to quit

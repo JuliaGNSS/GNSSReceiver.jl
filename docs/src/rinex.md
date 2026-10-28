@@ -273,7 +273,7 @@ data_channel = receive(
     read_uint8_iq_file(file, num_samples; center = 127.5, type = ComplexF32),
     GPSL1CA(),
     sampling_freq;
-    pvt_approximate_year = 2017,   # resolves the GPS week-number rollover for old data
+    approximate_year = 2017,   # resolves the GPS week-number rollover for old data
     write_rinex = RinexConfig(;
         directory,
         interval = 1.0u"s",

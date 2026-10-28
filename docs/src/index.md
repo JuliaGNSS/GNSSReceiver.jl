@@ -60,7 +60,7 @@ using GNSSReceiver, GNSSSignals, Tracking, SoapySDR, Unitful
 
 gnss_receiver_gui(;
     system = GPSL1CA(),
-    sampling_freq = 2e6u"Hz",
+    sampling_frequency = 2e6u"Hz",
     chunk_time = 4u"ms",
     run_time = 40u"s",
     num_ants = NumAnts(1),

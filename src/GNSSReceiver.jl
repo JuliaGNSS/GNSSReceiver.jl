@@ -728,7 +728,7 @@ function doppler_estimator_for(
     pvt_update_interval = 100ms,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
-    pvt_approximate_year::Integer = year(now(UTC)),
+    approximate_year::Integer = year(now(UTC)),
     code_lock_cn0_threshold = nothing,
 )
     lock_cn0_threshold = something(
@@ -741,7 +741,7 @@ function doppler_estimator_for(
         filter_config,
         vt_update_interval = pvt_update_interval,
         lock_cn0_threshold,
-        approximate_year = pvt_approximate_year,
+        approximate_year,
         enable_ionospheric_correction,
         enable_tropospheric_correction,
     )
@@ -761,7 +761,7 @@ function ReceiverState(
     pvt_update_interval = 100ms,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
-    pvt_approximate_year::Integer = year(now(UTC)),
+    approximate_year::Integer = year(now(UTC)),
     code_lock_cn0_threshold::Union{Nothing,typeof(1.0dBHz)} = nothing,
 )
     systems = _flatten_systems(band_systems)
@@ -772,7 +772,7 @@ function ReceiverState(
         pvt_update_interval,
         enable_ionospheric_correction,
         enable_tropospheric_correction,
-        pvt_approximate_year,
+        approximate_year,
         code_lock_cn0_threshold,
     )
     group_keys = map(signal_group_key, systems)
@@ -827,7 +827,7 @@ tracking); pass a [`NavigationFilterConfig`](https://JuliaGNSS.github.io/Trackin
 dynamics and the receiver's oscillator to that filter. The vector estimator decodes the
 satellites and solves the PVT itself, so it takes the remaining keywords —
 `pvt_update_interval` (its navigation cycle), `enable_ionospheric_correction`,
-`enable_tropospheric_correction` and `pvt_approximate_year` — here, at construction, and
+`enable_tropospheric_correction` and `approximate_year` — here, at construction, and
 `code_lock_cn0_threshold` sets the C/N₀ a satellite must hold to be in lock, both to its
 code lock detector and to the navigation filter (`nothing`, the default, takes
 `GNSSReceiver.get_default_code_lock_cn0_threshold`); the state carries it, so `process`
@@ -870,20 +870,20 @@ using .Dashboard: gui
 include("save_data.jl")
 
 """
-    gnss_receiver_gui(; system = GPSL1CA(), sampling_freq = 2e6Hz, kwargs...)
+    gnss_receiver_gui(; system = GPSL1CA(), sampling_frequency = 2e6Hz, kwargs...)
 
 Acquire, track and compute a PVT solution from a live SoapySDR device and display the
 result in a live terminal GUI. When the stream ends the final frame stays on screen; the
 call blocks until you quit the dashboard with `q`.
 
-`system` is a single system or a tuple of systems sharing one RF band (see
-[`receive`](@ref) / [`CombinedSignal`](@ref)). The device selected by `dev_args` is
-configured for `sampling_freq`, tuned to the shared band's centre frequency and streamed
-for `run_time` — all handled by SignalChannels' `stream_data`, which buffers a few seconds
-of signal for acquisition headroom and rechunks to the `chunk_time` processing length. Set
+`system` is a single system or a tuple of systems sharing one RF band (see [`receive`](@ref)
+/ [`CombinedSignal`](@ref)). The device selected by `dev_args` is configured for
+`sampling_frequency`, tuned to the shared band's centre frequency and streamed for
+`run_time` — all handled by SignalChannels' `stream_data`, which buffers a few seconds of
+signal for acquisition headroom and rechunks to the `chunk_time` processing length. Set
 `gain` to a fixed value or leave it `nothing` for automatic gain control; `antenna`,
-`interm_freq` and `num_ants` override the RF front end and antenna-channel count (one
-identical channel config is used per antenna). Samples are streamed as `stream_type`
+`intermediate_frequency` and `num_ants` override the RF front end and antenna-channel count
+(one identical channel config is used per antenna). Samples are streamed as `stream_type`
 (default `ComplexF32`); pass `stream_type = Complex{Int16}` to use Tracking's fast integer
 backend on an Int16-native device, in which case `max_meas` (the front-end full-scale) is
 required. It is ignored for float stream types.
@@ -893,7 +893,7 @@ navigation files alongside the live display; see [`receive`](@ref).
 """
 function gnss_receiver_gui(;
     system = GPSL1CA(),
-    sampling_freq = 2e6Hz,
+    sampling_frequency = 2e6Hz,
     # Duration of each processing chunk fed to `receive` (tracking granularity /
     # latency). The acquisition coherent-integration length is chosen internally by
     # `receive`, not by this value.
@@ -901,7 +901,7 @@ function gnss_receiver_gui(;
     run_time = 40s,
     num_ants = NumAnts(2),
     dev_args = first(Devices()),
-    interm_freq = 0.0Hz,
+    intermediate_frequency = 0.0Hz,
     gain::Union{Nothing,<:Unitful.Gain} = nothing,
     antenna = nothing,
     stream_type = ComplexF32,
@@ -912,17 +912,17 @@ function gnss_receiver_gui(;
     write_rinex::Union{Bool,RinexConfig} = false,
 )
     systems = as_systems(system)
-    num_samples_per_chunk = Int(upreferred(sampling_freq * chunk_time))
-    eval_num_samples = Int(upreferred(sampling_freq * run_time))
+    num_samples_per_chunk = Int(upreferred(sampling_frequency * chunk_time))
+    eval_num_samples = Int(upreferred(sampling_frequency * run_time))
 
     # One identical RX config per antenna channel. SignalChannels' `stream_data` opens
     # and configures the device (sample rate, bandwidth, centre frequency, gain / AGC,
     # antenna), buffers `buffer_time` of signal for acquisition headroom, and rechunks
     # the stream to the processing chunk length.
     channel_config = SDRChannelConfig(;
-        sample_rate = sampling_freq,
+        sample_rate = sampling_frequency,
         frequency = rx_center_frequency(systems),
-        bandwidth = sampling_freq,
+        bandwidth = sampling_frequency,
         gain,
         antenna,
     )
@@ -947,9 +947,9 @@ function gnss_receiver_gui(;
     data_channel = receive(
         data_stream,
         systems,
-        sampling_freq;
+        sampling_frequency;
         num_ants,
-        interm_freq,
+        intermediate_frequency,
         max_meas,
         write_rinex,
     )
@@ -961,7 +961,7 @@ function gnss_receiver_gui(;
 end
 
 """
-    gnss_write_to_file(; system = GPSL1CA(), sampling_freq = 2e6Hz, run_time = 4s,
+    gnss_write_to_file(; system = GPSL1CA(), sampling_frequency = 2e6Hz, run_time = 4s,
                        dev_args = first(Devices()), output_file = "gnss_test_data",
                        gain = 50dB)
 
@@ -975,18 +975,18 @@ finishes.
 """
 function gnss_write_to_file(;
     system = GPSL1CA(),
-    sampling_freq = 2e6Hz,
+    sampling_frequency = 2e6Hz,
     run_time = 4s,
     dev_args = first(Devices()),
     output_file = "gnss_test_data",
     gain::Union{Nothing,<:Unitful.Gain} = 50dB,
 )
-    eval_num_samples = Int(upreferred(sampling_freq * run_time))
+    eval_num_samples = Int(upreferred(sampling_frequency * run_time))
 
     channel_config = SDRChannelConfig(;
-        sample_rate = sampling_freq,
+        sample_rate = sampling_frequency,
         frequency = rx_center_frequency(as_systems(system)),
-        bandwidth = sampling_freq,
+        bandwidth = sampling_frequency,
         gain,
     )
     # Record raw Complex{Int16} samples, matching `read_files`' default element type.
@@ -1027,7 +1027,7 @@ function receive_and_gui(
         systems,
         adjusted_sample_freq;
         num_ants,
-        interm_freq = clock_drift * get_center_frequency(first(systems)),
+        intermediate_frequency = clock_drift * get_center_frequency(first(systems)),
         max_meas,
     )
     # Get gui channel from data channel and display the dashboard. `gui` owns the terminal

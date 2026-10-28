@@ -233,7 +233,7 @@ function process(
     subsample_interpolation = true,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
-    pvt_approximate_year::Integer = year(now(UTC)),
+    approximate_year::Integer = year(now(UTC)),
 ) where {N}
     # A single-antenna band delivers an N×1 frame; `Tracking` wants a plain vector
     # for one antenna and the matrix (rows = samples) for an array.
@@ -316,7 +316,7 @@ function process(
         time_in_lock_before_calculating_pvt,
         enable_ionospheric_correction,
         enable_tropospheric_correction,
-        pvt_approximate_year,
+        approximate_year,
     )
 
     ReceiverState(
@@ -366,7 +366,7 @@ function update_navigation(
     time_in_lock_before_calculating_pvt = 2s,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
-    pvt_approximate_year::Integer = year(now(UTC)),
+    approximate_year::Integer = year(now(UTC)),
 )
     isfinite(last_time_pvt_ran) &&
         pvt_epoch(runtime, pvt_update_interval, sampling_freq) <=
@@ -382,7 +382,7 @@ function update_navigation(
         pvt;
         enable_ionospheric_correction,
         enable_tropospheric_correction,
-        approximate_year = pvt_approximate_year,
+        approximate_year,
     )
     pvt, runtime
 end

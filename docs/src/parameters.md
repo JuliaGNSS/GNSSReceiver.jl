@@ -35,16 +35,16 @@ list lives in the [`receive` docstring](@ref receive) at the bottom of the page.
       C/N₀ penalty).
 
 - For **several RF bands**, use the multi-band method: a tuple of measurement channels
-  (one per band), a tuple of per-band system groups and a tuple of `interm_freqs`, all
-  aligned band-by-band. Every band is fused into one solution with per-constellation clock
-  biases and per-band inter-frequency biases:
+  (one per band), a tuple of per-band system groups and a tuple of
+  `intermediate_frequencies`, all aligned band-by-band. Every band is fused into one
+  solution with per-constellation clock biases and per-band inter-frequency biases:
 
   ```julia
   receive(
       (l1_channel, l5_channel),
       ((GPSL1CA(),), (CombinedSignal(GPSL5Q(), GPSL5I()),)),
       sampling_freq;
-      interm_freqs = (0.0u"Hz", 0.0u"Hz"),
+      intermediate_frequencies = (0.0u"Hz", 0.0u"Hz"),
   )
   ```
 
@@ -88,7 +88,7 @@ carry them; BeiDou B1C/B2a/B2b to the BDS-3 MEO/IGSO range 19-50).
 | Keyword | Default | Meaning |
 |---|---|---|
 | `num_ants` | `NumAnts(1)` | Number of antenna channels. Must match the columns of the measurement channel(s). |
-| `interm_freq` / `interm_freqs` | `0.0u"Hz"` | Intermediate frequency of the incoming samples (single-band `interm_freq`; a tuple `interm_freqs` for the multi-band method). |
+| `intermediate_frequency` / `intermediate_frequencies` | `0.0u"Hz"` | Intermediate frequency of the incoming samples (single-band `intermediate_frequency`; a tuple `intermediate_frequencies` for the multi-band method). |
 | `downconvert_and_correlator` | auto (by element type) | The correlator backend. `nothing` auto-selects: Tracking's fast integer backend for `Complex{Int16}` samples, the float `CPUThreadedDownconvertAndCorrelator()` otherwise. Pass one explicitly to override. |
 | `max_meas` | `nothing` | Front-end full-scale (largest `\|real\|`/`\|imag\|` of any sample, e.g. `2^11` for a 12-bit ADC). **Required** for `Complex{Int16}` samples (the integer backend); ignored for float samples or when `downconvert_and_correlator` is given. |
 
@@ -263,18 +263,18 @@ The counts themselves are set at detector construction; see the
 | `pvt_update_interval` | `100u"ms"` | How often the PVT solution is recomputed (also the rate at which the data channel emits). |
 | `enable_ionospheric_correction` | `true` | Apply the broadcast ionospheric correction. |
 | `enable_tropospheric_correction` | `true` | Apply the tropospheric correction. |
-| `pvt_approximate_year` | current UTC year | Resolves the GPS week-number rollover for old recordings. |
+| `approximate_year` | current UTC year | Resolves the GPS week-number rollover for old recordings. |
 
-`pvt_approximate_year` matters for archived data: an old recording processed with the wrong
+`approximate_year` matters for archived data: an old recording processed with the wrong
 year lands ~19.6 years off. The [Worked Example (Real Data)](@ref) sets
-`pvt_approximate_year = 2017` for its 2017 recording.
+`approximate_year = 2017` for its 2017 recording.
 
 ```julia
 data_channel = receive(
     measurement_channel, GPSL1CA(), 2.048e6u"Hz";
     pvt_update_interval = 200u"ms",
     enable_tropospheric_correction = false,
-    pvt_approximate_year = 2017,
+    approximate_year = 2017,
 )
 ```
 

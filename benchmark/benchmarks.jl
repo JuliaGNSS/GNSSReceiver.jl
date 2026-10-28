@@ -84,12 +84,15 @@ const DC_INT16_NOTHREAD = Tracking.Int16DownconvertAndCorrelator(2^7)
 # acquisition-plan NamedTuple keyed by the group's signal id, and the PVT year
 # keyword is `pvt_approximate_year` (was `approximate_year`). Lets
 # `benchpkg --bench-on=head` compute a real base-vs-head ratio across this
-# API-breaking bump. On GNSSSignals 5, the chip rate is `get_chip_rate`.
+# API-breaking bump. On GNSSSignals 5, the chip rate is `get_chip_rate` and the year
+# keyword `approximate_year` again.
 const _IS_MULTIBAND = isdefined(GNSSReceiver, :CombinedSignal)
 const _IS_GNSSSIGNALS_5 = isdefined(GNSSSignals, :get_chip_rate)
 _chip_rate(signal) =
     _IS_GNSSSIGNALS_5 ? GNSSSignals.get_chip_rate(signal) :
     GNSSSignals.get_code_frequency(signal)
+_year_keyword() =
+    _IS_GNSSSIGNALS_5 ? (; approximate_year = 2017) : (; pvt_approximate_year = 2017)
 
 _process(rs, acq_plans, meas, dc; kwargs...) =
     if _IS_MULTIBAND
@@ -102,7 +105,7 @@ _process(rs, acq_plans, meas, dc; kwargs...) =
             (INTERM_FREQ,);
             downconvert_and_correlator = dc,
             num_ants = NumAnts(1),
-            pvt_approximate_year = 2017,
+            _year_keyword()...,
             kwargs...,
         )
     else

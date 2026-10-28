@@ -29,7 +29,8 @@
     @testset "Real-time replay pacing (sample_rate)" begin
         # 6 chunks of 4 samples at 1 kHz ⇒ 4 ms/chunk ⇒ ≳ 24 ms of sleeps; loose lower
         # bound avoids CI-timing flakiness while still proving pacing happens. Same data.
-        t = @elapsed chunks = collect(read_uint8_iq_file(tmp, 4; sample_rate = 1000u"Hz"))
+        t = @elapsed chunks =
+            collect(read_uint8_iq_file(tmp, 4; sampling_frequency = 1000u"Hz"))
         @test length(chunks) == 6
         @test chunks[1][1, 1] == complex(Int16(-128), Int16(-127))
         @test t >= 0.012
@@ -56,7 +57,7 @@ end
     @testset "Real-time replay pacing (sample_rate)" begin
         # 6 chunks of 4 samples at 1 kHz ⇒ 4 ms/chunk ⇒ ≳ 24 ms of pacing; loose lower bound
         # avoids CI-timing flakiness while still proving pacing happens.
-        t = @elapsed chunks = collect(read_files(tmp, 4; sample_rate = 1000u"Hz"))
+        t = @elapsed chunks = collect(read_files(tmp, 4; sampling_frequency = 1000u"Hz"))
         @test length(chunks) == 6
         @test chunks[1][1, 1] == complex(Int16(1), Int16(-1))
         @test t >= 0.012

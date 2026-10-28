@@ -84,7 +84,7 @@ end
         num_samples_for_acquisition = 20000,
         vector_tracking = config,
         pvt_update_interval = 200u"ms",
-        pvt_approximate_year = 2017,
+        approximate_year = 2017,
         enable_ionospheric_correction = false,
     )
     navigation = configured_state.track_state.doppler_estimator.navigation
