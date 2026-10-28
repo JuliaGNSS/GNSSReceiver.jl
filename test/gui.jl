@@ -800,3 +800,28 @@ end
     # Bands are named through `get_band_name`.
     @test "  L5 (vs L1): 5.67 m" in lines
 end
+
+@testset "PVT diagnostics count an inter-system bias taken from a broadcast offset" begin
+    # GPS on L1 only and Galileo on E5a only: the satellites cannot separate the Galileo
+    # clock from the L5 inter-frequency bias, so the fix ties the clocks with the GGTO. The
+    # six measurements then fit 3 + 1 clock + 1 IFB = 5 unknowns, one to spare.
+    keys_ = [
+        [(:GPSL1CA, prn) for prn in (3, 9, 12, 23)]
+        [(:GalileoE5aI, 4), (:GalileoE5aI, 19)]
+    ]
+    info = SatelliteInfo(ECEF(5e6, 3e6, 1e6), 0.0u"s", 0.2u"m", 0.0u"m/s")
+    tied(applied) = PVTSolution(;
+        reference_system = GPST(),
+        inter_system_biases = Dictionary{SupportedTimeSystem,typeof(1.0u"m")}(
+            [GST()],
+            [-12.34u"m"],
+        ),
+        applied_broadcast_inter_system_biases = applied,
+        inter_frequency_biases = Dictionary([:L5], [InterFrequencyBias(5.67u"m", :L1)]),
+        satellites = Dictionary(keys_, fill(info, length(keys_))),
+    )
+    ggto = PositionVelocityTime.BroadcastInterSystemBias(GST(), GPST(), -12.34u"m")
+    @test "  (insufficient redundancy)" ∉ GNSSReceiver.pvt_details_lines(tied([ggto]))
+    # Estimated rather than taken from the GGTO, the Galileo clock is a sixth unknown.
+    @test "  (insufficient redundancy)" in GNSSReceiver.pvt_details_lines(tied([]))
+end

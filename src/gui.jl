@@ -353,16 +353,15 @@ function _fmt2(x)
     isnothing(dot) ? s * ".00" : s * '0'^max(0, 2 - (length(s) - dot))
 end
 
-# The PVT solution's internals as text lines: DOP, inter-system and inter-frequency
-# biases (metres), and residual RMS in both domains — range and range rate, overall
-# and broken down per signal, which is why the block is named for the residuals
-# rather than for the pseudoranges one of its two columns is about. Appended
-# below the position/velocity/time block in the combined panel. The residuals are
-# greyed out until the solution is over-determined — with only
-# `3 + #time-systems + #extra-bands` satellites the least-squares residual is ~0 by
-# construction, so its RMS is meaningless. Sections that don't apply (no
-# inter-system bias for a single constellation, no inter-frequency bias for a single
-# band) are omitted. Only called with a fix present, so no "waiting" fallback.
+# The PVT solution's internals as text lines: DOP, inter-system and inter-frequency biases
+# (metres), and residual RMS in both domains — range and range rate, overall and broken down
+# per signal, which is why the block is named for the residuals rather than for the
+# pseudoranges one of its two columns is about. Appended below the position/velocity/time
+# block in the combined panel. The residuals are greyed out until the solution is
+# over-determined — with only as many measurements as unknowns the least-squares residual is
+# ~0 by construction, so its RMS is meaningless. Sections that don't apply (no inter-system
+# bias for a single constellation, no inter-frequency bias for a single band) are omitted.
+# Only called with a fix present, so no "waiting" fallback.
 function pvt_details_lines(pvt)
     lines = String[]
 
@@ -408,8 +407,11 @@ function pvt_details_lines(pvt)
     if !isempty(pvt.satellites)
         n = length(pvt.satellites)
         # Estimated unknowns: 3 position + one clock per time system (reference +
-        # each inter-system bias) + one per extra band.
-        num_unknowns = 3 + (1 + length(pvt.inter_system_biases)) + length(pvt.inter_frequency_biases)
+        # each inter-system bias) + one per extra band, less one per inter-system bias
+        # taken from a broadcast time offset rather than estimated.
+        num_unknowns =
+            3 + (1 + length(pvt.inter_system_biases)) + length(pvt.inter_frequency_biases) -
+            length(pvt.applied_broadcast_inter_system_biases)
         # Range and range-rate residuals side by side: the rate column is the Doppler-domain
         # counterpart, so a satellite consistent in range but not in rate (a cycle slip, or a
         # replica the loop is dragging) shows up as a rate RMS out of scale with the range one.

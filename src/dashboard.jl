@@ -416,9 +416,9 @@ function _render_skyplot(buf, area::Rect, gui_data, num_dots)
     if gui_data === nothing || isnothing(gui_data.pvt.time)
         nsat = gui_data === nothing ? 0 : length(gui_data.sat_data)
         # `nsat` counts tracked (not necessarily decoded) satellites, and the count
-        # a fix needs is layout-dependent (3 + one clock per time system + one IFB
-        # per extra band), so the panel reports progress and lets the fix itself
-        # signal success.
+        # a fix needs is layout-dependent (3 + one clock per time system not tied to
+        # another by a broadcast time offset + one IFB per extra band), so the panel
+        # reports progress and lets the fix itself signal success.
         msg = nsat == 0 ? "Searching for satellites$(repeat(".", num_dots))" :
               "Decoding satellites$(repeat(".", num_dots))"
         set_string!(buf, inner.x + 1, inner.y, msg, tstyle(:text_dim); max_x = right(inner))
