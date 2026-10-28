@@ -388,7 +388,7 @@ function plan_band_acquisition(
     # plans themselves are all derived from these signals.
     acq_systems = map(
         (system, acq_doppler_resolution) ->
-            acquisition_signal(system, sampling_freq, acq_doppler_resolution),
+            acquisition_signal(system, acq_doppler_resolution),
         systems,
         acq_doppler_resolutions,
     )
@@ -399,7 +399,7 @@ function plan_band_acquisition(
         # `ideal` is the minimum coherent length meeting the required resolution
         # (`ceil`, so the achieved resolution never exceeds the required maximum).
         ideal = coherent_code_periods_for_resolution(system, acq_doppler_resolution)
-        snap_coherent_code_periods(system, sampling_freq, ideal)
+        snap_coherent_code_periods(system, ideal)
     end
 
     # Size this band's buffer to the largest coherent plan window

@@ -151,26 +151,19 @@ primary_code_period(signal::AbstractGNSSSignal) =
 samples_per_code(system::AbstractGNSSSignal, sampling_freq) =
     ceil(Int, get_code_length(system) * upreferred(sampling_freq / get_chip_rate(system)))
 
-# Code periods per navigation data bit, matching Acquisition's `plan_acquire`.
-# `nothing` for dataless (pilot) signals, which carry no bit-period constraint.
-function code_periods_per_data_bit(system::AbstractGNSSSignal, sampling_freq)
-    bit_rate = get_bit_rate(system)
-    (isfinite(ustrip(bit_rate)) && ustrip(bit_rate) > 0) || return nothing
-    ceil(Int, upreferred(sampling_freq / bit_rate)) ÷ samples_per_code(system, sampling_freq)
-end
-
 # Is a coherent window of `nc` code periods a length `plan_acquire` accepts? A
 # window spanning ≥ one navigation bit must cover whole bits, and (for tiered/pilot
 # signals) whole secondary-code periods; sub-bit windows are unconstrained. This
 # mirrors the divisibility constraints `plan_acquire` enforces — it validates
-# these rather than deriving them, so the caller must land on a valid `nc`.
-function is_valid_coherent_length(system::AbstractGNSSSignal, sampling_freq, nc::Int)
+# these rather than deriving them, so the caller must land on a valid `nc`. A dataless
+# pilot spans no bits (`get_code_blocks_per_bit` is 0) and has no bit constraint.
+function is_valid_coherent_length(system::AbstractGNSSSignal, nc::Int)
     nc <= 1 && return nc == 1
     L = get_secondary_code_length(system)
     (L > 1 && nc % L != 0) && return false
-    bpc = code_periods_per_data_bit(system, sampling_freq)
-    (!isnothing(bpc) && nc >= bpc && nc % bpc != 0) && return false
-    true
+    blocks = get_code_blocks_per_bit(system)
+    spans_partial_bit = !iszero(blocks) && nc >= blocks && nc % blocks != 0
+    !spans_partial_bit
 end
 
 # Coherent code-period count needed to reach a requested acquisition Doppler
@@ -206,11 +199,11 @@ coherent_integration_time(system::AbstractGNSSSignal, nc::Integer) =
 # keeps the achieved Doppler resolution (∝ 1/nc) at least as fine as requested —
 # `acq_doppler_resolution` is treated as a maximum, so snapping must not coarsen it.
 # A valid length always exists above `ideal` (multiples of the secondary-code /
-# data-bit period), so the search terminates.
-function snap_coherent_code_periods(system::AbstractGNSSSignal, sampling_freq, ideal::Int)
+# bit period), so the search terminates.
+function snap_coherent_code_periods(system::AbstractGNSSSignal, ideal::Int)
     ideal <= 1 && return 1
     nc = ideal
-    while !is_valid_coherent_length(system, sampling_freq, nc)
+    while !is_valid_coherent_length(system, nc)
         nc += 1
     end
     nc
@@ -583,13 +576,13 @@ const MAX_SECONDARY_CODE_ROTATIONS = 32
 # B2a-Q (L=100>32) always fall back to data. A plain (non-combined) signal — B1I, B3I
 # and B2b-I among them, none of which has a pilot component — is its own acquisition
 # signal.
-acquisition_signal(system::AbstractGNSSSignal, sampling_freq, acq_doppler_resolution) = system
-function acquisition_signal(system::CombinedSignal, sampling_freq, acq_doppler_resolution)
+acquisition_signal(system::AbstractGNSSSignal, acq_doppler_resolution) = system
+function acquisition_signal(system::CombinedSignal, acq_doppler_resolution)
     pilot, data = system.pilot, system.data
     # Coherent length each component needs to meet the requested resolution, snapped
     # to a length `plan_acquire` accepts (the same value `plan_band_acquisition` will build).
     snap(s) = snap_coherent_code_periods(
-        s, sampling_freq, coherent_code_periods_for_resolution(s, acq_doppler_resolution))
+        s, coherent_code_periods_for_resolution(s, acq_doppler_resolution))
     nc_pilot = snap(pilot)
     within_cap =
         nc_pilot == 1 || get_secondary_code_length(pilot) <= MAX_SECONDARY_CODE_ROTATIONS
