@@ -75,7 +75,7 @@ if !isfile(file) || filesize(file) < nbytes
 end
 
 sampling_freq = 2.048e6u"Hz"
-system = GPSL1CA()
+signal = GPSL1CA()
 num_samples = Int(upreferred(sampling_freq * 4u"ms"))
 nothing # hide
 ```
@@ -107,7 +107,7 @@ our named tuple, not a `ReceiverDataOfInterest`:
 ```@example custom
 data_channel = receive(
     read_uint8_iq_file(file, num_samples; center = 127.5, type = ComplexF32),
-    system,
+    signal,
     sampling_freq;
     approximate_year = 2017,
     extract = tracking_details,

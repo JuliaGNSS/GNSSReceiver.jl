@@ -8,7 +8,7 @@ function acquire_band(
     track_state,
     receiver_sat_states,
     acquisition_buffer,
-    systems,
+    signals,
     acq_plans,
     measurement,
     last_time_acquisition_ran,
@@ -43,16 +43,16 @@ function acquire_band(
         runtime - last_time_acquisition_ran >= acquire_every
 
     # Acquire / reacquire per constellation, threading the shared TrackState.
-    # A type-stable fold over the systems tuple keeps `receiver_sat_states`
+    # A type-stable fold over the signals tuple keeps `receiver_sat_states`
     # concretely typed; a plain loop collecting into a Vector{Any} would box the
     # per-system dicts and make the whole per-frame path type-unstable.
     # `receiver_sat_states` and `acq_plans` are this band's per-group slices, already
-    # ordered to match `systems` by the caller (`_acquire_all_bands` selects them by
-    # `map(signal_group_key, systems)`), so their `values` zip positionally with
-    # `systems` inside `_acquire_all_systems`.
-    track_state, new_sat_state_dicts = _acquire_all_systems(
+    # ordered to match `signals` by the caller (`_acquire_all_bands` selects them by
+    # `map(signal_group_key, signals)`), so their `values` zip positionally with
+    # `signals` inside `_acquire_all_systems`.
+    track_state, new_sat_state_dicts = _acquire_all_signals(
         track_state,
-        systems,
+        signals,
         values(receiver_sat_states),
         values(acq_plans),
         (
@@ -100,20 +100,20 @@ end
     acquisition_buffers,
     last_time_acquisition_ran,
     band_keys::Tuple,
-    band_systems::Tuple,
+    band_signals::Tuple,
     measurements::Tuple,
     interm_freqs::Tuple,
     acq_plans,
     invariant_acq_args,
 )
     band_key = first(band_keys)
-    systems = first(band_systems)
-    group_keys = map(signal_group_key, systems)
+    signals = first(band_signals)
+    group_keys = map(signal_group_key, signals)
     track_state, band_receiver_sat_states, band_acquisition_buffer, band_last_time_acquisition_ran = acquire_band(
         track_state,
         receiver_sat_states[group_keys],
         acquisition_buffers[band_key],
-        systems,
+        signals,
         acq_plans[group_keys],
         first(measurements),
         last_time_acquisition_ran[band_key],
@@ -130,7 +130,7 @@ end
         acquisition_buffers,
         last_time_acquisition_ran,
         Base.tail(band_keys),
-        Base.tail(band_systems),
+        Base.tail(band_signals),
         Base.tail(measurements),
         Base.tail(interm_freqs),
         acq_plans,
@@ -148,7 +148,7 @@ end
 function acquire_if_due(
     receiver_state,
     band_keys,
-    band_systems,
+    band_signals,
     meas,
     interm_freqs,
     acq_plans,
@@ -172,7 +172,7 @@ function acquire_if_due(
             receiver_state.acquisition_buffers,
             receiver_state.last_time_acquisition_ran,
             band_keys,
-            band_systems,
+            band_signals,
             meas,
             interm_freqs,
             acq_plans,
@@ -221,9 +221,9 @@ function process(
     receiver_state::ReceiverState,
     acq_plans,
     measurements::Tuple,
-    band_systems::Tuple,
+    band_signals::Tuple,
     sampling_freq,
-    interm_freqs::Tuple = map(_ -> 0.0Hz, band_systems);
+    interm_freqs::Tuple = map(_ -> 0.0Hz, band_signals);
     downconvert_and_correlator = CPUThreadedDownconvertAndCorrelator(),
     num_ants::NumAnts{N} = NumAnts(1),
     acquire_every = 10s,
@@ -242,7 +242,7 @@ function process(
     # `get_band_id(system_band(first(band)))`), so read them off the type instead of
     # recomputing them from `band_systems` every chunk.
     band_keys = keys(receiver_state.acquisition_buffers)
-    all_systems = _flatten_systems(band_systems)
+    all_signals = _flatten_signals(band_signals)
 
     runtime = receiver_state.runtime
     # All bands advance from equal-length frames of the same time base, so they
@@ -254,7 +254,7 @@ function process(
         acquire_if_due(
             receiver_state,
             band_keys,
-            band_systems,
+            band_signals,
             meas,
             interm_freqs,
             acq_plans,
@@ -295,7 +295,7 @@ function process(
     receiver_sat_states = update_all_receiver_sat_states(
         receiver_sat_states,
         track_state,
-        all_systems,
+        all_signals,
         signal_duration,
         new_navigation_cycle,
     )
@@ -305,7 +305,7 @@ function process(
     pvt, last_time_pvt_ran = update_navigation(
         estimator,
         new_navigation_cycle,
-        all_systems,
+        all_signals,
         track_state,
         receiver_sat_states,
         receiver_state.pvt,
@@ -355,7 +355,7 @@ pvt_epoch(t, pvt_update_interval, sampling_freq) = fld(
 function update_navigation(
     ::AbstractDopplerEstimator,
     new_navigation_cycle,
-    all_systems,
+    all_signals,
     track_state,
     receiver_sat_states,
     pvt,
@@ -374,7 +374,7 @@ function update_navigation(
         return pvt, last_time_pvt_ran
     pvt = calc_pvt(
         pvt_signal_groups(
-            all_systems,
+            all_signals,
             track_state,
             receiver_sat_states,
             time_in_lock_before_calculating_pvt,
@@ -396,7 +396,7 @@ end
 function update_navigation(
     estimator::VectorPLLAndDLL,
     new_navigation_cycle,
-    all_systems,
+    all_signals,
     track_state,
     receiver_sat_states,
     pvt,
@@ -463,21 +463,21 @@ end
 # decoder of the *data* component; the combined `TrackedSat` carries the shared,
 # pilot-driven code phase.
 function pvt_signal_groups(
-    all_systems,
+    all_signals,
     track_state,
     receiver_sat_states,
     time_in_lock_before_calculating_pvt,
 )
-    NamedTuple{map(signal_group_key, all_systems)}(
-        map(all_systems) do system
-            group_key = signal_group_key(system)
+    NamedTuple{map(signal_group_key, all_signals)}(
+        map(all_signals) do signal
+            group_key = signal_group_key(signal)
             PositionVelocityTime.SignalGroup(
                 track_state.groups[group_key],
                 pvt_ready_decoders(
                     receiver_sat_states[group_key],
                     time_in_lock_before_calculating_pvt,
                 );
-                signal = ranging_signal(system),
+                signal = ranging_signal(signal),
             )
         end,
     )
@@ -486,13 +486,13 @@ end
 function update_all_receiver_sat_states(
     receiver_sat_states,
     track_state,
-    systems,
+    signals,
     signal_duration,
     new_navigation_cycle = false,
 )
     group_keys = keys(receiver_sat_states)
     estimator = track_state.doppler_estimator
-    # Map over `systems` (aligned with `group_keys`) so each group carries its own
+    # Map over `signals` (aligned with `group_keys`) so each group carries its own
     # ranging/data signal selectors: CN0 and carrier lock are read from the ranging
     # signal, the navigation bits decoded from the data signal.
     #
@@ -500,12 +500,12 @@ function update_all_receiver_sat_states(
     # allocating a fresh one every frame (the keys are unchanged; only the
     # `ReceiverSatState` values update). Safe because the emitted `sat_data` copies the
     # values it needs, so no consumer holds a reference into this dictionary.
-    new_vals = map(systems) do system
-        group_key = signal_group_key(system)
+    new_vals = map(signals) do signal
+        group_key = signal_group_key(signal)
         group_states = receiver_sat_states[group_key]
         map!(group_states, group_states) do receiver_sat_state
             prn = receiver_sat_state.prn
-            report = satellite_report(estimator, ranging_signal(system), prn)
+            report = satellite_report(estimator, ranging_signal(signal), prn)
             in_vt_loop = is_vector_loop_member(report)
             # A satellite in the vector loop keeps decoding and updating its
             # detectors even while out of (code) lock — the navigation filter
@@ -520,7 +520,7 @@ function update_all_receiver_sat_states(
                         report,
                         receiver_sat_state.decoder,
                         track_state,
-                        system,
+                        signal,
                         prn,
                     ),
                     update(
@@ -578,11 +578,11 @@ is_released_for_cause(report) =
 # the same bits a second time (it shares its buffers with the estimator's, which only the
 # health and data reads of this chunk see); a satellite the estimator has no record of
 # yet keeps its decoder. A scalar receiver decodes the data signal's soft bits itself.
-updated_decoder(::VectorPLLAndDLL, report, decoder, track_state, system, prn) =
+updated_decoder(::VectorPLLAndDLL, report, decoder, track_state, signal, prn) =
     isnothing(report) ? decoder : report.decoder
-function updated_decoder(::AbstractDopplerEstimator, report, decoder, track_state, system, prn)
-    group_key = signal_group_key(system)
-    data_idx = data_signal_index(system)
+function updated_decoder(::AbstractDopplerEstimator, report, decoder, track_state, signal, prn)
+    group_key = signal_group_key(signal)
+    data_idx = data_signal_index(signal)
     decode!(
         decoder,
         get_soft_bits(track_state, group_key, prn, data_idx),
@@ -624,8 +624,8 @@ tracked_sat_from_acq(
 # handed to another satellite, so resetting it in place would wipe that satellite's
 # buffers. It takes a fresh one instead: the estimator restarts its own decoder when the
 # satellite registers, and its next report replaces this one.
-reacquired_decoder(::VectorPLLAndDLL, decoder, data_sys, prn) = GNSSDecoderState(data_sys, prn)
-reacquired_decoder(::AbstractDopplerEstimator, decoder, data_sys, prn) =
+reacquired_decoder(::VectorPLLAndDLL, decoder, data, prn) = GNSSDecoderState(data, prn)
+reacquired_decoder(::AbstractDopplerEstimator, decoder, data, prn) =
     reset_decoder_state!(decoder)
 
 # Returns `(track_state, receiver_sat_states, acquired_prns)`. `acquired_prns`
@@ -637,16 +637,16 @@ function update_states_from_acquisition_results(
     code_lock_cn0_threshold,
     track_state,
     receiver_sat_states,
-    system,
+    signal,
     num_ants,
 )
-    group_key = signal_group_key(system)
+    group_key = signal_group_key(signal)
 
     # Fall back to the per-signal default code-lock threshold when the caller left
     # it unset; it comes from the ranging signal (the one the detector runs on).
     code_lock_threshold = something(
         code_lock_cn0_threshold,
-        get_default_code_lock_cn0_threshold(ranging_signal(system)),
+        get_default_code_lock_cn0_threshold(ranging_signal(signal)),
     )
 
     # CFAR alone decides detection: a result is accepted when its peak-to-noise ratio
@@ -657,20 +657,20 @@ function update_states_from_acquisition_results(
 
     # Build the decoder from the *data* signal, never from `res.signal`: with
     # pilot acquisition `res.signal` is the dataless pilot, which has no decoder.
-    data_sys = data_signal(system)
+    data = data_signal(signal)
     new_receiver_sat_states = map(acq_res_valids) do res
         decoder =
             res.prn in keys(receiver_sat_states) ?
             reacquired_decoder(
                 track_state.doppler_estimator,
                 receiver_sat_states[res.prn].decoder,
-                data_sys,
+                data,
                 res.prn,
-            ) : GNSSDecoderState(data_sys, res.prn)
+            ) : GNSSDecoderState(data, res.prn)
         ReceiverSatState(res, decoder, code_lock_threshold)
     end
 
-    tracking_sigs = tracking_signals(system)
+    tracking_sigs = tracking_signals(signal)
     new_sat_states = [
         tracked_sat_from_acq(res, tracking_sigs, num_ants, track_state.doppler_estimator) for res in acq_res_valids
     ]
@@ -685,30 +685,30 @@ function update_states_from_acquisition_results(
 end
 
 # Type-stable fold over the constellations: threads the shared TrackState and
-# collects each system's updated ReceiverSatState dict into a concrete tuple.
+# collects each signal's updated ReceiverSatState dict into a concrete tuple.
 # `invariant_acq_args` bundles the invariant per-frame arguments (splatted into
-# `acquire_satellites`). Recursion over the concrete `systems`/`sat_state_dicts`/`acq_plans`
+# `acquire_satellites`). Recursion over the concrete `signals`/`sat_state_dicts`/`acq_plans`
 # tuples unrolls at compile time, so no `Any` boxing.
-@inline _acquire_all_systems(track_state, ::Tuple{}, ::Tuple{}, ::Tuple{}, invariant_acq_args) =
+@inline _acquire_all_signals(track_state, ::Tuple{}, ::Tuple{}, ::Tuple{}, invariant_acq_args) =
     (track_state, ())
-@inline function _acquire_all_systems(
+@inline function _acquire_all_signals(
     track_state,
-    systems::Tuple,
+    signals::Tuple,
     sat_state_dicts::Tuple,
     acq_plans::Tuple,
     invariant_acq_args,
 )
     track_state, sat_state_dict =
-        acquire_satellites(track_state, first(sat_state_dicts), first(systems), first(acq_plans), invariant_acq_args...)
+        acquire_satellites(track_state, first(sat_state_dicts), first(signals), first(acq_plans), invariant_acq_args...)
     track_state, rest_dicts =
-        _acquire_all_systems(track_state, Base.tail(systems), Base.tail(sat_state_dicts), Base.tail(acq_plans), invariant_acq_args)
+        _acquire_all_signals(track_state, Base.tail(signals), Base.tail(sat_state_dicts), Base.tail(acq_plans), invariant_acq_args)
     (track_state, (sat_state_dict, rest_dicts...))
 end
 
 function acquire_satellites(
     track_state,
     receiver_sat_states,
-    system,
+    signal,
     acq_plan,
     acquisition_buffer,
     interm_freq,
@@ -722,7 +722,7 @@ function acquire_satellites(
     track_state, receiver_sat_states = try_to_reacquire_lost_satellites(
         track_state,
         receiver_sat_states,
-        system,
+        signal,
         acq_plan,
         acquisition_buffer,
         interm_freq,
@@ -752,7 +752,7 @@ function acquire_satellites(
             track_state, receiver_sat_states, _ = acquire_and_update_states(
                 track_state,
                 receiver_sat_states,
-                system,
+                signal,
                 acq_plan,
                 acquisition_buffer,
                 missing_satellites,
@@ -784,7 +784,7 @@ searched_prns(acq_plan) =
 function acquire_and_update_states(
     track_state,
     receiver_sat_states,
-    system,
+    signal,
     acq_plan,
     acquisition_buffer,
     prns,
@@ -795,7 +795,7 @@ function acquire_and_update_states(
         receiver_sat_states,
         Int[],
         acquisition_plans(acq_plan),
-        system,
+        signal,
         acquisition_buffer,
         prns,
         args,
@@ -809,7 +809,7 @@ function acquire_on_plans(
     receiver_sat_states,
     acquired_prns,
     plans::Tuple,
-    system,
+    signal,
     acquisition_buffer,
     prns,
     args,
@@ -820,7 +820,7 @@ function acquire_on_plans(
         track_state, receiver_sat_states, plan_acquired_prns = acquire_with_plan(
             track_state,
             receiver_sat_states,
-            system,
+            signal,
             plan,
             acquisition_buffer,
             plan_prns,
@@ -833,7 +833,7 @@ function acquire_on_plans(
         receiver_sat_states,
         acquired_prns,
         Base.tail(plans),
-        system,
+        signal,
         acquisition_buffer,
         prns,
         args,
@@ -843,7 +843,7 @@ end
 function acquire_with_plan(
     track_state,
     receiver_sat_states,
-    system,
+    signal,
     acq_plan,
     acquisition_buffer,
     prns,
@@ -870,7 +870,7 @@ function acquire_with_plan(
         code_lock_cn0_threshold,
         track_state,
         receiver_sat_states,
-        system,
+        signal,
         num_ants,
     )
 end
@@ -936,7 +936,7 @@ end
 function try_to_reacquire_lost_satellites(
     track_state,
     receiver_sat_states,
-    system,
+    signal,
     acq_plan,
     acquisition_buffer,
     interm_freq,
@@ -959,7 +959,7 @@ function try_to_reacquire_lost_satellites(
     track_state, receiver_sat_states, acquired_prns = acquire_and_update_states(
         track_state,
         receiver_sat_states,
-        system,
+        signal,
         acq_plan,
         acquisition_buffer,
         prns,

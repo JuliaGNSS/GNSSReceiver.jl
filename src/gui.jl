@@ -20,7 +20,7 @@ GUIData(
     GUIData{S}(sat_data, pvt, runtime, pvt_fresh, nothing)
 
 # Satellite labels follow the RINEX-3 convention: the satellite is identified by
-# its system letter + zero-padded PRN (`G30`, `E24`, `R05`, `C21` — the same code
+# its satellite-system letter + zero-padded PRN (`G30`, `E24`, `R05`, `C21` — the same code
 # used in RINEX files, IGS products and most receivers), and the signal's frequency
 # band is appended after a space (`G30 L5`). This keeps the satellite ID
 # unambiguous — `G05` is GPS PRN 5, never "GPS L5" — and drops the I/Q/CA signal
@@ -147,10 +147,10 @@ constellation_of(signal_id::Symbol) = get(SIGNAL_CONSTELLATIONS, signal_id, :Oth
 constellation_name(constellation::Symbol) =
     get(CONSTELLATION_NAMES, constellation, string(constellation))
 
-function sat_label(system_key::Symbol, prn::Integer)
-    sys = get(CONSTELLATION_LETTERS, constellation_of(system_key), "?")
-    band = get(BAND_ABBREVIATIONS, system_key, string(system_key))
-    string(sys, lpad(prn, 2, '0'), " ", rpad(band, 3))
+function sat_label(signal_id::Symbol, prn::Integer)
+    letter = get(CONSTELLATION_LETTERS, constellation_of(signal_id), "?")
+    band = get(BAND_ABBREVIATIONS, signal_id, string(signal_id))
+    string(letter, lpad(prn, 2, '0'), " ", rpad(band, 3))
 end
 
 # Display order for the CN0 bar chart: by constellation (GPS, then Galileo, then the
@@ -162,10 +162,10 @@ const CONSTELLATION_ORDER =
 
 # Sort key for a `(get_signal_id, prn)` satellite-data key: constellation, then PRN,
 # then signal.
-sat_sort_key((system_key, prn)::Tuple{Symbol,Int}) = (
-    get(CONSTELLATION_ORDER, constellation_of(system_key), 99),
+sat_sort_key((signal_id, prn)::Tuple{Symbol,Int}) = (
+    get(CONSTELLATION_ORDER, constellation_of(signal_id), 99),
     prn,
-    get(SIGNAL_ORDER, system_key, 99),
+    get(SIGNAL_ORDER, signal_id, 99),
 )
 
 # Every frequency band the GUI ranks and labels, used for the inter-frequency biases. As
@@ -249,18 +249,18 @@ end
 # `TIME_SYSTEM_ORDER`, i.e. GPS < Galileo < …) rather than `pvt.reference_system`, which
 # `calc_pvt` can swap between solves (the same instability as the IFB reference). Every ISB
 # is already referenced to the single `pvt.reference_system`. Returns a `Vector` of
-# `(system, value, reference_system)`.
+# `(time_system, value, reference_system)`.
 function isbs_vs_lowest_system(pvt)
     out = Tuple{Any,typeof(1.0m),Any}[]
     isempty(pvt.inter_system_biases) && return out
     bias = Dict{Any,typeof(1.0m)}(pvt.reference_system => 0.0m)
-    for (sys, v) in pairs(pvt.inter_system_biases)
-        bias[sys] = v
+    for (time_system, v) in pairs(pvt.inter_system_biases)
+        bias[time_system] = v
     end
     rank(s) = get(TIME_SYSTEM_ORDER, get_time_system_id(s), 99)
     ref = argmin(rank, keys(bias))
-    for sys in keys(bias)
-        sys == ref || push!(out, (sys, bias[sys] - bias[ref], ref))
+    for time_system in keys(bias)
+        time_system == ref || push!(out, (time_system, bias[time_system] - bias[ref], ref))
     end
     sort!(out; by = t -> rank(t[1]))
     return out
@@ -383,8 +383,9 @@ function pvt_details_lines(pvt)
     isbs = isbs_vs_lowest_system(pvt)
     if !isempty(isbs)
         push!(lines, "Inter-system biases (vs $(get_time_system_id(isbs[1][3]))):")
-        for (sys, bias, _) in isbs
-            push!(lines, "  $(get_time_system_id(sys)): $(_fmt2(ustrip(m, bias))) m")
+        for (time_system, bias, _) in isbs
+            id = get_time_system_id(time_system)
+            push!(lines, "  $id: $(_fmt2(ustrip(m, bias))) m")
         end
     end
 

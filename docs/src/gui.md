@@ -53,7 +53,7 @@ using SoapyRTLSDR_jll
 using GNSSReceiver, GNSSSignals, Tracking, SoapySDR, Unitful
 
 gnss_receiver_gui(;
-    system = GPSL1CA(),
+    signal = GPSL1CA(),
     sampling_frequency = 2e6u"Hz",
     chunk_time = 4u"ms",
     run_time = 40u"s",

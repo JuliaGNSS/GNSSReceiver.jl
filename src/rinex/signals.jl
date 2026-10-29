@@ -14,19 +14,19 @@
 # receiver's own correction to state, here with the sign RTKLIB writes.
 const BDS_PILOT_PHASE_CORRECTIONS = Dict(('C', "L1P") => 0.25, ('C', "L5P") => 0.25)
 
-# The correction [cycles] that aligns the carrier phase `code` of `system` with its band's
-# reference signal, `nothing` where it needs none (the reference itself, or a code Table A23
-# aligns with "None").
-function rinex_phase_shift(system::Char, code::AbstractString)
-    correction = phase_correction(system, code)
+# The correction [cycles] that aligns the carrier phase `code` of `satellite_system` with its
+# band's reference signal, `nothing` where it needs none (the reference itself, or a code
+# Table A23 aligns with "None").
+function rinex_phase_shift(satellite_system::Char, code::AbstractString)
+    correction = phase_correction(satellite_system, code)
     if isnothing(correction)
-        haskey(BDS_PILOT_PHASE_CORRECTIONS, (system, code)) || throw(
+        haskey(BDS_PILOT_PHASE_CORRECTIONS, (satellite_system, code)) || throw(
             ArgumentError(
-                "RINEX 3.05 Table A23 gives no phase alignment for $system $code, so its " *
-                "carrier phase cannot be written",
+                "RINEX 3.05 Table A23 gives no phase alignment for $satellite_system " *
+                "$code, so its carrier phase cannot be written",
             ),
         )
-        return BDS_PILOT_PHASE_CORRECTIONS[(system, code)]
+        return BDS_PILOT_PHASE_CORRECTIONS[(satellite_system, code)]
     end
     iszero(correction) ? nothing : correction
 end
@@ -92,44 +92,44 @@ function ranging_obs_codes(signal)
     end
 end
 
-# Build the observation-header layout for every configured system: the header's `obs_codes`
-# (RINEXParser's `observation_codes` of the ranging signals, in band and system order) plus
+# Build the observation-header layout for every configured signal: the header's `obs_codes`
+# (RINEXParser's `observation_codes` of the ranging signals, in band and signal order) plus
 # the per-group [`RinexSignalLayout`](@ref). Every band is sampled at `sampling_freq`.
-function rinex_layout(band_systems::Tuple, interm_freqs::Tuple, sampling_freq)
-    signals = AbstractGNSSSignal[]
+function rinex_layout(band_signals::Tuple, interm_freqs::Tuple, sampling_freq)
+    ranging_signals = AbstractGNSSSignal[]
     layouts = Dict{Symbol,RinexSignalLayout}()
-    for (systems, interm_freq) in zip(band_systems, interm_freqs)
-        for system in systems
+    for (signals, interm_freq) in zip(band_signals, interm_freqs)
+        for signal in signals
             # We range on the ranging signal (the pilot of a `CombinedSignal`), so that is
             # the signal the observables belong to — and its id is the group key that
             # addresses the satellite in `track_state` and in `pvt.satellites`.
-            signal = ranging_signal(system)
-            codes = ranging_obs_codes(signal)
-            system_char = RINEXParser.satellite_system(signal)
+            ranging = ranging_signal(signal)
+            codes = ranging_obs_codes(ranging)
+            satellite_system = RINEXParser.satellite_system(ranging)
             # The header declares a shared code once, so a satellite tracked on both
             # signals would give it twice in one record, which RINEX cannot hold.
             for (key, layout) in layouts
-                layout.system == system_char && layout.codes == codes && throw(
+                layout.system == satellite_system && layout.codes == codes && throw(
                     ArgumentError(
-                        "$key and $(get_signal_id(signal)) are both written as the " *
-                        "RINEX observations $(join(codes, ", ")) of system " *
-                        "$system_char, so a satellite tracked on both cannot be " *
+                        "$key and $(get_signal_id(ranging)) are both written as the " *
+                        "RINEX observations $(join(codes, ", ")) of satellite system " *
+                        "$satellite_system, so a satellite tracked on both cannot be " *
                         "written. Range on one of them for RINEX output.",
                     ),
                 )
             end
-            push!(signals, signal)
-            layouts[get_signal_id(signal)] = RinexSignalLayout(
-                system_char,
+            push!(ranging_signals, ranging)
+            layouts[get_signal_id(ranging)] = RinexSignalLayout(
+                satellite_system,
                 codes,
-                signal,
-                ustrip(Hz, get_center_frequency(signal)),
+                ranging,
+                ustrip(Hz, get_center_frequency(ranging)),
                 ustrip(Hz, interm_freq),
-                data_signal_index(system),
+                data_signal_index(signal),
                 float(sampling_freq),
-                rinex_phase_shift(system_char, codes.L),
+                rinex_phase_shift(satellite_system, codes.L),
             )
         end
     end
-    observation_codes(signals), layouts
+    observation_codes(ranging_signals), layouts
 end

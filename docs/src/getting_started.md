@@ -4,11 +4,11 @@ This page introduces the building blocks of GNSSReceiver.jl and shows the three 
 feed it with samples: a **live SDR**, a **file already stored in the sample element
 type**, and a **raw 8-bit offset-binary I/Q recording**.
 
-Throughout, `receive`'s second argument is a *system*: a single GNSS signal such as
+Throughout, `receive`'s second argument names the signals to receive: a GNSS signal such as
 `GPSL1CA()`, a [`CombinedSignal`](@ref) pilot+data pair, or a **tuple** of these that
 share one RF band (e.g. `(GPSL1CA(), GalileoE1B())`) — every constellation in the tuple is
 acquired, tracked and decoded and all are fused into a single multi-GNSS PVT solution. The
-examples below use a single system; see [Acquisition & Tracking Parameters](@ref) for the
+examples below use a single signal; see [Acquisition & Tracking Parameters](@ref) for the
 multi-constellation and multi-band forms. Note that the full-CBOC `GalileoE1B()` needs a
 sampling frequency above ~12.3 MHz — at lower rates use its BOC(1,1) approximation
 `GalileoE1B_BOC11()` (details on the parameters page).
@@ -61,7 +61,7 @@ using SoapyRTLSDR_jll          # or SoapyLMS7_jll, SoapyBladeRF_jll, SoapyUHD_jl
 using GNSSReceiver, GNSSSignals, Tracking, SoapySDR, Unitful
 
 gnss_receiver_gui(;
-    system = GPSL1CA(),
+    signal = GPSL1CA(),
     sampling_frequency = 2e6u"Hz",
     chunk_time = 4u"ms",           # processing chunk length (tracking granularity)
     run_time = 40u"s",
@@ -70,8 +70,8 @@ gnss_receiver_gui(;
 )
 ```
 
-`system` here can also be a tuple of systems sharing one RF band, e.g.
-`system = (GPSL1CA(), GalileoE1B())`, to receive several constellations at once.
+`signal` here can also be a tuple of signals sharing one RF band, e.g.
+`signal = (GPSL1CA(), GalileoE1B())`, to receive several constellations at once.
 
 To record raw samples now and process them later, use [`gnss_write_to_file`](@ref).
 
@@ -85,7 +85,7 @@ path per antenna channel. Read them as `ComplexF32` so the default
 using GNSSReceiver, GNSSSignals, Tracking, Unitful
 using Unitful: Hz, ms
 
-system = GPSL1CA()
+signal = GPSL1CA()
 sampling_freq = 5e6u"Hz"
 files = map(i -> "antenna$i.dat", 1:4)     # one file per antenna channel
 
@@ -97,7 +97,7 @@ measurement_channel = read_files(files, num_samples; type = ComplexF32)
 
 data_channel = receive(
     measurement_channel,
-    system,
+    signal,
     sampling_freq;
     num_ants = NumAnts(4),
 )

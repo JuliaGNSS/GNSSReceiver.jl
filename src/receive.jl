@@ -204,7 +204,7 @@ is_sat_in_lock_at(sat_state_dict, prn) =
     haskey(sat_state_dict, prn) && is_in_lock(sat_state_dict[prn])
 
 # Prompt correlator value of a satellite's ranging signal (the pilot, for a combined
-# system) — the quantity `SatelliteDataOfInterest` reports.
+# signal) — the quantity `SatelliteDataOfInterest` reports.
 _ranging_prompt(sat_state) =
     get_prompt(get_last_fully_integrated_correlator(sat_state, RANGING_SIGNAL_INDEX))
 
@@ -222,7 +222,7 @@ function _sat_data_value_type(track_state, receiver_sat_states)
 end
 
 # Build the `(signal_id, prn) => SatelliteDataOfInterest` dictionary from a receiver state.
-# The tracking-group keys are exactly `keys(receiver_sat_states)`, so no `systems` argument
+# The tracking-group keys are exactly `keys(receiver_sat_states)`, so no `signals` argument
 # is needed. Built as an explicitly-typed dictionary so it is a concrete, uniform
 # `Dictionary{Tuple{Symbol,Int},SatelliteDataOfInterest{P}}` whether or not a satellite is
 # tracked and across single- or multi-band states.
@@ -370,48 +370,48 @@ carrier_doppler_pull_in_range(estimator::VectorPLLAndDLL, signal::AbstractGNSSSi
 
 # Build the per-constellation acquisition plans and the acquisition-buffer sample
 # count for one band from the caller-supplied per-system target acquisition Doppler
-# resolutions. Returns `(systems, acq_plans, num_samples_for_acquisition)`.
+# resolutions. Returns `(signals, acq_plans, num_samples_for_acquisition)`.
 function plan_band_acquisition(
-    systems,
+    signals,
     sampling_freq,
     acq_doppler_resolutions;
     prns = nothing,
 )
-    systems = as_systems(systems)
+    signals = as_signals(signals)
 
-    # Ensure that systems is single band
-    assert_single_band(systems)
+    # Ensure that signals is single band
+    assert_single_band(signals)
 
-    # Acquisition runs on each system's acquisition signal: the pilot when the
+    # Acquisition runs on each signal's acquisition signal: the pilot when the
     # required resolution lands exactly on a valid pilot coherent length, else the
     # data component (see `acquisition_signal`). Plan sizing, buffer length and the
     # plans themselves are all derived from these signals.
-    acq_systems = map(
-        (system, acq_doppler_resolution) ->
-            acquisition_signal(system, acq_doppler_resolution),
-        systems,
+    acq_signals = map(
+        (signal, acq_doppler_resolution) ->
+            acquisition_signal(signal, acq_doppler_resolution),
+        signals,
         acq_doppler_resolutions,
     )
 
-    # Coherent code periods per system from the required Doppler resolution
+    # Coherent code periods per signal from the required Doppler resolution
     # (bin spacing = 1 / (nc · T_code)), snapped to a length `plan_acquire` accepts.
-    ncoh = map(acq_systems, acq_doppler_resolutions) do system, acq_doppler_resolution
+    ncoh = map(acq_signals, acq_doppler_resolutions) do signal, acq_doppler_resolution
         # `ideal` is the minimum coherent length meeting the required resolution
         # (`ceil`, so the achieved resolution never exceeds the required maximum).
-        ideal = coherent_code_periods_for_resolution(system, acq_doppler_resolution)
-        snap_coherent_code_periods(system, ideal)
+        ideal = coherent_code_periods_for_resolution(signal, acq_doppler_resolution)
+        snap_coherent_code_periods(signal, ideal)
     end
 
-    # The acquisition plans of each system, keyed like the tracking groups: one per bit
+    # The acquisition plans of each signal, keyed like the tracking groups: one per bit
     # period its PRNs broadcast at (see `plan_system_acquisition`). The plans are built for
     # (and PRNs restricted by) the acquisition signal; the group key is the ranging
     # signal's id.
-    group_keys = map(signal_group_key, systems)
+    group_keys = map(signal_group_key, signals)
     plans_and_lengths =
-        map(systems, acq_systems, ncoh, acq_doppler_resolutions) do system, acq_sys, nc, res
+        map(signals, acq_signals, ncoh, acq_doppler_resolutions) do signal, acq_signal, nc, res
             # Per-GNSS candidate PRNs restricted to those that broadcast this signal.
-            prns_for_system = collect(search_prns(prns, data_signal(system)))
-            plan_system_acquisition(acq_sys, sampling_freq, prns_for_system, nc, res)
+            prns_for_system = collect(search_prns(prns, data_signal(signal)))
+            plan_system_acquisition(acq_signal, sampling_freq, prns_for_system, nc, res)
         end
     acq_plans = NamedTuple{group_keys}(map(first, plans_and_lengths))
 
@@ -420,25 +420,25 @@ function plan_band_acquisition(
     num_samples_for_acquisition = maximum(
         map(
             (s, (_, ncs)) -> maximum(ncs) * samples_per_code(s, sampling_freq),
-            acq_systems,
+            acq_signals,
             plans_and_lengths,
         ),
     )
 
-    return systems, acq_plans, num_samples_for_acquisition
+    return signals, acq_plans, num_samples_for_acquisition
 end
 
-# The acquisition plans of one system and their coherent lengths, as two tuples: one plan
+# The acquisition plans of one signal and their coherent lengths, as two tuples: one plan
 # per bit period among `prns` (`get_code_blocks_per_bit(signal, prn)`). One plan holds one
 # bit count, so satellites whose bits differ in length are planned apart. That is one plan
 # on every signal but BeiDou B1I and B3I, whose GEO satellites broadcast D2 bits ten times
 # shorter than the others' D1 and carry no NH20 overlay. The signal's own satellites keep
 # `nc`; the others are planned without the overlay search (their overlay columns are
 # no-ops), on the shortest whole number of their bits that meets the resolution.
-function plan_system_acquisition(acq_sys, sampling_freq, prns, nc, acq_doppler_resolution)
-    own_code_blocks_per_bit = get_code_blocks_per_bit(acq_sys)
+function plan_system_acquisition(acq_signal, sampling_freq, prns, nc, acq_doppler_resolution)
+    own_code_blocks_per_bit = get_code_blocks_per_bit(acq_signal)
     plan(prns, nc; kwargs...) = plan_acquire(
-        acq_sys,
+        acq_signal,
         float(sampling_freq),
         prns;
         num_coherently_integrated_code_periods = nc,
@@ -449,13 +449,13 @@ function plan_system_acquisition(acq_sys, sampling_freq, prns, nc, acq_doppler_r
         max_secondary_code_rotations = MAX_SECONDARY_CODE_ROTATIONS,
         kwargs...,
     )
-    code_blocks_per_bit(prn) = get_code_blocks_per_bit(acq_sys, prn)
+    code_blocks_per_bit(prn) = get_code_blocks_per_bit(acq_signal, prn)
     own_prns = filter(prn -> code_blocks_per_bit(prn) == own_code_blocks_per_bit, prns)
     other_prns = setdiff(prns, own_prns)
     isempty(other_prns) && return (plan(prns, nc),), (nc,)
     other_code_blocks_per_bit = only(unique(map(code_blocks_per_bit, other_prns)))
     other_nc = snap_coherent_code_periods(
-        coherent_code_periods_for_resolution(acq_sys, acq_doppler_resolution),
+        coherent_code_periods_for_resolution(acq_signal, acq_doppler_resolution),
         1,
         other_code_blocks_per_bit,
     )
@@ -477,16 +477,16 @@ should_emit(state, previous_state, last_output, pvt_update_interval) =
     state.runtime - last_output >= 3 * pvt_update_interval / 2
 
 """
-    receive(measurement_channel, systems, sampling_freq; num_ants = NumAnts(1), kwargs...)
+    receive(measurement_channel, signals, sampling_freq; num_ants = NumAnts(1), kwargs...)
     receive(measurement_channels::Tuple, systems_per_band::Tuple, sampling_freq; kwargs...)
 
 Run the full acquire → track → decode → PVT pipeline over the samples arriving on
 `measurement_channel` and return a channel of per-chunk [`ReceiverDataOfInterest`](@ref).
 
-`systems` is a single GNSS system, a [`CombinedSignal`](@ref) pilot+data pair, or a tuple of
+`signals` is a single GNSS signal, a [`CombinedSignal`](@ref) pilot+data pair, or a tuple of
 these that share one RF band and sample stream; every constellation is acquired, tracked and
 decoded, and all are fused into a single multi-GNSS PVT solution. The multi-band method
-takes a tuple of measurement channels (one per RF band), a tuple of per-band system groups
+takes a tuple of measurement channels (one per RF band), a tuple of per-band signal groups
 and a tuple of `intermediate_frequencies`, all aligned band-by-band, and fuses every band
 into one solution with per-constellation clock biases and per-band inter-frequency biases.
 The band channels must deliver equal-length frames from one shared time base (e.g. a single
@@ -497,10 +497,10 @@ Sampled at `sampling_freq`, each chunk is processed by [`process`](@ref) in a sp
 task; one `ReceiverDataOfInterest` is emitted per PVT solution, in the chunk that produced
 it, and at least every 1.5 `pvt_update_interval` while there is none. Acquisition
 (Acquisition 2 FM-DBZP with CFAR) runs at most every `acquire_every`; its coherent length
-and Doppler resolution are derived per system from the tracking loop pull-in range, and
+and Doppler resolution are derived per signal from the tracking loop pull-in range, and
 `prns` restricts the search (`nothing` ⇒ each constellation's default range, a per-GNSS
 `NamedTuple`/`Dict` keyed by `get_constellation_id`, or a plain collection applied to
-every system). A satellite is declared locked from its CN0 — referred to a one-code-block
+every signal). A satellite is declared locked from its CN0 — referred to a one-code-block
 record, so an `N`-block record locks at `10·log10(N)` dB less — against
 `code_lock_cn0_threshold` (`nothing` ⇒ each signal's
 `GNSSReceiver.get_default_code_lock_cn0_threshold`, 30 dB-Hz), and contributes to the PVT
@@ -547,14 +547,14 @@ CPU backend (logged once); every other element type uses the float CPU backend a
 """
 function receive(
     measurement_channel::SignalChannel,
-    systems,
+    signals,
     sampling_freq;
     intermediate_frequency = 0.0Hz,
     kwargs...,
 )
     receive(
         (measurement_channel,),
-        (systems,),
+        (signals,),
         sampling_freq;
         intermediate_frequencies = (intermediate_frequency,),
         kwargs...,
@@ -563,14 +563,14 @@ end
 
 function receive(
     measurement_channels::Tuple{Vararg{SignalChannel}},
-    systems_per_band::Tuple,
+    signals_per_band::Tuple,
     sampling_freq;
     num_ants::NumAnts{N} = NumAnts(1),
     intermediate_frequencies::Tuple = map(_ -> 0.0Hz, measurement_channels),
     acquire_every = 10s,
     # PRNs to acquire. `nothing` ⇒ each constellation's default range; a per-GNSS
     # `NamedTuple`/`Dict` keyed by `get_constellation_id` (`(GPS = …, Galileo = …)`);
-    # or a plain collection applied to every system. Each system's search is further
+    # or a plain collection applied to every signal. Each signal's search is further
     # restricted to the PRNs that broadcast its signal (see `broadcasting_prns`).
     prns = nothing,
     # Front-end full-scale, used only to auto-select and size the integer backend for
@@ -611,11 +611,11 @@ function receive(
 ) where {N}
     n_bands = length(measurement_channels)
     (
-        length(systems_per_band) == n_bands &&
+        length(signals_per_band) == n_bands &&
         length(intermediate_frequencies) == n_bands
     ) || throw(
         ArgumentError(
-            "measurement_channels, systems_per_band and intermediate_frequencies must " *
+            "measurement_channels, signals_per_band and intermediate_frequencies must " *
             "have equal length",
         ),
     )
@@ -631,11 +631,11 @@ function receive(
             max_meas,
         ) : downconvert_and_correlator
 
-    # Normalise the systems band-by-band and derive each band's key up front.
-    band_systems = map(as_systems, systems_per_band)
-    band_keys = map(s -> get_band_id(system_band(first(s))), band_systems)
+    # Normalise the signals band-by-band and derive each band's key up front.
+    band_signals = map(as_signals, signals_per_band)
+    band_keys = map(s -> get_band_id(signal_band(first(s))), band_signals)
 
-    # Acquisition Doppler resolution derived per system from the carrier loops'
+    # Acquisition Doppler resolution derived per signal from the carrier loops'
     # *pull-in range* (bin = 2·margin·pull_in), so the worst-case post-acquisition
     # residual lands inside the loop's capture range; a smaller `pull_in_margin`
     # gives finer bins. The pull-in depends on the scalar loop a satellite runs fresh
@@ -643,10 +643,10 @@ function receive(
     # same in both modes, since `VectorPLLAndDLL` wraps it until the navigation filter
     # takes the satellite over.
     pull_in_margin = 0.5
-    band_acq_doppler_resolutions = map(band_systems) do systems
-        map(systems) do system
+    band_acq_doppler_resolutions = map(band_signals) do signals
+        map(signals) do signal
             2 * pull_in_margin *
-            carrier_doppler_pull_in_range(SCALAR_DOPPLER_ESTIMATOR, ranging_signal(system))
+            carrier_doppler_pull_in_range(SCALAR_DOPPLER_ESTIMATOR, ranging_signal(signal))
         end
     end
 
@@ -656,8 +656,8 @@ function receive(
 
     # Per-band acquisition plans and buffer sizes (each band is validated as
     # single-band by `plan_band_acquisition`).
-    setups = map(band_systems, band_acq_doppler_resolutions) do systems, acq_doppler_resolutions
-        plan_band_acquisition(systems, sampling_freq, acq_doppler_resolutions; prns)
+    setups = map(band_signals, band_acq_doppler_resolutions) do signals, acq_doppler_resolutions
+        plan_band_acquisition(signals, sampling_freq, acq_doppler_resolutions; prns)
     end
     # One acquisition-plan NamedTuple across all bands, keyed by group key (unique
     # across bands). `merge` of the per-band NamedTuples flattens them.
@@ -670,7 +670,7 @@ function receive(
         map((ch, s) -> SampleBuffer(eltype(eltype(ch)), s[3]), measurement_channels, setups),
     )
     initial_state = ReceiverState(
-        band_systems,
+        band_signals,
         buffers;
         num_ants,
         vector_tracking,
@@ -700,7 +700,7 @@ function receive(
         isnothing(config) ? nothing :
         RinexLogger(
             config,
-            band_systems,
+            band_signals,
             intermediate_frequencies,
             sampling_freq;
             approximate_year,
@@ -731,7 +731,7 @@ function receive(
                     previous_state,
                     acq_plans,
                     measurements,
-                    band_systems,
+                    band_signals,
                     sampling_freq,
                     intermediate_frequencies;
                     downconvert_and_correlator = resolved_dc,

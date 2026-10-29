@@ -17,9 +17,9 @@ a terminal GUI, persist to disk, or post-process in Julia.
 - End-to-end **acquire → track → decode → PVT** pipeline over a lock-free sample channel.
 - **Multi-constellation, multi-band**: GPS (L1 C/A, L1C, L2C, L5), Galileo (E1, E5a,
   E5b, E6-B) and BeiDou (B1I, B3I, B1C, B2a, B2b), on their GPST/GST/BDT time systems.
-  Pass a tuple of systems that share one RF band to
+  Pass a tuple of signals that share one RF band to
   fuse them (e.g. `(GPSL1CA(), GalileoE1B())`), or a tuple of measurement channels and
-  system groups to fuse several bands into one solution with per-constellation clock
+  signal groups to fuse several bands into one solution with per-constellation clock
   biases and per-band inter-frequency biases.
 - Pilot + data **combined tracking** via [`CombinedSignal`](@ref): range on the dataless
   pilot, decode the navigation message from the data component (e.g. Galileo E1B/E1C,
@@ -59,7 +59,7 @@ using SoapyRTLSDR_jll          # your device's SoapySDR driver
 using GNSSReceiver, GNSSSignals, Tracking, SoapySDR, Unitful
 
 gnss_receiver_gui(;
-    system = GPSL1CA(),
+    signal = GPSL1CA(),
     sampling_frequency = 2e6u"Hz",
     chunk_time = 4u"ms",
     run_time = 40u"s",

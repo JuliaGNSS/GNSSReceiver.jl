@@ -95,8 +95,8 @@ The observation codes come from the constellation code tables of RINEX 3.05 — 
 (GPS), 16 (Galileo) and 19 (BDS), as RINEXParser's `observation_code` gives them — and name
 the signal the receiver actually ranges on — for a [`CombinedSignal`](@ref) that is the pilot, so
 `CombinedSignal(GalileoE1C(), GalileoE1B())` is written as `C1C`/`L1C`/`D1C`/`S1C` under
-system `E`. A satellite tracked on several signals or bands appears once per epoch, with
-each signal in its own column, and several constellations produce one mixed (`M`) file.
+satellite system `E`. A satellite tracked on several signals or bands appears once per
+epoch, with each signal in its own column, and several constellations produce one mixed (`M`) file.
 
 The **navigation file** carries the decoded broadcast ephemerides, deduplicated so each is
 written exactly once, plus the ionosphere (Klobuchar / NeQuick), time-system (UTC, GGTO) and

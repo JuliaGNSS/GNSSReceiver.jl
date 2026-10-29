@@ -38,7 +38,7 @@ three calls — [`read_uint8_iq_file`](@ref), [`receive`](@ref) and [`collect_da
 using GNSSReceiver, GNSSSignals, Unitful
 
 sampling_freq = 2.048e6u"Hz"
-system = GPSL1CA()
+signal = GPSL1CA()
 num_samples = Int(upreferred(sampling_freq * 4u"ms"))   # 4 ms chunks
 
 measurement_channel =
@@ -46,7 +46,7 @@ measurement_channel =
 
 data_channel = receive(
     measurement_channel,
-    system,
+    signal,
     sampling_freq;
     approximate_year = 2017,   # resolves the GPS week-number rollover for old data
 )

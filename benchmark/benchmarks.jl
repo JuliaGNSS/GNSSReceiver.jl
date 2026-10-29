@@ -39,7 +39,7 @@ const SUITE = BenchmarkGroup()
 # speedup, present on both revisions, so it is not a base/head difference.
 const SIGNAL_URL = "https://sdr.ion.org/RTL_SDR/RTLSDR_Bands-L1.uint8"
 const SAMPLING_FREQ = 2.048e6u"Hz"
-const SYSTEM = GPSL1CA()
+const SIGNAL = GPSL1CA()
 const INTERM_FREQ = 0.0u"Hz"
 const CHUNK = Int(upreferred(SAMPLING_FREQ * 4u"ms"))        # 8192 samples per process() call
 const ACQ_CODE_CYCLES = 10        # 10 ms coherent integration locks the full healthy set
@@ -61,9 +61,9 @@ const STAGE_LABEL = "$(uconvert(u"s", N_1S * CHUNK / SAMPLING_FREQ)) signal"
 
 # Coherent integration time (ACQ_CODE_CYCLES code periods) — the main driver of
 # `acquire!` cost, so it goes in the acquisition benchmark's label. Derived from
-# the system's code length / chip rate rather than hard-coded.
+# the signal's code length / chip rate rather than hard-coded.
 const COHERENT_INTEGRATION =
-    uconvert(u"ms", ACQ_CODE_CYCLES * get_code_length(SYSTEM) / _chip_rate(SYSTEM))
+    uconvert(u"ms", ACQ_CODE_CYCLES * get_code_length(SIGNAL) / _chip_rate(SIGNAL))
 
 const DC = Tracking.CPUThreadedDownconvertAndCorrelator()
 
@@ -80,7 +80,7 @@ const DC_INT16_NOTHREAD = Tracking.Int16DownconvertAndCorrelator(2^7)
 
 # Feature-detect the multi-band API so this one script runs against both the
 # multi-constellation head and the single-band base: on the head, `process` takes
-# tuples of measurements / systems / intermediate frequencies plus an
+# tuples of measurements / signals / intermediate frequencies plus an
 # acquisition-plan NamedTuple keyed by the group's signal id, and the PVT year
 # keyword is `pvt_approximate_year` (was `approximate_year`). Lets
 # `benchpkg --bench-on=head` compute a real base-vs-head ratio across this
@@ -100,7 +100,7 @@ _process(rs, acq_plans, meas, dc; kwargs...) =
             rs,
             acq_plans,
             (meas,),
-            ((SYSTEM,),),
+            ((SIGNAL,),),
             SAMPLING_FREQ,
             (INTERM_FREQ,);
             downconvert_and_correlator = dc,
@@ -113,7 +113,7 @@ _process(rs, acq_plans, meas, dc; kwargs...) =
             rs,
             acq_plans...,
             meas,
-            SYSTEM,
+            SIGNAL,
             SAMPLING_FREQ;
             downconvert_and_correlator = dc,
             num_ants = NumAnts(1),
@@ -125,12 +125,12 @@ _process(rs, acq_plans, meas, dc; kwargs...) =
 function make_receiver_and_plan(::Type{T}) where {T}
     nacq = round(
         Int,
-        get_code_length(SYSTEM) * upreferred(SAMPLING_FREQ / _chip_rate(SYSTEM)) *
+        get_code_length(SIGNAL) * upreferred(SAMPLING_FREQ / _chip_rate(SIGNAL)) *
         ACQ_CODE_CYCLES,
     )
-    rs = ReceiverState(T, SYSTEM; num_ants = NumAnts(1), num_samples_for_acquisition = nacq)
+    rs = ReceiverState(T, SIGNAL; num_ants = NumAnts(1), num_samples_for_acquisition = nacq)
     plan = Acquisition.plan_acquire(
-        SYSTEM,
+        SIGNAL,
         float(SAMPLING_FREQ),
         collect(1:32);
         num_coherently_integrated_code_periods = ACQ_CODE_CYCLES,
@@ -138,7 +138,7 @@ function make_receiver_and_plan(::Type{T}) where {T}
     # The multi-band head selects each band's plans from a NamedTuple keyed by the
     # group's signal id; the single-band base takes the plan positionally.
     acq_plans =
-        _IS_MULTIBAND ? NamedTuple{(GNSSReceiver.signal_group_key(SYSTEM),)}((plan,)) :
+        _IS_MULTIBAND ? NamedTuple{(GNSSReceiver.signal_group_key(SIGNAL),)}((plan,)) :
         (plan,)
     return rs, acq_plans
 end
@@ -319,7 +319,7 @@ function run_receive_cold_start(chunks, dc)
     dc_kw = dc === nothing ? (;) : (; downconvert_and_correlator = dc)
     data_channel = receive(
         measurement_channel,
-        SYSTEM,
+        SIGNAL,
         SAMPLING_FREQ;
         num_ants = NumAnts(1),
         acquire_every = ACQUIRE_EVERY,

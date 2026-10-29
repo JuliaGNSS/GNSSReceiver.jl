@@ -61,8 +61,8 @@ _gps_lnav_data(; kwargs...) = GNSSDecoder.GPSL1CAData(;
 # A decoder state holding `data` as validated navigation data. A freshly constructed decoder
 # reports no bit count until it has synchronised; zero puts the transmit time exactly on
 # the decoded time of week, which is what makes the expected pseudoranges below exact.
-_decoder_with(system, prn, data) = GNSSDecoder.GNSSDecoderState(
-    GNSSDecoderState(system, prn);
+_decoder_with(signal, prn, data) = GNSSDecoder.GNSSDecoderState(
+    GNSSDecoderState(signal, prn);
     data,
     raw_data = data,
     num_bits_since_sync = 0,
@@ -339,17 +339,17 @@ end
 @testset "A pilot's polarity comes from its secondary code" begin
     # The sync of a pilot's secondary code reads the carrier's polarity off the prompts, so it
     # is known without the data component's decoder having synchronised.
-    system = CombinedSignal(GalileoE1C(), GalileoE1B())
+    signal = CombinedSignal(GalileoE1C(), GalileoE1B())
     key = get_signal_id(GalileoE1C())
     track_state =
         GNSSReceiver.ReceiverState(
             ComplexF64,
-            system;
+            signal;
             num_samples_for_acquisition = 20000,
             num_ants = NumAnts(1),
         ).track_state
     sat = GNSSReceiver.create_tracked_sat(
-        GNSSReceiver.tracking_signals(system),
+        GNSSReceiver.tracking_signals(signal),
         11,
         0.0,
         0.0Hz,
@@ -367,7 +367,7 @@ end
             )
         ],
     )
-    _, layouts = GNSSReceiver.rinex_layout(((system,),), (0.0Hz,), 2.048e6Hz)
+    _, layouts = GNSSReceiver.rinex_layout(((signal,),), (0.0Hz,), 2.048e6Hz)
     decoder = GNSSDecoder.GNSSDecoderState(GalileoE1B(), 11)
     @test isnothing(decoder.num_bits_since_sync)
     polarity(state) = GNSSReceiver.carrier_polarity(state, key, 11, layouts[key], decoder)
@@ -424,17 +424,17 @@ function _rinex_receiver_state(;
     phase_locked = true,
     data = _gps_lnav_data(),
 )
-    system = GPSL1CA()
-    key = get_signal_id(system)
-    band_key = get_band_id(GNSSReceiver.system_band(system))
+    signal = GPSL1CA()
+    key = get_signal_id(signal)
+    band_key = get_band_id(GNSSReceiver.signal_band(signal))
     receiver_state = GNSSReceiver.ReceiverState(
         ComplexF64,
-        system;
+        signal;
         num_samples_for_acquisition = 20000,
         num_ants = NumAnts(1),
     )
     sat = GNSSReceiver.create_tracked_sat(
-        GNSSReceiver.tracking_signals(system),
+        GNSSReceiver.tracking_signals(signal),
         prn,
         0.0,
         doppler,
@@ -448,7 +448,7 @@ function _rinex_receiver_state(;
     track_state = merge_sats(receiver_state.track_state, key, [sat])
     sat_state = GNSSReceiver.ReceiverSatState(
         prn,
-        _decoder_with(system, prn, data),
+        _decoder_with(signal, prn, data),
         GNSSReceiver.CodeLockDetector(),
         GNSSReceiver.CarrierLockDetector(),
         3.0u"s",
@@ -1379,7 +1379,7 @@ end
 
 @testset "receive writes valid RINEX when disabled and when enabled" begin
     sampling_freq = 5e6Hz
-    system = GPSL1CA()
+    signal = GPSL1CA()
     num_samples = 20000
 
     function noise_channel()
@@ -1398,7 +1398,7 @@ end
     directory = mktempdir()
     cd(directory) do
         data_channel =
-            receive(noise_channel(), system, sampling_freq; num_ants = NumAnts(1))
+            receive(noise_channel(), signal, sampling_freq; num_ants = NumAnts(1))
         collect_data(data_channel)
         @test isempty(readdir())
     end
@@ -1409,7 +1409,7 @@ end
     nav_file = joinpath(directory, "noise.nav")
     data_channel = receive(
         noise_channel(),
-        system,
+        signal,
         sampling_freq;
         num_ants = NumAnts(1),
         write_rinex = RinexConfig(; obs_file, nav_file),

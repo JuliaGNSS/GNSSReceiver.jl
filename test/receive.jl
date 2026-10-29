@@ -4,8 +4,8 @@
     Complex{Int16},
 ]
     sampling_freq = 5e6Hz
-    system = GPSL1CA()
-    key = get_signal_id(system)
+    signal = GPSL1CA()
+    key = get_signal_id(signal)
     num_samples = 20000
     num_ants = 4
 
@@ -36,7 +36,7 @@
     # `max_meas` is ignored for the float element types.
     data_channel = receive(
         measurement_channel,
-        system,
+        signal,
         sampling_freq;
         num_ants = NumAnts(num_ants),
         max_meas = 2^12,
@@ -48,7 +48,7 @@
     end
 end
 
-@testset "Rejects a pilot-only (non-decodable) system" begin
+@testset "Rejects a pilot-only (non-decodable) signal" begin
     # A bare pilot carries no navigation data, so it has no decoder and must be
     # rejected up front rather than failing deep in decoder construction.
     @test_throws ArgumentError GNSSReceiver.ReceiverState(
@@ -80,7 +80,7 @@ end
     @test GNSSReceiver.is_decodable(GNSSReceiver.CombinedSignal(GPSL5Q(), GPSL5I()))
 end
 
-@testset "Rejects systems spanning more than one RF band" begin
+@testset "Rejects signals spanning more than one RF band" begin
     # One sample stream carries one carrier, so a genuinely un-tunable mix must be
     # rejected — while signals of different constellations sharing a carrier are fine.
     @test isnothing(GNSSReceiver.assert_single_band((GPSL1CA(), GalileoE1B())))
@@ -113,7 +113,7 @@ end
 
 @testset "Receive with a custom extract hook" begin
     sampling_freq = 5e6Hz
-    system = GPSL1CA()
+    signal = GPSL1CA()
     num_samples = 20000
     num_ants = 4
     max_meas = 2^12
@@ -129,7 +129,7 @@ end
     # the 80 ms noise run yields a real sequence rather than a single snapshot.
     data_channel = receive(
         measurement_channel,
-        system,
+        signal,
         sampling_freq;
         num_ants = NumAnts(num_ants),
         max_meas,
@@ -153,7 +153,7 @@ end
 
 @testset "Receive falls back to a runtime call for a non-inferrable extract" begin
     sampling_freq = 5e6Hz
-    system = GPSL1CA()
+    signal = GPSL1CA()
     num_samples = 20000
     num_ants = 4
     max_meas = 2^12
@@ -169,7 +169,7 @@ end
 
     data_channel = receive(
         measurement_channel,
-        system,
+        signal,
         sampling_freq;
         num_ants = NumAnts(num_ants),
         max_meas,

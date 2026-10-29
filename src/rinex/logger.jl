@@ -76,7 +76,7 @@ Base.@kwdef mutable struct RinexLogger
     # configuration rather than from what has been decoded so far: it pins the navigation
     # header's satellite system, and a header written before a second constellation showed
     # up would make RINEXParser reject that constellation's records.
-    systems::Vector{Char}
+    satellite_systems::Vector{Char}
     # The time system of the epochs, fixed for the file as its header states it (GPS for a
     # mixed file) rather than following the PVT solution's reference system.
     time_system::GNSSSignals.TimeSystem
@@ -114,15 +114,15 @@ end
 
 function RinexLogger(
     config::RinexConfig,
-    band_systems::Tuple,
+    band_signals::Tuple,
     interm_freqs::Tuple,
     sampling_freq;
     approximate_year::Integer = year(now(UTC)),
     pvt_update_interval = 100ms,
 )
     check_rinex_config(config)
-    obs_codes, layouts = rinex_layout(band_systems, interm_freqs, sampling_freq)
-    systems = unique(layout.system for layout in values(layouts))
+    obs_codes, layouts = rinex_layout(band_signals, interm_freqs, sampling_freq)
+    satellite_systems = unique(layout.system for layout in values(layouts))
     # The writers are opened here rather than inside the task so that an unwritable path
     # fails at the `receive` call. A file named by the convention is named when it is
     # closed, from its first epoch (see `RinexConfig`). An observation value too wide for
@@ -144,7 +144,7 @@ function RinexLogger(
                 session = obs_writer,
                 with_marker_name = isnothing(obs_writer),
             ),
-            initial_nav_header(systems);
+            initial_nav_header(satellite_systems);
             overflow = :skip,
         )
     catch
@@ -163,8 +163,8 @@ function RinexLogger(
         config,
         header,
         layouts,
-        systems,
-        time_system = gnss_time_system(systems),
+        satellite_systems,
+        time_system = gnss_time_system(satellite_systems),
         approximate_year,
         channel,
         task = spawn_rinex_writer(channel, obs_writer, nav_writer),

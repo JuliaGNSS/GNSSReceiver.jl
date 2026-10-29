@@ -102,8 +102,8 @@ let
     @testset "ION RTL-SDR signal integration test ($type)" for type in
                                                                [ComplexF32, Complex{Int16}]
         sampling_freq = 2.048e6u"Hz"
-        system = GPSL1CA()
-        signal_id = get_signal_id(system)  # :GPSL1CA — the key half of the (signal, prn) tuple
+        signal = GPSL1CA()
+        signal_id = get_signal_id(signal)  # :GPSL1CA — the key half of the (signal, prn) tuple
         # 4 ms chunks = 8192 samples at 2.048 MHz
         num_samples = Int(upreferred(sampling_freq * 4u"ms"))
         num_ants = 1
@@ -125,7 +125,7 @@ let
         # integer backend; ignored for the `ComplexF32` float backend.
         data_channel = receive(
             measurement_channel,
-            system,
+            signal,
             sampling_freq;
             num_ants = NumAnts(num_ants),
             intermediate_frequency = 0.0u"Hz",
@@ -283,7 +283,7 @@ let
     # them out).
     @testset "Reacquisition after a mid-stream sample slip" begin
         sampling_freq = 2.048e6u"Hz"
-        system = GPSL1CA()
+        signal = GPSL1CA()
         num_samples = Int(upreferred(sampling_freq * 4u"ms"))
         chunk_time = 4e-3  # seconds of signal per chunk
         # The derived cold-start acquisition (4 ms coherent integration here) locks the
@@ -315,7 +315,7 @@ let
 
         data_channel = receive(
             measurement_channel,
-            system,
+            signal,
             sampling_freq;
             num_ants = NumAnts(1),
             intermediate_frequency = 0.0u"Hz",
@@ -360,7 +360,7 @@ let
         # guards the `uconvert(Hz, …)` normalisation in `process` (regression for the VT
         # first-fix crash). Do not "tidy" this back to Hz.
         sampling_freq = 2.048u"MHz"
-        system = GPSL1CA()
+        signal = GPSL1CA()
         num_samples = Int(upreferred(sampling_freq * 4u"ms"))
 
         measurement_channel = GNSSReceiver.spawn_signal_channel_thread(;
@@ -388,7 +388,7 @@ let
 
         data_channel = receive(
             measurement_channel,
-            system,
+            signal,
             sampling_freq;
             num_ants = NumAnts(1),
             intermediate_frequency = 0.0u"Hz",

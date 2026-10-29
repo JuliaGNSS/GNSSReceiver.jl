@@ -170,8 +170,12 @@ function build_obs_epoch(logger::RinexLogger, receiver_state, timing::ObsEpochTi
     )
     # Deterministic satellite order within the epoch, as RINEX files conventionally carry.
     sats = [
-        SatObs(logger.header, system, prn, satellites[(system, prn)]) for
-        (system, prn) in sort!(collect(keys(satellites)))
+        SatObs(
+            logger.header,
+            satellite_system,
+            prn,
+            satellites[(satellite_system, prn)],
+        ) for (satellite_system, prn) in sort!(collect(keys(satellites)))
     ]
     ObsEpoch(time, sats; fractional_second)
 end

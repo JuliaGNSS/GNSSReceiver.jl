@@ -1,26 +1,26 @@
 @testset "process with number of antennas $i" for i in [1, 4]
     measurement = randn(ComplexF64, 20000, i)
-    system = GPSL1CA()
-    systems = (system,)
-    key = get_signal_id(system)
-    bk = get_band_id(GNSSReceiver.system_band(system))
+    signal = GPSL1CA()
+    signals = (signal,)
+    key = get_signal_id(signal)
+    bk = get_band_id(GNSSReceiver.signal_band(signal))
     sampling_freq = 5e6Hz
 
     receiver_state = GNSSReceiver.ReceiverState(
         ComplexF64,
-        system;
+        signal;
         num_samples_for_acquisition = 20000,
         num_ants = NumAnts(i),
     )
 
-    acq_plans = (; key => plan_acquire(system, float(sampling_freq), collect(1:32)))
+    acq_plans = (; key => plan_acquire(signal, float(sampling_freq), collect(1:32)))
 
     # A tiny false-alarm probability so pure noise never acquires.
     next_receiver_state = GNSSReceiver.process(
         receiver_state,
         acq_plans,
         (measurement,),
-        (systems,),
+        (signals,),
         sampling_freq,
         (0.0u"Hz",);
         num_ants = NumAnts(i),
@@ -38,7 +38,7 @@
         receiver_state.track_state,
         key,
         [GNSSReceiver.create_tracked_sat(
-            GNSSReceiver.tracking_signals(system),
+            GNSSReceiver.tracking_signals(signal),
             1,
             0.0,
             20.0u"Hz",
@@ -47,7 +47,7 @@
         )],
     )
     receiver_sat_states =
-        (; key => Dictionary([1], [GNSSReceiver.ReceiverSatState(system, 1)]))
+        (; key => Dictionary([1], [GNSSReceiver.ReceiverSatState(signal, 1)]))
     acquisition_buffers = NamedTuple{(bk,)}((GNSSReceiver.SampleBuffer(ComplexF64, 20000),))
     last_time_acquisition_ran = NamedTuple{(bk,)}((-Inf * 1.0u"s",))
     pvt = PVTSolution()
@@ -68,7 +68,7 @@
         receiver_state,
         acq_plans,
         (measurement,),
-        (systems,),
+        (signals,),
         sampling_freq,
         (0.0u"Hz",);
         num_ants = NumAnts(i),
@@ -81,10 +81,10 @@ end
 # A due scalar solve with fewer than four PVT-ready satellites returns the previous
 # solution unchanged, while still recording that the solve ran.
 @testset "Scalar solve returns the previous solution without enough satellites" begin
-    system = GPSL1CA()
+    signal = GPSL1CA()
     receiver_state = GNSSReceiver.ReceiverState(
         ComplexF64,
-        system;
+        signal;
         num_samples_for_acquisition = 20000,
         num_ants = NumAnts(1),
     )
@@ -94,7 +94,7 @@ end
     pvt_out, last_time_pvt_ran = GNSSReceiver.update_navigation(
         receiver_state.track_state.doppler_estimator,
         false,
-        (system,),
+        (signal,),
         receiver_state.track_state,
         receiver_state.receiver_sat_states,
         pvt,
@@ -110,18 +110,18 @@ end
 # `last_time_pvt_ran` to the current runtime) in the first chunk of each
 # `pvt_update_interval` epoch.
 @testset "process PVT cadence gate" begin
-    system = GPSL1CA()
-    systems = (system,)
-    key = get_signal_id(system)
+    signal = GPSL1CA()
+    signals = (signal,)
+    key = get_signal_id(signal)
     sampling_freq = 5e6Hz
     measurement = randn(ComplexF64, 20000, 1)
     base = GNSSReceiver.ReceiverState(
         ComplexF64,
-        system;
+        signal;
         num_samples_for_acquisition = 20000,
         num_ants = NumAnts(1),
     )
-    acq_plans = (; key => plan_acquire(system, float(sampling_freq), collect(1:32)))
+    acq_plans = (; key => plan_acquire(signal, float(sampling_freq), collect(1:32)))
 
     with_pvt_timing(runtime, last_time_pvt_ran) = ReceiverState(
         base.track_state,
@@ -140,7 +140,7 @@ end
         with_pvt_timing(4.996u"s", 4.9u"s"),
         acq_plans,
         (measurement,),
-        (systems,),
+        (signals,),
         sampling_freq,
         (0.0u"Hz",);
         acq_pfa = 1e-12,
@@ -153,7 +153,7 @@ end
         with_pvt_timing(5.0u"s", 4.9u"s"),
         acq_plans,
         (measurement,),
-        (systems,),
+        (signals,),
         sampling_freq,
         (0.0u"Hz",);
         acq_pfa = 1e-12,
@@ -166,12 +166,12 @@ end
 # some boundaries; a gate on the elapsed time since the last solve deferred those
 # solves by a chunk (every 100 ms / 104 ms with 4 ms chunks).
 @testset "Scalar PVT solves stay on the epoch grid" begin
-    system = GPSL1CA()
+    signal = GPSL1CA()
     sampling_freq = 5e6Hz
     signal_duration = 20000 / sampling_freq # 4 ms
     state = GNSSReceiver.ReceiverState(
         ComplexF64,
-        system;
+        signal;
         num_samples_for_acquisition = 20000,
         num_ants = NumAnts(1),
     )
@@ -184,7 +184,7 @@ end
         pvt, solved_at = GNSSReceiver.update_navigation(
             estimator,
             false,
-            (system,),
+            (signal,),
             state.track_state,
             state.receiver_sat_states,
             pvt,
@@ -226,10 +226,10 @@ function out_of_lock_code_detector()
     detector
 end
 
-function out_of_lock_sat_state(system, prn; time_out_of_lock = 0.0u"s")
+function out_of_lock_sat_state(signal, prn; time_out_of_lock = 0.0u"s")
     GNSSReceiver.ReceiverSatState(
         prn,
-        GNSSDecoderState(system, prn),
+        GNSSDecoderState(signal, prn),
         out_of_lock_code_detector(),
         GNSSReceiver.CarrierLockDetector(),
         0.0u"s",
@@ -241,18 +241,18 @@ end
 
 # A single-group track state with one satellite seeded through the receiver's
 # canonical constructor, so its slot type matches what `ReceiverState` pinned.
-function single_sat_track_state(system, prn; num_ants = NumAnts(1))
+function single_sat_track_state(signal, prn; num_ants = NumAnts(1))
     base = GNSSReceiver.ReceiverState(
         ComplexF64,
-        system;
+        signal;
         num_samples_for_acquisition = 20000,
         num_ants,
     )
     merge_sats(
         base.track_state,
-        get_signal_id(system),
+        get_signal_id(signal),
         [GNSSReceiver.create_tracked_sat(
-            GNSSReceiver.tracking_signals(system),
+            GNSSReceiver.tracking_signals(signal),
             prn,
             0.0,
             20.0u"Hz",
@@ -318,7 +318,7 @@ end
 # A satellite that has been in lock long past `time_in_lock_before_calculating_pvt`, so the
 # only thing the PVT gate can still object to is the state of its lock detectors.
 function pvt_sat_state(
-    system,
+    signal,
     prn,
     code_lock_detector,
     carrier_lock_detector;
@@ -327,7 +327,7 @@ function pvt_sat_state(
 )
     GNSSReceiver.ReceiverSatState(
         prn,
-        GNSSDecoderState(system, prn),
+        GNSSDecoderState(signal, prn),
         code_lock_detector,
         carrier_lock_detector,
         uconvert(u"s", float(time_in_lock)),
@@ -338,7 +338,7 @@ function pvt_sat_state(
 end
 
 @testset "is_ranging_ready on a ReceiverSatState needs both detectors" begin
-    system = GPSL1CA()
+    signal = GPSL1CA()
     ready_code = ranging_ready_code_detector()
     ready_carrier = ranging_ready_carrier_detector()
     fresh_code = fresh_code_detector()
@@ -353,10 +353,10 @@ end
     combinations = Dictionary(
         [(false, false), (true, false), (false, true), (true, true)],
         [
-            pvt_sat_state(system, 1, fresh_code, fresh_carrier),
-            pvt_sat_state(system, 1, ready_code, fresh_carrier),
-            pvt_sat_state(system, 1, fresh_code, ready_carrier),
-            pvt_sat_state(system, 1, ready_code, ready_carrier),
+            pvt_sat_state(signal, 1, fresh_code, fresh_carrier),
+            pvt_sat_state(signal, 1, ready_code, fresh_carrier),
+            pvt_sat_state(signal, 1, fresh_code, ready_carrier),
+            pvt_sat_state(signal, 1, ready_code, ready_carrier),
         ],
     )
     # An AND, not an OR and not just one of the two: only the state whose *both* detectors
@@ -373,36 +373,36 @@ end
     # while its carrier phase-lock indicator is starved of prompts — ANDing the carrier latch
     # would permanently exclude a member that joined the loop before that latch fired.
     @test GNSSReceiver.is_ranging_ready(
-        pvt_sat_state(system, 1, ready_code, fresh_carrier; in_vt_loop = true),
+        pvt_sat_state(signal, 1, ready_code, fresh_carrier; in_vt_loop = true),
     )
     @test !GNSSReceiver.is_ranging_ready(
-        pvt_sat_state(system, 1, ready_code, fresh_carrier),
+        pvt_sat_state(signal, 1, ready_code, fresh_carrier),
     )
     # But a member whose *code* detector has not settled is still not rangeable.
     @test !GNSSReceiver.is_ranging_ready(
-        pvt_sat_state(system, 1, fresh_code, ready_carrier; in_vt_loop = true),
+        pvt_sat_state(signal, 1, fresh_code, ready_carrier; in_vt_loop = true),
     )
 end
 
 # The satellites `pvt_signal_groups` hands the solve for one GPS L1 C/A group.
-pvt_group_sats(system, sat_states, track_state, threshold) = collect(
+pvt_group_sats(signal, sat_states, track_state, threshold) = collect(
     GNSSReceiver.pvt_signal_groups(
-        (system,),
+        (signal,),
         track_state,
-        (; get_signal_id(system) => sat_states),
+        (; get_signal_id(signal) => sat_states),
         threshold,
-    )[get_signal_id(system)].satellites,
+    )[get_signal_id(signal)].satellites,
 )
 
 @testset "pvt_signal_groups admits only ranging-ready satellites" begin
-    system = GPSL1CA()
-    key = get_signal_id(system)
-    track_state = single_sat_track_state(system, 5)
+    signal = GPSL1CA()
+    key = get_signal_id(signal)
+    track_state = single_sat_track_state(signal, 5)
     time_in_lock_before_pvt = 2u"s"
 
-    not_ready = pvt_sat_state(system, 5, fresh_code_detector(), fresh_carrier_detector())
+    not_ready = pvt_sat_state(signal, 5, fresh_code_detector(), fresh_carrier_detector())
     ready = pvt_sat_state(
-        system,
+        signal,
         5,
         ranging_ready_code_detector(),
         ranging_ready_carrier_detector(),
@@ -418,14 +418,14 @@ pvt_group_sats(system, sat_states, track_state, threshold) = collect(
     @test GNSSReceiver.is_ranging_ready(ready)
 
     @test isempty(
-        pvt_group_sats(system, Dictionary([5], [not_ready]), track_state, time_in_lock_before_pvt),
+        pvt_group_sats(signal, Dictionary([5], [not_ready]), track_state, time_in_lock_before_pvt),
     )
 
     states =
-        pvt_group_sats(system, Dictionary([5], [ready]), track_state, time_in_lock_before_pvt)
+        pvt_group_sats(signal, Dictionary([5], [ready]), track_state, time_in_lock_before_pvt)
     @test length(states) == 1
     # PVT is handed the ranging signal, and the satellite's own decoder and code phase.
-    @test states[1].signal == GNSSReceiver.ranging_signal(system)
+    @test states[1].signal == GNSSReceiver.ranging_signal(signal)
     @test states[1].code_phase == get_code_phase(get_sat_state(track_state, key, 5))
     @test states[1].decoder === ready.decoder
 
@@ -433,12 +433,12 @@ pvt_group_sats(system, sat_states, track_state, threshold) = collect(
     # that has not yet been in lock long enough to have decoded usable data.
     @test isempty(
         pvt_group_sats(
-            system,
+            signal,
             Dictionary(
                 [5],
                 [
                     pvt_sat_state(
-                        system,
+                        signal,
                         5,
                         ranging_ready_code_detector(),
                         ranging_ready_carrier_detector();
@@ -458,9 +458,9 @@ end
     # phase, and during pull-in that phase is still a transient. Its detectors are driven to
     # ranging readiness first, so the *time* gate is the only thing this testset varies —
     # `is_ranging_ready`, the other half of the same conjunction, is covered above.
-    system = GPSL1CA()
-    key = get_signal_id(system)
-    track_state = single_sat_track_state(system, 1)
+    signal = GPSL1CA()
+    key = get_signal_id(signal)
+    track_state = single_sat_track_state(signal, 1)
     ready_code = ranging_ready_code_detector()
     ready_carrier = ranging_ready_carrier_detector()
     settled(time_in_lock) = Dictionary(
@@ -468,7 +468,7 @@ end
         [
             GNSSReceiver.ReceiverSatState(
                 1,
-                GNSSDecoderState(system, 1),
+                GNSSDecoderState(signal, 1),
                 ready_code,
                 ready_carrier,
                 time_in_lock,
@@ -479,7 +479,7 @@ end
         ],
     )
     collect_ready(time_in_lock, threshold) =
-        pvt_group_sats(system, settled(time_in_lock), track_state, threshold)
+        pvt_group_sats(signal, settled(time_in_lock), track_state, threshold)
 
     @test isempty(collect_ready(0.0u"s", 2u"s"))   # just locked
     @test isempty(collect_ready(2.0u"s", 2u"s"))   # exactly at the gate — strictly greater
@@ -495,10 +495,10 @@ end
 end
 
 @testset "ReceiverSatState lock-timer transitions" begin
-    system = GPSL1CA()
+    signal = GPSL1CA()
     state = GNSSReceiver.ReceiverSatState(
         1,
-        GNSSDecoderState(system, 1),
+        GNSSDecoderState(signal, 1),
         GNSSReceiver.CodeLockDetector(),
         GNSSReceiver.CarrierLockDetector(),
         0.0u"s",
@@ -522,25 +522,25 @@ end
 end
 
 @testset "remove_lost_satellites drops out-of-lock tracked satellites" begin
-    system = GPSL1CA()
-    key = get_signal_id(system)
-    track_state = single_sat_track_state(system, 5)
-    receiver_sat_states = (; key => Dictionary([5], [out_of_lock_sat_state(system, 5)]))
+    signal = GPSL1CA()
+    key = get_signal_id(signal)
+    track_state = single_sat_track_state(signal, 5)
+    receiver_sat_states = (; key => Dictionary([5], [out_of_lock_sat_state(signal, 5)]))
 
     pruned = GNSSReceiver.remove_lost_satellites(receiver_sat_states, track_state)
     @test length(get_sat_states(pruned)) == 0
 end
 
 @testset "update_all_receiver_sat_states advances out-of-lock timer" begin
-    system = GPSL1CA()
-    key = get_signal_id(system)
-    track_state = single_sat_track_state(system, 5)
-    receiver_sat_states = (; key => Dictionary([5], [out_of_lock_sat_state(system, 5)]))
+    signal = GPSL1CA()
+    key = get_signal_id(signal)
+    track_state = single_sat_track_state(signal, 5)
+    receiver_sat_states = (; key => Dictionary([5], [out_of_lock_sat_state(signal, 5)]))
 
     updated = GNSSReceiver.update_all_receiver_sat_states(
         receiver_sat_states,
         track_state,
-        (system,),
+        (signal,),
         4u"ms",
     )
     @test updated[key][5].time_out_of_lock == 4u"ms"
@@ -553,14 +553,14 @@ end
     # chunk both have to be exactly the tracked satellite's. Noise only, which leaves the
     # satellite in lock through the code detector's warm-up and dwell; 40 chunks of 4 ms run
     # past the indicator's 100 ms time constant, before which it is `NaN` on both sides.
-    system = GPSL1CA()
-    key = get_signal_id(system)
-    bk = get_band_id(GNSSReceiver.system_band(system))
+    signal = GPSL1CA()
+    key = get_signal_id(signal)
+    bk = get_band_id(GNSSReceiver.signal_band(signal))
     sampling_freq = 5e6u"Hz"
     num_samples = 20000
-    track_state = single_sat_track_state(system, 5)
+    track_state = single_sat_track_state(signal, 5)
     receiver_sat_states =
-        (; key => Dictionary([5], [GNSSReceiver.ReceiverSatState(system, 5)]))
+        (; key => Dictionary([5], [GNSSReceiver.ReceiverSatState(signal, 5)]))
     carrier_detector_of(states) = states[key][5].carrier_lock_detector
     rng = Random.Xoshiro(1)
     for _ = 1:40
@@ -572,7 +572,7 @@ end
         receiver_sat_states = GNSSReceiver.update_all_receiver_sat_states(
             receiver_sat_states,
             track_state,
-            (system,),
+            (signal,),
             num_samples / sampling_freq,
         )
         @test GNSSReceiver.is_in_lock(receiver_sat_states[key][5])
@@ -591,17 +591,17 @@ end
 end
 
 @testset "tracked_sat_from_acq builds a matching tracked-sat slot ($i antennas)" for i in [1, 4]
-    system = GPSL1CA()
+    signal = GPSL1CA()
     num_ants = NumAnts(i)
     empty_track_state =
         GNSSReceiver.ReceiverState(
             ComplexF64,
-            system;
+            signal;
             num_samples_for_acquisition = 20000,
             num_ants,
         ).track_state
     acq = Acquisition.AcquisitionResults(
-        system,
+        signal,
         5,
         5e6u"Hz",
         100.0u"Hz",
@@ -619,43 +619,43 @@ end
     )
     tracked_sat = GNSSReceiver.tracked_sat_from_acq(
         acq,
-        GNSSReceiver.tracking_signals(system),
+        GNSSReceiver.tracking_signals(signal),
         num_ants,
         empty_track_state.doppler_estimator,
     )
     # Built with the same slot type the track state pins (for multiple antennas that
     # includes the `EigenBeamformer` post-corr filter), so `merge_sats` accepts it.
     @test tracked_sat isa eltype(get_sat_states(empty_track_state))
-    merged = merge_sats(empty_track_state, get_signal_id(system), [tracked_sat])
+    merged = merge_sats(empty_track_state, get_signal_id(signal), [tracked_sat])
     @test length(get_sat_states(merged)) == 1
 end
 
 # The code-lock threshold is set once, on the state: `process` carries it from chunk to
 # chunk, and a satellite it acquires gets a code lock detector built with it.
 @testset "process judges code lock by the state's threshold" begin
-    system = GPSL1CA()
-    key = get_signal_id(system)
+    signal = GPSL1CA()
+    key = get_signal_id(signal)
     sampling_freq = 5e6Hz
     receiver_state = GNSSReceiver.ReceiverState(
         ComplexF64,
-        system;
+        signal;
         num_samples_for_acquisition = 20000,
         code_lock_cn0_threshold = 25.0u"dBHz",
     )
     @test receiver_state.code_lock_cn0_threshold == 25.0u"dBHz"
-    acq_plans = (; key => plan_acquire(system, float(sampling_freq), collect(1:32)))
+    acq_plans = (; key => plan_acquire(signal, float(sampling_freq), collect(1:32)))
     next_receiver_state = GNSSReceiver.process(
         receiver_state,
         acq_plans,
         (randn(ComplexF64, 20000, 1),),
-        ((system,),),
+        ((signal,),),
         sampling_freq;
         acq_pfa = 1e-12,
     )
     @test next_receiver_state.code_lock_cn0_threshold == 25.0u"dBHz"
 
     acq = Acquisition.AcquisitionResults(
-        system,
+        signal,
         5,
         5e6u"Hz",
         100.0u"Hz",
@@ -677,23 +677,23 @@ end
         next_receiver_state.code_lock_cn0_threshold,
         next_receiver_state.track_state,
         next_receiver_state.receiver_sat_states[key],
-        system,
+        signal,
         NumAnts(1),
     )
     @test receiver_sat_states[5].code_lock_detector.cn0_threshold == 25.0u"dBHz"
 end
 
 @testset "update_states_from_acquisition_results is a no-op without detections" begin
-    system = GPSL1CA()
+    signal = GPSL1CA()
     num_ants = NumAnts(1)
     base = GNSSReceiver.ReceiverState(
         ComplexF64,
-        system;
+        signal;
         num_samples_for_acquisition = 20000,
         num_ants,
     )
     empty_track_state = base.track_state
-    empty_receiver_sat_states = base.receiver_sat_states[get_signal_id(system)]
+    empty_receiver_sat_states = base.receiver_sat_states[get_signal_id(signal)]
 
     # No acquisition results leaves both the track state and the receiver-sat-state
     # dictionary untouched. (The detection-handover path is covered end-to-end by the
@@ -704,7 +704,7 @@ end
         nothing,
         empty_track_state,
         empty_receiver_sat_states,
-        system,
+        signal,
         num_ants,
     )
     @test ts === empty_track_state
@@ -713,10 +713,10 @@ end
 end
 
 @testset "try_to_reacquire_lost_satellites counts failed reacquisitions" begin
-    system = GPSL1CA()
+    signal = GPSL1CA()
     num_ants = NumAnts(1)
     sampling_freq = 5e6Hz
-    acq_plan = plan_acquire(system, float(sampling_freq), collect(1:32))
+    acq_plan = plan_acquire(signal, float(sampling_freq), collect(1:32))
 
     # Fill the acquisition buffer with noise so the reacquisition attempt runs but the
     # (deterministic) acquisition finds nothing, driving the failed-reacquisition
@@ -729,17 +729,17 @@ end
     )
     @test GNSSReceiver.SampleBuffers.isfull(acquisition_buffer)
 
-    track_state = single_sat_track_state(system, 5)
+    track_state = single_sat_track_state(signal, 5)
     receiver_sat_states = Dictionary(
         [5],
-        [out_of_lock_sat_state(system, 5; time_out_of_lock = 0.25u"s")],
+        [out_of_lock_sat_state(signal, 5; time_out_of_lock = 0.25u"s")],
     )
     @test GNSSReceiver.should_reacquire(receiver_sat_states[5])
 
     _, updated_receiver_sat_states = GNSSReceiver.try_to_reacquire_lost_satellites(
         track_state,
         receiver_sat_states,
-        system,
+        signal,
         acq_plan,
         acquisition_buffer,
         0.0u"Hz",

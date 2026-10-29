@@ -10,7 +10,8 @@
 # documented way to write each one exactly once.
 function build_nav_records(logger::RinexLogger, receiver_state)
     ephemerides = Vector{Union{GPSEphemeris,GalileoEphemeris,BeiDouEphemeris}}()
-    header = RinexNavHeader(; satellite_system = nav_satellite_system(logger.systems))
+    header =
+        RinexNavHeader(; satellite_system = nav_satellite_system(logger.satellite_systems))
     isnothing(logger.config.nav_file) && return ephemerides, header
     for (group_key, sat_states) in pairs(receiver_state.receiver_sat_states)
         haskey(logger.layouts, group_key) || continue

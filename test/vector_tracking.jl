@@ -135,12 +135,12 @@ end
     @test GNSSReceiver.vector_tracking_signal(combined).second === combined.data
     @test GNSSReceiver.vector_tracking_signal(combined.data) === combined.data
 
-    system = combined
-    key = GNSSReceiver.signal_group_key(system)
+    signal = combined
+    key = GNSSReceiver.signal_group_key(signal)
     sampling_freq = 24.552e6Hz
     receiver_state = GNSSReceiver.ReceiverState(
         ComplexF64,
-        system;
+        signal;
         num_samples_for_acquisition = 100,
         vector_tracking = true,
     )
@@ -156,7 +156,7 @@ end
         receiver_state.track_state,
         key,
         [GNSSReceiver.create_tracked_sat(
-            GNSSReceiver.tracking_signals(system),
+            GNSSReceiver.tracking_signals(signal),
             prn,
             0.0,
             0.0u"Hz",
@@ -166,7 +166,7 @@ end
     )
     state = ReceiverState(
         track_state,
-        (; key => Dictionary([prn], [GNSSReceiver.ReceiverSatState(system, prn)])),
+        (; key => Dictionary([prn], [GNSSReceiver.ReceiverSatState(signal, prn)])),
         receiver_state.acquisition_buffers,
         # Acquisition just ran, so no scan is due during these chunks.
         map(_ -> 0.0u"s", receiver_state.last_time_acquisition_ran),
@@ -184,7 +184,7 @@ end
             state,
             acq_plans,
             (randn(rng, ComplexF64, num_samples, 1) .* 10,),
-            ((system,),),
+            ((signal,),),
             sampling_freq;
             acq_pfa = 1e-12,
             acquire_every = 1000u"s",
@@ -192,7 +192,7 @@ end
     end
     report = TrackingLoops.satellite_report(estimator, GalileoE1C(), prn)
     @test !isnothing(report)
-    @test report.decoder isa GNSSReceiver.decoder_state_type(system)
+    @test report.decoder isa GNSSReceiver.decoder_state_type(signal)
     # Reports are keyed by the driver: there is none under the data component.
     @test isnothing(TrackingLoops.satellite_report(estimator, GalileoE1B(), prn))
     # Still within its lock detectors' warm-up, so in lock and updated every chunk.
@@ -223,19 +223,19 @@ end
 
     # The vector estimator decodes every satellite it steps, so the receiver takes its
     # decoder over; a satellite it has no record of yet keeps the receiver's.
-    system = GPSL1CA()
-    own_decoder = GNSSDecoderState(system, 3)
-    engine_decoder = GNSSDecoderState(system, 3)
-    estimator = VectorPLLAndDLL(system; approximate_year = 2017)
+    signal = GPSL1CA()
+    own_decoder = GNSSDecoderState(signal, 3)
+    engine_decoder = GNSSDecoderState(signal, 3)
+    estimator = VectorPLLAndDLL(signal; approximate_year = 2017)
     @test GNSSReceiver.updated_decoder(
         estimator,
         fake_report(; decoder = engine_decoder),
         own_decoder,
         nothing,
-        system,
+        signal,
         3,
     ) === engine_decoder
-    @test GNSSReceiver.updated_decoder(estimator, nothing, own_decoder, nothing, system, 3) ===
+    @test GNSSReceiver.updated_decoder(estimator, nothing, own_decoder, nothing, signal, 3) ===
           own_decoder
 end
 
@@ -246,10 +246,10 @@ end
     # Satellite 5 dropped out and its slot went to satellite 7, so the decoder still held
     # for 5 shares its soft-symbol buffer with 7's live one: re-acquiring 5 must not reset
     # that decoder in place.
-    system = GPSL1CA()
-    key = GNSSReceiver.signal_group_key(system)
+    signal = GPSL1CA()
+    key = GNSSReceiver.signal_group_key(signal)
     dropped_prn, new_prn = 5, 7
-    dropped_decoder = GNSSDecoderState(system, dropped_prn)
+    dropped_decoder = GNSSDecoderState(signal, dropped_prn)
     live_decoder = decode!(
         reset_decoder_state!(dropped_decoder, new_prn),
         ones(100),
@@ -273,7 +273,7 @@ end
         )],
     )
     acq = Acquisition.AcquisitionResults(
-        system,
+        signal,
         dropped_prn,
         5e6u"Hz",
         100.0u"Hz",
@@ -293,7 +293,7 @@ end
 
     vector_state = GNSSReceiver.ReceiverState(
         ComplexF64,
-        system;
+        signal;
         num_samples_for_acquisition = 20000,
         vector_tracking = true,
     )
@@ -303,7 +303,7 @@ end
         nothing,
         vector_state.track_state,
         receiver_sat_states,
-        system,
+        signal,
         NumAnts(1),
     )
     @test acquired == [dropped_prn]
@@ -316,7 +316,7 @@ end
     # keeps its decoded data.
     scalar_state = GNSSReceiver.ReceiverState(
         ComplexF64,
-        system;
+        signal;
         num_samples_for_acquisition = 20000,
         vector_tracking = false,
     )
@@ -326,7 +326,7 @@ end
         nothing,
         scalar_state.track_state,
         receiver_sat_states,
-        system,
+        signal,
         NumAnts(1),
     )
     @test scalar_sat_states[dropped_prn].decoder.cache === dropped_decoder.cache
@@ -334,12 +334,12 @@ end
 end
 
 @testset "Vector-loop members stay tracked through an outage" begin
-    system = GPSL1CA()
-    key = get_signal_id(system)
+    signal = GPSL1CA()
+    key = get_signal_id(signal)
     prn = 9
     receiver_state = GNSSReceiver.ReceiverState(
         ComplexF64,
-        system;
+        signal;
         num_samples_for_acquisition = 20000,
         vector_tracking = true,
     )
@@ -347,7 +347,7 @@ end
         receiver_state.track_state,
         key,
         [GNSSReceiver.create_tracked_sat(
-            GNSSReceiver.tracking_signals(system),
+            GNSSReceiver.tracking_signals(signal),
             prn,
             0.0,
             20.0u"Hz",
@@ -359,7 +359,7 @@ end
     # A member out of code lock is neither reacquired nor removed.
     out_of_lock_member = GNSSReceiver.ReceiverSatState(
         prn,
-        GNSSDecoderState(system, prn),
+        GNSSDecoderState(signal, prn),
         out_of_lock_code_detector(),
         GNSSReceiver.CarrierLockDetector(),
         0.0u"s",
@@ -382,7 +382,7 @@ end
     # While in the vector loop, lock follows the code detector alone.
     code_locked_member = GNSSReceiver.ReceiverSatState(
         prn,
-        GNSSDecoderState(system, prn),
+        GNSSDecoderState(signal, prn),
         GNSSReceiver.CodeLockDetector(),
         GNSSReceiver.set_out_of_lock(GNSSReceiver.CarrierLockDetector()),
         0.0u"s",
@@ -401,10 +401,10 @@ end
 end
 
 @testset "The receiver copies the vector estimator's solution once per cycle" begin
-    system = GPSL1CA()
+    signal = GPSL1CA()
     receiver_state = GNSSReceiver.ReceiverState(
         ComplexF64,
-        system;
+        signal;
         num_samples_for_acquisition = 20000,
         vector_tracking = true,
     )
@@ -413,7 +413,7 @@ end
     navigate(new_cycle) = GNSSReceiver.update_navigation(
         estimator,
         new_cycle,
-        (system,),
+        (signal,),
         receiver_state.track_state,
         receiver_state.receiver_sat_states,
         previous,

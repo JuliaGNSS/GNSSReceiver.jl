@@ -142,11 +142,11 @@ using GNSSReceiver.SampleBuffers
 primary_code_period(signal::AbstractGNSSSignal) =
     uconvert(s, get_code_length(signal) / get_chip_rate(signal))
 
-# Number of samples spanning one primary code period of `system` at `sampling_freq`.
+# Number of samples spanning one primary code period of `signal` at `sampling_freq`.
 # Uses the same `ceil` convention as Acquisition's `plan_acquire`, so buffer sizing
 # matches the plan's sample requirement exactly.
-samples_per_code(system::AbstractGNSSSignal, sampling_freq) =
-    ceil(Int, get_code_length(system) * upreferred(sampling_freq / get_chip_rate(system)))
+samples_per_code(signal::AbstractGNSSSignal, sampling_freq) =
+    ceil(Int, get_code_length(signal) * upreferred(sampling_freq / get_chip_rate(signal)))
 
 # Is a coherent window of `nc` code periods a length `plan_acquire` accepts? A
 # window spanning ≥ one navigation bit must cover whole bits, and (for tiered/pilot
@@ -157,10 +157,10 @@ samples_per_code(system::AbstractGNSSSignal, sampling_freq) =
 # second form takes the secondary-code length and the code periods per bit directly, for a
 # plan whose satellites differ from the signal in either (BeiDou GEO; see
 # `plan_band_acquisition`).
-is_valid_coherent_length(system::AbstractGNSSSignal, nc::Int) = is_valid_coherent_length(
+is_valid_coherent_length(signal::AbstractGNSSSignal, nc::Int) = is_valid_coherent_length(
     nc,
-    get_secondary_code_length(system),
-    get_code_blocks_per_bit(system),
+    get_secondary_code_length(signal),
+    get_code_blocks_per_bit(signal),
 )
 function is_valid_coherent_length(nc::Int, secondary_code_length, code_blocks_per_bit)
     nc <= 1 && return nc == 1
@@ -180,24 +180,24 @@ end
 # (Fourier duality); the carrier only affects the Doppler search *span*, not its
 # resolution. Shared by the acquisition-signal chooser and `plan_band_acquisition` so the two
 # can never disagree on the required coherent length.
-function coherent_code_periods_for_resolution(system::AbstractGNSSSignal, acq_doppler_resolution)
+function coherent_code_periods_for_resolution(signal::AbstractGNSSSignal, acq_doppler_resolution)
     isnothing(acq_doppler_resolution) && return 1
     max(
         1,
         ceil(
             Int,
             upreferred(
-                get_chip_rate(system) / (acq_doppler_resolution * get_code_length(system)),
+                get_chip_rate(signal) / (acq_doppler_resolution * get_code_length(signal)),
             ),
         ),
     )
 end
 
-# Wall-clock duration of a coherent integration of `nc` code periods of `system`
+# Wall-clock duration of a coherent integration of `nc` code periods of `signal`
 # (nc · T_code = nc · get_code_length / get_chip_rate). Used to compare the
 # pilot's and data component's acquisition windows on the same (time) axis.
-coherent_integration_time(system::AbstractGNSSSignal, nc::Integer) =
-    nc * get_code_length(system) / get_chip_rate(system)
+coherent_integration_time(signal::AbstractGNSSSignal, nc::Integer) =
+    nc * get_code_length(signal) / get_chip_rate(signal)
 
 # Snap a resolution-derived coherent code-period count UP to the smallest value
 # `plan_acquire` accepts (see `is_valid_coherent_length`). Rounding up (never down)
@@ -205,11 +205,11 @@ coherent_integration_time(system::AbstractGNSSSignal, nc::Integer) =
 # `acq_doppler_resolution` is treated as a maximum, so snapping must not coarsen it.
 # A valid length always exists above `ideal` (multiples of the secondary-code /
 # bit period), so the search terminates.
-snap_coherent_code_periods(system::AbstractGNSSSignal, ideal::Int) =
+snap_coherent_code_periods(signal::AbstractGNSSSignal, ideal::Int) =
     snap_coherent_code_periods(
         ideal,
-        get_secondary_code_length(system),
-        get_code_blocks_per_bit(system),
+        get_secondary_code_length(signal),
+        get_code_blocks_per_bit(signal),
     )
 function snap_coherent_code_periods(ideal::Int, secondary_code_length, code_blocks_per_bit)
     ideal <= 1 && return 1
@@ -220,9 +220,9 @@ function snap_coherent_code_periods(ideal::Int, secondary_code_length, code_bloc
     nc
 end
 
-# Default PRNs to search per system. Kept conservative to bound the
+# Default PRNs to search per signal. Kept conservative to bound the
 # acquisition cost; override via the `prns` keyword of `receive`. The
-# per-constellation supertypes let us default to each system's allocated PRN range:
+# per-constellation supertypes let us default to each signal's allocated PRN range:
 # GPS 1:32, Galileo 1:36, BeiDou 1:63 — searching only 1:32 would silently skip the
 # higher Galileo PRNs, and, on BeiDou, every satellite above it.
 #
@@ -274,22 +274,22 @@ broadcasting_prns(::Union{GPSL2CM,GPSL2CL}) = GPS_L2C_PRNS
 broadcasting_prns(::Union{BeiDouB1C_D,BeiDouB1C_P,BeiDouB2aI,BeiDouB2aQ,BeiDouB2bI}) =
     BEIDOU_BDS3_MEO_IGSO_PRNS
 
-# The candidate PRNs the caller asked to search for `system`. `prns` may be:
+# The candidate PRNs the caller asked to search for `signal`. `prns` may be:
 #   * `nothing`                       ⇒ the constellation default (`default_prns`);
 #   * a per-GNSS `NamedTuple` / `Dict` keyed by GNSSSignals' `get_constellation_id`
 #     (`:GPS`, …), falling back to the default for a constellation not listed;
-#   * any other collection            ⇒ used for every system (backwards compatible).
-requested_prns(::Nothing, system) = default_prns(system)
-requested_prns(prns::Union{NamedTuple,AbstractDict}, system) =
-    get(prns, get_constellation_id(system), default_prns(system))
-requested_prns(prns, system) = prns
+#   * any other collection            ⇒ used for every signal (backwards compatible).
+requested_prns(::Nothing, signal) = default_prns(signal)
+requested_prns(prns::Union{NamedTuple,AbstractDict}, signal) =
+    get(prns, get_constellation_id(signal), default_prns(signal))
+requested_prns(prns, signal) = prns
 
-# PRNs to actually acquire for `system`: the requested candidates restricted to the
+# PRNs to actually acquire for `signal`: the requested candidates restricted to the
 # PRNs that broadcast the signal (request order preserved). Empty is legal — the
-# band simply has nothing to acquire for that system.
-function search_prns(prns, system)
-    requested = requested_prns(prns, system)
-    capable = broadcasting_prns(system)
+# band simply has nothing to acquire for that signal.
+function search_prns(prns, signal)
+    requested = requested_prns(prns, signal)
+    capable = broadcasting_prns(signal)
     isnothing(capable) ? collect(requested) : intersect(requested, capable)
 end
 
@@ -338,24 +338,24 @@ function ReceiverSatState(
     )
 end
 
-# A fresh satellite of `system`, a plain signal or a `CombinedSignal`: the decoder runs on
+# A fresh satellite of `signal`, a plain signal or a `CombinedSignal`: the decoder runs on
 # the data component, the lock detectors on the ranging signal.
 function ReceiverSatState(
-    system,
+    signal,
     prn::Int,
     code_lock_cn0_threshold::typeof(1.0dBHz) =
-        get_default_code_lock_cn0_threshold(ranging_signal(system)),
+        get_default_code_lock_cn0_threshold(ranging_signal(signal)),
 )
     ReceiverSatState(
         prn,
-        GNSSDecoderState(data_signal(system), prn),
+        GNSSDecoderState(data_signal(signal), prn),
         CodeLockDetector(;
             cn0_threshold = code_lock_cn0_threshold,
             # The detector runs on the ranging signal, so its code period is the reference.
-            reference_integration_time = primary_code_period(ranging_signal(system)),
+            reference_integration_time = primary_code_period(ranging_signal(signal)),
         ),
         CarrierLockDetector(;
-            reference_integration_time = primary_code_period(ranging_signal(system)),
+            reference_integration_time = primary_code_period(ranging_signal(signal)),
         ),
         0.0s,
         0.0s,
@@ -418,7 +418,7 @@ end
 # band buffers its own RF stream — so `acquisition_buffers` and
 # `last_time_acquisition_ran` are NamedTuples keyed by `band_key` (`get_band_id`:
 # `:L1`, `:L5`, …), one entry per band. `receiver_sat_states` is a NamedTuple keyed by each
-# system's group key (`get_signal_id`, the ranging signal's id, unique across
+# signal's group key (`get_signal_id`, the ranging signal's id, unique across
 # bands), each value a per-constellation dictionary of `ReceiverSatState` by PRN.
 #
 # Under vector tracking the navigation state — decoders, PVT and the navigation
@@ -449,11 +449,11 @@ struct ReceiverState{
     code_lock_cn0_threshold::C
 end
 
-# Flatten a tuple of per-band system tuples into one flat tuple of systems.
+# Flatten a tuple of per-band signal tuples into one flat tuple of signals.
 # Recursion (rather than `reduce`/splat) keeps every step concretely typed.
-_flatten_systems(::Tuple{}) = ()
-_flatten_systems(band_systems::Tuple) =
-    (first(band_systems)..., _flatten_systems(Base.tail(band_systems))...)
+_flatten_signals(::Tuple{}) = ()
+_flatten_signals(band_signals::Tuple) =
+    (first(band_signals)..., _flatten_signals(Base.tail(band_signals))...)
 
 get_num_ants(num_ants::NumAnts{N}) where {N} = N
 
@@ -503,8 +503,8 @@ end
 # its beamforming weights (`N₀ = wᴴR̂w`, see `create_post_corr_filter`); measured on fewer
 # antennas than the group tracks, the floor and the prompt it is divided into would
 # describe different arrays, and Tracking rejects the mismatch at construction.
-create_noise_estimators(systems::Tuple, num_ants::NumAnts) =
-    _noise_estimators(_flatten_systems(map(tracking_signals, systems)), num_ants)
+create_noise_estimators(signals::Tuple, num_ants::NumAnts) =
+    _noise_estimators(_flatten_signals(map(tracking_signals, signals)), num_ants)
 
 # Fold one single-entry NamedTuple per signal together. The deduplication is `merge`'s,
 # and that is the point: it resolves the shared keys in the *type* domain, where a
@@ -528,9 +528,10 @@ _noise_estimator(signal, num_ants::NumAnts) =
 # transitions to squash the discriminator) and decodes the message from the *data*.
 #
 # `CombinedSignal(pilot, data)` declares such a pair. Everywhere the receiver takes
-# a *signal system* it is either a plain `AbstractGNSSSignal` (data-only) or a
-# `CombinedSignal`; the helpers below map a system to the concrete signals each
-# stage needs, keeping the rest of the receiver system-agnostic.
+# a *signal* it is either a plain `AbstractGNSSSignal` (data-only) or a
+# `CombinedSignal`; the helpers below map a signal to the component each stage needs
+# (`ranging_signal`, `data_signal`, `tracking_signals`), keeping the rest of the receiver
+# agnostic of the pairing.
 """
     CombinedSignal(pilot, data)
 
@@ -539,7 +540,7 @@ receiver ranges on the dataless `pilot` (its prompt has no navigation-bit transi
 squash the discriminator) and decodes the navigation message from the `data` component —
 e.g. `CombinedSignal(GalileoE1C(), GalileoE1B())` or `CombinedSignal(GPSL5Q(), GPSL5I())`.
 
-Pass it anywhere [`receive`](@ref) / [`ReceiverState`](@ref) take a signal system; a plain
+Pass it anywhere [`receive`](@ref) / [`ReceiverState`](@ref) take a signal; a plain
 `AbstractGNSSSignal` (e.g. `GPSL1CA()`) is the data-only alternative.
 """
 struct CombinedSignal{P<:AbstractGNSSSignal,D<:AbstractGNSSSignal}
@@ -548,16 +549,16 @@ struct CombinedSignal{P<:AbstractGNSSSignal,D<:AbstractGNSSSignal}
 end
 
 # The signal whose navigation message is decoded, and that identifies the
-# satellite everywhere downstream (tracking-group key, PVT `system`,
+# satellite everywhere downstream (tracking-group key, PVT `signal`,
 # constellation, `sat_data` key).
-data_signal(system::AbstractGNSSSignal) = system
-data_signal(system::CombinedSignal) = system.data
+data_signal(signal::AbstractGNSSSignal) = signal
+data_signal(signal::CombinedSignal) = signal.data
 
 # The signal the code/carrier loops range on — the `Tracking` estimator-driver
 # (first entry of `tracking_signals`), and the one the CN0 and lock detectors
 # read.
-ranging_signal(system::AbstractGNSSSignal) = system
-ranging_signal(system::CombinedSignal) = system.pilot
+ranging_signal(signal::AbstractGNSSSignal) = signal
+ranging_signal(signal::CombinedSignal) = signal.pilot
 
 # Cap on Acquisition's secondary-code rotation search. `plan_band_acquisition` passes this
 # explicitly to `plan_acquire` (rather than leaning on its matching default, which
@@ -587,9 +588,9 @@ const MAX_SECONDARY_CODE_ROTATIONS = 32
 # B2a-Q (L=100>32) always fall back to data. A plain (non-combined) signal — B1I, B3I
 # and B2b-I among them, none of which has a pilot component — is its own acquisition
 # signal.
-acquisition_signal(system::AbstractGNSSSignal, acq_doppler_resolution) = system
-function acquisition_signal(system::CombinedSignal, acq_doppler_resolution)
-    pilot, data = system.pilot, system.data
+acquisition_signal(signal::AbstractGNSSSignal, acq_doppler_resolution) = signal
+function acquisition_signal(signal::CombinedSignal, acq_doppler_resolution)
+    pilot, data = signal.pilot, signal.data
     # Coherent length each component needs to meet the requested resolution, snapped
     # to a length `plan_acquire` accepts (the same value `plan_band_acquisition` will build).
     snap(s) = snap_coherent_code_periods(
@@ -605,73 +606,73 @@ end
 # The signal tuple handed to a `Tracking` group: the ranging (driver) signal
 # first, the data signal last. For a plain signal the two coincide, so the
 # group tracks that single signal.
-tracking_signals(system::AbstractGNSSSignal) = (system,)
-tracking_signals(system::CombinedSignal) = (system.pilot, system.data)
+tracking_signals(signal::AbstractGNSSSignal) = (signal,)
+tracking_signals(signal::CombinedSignal) = (signal.pilot, signal.data)
 
-# Per-signal selectors into `tracking_signals(system)` for the `Tracking`
+# Per-signal selectors into `tracking_signals(signal)` for the `Tracking`
 # accessors: ranging is always the first signal, data always the last. Both are
 # `1` for a plain signal.
 const RANGING_SIGNAL_INDEX = 1
-data_signal_index(system) = length(tracking_signals(system))
+data_signal_index(signal) = length(tracking_signals(signal))
 
-# Tracking-group key / `sat_data` key for a system: the id of the signal the loops
+# Tracking-group key / `sat_data` key for a signal: the id of the signal the loops
 # range on — the pilot for a `CombinedSignal`, and the signal itself (its data
 # component) for a plain signal. This is exactly what PVT keys `pvt.satellites` by (we hand
 # `calc_pvt` the ranging signal), so tracking groups, `receiver_sat_states`, acq
 # plans, `sat_data` and `pvt.satellites` all share one `(signal, prn)` namespace. Decoding
 # still runs on the group's data component regardless of the key.
-signal_group_key(system) = get_signal_id(ranging_signal(system))
+signal_group_key(signal) = get_signal_id(ranging_signal(signal))
 
-# RF band of a system, taken from its ranging signal (a pilot/data pair shares one
+# RF band of a signal, taken from its ranging signal (a pilot/data pair shares one
 # band). Used by `assert_single_band`.
-system_band(system) = get_band(ranging_signal(system))
+signal_band(signal) = get_band(ranging_signal(signal))
 
-# Normalise a single system or a collection of systems to a tuple of systems.
-as_systems(systems::Tuple) = systems
-as_systems(system::AbstractGNSSSignal) = (system,)
-as_systems(system::CombinedSignal) = (system,)
+# Normalise a single signal or a collection of signals to a tuple of signals.
+as_signals(signals::Tuple) = signals
+as_signals(signal::AbstractGNSSSignal) = (signal,)
+as_signals(signal::CombinedSignal) = (signal,)
 
 # A single sample stream (SDR front-end or file) can only carry one RF band, so
-# every requested system must share one. `get_band` exposes the shared carrier
+# every requested signal must share one. `get_band` exposes the shared carrier
 # at the type level — GPS L1 C/A and Galileo E1B both report `L1()`, so multi-GNSS
 # L1 works — letting us reject a genuinely un-tunable mix (e.g. L1 + L5) instead
-# of silently dropping the rest of the systems.
-function assert_single_band(systems)
-    bands = map(system_band, systems)
+# of silently dropping the rest of the signals.
+function assert_single_band(signals)
+    bands = map(signal_band, signals)
     allequal(bands) || throw(
         ArgumentError(
-            "All systems must share one RF band; got bands " *
+            "All signals must share one RF band; got bands " *
             join(map(get_band_name, bands), ", "),
         ),
     )
     nothing
 end
 
-# A pilot component carries no navigation data, so a system is only trackable if its
+# A pilot component carries no navigation data, so a signal is only trackable if its
 # data component is decodable — i.e. `GNSSDecoderState` has a method for it. The
 # decoder method table is the authoritative definition of "data-carrying", so no
 # separate pilot trait is needed.
-is_decodable(system) = hasmethod(GNSSDecoderState, Tuple{typeof(data_signal(system)),Int})
+is_decodable(signal) = hasmethod(GNSSDecoderState, Tuple{typeof(data_signal(signal)),Int})
 
-# The decoder-state type of a system's data component, used to type the (still empty)
+# The decoder-state type of a signal's data component, used to type the (still empty)
 # per-satellite dictionaries. Asked of inference rather than read off a throwaway instance:
 # building one allocates the whole decoder — for Galileo an AFF3CT Viterbi decoder, which
 # cannot be constructed at all where `libaff3ct_jl` is missing (Windows) — long before any
 # satellite is acquired. The constructors are trivial and type-stable, so this resolves to
 # the same concrete type; were inference ever to give up, `ReceiverSatState`'s
 # `DS<:GNSSDecoderState` bound would reject the result loudly rather than silently.
-decoder_state_type(system) =
-    Base.promote_op(GNSSDecoderState, typeof(data_signal(system)), Int)
+decoder_state_type(signal) =
+    Base.promote_op(GNSSDecoderState, typeof(data_signal(signal)), Int)
 
-# Reject a system whose data component cannot be decoded — e.g. a bare pilot such as
-# `GPSL5Q()` passed as a system, or a `CombinedSignal` with a non-data `.data` slot.
+# Reject a signal whose data component cannot be decoded — e.g. a bare pilot such as
+# `GPSL5Q()` passed as a signal, or a `CombinedSignal` with a non-data `.data` slot.
 # Tracking a pilot alone yields no navigation message, ephemeris or PVT, and would
 # otherwise fail deep in decoder construction with a cryptic `MethodError`.
-function assert_decodable(systems)
-    for system in systems
-        is_decodable(system) || throw(
+function assert_decodable(signals)
+    for signal in signals
+        is_decodable(signal) || throw(
             ArgumentError(
-                "System with data component $(get_signal_name(data_signal(system))) is " *
+                "System with data component $(get_signal_name(data_signal(signal))) is " *
                 "not decodable; tracking a pilot-only signal is not supported — pair it " *
                 "with its data component via `CombinedSignal(pilot, data)`.",
             ),
@@ -680,12 +681,12 @@ function assert_decodable(systems)
     nothing
 end
 
-# RF centre frequency to tune the front-end to for a single-band group of systems:
+# RF centre frequency to tune the front-end to for a single-band group of signals:
 # the shared band's carrier, taken from the ranging signal. Used to set the SDR RX
 # frequency (see `rx_center_frequency` caller in the SoapySDR setup).
-function rx_center_frequency(systems)
-    assert_single_band(systems)
-    get_center_frequency(ranging_signal(first(systems)))
+function rx_center_frequency(signals)
+    assert_single_band(signals)
+    get_center_frequency(ranging_signal(first(signals)))
 end
 
 # The scalar loop every satellite runs fresh from acquisition: the conventional
@@ -694,23 +695,23 @@ end
 # bins from this loop's pull-in range.
 const SCALAR_DOPPLER_ESTIMATOR = ConventionalAssistedPLLAndDLL()
 
-# How a system is given to the vector estimator: a plain signal is ranged on and decoded
+# How a signal is given to the vector estimator: a plain signal is ranged on and decoded
 # alike; a `CombinedSignal` as `pilot => data`, so the satellite ranges on the pilot that
 # drives its loops and the estimator decodes the data component.
-vector_tracking_signal(system::AbstractGNSSSignal) = system
-vector_tracking_signal(system::CombinedSignal) = system.pilot => system.data
+vector_tracking_signal(signal::AbstractGNSSSignal) = signal
+vector_tracking_signal(signal::CombinedSignal) = signal.pilot => signal.data
 
 # The tracking loops' Doppler estimator for the `vector_tracking` mode, which is either
 # a switch or the navigation filter's configuration: `false` gives the conventional
 # FLL-assisted PLL/DLL for scalar tracking, `true` vector tracking with the
 # `NavigationFilterConfig` defaults, and a `NavigationFilterConfig` both enables it and
 # describes the platform and oscillator. Vector tracking runs TrackingLoops'
-# `VectorPLLAndDLL` over every system (see `vector_tracking_signal`), which wraps that
+# `VectorPLLAndDLL` over every signal (see `vector_tracking_signal`), which wraps that
 # same scalar loop and owns the whole navigation pipeline — decoding, the scalar PVT that
 # seeds the filter and the filter itself, run once every `pvt_update_interval`. Not
 # user-selectable — the mode alone determines it.
-doppler_estimator_for(vector_tracking::Bool, systems; kwargs...) =
-    vector_tracking ? doppler_estimator_for(NavigationFilterConfig(), systems; kwargs...) :
+doppler_estimator_for(vector_tracking::Bool, signals; kwargs...) =
+    vector_tracking ? doppler_estimator_for(NavigationFilterConfig(), signals; kwargs...) :
     SCALAR_DOPPLER_ESTIMATOR
 
 # The vector loop's lock threshold — the C/N₀ a satellite must hold to count as in lock to
@@ -721,7 +722,7 @@ doppler_estimator_for(vector_tracking::Bool, systems; kwargs...) =
 # own code lock detector does.
 function doppler_estimator_for(
     filter_config::NavigationFilterConfig,
-    systems;
+    signals;
     pvt_update_interval = 100ms,
     enable_ionospheric_correction = true,
     enable_tropospheric_correction = true,
@@ -730,10 +731,10 @@ function doppler_estimator_for(
 )
     lock_cn0_threshold = something(
         code_lock_cn0_threshold,
-        minimum(system -> get_default_code_lock_cn0_threshold(ranging_signal(system)), systems),
+        minimum(signal -> get_default_code_lock_cn0_threshold(ranging_signal(signal)), signals),
     )
     VectorPLLAndDLL(
-        map(vector_tracking_signal, systems)...;
+        map(vector_tracking_signal, signals)...;
         inner = SCALAR_DOPPLER_ESTIMATOR,
         filter_config,
         vt_update_interval = pvt_update_interval,
@@ -745,13 +746,13 @@ function doppler_estimator_for(
 end
 
 # Primary constructor: build one multi-band receiver state from the per-band
-# system tuples and pre-built per-band acquisition buffers (keyed by `band_key`).
-# All systems across all bands become tracking groups in a single `TrackState`,
+# signal tuples and pre-built per-band acquisition buffers (keyed by `band_key`).
+# All signals across all bands become tracking groups in a single `TrackState`,
 # keyed by their (unique) group key. The navigation keywords configure the vector
 # estimator, which runs the navigation cycle itself; a scalar receiver takes them
 # per chunk in `process` instead.
 function ReceiverState(
-    band_systems::Tuple,
+    band_signals::Tuple,
     acquisition_buffers::NamedTuple;
     num_ants::NumAnts = NumAnts(1),
     vector_tracking::Union{Bool,NavigationFilterConfig} = false,
@@ -761,34 +762,34 @@ function ReceiverState(
     approximate_year::Integer = year(now(UTC)),
     code_lock_cn0_threshold::Union{Nothing,typeof(1.0dBHz)} = nothing,
 )
-    systems = _flatten_systems(band_systems)
-    assert_decodable(systems)
+    signals = _flatten_signals(band_signals)
+    assert_decodable(signals)
     doppler_estimator = doppler_estimator_for(
         vector_tracking,
-        systems;
+        signals;
         pvt_update_interval,
         enable_ionospheric_correction,
         enable_tropospheric_correction,
         approximate_year,
         code_lock_cn0_threshold,
     )
-    group_keys = map(signal_group_key, systems)
-    # One tracking group per system: a plain signal alone, a `CombinedSignal` as its
+    group_keys = map(signal_group_key, signals)
+    # One tracking group per signal: a plain signal alone, a `CombinedSignal` as its
     # pilot (ranging driver) + data component (see `tracking_signals`). Each group
     # carries its own band, so a single `TrackState` spans every band. Each group's
     # empty satellite dictionary is typed after a template built through
     # `create_tracked_sat` — the same constructor the acquisition handover uses — so
     # acquired sats merge without a slot-type mismatch (see `create_tracked_sat`).
-    groups = NamedTuple{group_keys}(map(systems) do system
-        sigs = tracking_signals(system)
+    groups = NamedTuple{group_keys}(map(signals) do signal
+        sigs = tracking_signals(signal)
         template = create_tracked_sat(sigs, 0, 0.0, 0.0Hz, num_ants, doppler_estimator)
         sats = Dictionary{Int,typeof(template)}(Int[], typeof(template)[])
         SignalGroup(get_band(first(sigs)), sats, sigs, num_ants)
     end)
     track_state =
-        TrackState(groups, doppler_estimator, create_noise_estimators(systems, num_ants))
-    receiver_sat_states = NamedTuple{group_keys}(map(systems) do system
-        DS = decoder_state_type(system)
+        TrackState(groups, doppler_estimator, create_noise_estimators(signals, num_ants))
+    receiver_sat_states = NamedTuple{group_keys}(map(signals) do signal
+        DS = decoder_state_type(signal)
         Dictionary{Int,ReceiverSatState{DS}}()
     end)
     # One acquisition timer per band, keyed like the buffers.
@@ -808,12 +809,12 @@ function ReceiverState(
 end
 
 """
-    ReceiverState(T, systems; num_samples_for_acquisition, num_ants = NumAnts(1), kwargs...)
+    ReceiverState(T, signals; num_samples_for_acquisition, num_ants = NumAnts(1), kwargs...)
 
-Build the initial receiver state for tracking `systems`, where `T` is the element type of
+Build the initial receiver state for tracking `signals`, where `T` is the element type of
 the incoming signal samples (e.g. `ComplexF64` or `Complex{Int16}`).
 
-`systems` is a single GNSS system, a [`CombinedSignal`](@ref) pilot+data pair, or a tuple
+`signals` is a single GNSS signal, a [`CombinedSignal`](@ref) pilot+data pair, or a tuple
 of these sharing one RF band; each becomes a tracking group in a single `TrackState`,
 keyed by its ranging signal's id. `num_samples_for_acquisition` sizes the acquisition
 sample buffer, and `num_ants` selects single- versus multi-antenna processing.
@@ -831,19 +832,19 @@ code lock detector and to the navigation filter (`nothing`, the default, takes
 judges every satellite by the threshold the vector loop does. A
 [`CombinedSignal`](@ref) ranges on its pilot and decodes its data component under vector
 tracking too. One
-`ReceiverState` spans every band; pass the per-band system tuples and pre-built acquisition
+`ReceiverState` spans every band; pass the per-band signal tuples and pre-built acquisition
 buffers to the primary constructor for the multi-band case.
 """
 function ReceiverState(
     ::Type{T}, # Must be the same type as the incoming signal
-    systems;
+    signals;
     num_samples_for_acquisition,
     kwargs...,
 ) where {T}
-    systems = as_systems(systems)
-    band_key = get_band_id(system_band(first(systems)))
+    signals = as_signals(signals)
+    band_key = get_band_id(signal_band(first(signals)))
     buffers = NamedTuple{(band_key,)}((SampleBuffer(T, num_samples_for_acquisition),))
-    ReceiverState((systems,), buffers; kwargs...)
+    ReceiverState((signals,), buffers; kwargs...)
 end
 
 include("read_file.jl")
@@ -867,13 +868,13 @@ using .Dashboard: gui
 include("save_data.jl")
 
 """
-    gnss_receiver_gui(; system = GPSL1CA(), sampling_frequency = 2e6Hz, kwargs...)
+    gnss_receiver_gui(; signal = GPSL1CA(), sampling_frequency = 2e6Hz, kwargs...)
 
 Acquire, track and compute a PVT solution from a live SoapySDR device and display the
 result in a live terminal GUI. When the stream ends the final frame stays on screen; the
 call blocks until you quit the dashboard with `q`.
 
-`system` is a single system or a tuple of systems sharing one RF band (see [`receive`](@ref)
+`signal` is a single signal or a tuple of signals sharing one RF band (see [`receive`](@ref)
 / [`CombinedSignal`](@ref)). The device selected by `dev_args` is configured for
 `sampling_frequency`, tuned to the shared band's centre frequency and streamed for
 `run_time` — all handled by SignalChannels' `stream_data`, which buffers a few seconds of
@@ -889,7 +890,7 @@ Set `write_rinex = true` (or a [`RinexConfig`](@ref)) to record RINEX 3.05 obser
 navigation files alongside the live display; see [`receive`](@ref).
 """
 function gnss_receiver_gui(;
-    system = GPSL1CA(),
+    signal = GPSL1CA(),
     sampling_frequency = 2e6Hz,
     # Duration of each processing chunk fed to `receive` (tracking granularity /
     # latency). The acquisition coherent-integration length is chosen internally by
@@ -908,7 +909,7 @@ function gnss_receiver_gui(;
     # RINEX 3.05 recording: `false`, `true`, or a `RinexConfig` (see `receive`).
     write_rinex::Union{Bool,RinexConfig} = false,
 )
-    systems = as_systems(system)
+    signals = as_signals(signal)
     num_samples_per_chunk = Int(upreferred(sampling_frequency * chunk_time))
     eval_num_samples = Int(upreferred(sampling_frequency * run_time))
 
@@ -918,7 +919,7 @@ function gnss_receiver_gui(;
     # the stream to the processing chunk length.
     channel_config = SDRChannelConfig(;
         sample_rate = sampling_frequency,
-        frequency = rx_center_frequency(systems),
+        frequency = rx_center_frequency(signals),
         bandwidth = sampling_frequency,
         gain,
         antenna,
@@ -940,10 +941,10 @@ function gnss_receiver_gui(;
     Base.errormonitor(warning_task)
 
     # Performing GNSS acquisition and tracking. `receive`'s single-channel convenience
-    # method wraps the stream and systems into the one-band tuple form.
+    # method wraps the stream and signals into the one-band tuple form.
     data_channel = receive(
         data_stream,
-        systems,
+        signals,
         sampling_frequency;
         num_ants,
         intermediate_frequency,
@@ -958,7 +959,7 @@ function gnss_receiver_gui(;
 end
 
 """
-    gnss_write_to_file(; system = GPSL1CA(), sampling_frequency = 2e6Hz, run_time = 4s,
+    gnss_write_to_file(; signal = GPSL1CA(), sampling_frequency = 2e6Hz, run_time = 4s,
                        dev_args = first(Devices()), output_file = "gnss_test_data",
                        gain = 50dB)
 
@@ -971,7 +972,7 @@ later offline replay with [`read_files`](@ref) and [`receive`](@ref). SignalChan
 finishes.
 """
 function gnss_write_to_file(;
-    system = GPSL1CA(),
+    signal = GPSL1CA(),
     sampling_frequency = 2e6Hz,
     run_time = 4s,
     dev_args = first(Devices()),
@@ -982,7 +983,7 @@ function gnss_write_to_file(;
 
     channel_config = SDRChannelConfig(;
         sample_rate = sampling_frequency,
-        frequency = rx_center_frequency(as_systems(system)),
+        frequency = rx_center_frequency(as_signals(signal)),
         bandwidth = sampling_frequency,
         gain,
     )
@@ -1001,7 +1002,7 @@ end
 function receive_and_gui(
     files;
     clock_drift = 0.0,
-    system = GPSL1CA(),
+    signal = GPSL1CA(),
     sampling_freq = 5e6Hz,
     type = Complex{Int16},
     num_ants = NumAnts(4),
@@ -1010,7 +1011,7 @@ function receive_and_gui(
     max_meas = nothing,
 )
     #    files = map(i -> "/mnt/data_disk/measurementComplex{Int16}$i.dat", 1:2)
-    systems = as_systems(system)
+    signals = as_signals(signal)
     close_stream_event = Base.Event()
     adjusted_sample_freq = sampling_freq * (1 - clock_drift)
 
@@ -1021,10 +1022,10 @@ function receive_and_gui(
     # Let's receive GPS L1 signals
     data_channel = receive(
         measurement_channel,
-        systems,
+        signals,
         adjusted_sample_freq;
         num_ants,
-        intermediate_frequency = clock_drift * get_center_frequency(first(systems)),
+        intermediate_frequency = clock_drift * get_center_frequency(first(signals)),
         max_meas,
     )
     # Get gui channel from data channel and display the dashboard. `gui` owns the terminal

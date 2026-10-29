@@ -140,8 +140,8 @@ rinex_target(config::RinexConfig, ::Symbol; session = nothing, with_marker_name 
 # corrections. Its satellite system, which the name reports, is settled by the configuration
 # before a single ephemeris is decoded (RINEXParser's `nav_satellite_system`) — the same
 # choice [`build_nav_records`](@ref) makes.
-initial_nav_header(systems) =
-    RinexNavHeader(; satellite_system = nav_satellite_system(systems))
+initial_nav_header(satellite_systems) =
+    RinexNavHeader(; satellite_system = nav_satellite_system(satellite_systems))
 
 # The observation-header metadata a configuration that gives none writes over RINEXParser's
 # own defaults (`marker_type = "GEODETIC"`): RINEX placeholders, and this receiver as the

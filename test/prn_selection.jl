@@ -56,7 +56,7 @@
     # 3 is BDS-2 and 60 is a BDS-3 GEO; neither carries B1C.
     @test G.search_prns((BeiDou = [3, 20, 60],), BeiDouB1C_D()) == [20]
 
-    # Backwards compatible: a plain collection applies to every system.
+    # Backwards compatible: a plain collection applies to every signal.
     @test G.search_prns([1, 8, 30, 7], GPSL5I()) == [1, 8, 30]  # 7 is not L5-capable
     @test G.search_prns([1, 8, 30, 7], GPSL1CA()) == [1, 8, 30, 7]
 

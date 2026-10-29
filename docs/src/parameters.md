@@ -9,21 +9,21 @@ list lives in the [`receive` docstring](@ref receive) at the bottom of the page.
 
 `receive`'s second argument selects which signals to receive:
 
-- A **single system** — one GNSS signal (`GPSL1CA()`), a [`CombinedSignal`](@ref)
-  pilot+data pair, or a tuple of these — that shares one RF band:
+- A **single signal** — a GNSS signal such as `GPSL1CA()`, or a
+  [`CombinedSignal`](@ref) pilot+data pair:
 
   ```julia
   receive(measurement_channel, GPSL1CA(), sampling_freq)
   ```
 
-- A **tuple of systems** sharing one RF band, fused into a single multi-GNSS PVT
+- A **tuple of signals** sharing one RF band, fused into a single multi-GNSS PVT
   solution. GPS L1 C/A and Galileo E1 both live on L1, so they can share one stream:
 
   ```julia
   receive(measurement_channel, (GPSL1CA(), GalileoE1B()), sampling_freq)
   ```
 
-  (All systems in the tuple must share one RF band; mixing bands — e.g. L1 and L5 —
+  (All signals in the tuple must share one RF band; mixing bands — e.g. L1 and L5 —
   throws.)
 
   !!! note "Galileo E1B needs a high sampling frequency — or its BOC(1,1) approximation"
@@ -35,7 +35,7 @@ list lives in the [`receive` docstring](@ref receive) at the bottom of the page.
       C/N₀ penalty).
 
 - For **several RF bands**, use the multi-band method: a tuple of measurement channels
-  (one per band), a tuple of per-band system groups and a tuple of
+  (one per band), a tuple of per-band signal groups and a tuple of
   `intermediate_frequencies`, all aligned band-by-band. Every band is fused into one
   solution with per-constellation clock biases and per-band inter-frequency biases:
 
@@ -56,7 +56,7 @@ on) and the data component (whose navigation message is decoded) together in one
 Acquisition is the search that finds which satellites are visible and gives a first
 estimate of their code phase and Doppler. It re-runs at most every `acquire_every` of
 signal time. Its **coherent integration length and Doppler resolution are not user
-knobs** — they are derived internally, per system, from the tracking loop's carrier-Doppler
+knobs** — they are derived internally, per signal, from the tracking loop's carrier-Doppler
 *pull-in range*, so that the worst-case post-acquisition residual always lands inside the
 loop's capture range. A detection is accepted purely on a CFAR test (constant false-alarm
 rate) at a fixed internal false-alarm probability — there is no acquisition CN0 threshold.
@@ -64,7 +64,7 @@ rate) at a fixed internal false-alarm probability — there is no acquisition CN
 | Keyword | Default | Meaning |
 |---|---|---|
 | `acquire_every` | `10u"s"` | How often (in signal time) acquisition re-runs to look for new satellites. |
-| `prns` | `nothing` | Which PRNs to search for. `nothing` ⇒ each constellation's default range; a per-GNSS `NamedTuple`/`Dict` keyed by constellation; or a plain collection applied to every system. |
+| `prns` | `nothing` | Which PRNs to search for. `nothing` ⇒ each constellation's default range; a per-GNSS `NamedTuple`/`Dict` keyed by constellation; or a plain collection applied to every signal. |
 
 ### Restricting the PRN search
 
@@ -78,8 +78,8 @@ data_channel = receive(
 )
 ```
 
-A plain collection is applied to every system, and `nothing` uses each constellation's
-default range — GPS 1:32, Galileo 1:36, BeiDou 1:63. Each system's search is further
+A plain collection is applied to every signal, and `nothing` uses each constellation's
+default range — GPS 1:32, Galileo 1:36, BeiDou 1:63. Each signal's search is further
 restricted to the PRNs that actually broadcast its signal (GPS L5/L2C to the blocks that
 carry them; BeiDou B1C/B2a/B2b to the BDS-3 MEO/IGSO range 19-50).
 

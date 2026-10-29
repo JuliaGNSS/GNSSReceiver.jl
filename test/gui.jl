@@ -508,7 +508,7 @@ end
     @test occursin("run time", out) && occursin("10.0 s", out)
     # The block is titled "Position Velocity Time (PVT)" and, with diagnostics on, folds in
     # the solution internals: the full DOP breakdown (GDOP/PDOP/HDOP/VDOP/TDOP) is shown;
-    # residuals flagged (4 sats, single system/band ⇒ no redundancy), so the "insufficient
+    # residuals flagged (4 sats, one time system and band ⇒ no redundancy), so the "insufficient
     # redundancy" note appears.
     @test occursin("Position Velocity Time (PVT)", out)
     @test occursin("GDOP", out) && occursin("HDOP", out) && occursin("VDOP", out) &&
@@ -702,7 +702,7 @@ end
 end
 
 @testset "Satellite labels and display order" begin
-    # RINEX-style system letter + zero-padded PRN + band token, every label the same
+    # RINEX-style satellite-system letter + zero-padded PRN + band token, each label the same
     # width (the token is padded to the widest, 3 chars).
     @test GNSSReceiver.sat_label(:GPSL1CA, 3) == "G03 L1 "
     @test GNSSReceiver.sat_label(:GPSL1C_P, 30) == "G30 L1C"
